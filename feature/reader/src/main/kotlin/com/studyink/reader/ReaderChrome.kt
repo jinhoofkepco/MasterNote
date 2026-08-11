@@ -6,12 +6,12 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -25,13 +25,10 @@ import androidx.compose.material.icons.rounded.Brush
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Edit
-import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.FitScreen
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -53,6 +50,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -61,7 +59,10 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
+import kotlin.math.PI
+import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -70,6 +71,9 @@ private val InkRed = Color(0xFFE23B3B)
 private val InkBlue = Color(0xFF3568E8)
 private val InkGreen = Color(0xFF2F9B67)
 private val InkYellow = Color(0xFFF1B92B)
+private const val CompactFanRadius = 108
+private const val FanOriginX = 135
+private const val FanOriginY = 190
 
 private enum class RadialMenuPage { MAIN, COLORS, PEN }
 
@@ -131,8 +135,8 @@ fun StylusToolMenu(
 
     MaterialTheme {
         Popup(
-            alignment = Alignment.BottomEnd,
-            offset = IntOffset(22, 22),
+            alignment = Alignment.BottomCenter,
+            offset = IntOffset.Zero,
             onDismissRequest = onDismissRequest,
             properties = PopupProperties(
                 focusable = false,
@@ -141,7 +145,7 @@ fun StylusToolMenu(
                 clippingEnabled = true,
             ),
         ) {
-            Box(modifier = Modifier.size(width = 300.dp, height = 250.dp)) {
+            Box(modifier = Modifier.size(width = 270.dp, height = 240.dp)) {
                 when (menuPage) {
                     RadialMenuPage.MAIN -> MainRadialMenu(
                         state = state,
@@ -174,7 +178,6 @@ fun StylusToolMenu(
                         selectedOpacity = selectedOpacity,
                         onSelectWidth = onSelectWidth,
                         onSelectOpacity = onSelectOpacity,
-                        onBack = { menuPage = RadialMenuPage.MAIN },
                     )
                 }
             }
@@ -199,10 +202,10 @@ private fun MainRadialMenu(
     onRedo: () -> Unit,
 ) {
     RadialFan(
-        itemCount = 9,
-        originX = 150,
-        originY = 215,
-        radius = 120,
+        itemCount = 7,
+        originX = FanOriginX,
+        originY = FanOriginY,
+        radius = CompactFanRadius,
         startAngleDegrees = 180f,
         sweepAngleDegrees = 180f,
         animationKey = "main-tools",
@@ -215,44 +218,32 @@ private fun MainRadialMenu(
                 size = 44,
             ) { onUndo() }
             1 -> RadialActionButton(
-                icon = Icons.Rounded.ChevronLeft,
-                label = "이전 페이지",
-                enabled = currentPage > 0,
-                size = 44,
-            ) { onPreviousPage() }
-            2 -> RadialActionButton(
                 icon = Icons.AutoMirrored.Rounded.Backspace,
                 label = "지우개",
                 selected = selectedTool == ReaderTool.PARTIAL_ERASER,
                 size = 44,
             ) { onSelectTool(ReaderTool.PARTIAL_ERASER) }
-            3 -> RadialActionButton(
+            2 -> RadialActionButton(
                 icon = Icons.Rounded.Edit,
                 label = "펜",
                 selected = selectedTool == ReaderTool.PEN,
                 size = 44,
             ) { onOpenPen() }
-            4 -> RadialActionButton(
+            3 -> RadialActionButton(
                 icon = Icons.Rounded.Brush,
                 label = "형광펜",
                 selected = selectedTool == ReaderTool.HIGHLIGHTER,
                 size = 44,
             ) { onSelectTool(ReaderTool.HIGHLIGHTER) }
-            5 -> PaletteButton(
+            4 -> PaletteButton(
                 selectedColorArgb = selectedColorArgb,
                 onClick = onOpenColors,
             )
-            6 -> RadialActionButton(
+            5 -> RadialActionButton(
                 icon = Icons.Rounded.FitScreen,
                 label = "확대 초기화",
                 size = 44,
             ) { onResetZoom() }
-            7 -> RadialActionButton(
-                icon = Icons.Rounded.ChevronRight,
-                label = "다음 페이지",
-                enabled = currentPage + 1 < pageCount,
-                size = 44,
-            ) { onNextPage() }
             else -> RadialActionButton(
                 icon = Icons.AutoMirrored.Rounded.Redo,
                 label = "다시 실행",
@@ -261,7 +252,13 @@ private fun MainRadialMenu(
             ) { onRedo() }
         }
     }
-    PageBadge(currentPage = currentPage, pageCount = pageCount, x = 123, y = 200)
+    PageControl(
+        currentPage = currentPage,
+        pageCount = pageCount,
+        onPreviousPage = onPreviousPage,
+        onNextPage = onNextPage,
+        modifier = Modifier.offset(x = 67.dp, y = 202.dp),
+    )
 }
 
 @Composable
@@ -279,9 +276,9 @@ private fun ColorRadialMenu(
     )
     RadialFan(
         itemCount = colors.size + 1,
-        originX = 150,
-        originY = 215,
-        radius = 120,
+        originX = FanOriginX,
+        originY = FanOriginY,
+        radius = CompactFanRadius,
         startAngleDegrees = 180f,
         sweepAngleDegrees = 180f,
         animationKey = "colors",
@@ -302,16 +299,15 @@ private fun PenRadialMenu(
     selectedOpacity: Float,
     onSelectWidth: (Float) -> Unit,
     onSelectOpacity: (Float) -> Unit,
-    onBack: () -> Unit,
 ) {
     val widths = listOf(6.4f, 4.8f, 3.2f, 2.4f, 1.6f)
     RadialFan(
         itemCount = widths.size,
-        originX = 185,
-        originY = 210,
-        radius = 135,
-        startAngleDegrees = 190f,
-        sweepAngleDegrees = 80f,
+        originX = FanOriginX,
+        originY = FanOriginY,
+        radius = CompactFanRadius,
+        startAngleDegrees = 180f,
+        sweepAngleDegrees = 180f,
         animationKey = "pen-widths",
     ) { index ->
         StrokeWidthChoice(
@@ -320,23 +316,13 @@ private fun PenRadialMenu(
             onSelect = onSelectWidth,
         )
     }
-    PenStrokePreview(
-        color = Color(selectedColorArgb).copy(alpha = selectedOpacity),
+    CurvedOpacitySlider(
+        color = Color(selectedColorArgb),
         widthDp = selectedWidthDp,
-        modifier = Modifier.offset(x = 207.dp, y = 82.dp).size(width = 82.dp, height = 90.dp),
-    )
-    OpacityControl(
         opacity = selectedOpacity,
         onOpacityChange = onSelectOpacity,
-        modifier = Modifier.offset(x = 87.dp, y = 168.dp).size(width = 178.dp, height = 76.dp),
+        modifier = Modifier.offset(x = 80.dp, y = 112.dp).size(width = 110.dp, height = 72.dp),
     )
-    RadialActionButton(
-        icon = Icons.Rounded.ExpandMore,
-        label = "도구 메뉴로 돌아가기",
-        size = 40,
-        x = 14,
-        y = 207,
-    ) { onBack() }
 }
 
 /**
@@ -532,99 +518,124 @@ private fun StrokeWidthChoice(
 }
 
 @Composable
-private fun OpacityControl(
+private fun CurvedOpacitySlider(
+    color: Color,
+    widthDp: Float,
     opacity: Float,
     onOpacityChange: (Float) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Surface(
-        modifier = modifier.semantics { contentDescription = "펜 투명도" },
-        shape = RoundedCornerShape(18.dp),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
-        shadowElevation = 6.dp,
-        tonalElevation = 2.dp,
-    ) {
-        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text("투명도", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Medium)
-                Text(
-                    "${(opacity * 100).roundToInt()}%",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Medium,
-                )
-            }
-            Slider(
-                value = opacity,
-                onValueChange = { onOpacityChange(it.coerceIn(0.15f, 1f)) },
-                valueRange = 0.15f..1f,
-                modifier = Modifier.fillMaxWidth(),
-                colors = SliderDefaults.colors(
-                    thumbColor = MaterialTheme.colorScheme.primary,
-                    activeTrackColor = MaterialTheme.colorScheme.primary,
-                    inactiveTrackColor = MaterialTheme.colorScheme.outlineVariant,
-                ),
-            )
-        }
+    val startAngle = 210f
+    val sweepAngle = 150f
+    val updateOpacity: (Offset, Float, Float) -> Unit = { position, width, height ->
+        val center = Offset(width * 0.5f, height * 0.9f)
+        var angle = (atan2(position.y - center.y, position.x - center.x) * 180f / PI.toFloat())
+        if (angle < 0f) angle += 360f
+        if (angle < 90f) angle += 360f
+        val fraction = ((angle - startAngle) / sweepAngle).coerceIn(0f, 1f)
+        onOpacityChange(0.15f + fraction * 0.85f)
     }
-}
-
-@Composable
-private fun PenStrokePreview(
-    color: Color,
-    widthDp: Float,
-    modifier: Modifier = Modifier,
-) {
-    val previewSurface = MaterialTheme.colorScheme.surface
-    Canvas(modifier = modifier.semantics { contentDescription = "현재 펜 미리보기" }) {
-        val path = Path().apply {
-            moveTo(0f, size.height * 0.18f)
-            cubicTo(
-                size.width * 0.45f, size.height * 0.02f,
-                size.width * 0.82f, size.height * 0.18f,
-                size.width * 0.86f, size.height * 0.80f,
+    val inputModifier = modifier
+        .semantics { contentDescription = "펜 투명도 ${(opacity * 100).roundToInt()}%" }
+        .pointerInput(onOpacityChange) {
+            detectTapGestures { position ->
+                updateOpacity(position, size.width.toFloat(), size.height.toFloat())
+            }
+        }
+        .pointerInput(onOpacityChange) {
+            detectDragGestures(
+                onDragStart = { position ->
+                    updateOpacity(position, size.width.toFloat(), size.height.toFloat())
+                },
+                onDrag = { change, _ ->
+                    change.consume()
+                    updateOpacity(change.position, size.width.toFloat(), size.height.toFloat())
+                },
             )
         }
-        drawPath(
-            path = path,
-            brush = Brush.verticalGradient(listOf(color.copy(alpha = 0.18f), color)),
+    val previewSurface = MaterialTheme.colorScheme.surface
+    Canvas(modifier = inputModifier) {
+        val center = Offset(size.width * 0.5f, size.height * 0.9f)
+        val radius = min(size.width * 0.45f, size.height * 0.72f)
+        val strokeWidth = (widthDp * 4.6f).dp.toPx().coerceIn(12.dp.toPx(), 30.dp.toPx())
+        drawArc(
+            color = color.copy(alpha = 0.15f),
+            startAngle = startAngle,
+            sweepAngle = sweepAngle,
+            useCenter = false,
+            topLeft = Offset(center.x - radius, center.y - radius),
+            size = androidx.compose.ui.geometry.Size(radius * 2f, radius * 2f),
+            style = Stroke(width = strokeWidth, cap = StrokeCap.Round),
+        )
+        val progress = ((opacity - 0.15f) / 0.85f).coerceIn(0f, 1f)
+        drawArc(
+            color = color.copy(alpha = opacity),
+            startAngle = startAngle,
+            sweepAngle = sweepAngle * progress,
+            useCenter = false,
+            topLeft = Offset(center.x - radius, center.y - radius),
+            size = androidx.compose.ui.geometry.Size(radius * 2f, radius * 2f),
             style = Stroke(
-                width = (widthDp * 5.2f).dp.toPx().coerceIn(12.dp.toPx(), 34.dp.toPx()),
+                width = strokeWidth,
                 cap = StrokeCap.Round,
             ),
         )
-        drawCircle(
-            color = previewSurface,
-            radius = 16.dp.toPx(),
-            center = Offset(size.width * 0.86f, size.height * 0.80f),
+        val thumbAngle = Math.toRadians((startAngle + sweepAngle * progress).toDouble())
+        val thumbCenter = Offset(
+            x = center.x + radius * cos(thumbAngle).toFloat(),
+            y = center.y + radius * sin(thumbAngle).toFloat(),
         )
         drawCircle(
-            color = color,
-            radius = 12.dp.toPx(),
-            center = Offset(size.width * 0.86f, size.height * 0.80f),
+            color = previewSurface,
+            radius = 14.dp.toPx(),
+            center = thumbCenter,
+        )
+        drawCircle(
+            color = color.copy(alpha = opacity),
+            radius = 10.dp.toPx(),
+            center = thumbCenter,
         )
     }
 }
 
 @Composable
-private fun PageBadge(currentPage: Int, pageCount: Int, x: Int, y: Int) {
+private fun PageControl(
+    currentPage: Int,
+    pageCount: Int,
+    onPreviousPage: () -> Unit,
+    onNextPage: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     Surface(
-        modifier = Modifier.offset(x.dp, y.dp).size(width = 54.dp, height = 30.dp),
+        modifier = modifier.size(width = 136.dp, height = 36.dp),
         shape = RoundedCornerShape(999.dp),
         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
         shadowElevation = 4.dp,
         tonalElevation = 2.dp,
     ) {
-        Box(contentAlignment = Alignment.Center) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            IconButton(
+                onClick = onPreviousPage,
+                enabled = currentPage > 0,
+                modifier = Modifier.size(36.dp).semantics { contentDescription = "이전 페이지" },
+            ) {
+                Icon(Icons.Rounded.ChevronLeft, contentDescription = null, modifier = Modifier.size(22.dp))
+            }
             Text(
                 text = "${currentPage + 1}/${pageCount.coerceAtLeast(1)}",
                 style = MaterialTheme.typography.labelMedium,
                 fontWeight = FontWeight.Medium,
             )
+            IconButton(
+                onClick = onNextPage,
+                enabled = currentPage + 1 < pageCount,
+                modifier = Modifier.size(36.dp).semantics { contentDescription = "다음 페이지" },
+            ) {
+                Icon(Icons.Rounded.ChevronRight, contentDescription = null, modifier = Modifier.size(22.dp))
+            }
         }
     }
 }

@@ -103,8 +103,6 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             it.onStylusContact = {
                 if (stylusMenuExpanded) {
                     stylusMenuExpanded = false
-                    selectedTool = ReaderTool.PEN
-                    it.tool = ReaderTool.PEN
                     dryInkView.eraserPreview = null
                 }
             }
@@ -250,7 +248,6 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         if (stylusMenuExpanded && event.isPageStylusDown()) {
             stylusMenuExpanded = false
-            selectTool(ReaderTool.PEN)
         }
         if (handleStylusButton(event)) return true
         return super.dispatchTouchEvent(event)
