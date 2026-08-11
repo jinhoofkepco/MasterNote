@@ -16,6 +16,12 @@
 
 앱을 처음 열면 내장 예제 PDF가 자동으로 표시됩니다. 상단의 `PDF 열기`로 기기의 다른 PDF를 선택할 수 있습니다.
 
+## 최신 테스트 APK
+
+[MasterNote.apk 다운로드](https://github.com/jinhoofkepco/MasterNote/releases/download/dev-latest/MasterNote.apk)
+
+`main`에 변경 사항이 올라오면 GitHub Actions가 빌드와 단위 테스트를 실행한 뒤 위 파일을 교체합니다. APK는 고정된 테스트 인증서로 서명되며, 인증서 지문이 달라지면 배포 단계가 실패하도록 검사합니다.
+
 ## 빌드
 
 ```bash
