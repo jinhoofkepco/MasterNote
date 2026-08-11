@@ -3,6 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val masterNoteKeystorePath = providers.environmentVariable("MASTERNOTE_KEYSTORE_PATH").orNull
+
 android {
     namespace = "com.studyink.app"
     compileSdk = 36
@@ -15,6 +17,17 @@ android {
         versionCode = 1
         versionName = "0.1.0-kernel"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            if (masterNoteKeystorePath != null) {
+                storeFile = file(masterNoteKeystorePath)
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
     }
 
     buildTypes {
