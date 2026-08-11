@@ -114,7 +114,7 @@ class InkInputView(context: Context) : View(context) {
                     StrokeAsset(
                         pageNumber = currentPage,
                         tool = if (activeTool == ReaderTool.PEN) StrokeTool.PEN else StrokeTool.HIGHLIGHTER,
-                        colorArgb = if (activeTool == ReaderTool.PEN) penColorWithOpacity() else 0xFFFFD93D.toInt(),
+                        colorArgb = if (activeTool == ReaderTool.PEN) penColorWithOpacity() else 0x66FFE45C,
                         width = strokeWidthCanonical,
                         points = currentPoints.toList(),
                     )

@@ -11,6 +11,7 @@ import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
 import com.studyink.reader.DryInkView
 import com.studyink.reader.ReaderActivity
+import com.studyink.core.model.StrokeTool
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -103,6 +104,34 @@ class ReaderInteractionTest {
             SystemClock.sleep(100)
         }
         throw AssertionError("팝업의 다음 페이지 아이콘이 2페이지로 이동하지 못했습니다")
+    }
+
+    @Test
+    fun highlighterSelectionSurvivesMenuDismissAndStoresTransparentStroke() {
+        val eventTime = SystemClock.uptimeMillis()
+        val event = motionEvent(
+            action = MotionEvent.ACTION_BUTTON_PRESS,
+            source = InputDevice.SOURCE_STYLUS,
+            toolType = MotionEvent.TOOL_TYPE_STYLUS,
+            x = 520f,
+            y = 920f,
+            buttonState = MotionEvent.BUTTON_STYLUS_PRIMARY,
+            eventTime = eventTime,
+        )
+        scenario.onActivity { activity -> assertTrue(activity.dispatchGenericMotionEvent(event)) }
+        event.recycle()
+
+        assertTrue(device.wait(Until.hasObject(By.desc("형광펜")), 3_000))
+        device.findObject(By.desc("형광펜")).click()
+        val before = revision()
+        dispatchStroke(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 360f, 820f, 520f, 850f)
+        assertTrue("형광펜 획이 저장되어야 합니다", waitForRevisionAfter(before))
+
+        scenario.onActivity { activity ->
+            val stroke = activity.findDryInkView().snapshot.activeStrokes.last()
+            assertEquals(StrokeTool.HIGHLIGHTER, stroke.tool)
+            assertEquals(0x66FFE45C, stroke.colorArgb)
+        }
     }
 
     private fun dispatchStroke(
