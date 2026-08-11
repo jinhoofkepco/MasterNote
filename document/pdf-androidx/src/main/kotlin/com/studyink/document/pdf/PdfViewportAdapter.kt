@@ -1,12 +1,16 @@
 package com.studyink.document.pdf
 
+import android.annotation.SuppressLint
 import android.graphics.PointF
 import android.graphics.RectF
 import android.util.SparseArray
+import android.view.View
 import androidx.pdf.PdfPoint
 import androidx.pdf.view.PdfView
 import com.studyink.core.model.CANONICAL_PAGE_WIDTH
 import com.studyink.core.model.PagePoint
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 data class CanonicalPdfPoint(val pageNumber: Int, val point: PagePoint)
 
@@ -15,6 +19,7 @@ class PdfViewportAdapter {
     private var pageWidths: Map<Int, Float> = emptyMap()
     private var pageLocations = SparseArray<RectF>()
     private var activePageNumber = 0
+    private var settlePosted = false
 
     var onViewportChanged: () -> Unit = {}
 
@@ -31,16 +36,31 @@ class PdfViewportAdapter {
                 }
             }
             onViewportChanged()
+            if (pdfView?.gestureState == PdfView.GESTURE_STATE_IDLE) scheduleActivePageSettle()
         }
     }
 
+    private val gestureStateChangedListener = object : PdfView.OnGestureStateChangedListener {
+        override fun onGestureStateChanged(newState: Int) {
+            if (newState == PdfView.GESTURE_STATE_IDLE) scheduleActivePageSettle()
+        }
+    }
+
+    @SuppressLint("RestrictedApi")
     fun attach(view: PdfView) {
         pdfView?.removeOnViewportChangedListener(viewportChangedListener)
+        pdfView?.removeOnGestureStateChangedListener(gestureStateChangedListener)
         pdfView = view
+        pageWidths = emptyMap()
+        pageLocations.clear()
+        activePageNumber = 0
+        settlePosted = false
         view.pagesPerRow = PdfView.SINGLE_PAGE
         view.verticalAlignment = PdfView.VERTICAL_ALIGNMENT_CENTER
+        view.overScrollMode = View.OVER_SCROLL_NEVER
         hideBuiltInPageControls(view)
         view.addOnViewportChangedListener(viewportChangedListener)
+        view.addOnGestureStateChangedListener(gestureStateChangedListener)
     }
 
     fun setPageWidths(widths: Map<Int, Float>) {
@@ -83,6 +103,7 @@ class PdfViewportAdapter {
             hideBuiltInPageControls(view)
             view.scrollToPage(pageNumber)
             view.postDelayed({ hideBuiltInPageControls(view) }, 300L)
+            view.postDelayed(::scheduleActivePageSettle, 320L)
         }
         onViewportChanged()
     }
@@ -90,10 +111,48 @@ class PdfViewportAdapter {
     fun resetZoom() {
         pdfView?.let { view ->
             view.zoom = view.minZoom
-            view.post { view.scrollToPage(activePageNumber) }
+            view.post {
+                view.scrollToPage(activePageNumber)
+                scheduleActivePageSettle()
+            }
         }
     }
 
+    private fun scheduleActivePageSettle() {
+        val view = pdfView ?: return
+        if (pageWidths[activePageNumber] == null || settlePosted) return
+        settlePosted = true
+        view.post {
+            settlePosted = false
+            if (pdfView !== view) return@post
+            settleActivePage(view)
+        }
+    }
+
+    private fun settleActivePage(view: PdfView) {
+        val page = pageLocations[activePageNumber]
+        if (page == null) {
+            view.scrollToPage(activePageNumber)
+            return
+        }
+        val viewportHeight = view.height.toFloat()
+        if (viewportHeight <= 0f) return
+
+        val verticalCorrection = if (page.height() <= viewportHeight) {
+            page.top - (viewportHeight - page.height()) / 2f
+        } else {
+            when {
+                page.top > 0f -> page.top
+                page.bottom < viewportHeight -> page.bottom - viewportHeight
+                else -> 0f
+            }
+        }
+        if (abs(verticalCorrection) >= 1f) {
+            view.scrollBy(0, verticalCorrection.roundToInt())
+        }
+    }
+
+    @SuppressLint("RestrictedApi")
     private fun hideBuiltInPageControls(view: PdfView) {
         // PdfViewerFragment currently enables its internal fast scroller after PdfView creation.
         // Disable that renderer as well as its public visibility state so navigation stays in our menu.

@@ -59,7 +59,10 @@ class DryInkView(context: Context) : View(context) {
     }
 
     private fun drawPageMask(canvas: Canvas, page: RectF?) {
-        if (page == null) return
+        if (page == null) {
+            canvas.drawColor(pageMaskPaint.color)
+            return
+        }
         canvas.drawRect(0f, 0f, width.toFloat(), page.top.coerceAtLeast(0f), pageMaskPaint)
         canvas.drawRect(0f, page.bottom.coerceAtMost(height.toFloat()), width.toFloat(), height.toFloat(), pageMaskPaint)
         canvas.drawRect(0f, page.top, page.left.coerceAtLeast(0f), page.bottom, pageMaskPaint)

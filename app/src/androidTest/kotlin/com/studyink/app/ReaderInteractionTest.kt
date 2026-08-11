@@ -1,20 +1,23 @@
 package com.studyink.app
 
-import android.os.SystemClock
-import android.view.InputDevice
-import android.view.MotionEvent
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
+import android.os.SystemClock
+import android.view.InputDevice
+import android.view.MotionEvent
+import androidx.pdf.view.PdfView
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
+import com.studyink.core.model.StrokeTool
+import com.studyink.document.pdf.ReaderPdfFragment
 import com.studyink.reader.DryInkView
 import com.studyink.reader.ReaderActivity
-import com.studyink.core.model.StrokeTool
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -174,6 +177,56 @@ class ReaderInteractionTest {
         }
     }
 
+    @Test
+    fun zoomAndVerticalScrollStayOnTheSelectedPageWithoutThePdfEditButton() {
+        var initialId = ""
+        scenario.onActivity { activity ->
+            initialId = activity.findDryInkView().snapshot.documentId
+            val pdf = createColorPagesPdf(activity.filesDir, "page-lock-${System.nanoTime()}.pdf")
+            openDocument(activity, Uri.fromFile(pdf))
+        }
+        waitForStableDocumentId(excluding = initialId)
+
+        scenario.onActivity { activity ->
+            ReaderActivity::class.java
+                .getDeclaredMethod("showPage", Int::class.javaPrimitiveType)
+                .apply { isAccessible = true }
+                .invoke(activity, 1)
+
+            activity.readerPdfFragment().onRequestImmersiveMode(false)
+            assertTrue(
+                "AndroidX PDF 편집 버튼은 항상 숨겨져야 합니다",
+                !activity.readerPdfFragment().isToolboxVisible,
+            )
+        }
+
+        repeat(3) {
+            scenario.onActivity { activity ->
+                activity.findPdfView().apply {
+                    zoom = maxOf(minZoom * 2.5f, 1.5f).coerceAtMost(maxZoom)
+                }
+            }
+            SystemClock.sleep(400)
+            repeat(2) { device.swipe(540, 1_700, 540, 450, 20) }
+            assertOnlySelectedPageColorIsVisible()
+
+            repeat(2) { device.swipe(540, 450, 540, 1_700, 20) }
+            assertOnlySelectedPageColorIsVisible()
+
+            scenario.onActivity { activity ->
+                activity.findPdfView().apply { zoom = minZoom }
+            }
+            SystemClock.sleep(300)
+        }
+
+        scenario.onActivity { activity ->
+            assertTrue(
+                "확대·축소 후에도 PDF 편집 버튼이 나타나면 안 됩니다",
+                !activity.readerPdfFragment().isToolboxVisible,
+            )
+        }
+    }
+
     private fun openStylusMenu() {
         val eventTime = SystemClock.uptimeMillis()
         val event = motionEvent(
@@ -290,6 +343,46 @@ class ReaderInteractionTest {
         return false
     }
 
+    private fun assertOnlySelectedPageColorIsVisible() {
+        SystemClock.sleep(500)
+        repeat(20) {
+            val bitmap = device.takeScreenshot() ?: run {
+                SystemClock.sleep(100)
+                return@repeat
+            }
+            var contentTop = 0
+            var contentBottom = bitmap.height
+            scenario.onActivity { activity ->
+                val dryInk = activity.findDryInkView()
+                val location = IntArray(2)
+                dryInk.getLocationOnScreen(location)
+                contentTop = location[1].coerceIn(0, bitmap.height)
+                contentBottom = (location[1] + dryInk.height).coerceIn(contentTop, bitmap.height)
+            }
+
+            var previousPagePixels = 0
+            var selectedPagePixels = 0
+            var nextPagePixels = 0
+            for (y in contentTop until contentBottom step 8) {
+                for (x in 0 until bitmap.width step 8) {
+                    val pixel = bitmap.getPixel(x, y)
+                    when {
+                        pixel.isNear(PAGE_ONE_COLOR) -> previousPagePixels++
+                        pixel.isNear(PAGE_TWO_COLOR) -> selectedPagePixels++
+                        pixel.isNear(PAGE_THREE_COLOR) -> nextPagePixels++
+                    }
+                }
+            }
+            if (selectedPagePixels > 100) {
+                assertEquals("이전 페이지가 화면에 나타나면 안 됩니다", 0, previousPagePixels)
+                assertEquals("다음 페이지가 화면에 나타나면 안 됩니다", 0, nextPagePixels)
+                return
+            }
+            SystemClock.sleep(100)
+        }
+        throw AssertionError("확대·이동 후 선택한 2페이지가 화면으로 복귀하지 않았습니다")
+    }
+
     private fun revision(): Long {
         var revision = -1L
         scenario.onActivity { activity -> revision = activity.findDryInkView().snapshot.revision }
@@ -309,6 +402,22 @@ class ReaderInteractionTest {
         throw AssertionError("DryInkView를 찾을 수 없습니다")
     }
 
+    private fun ReaderActivity.findPdfView(): PdfView {
+        val root = findViewById<android.view.ViewGroup>(android.R.id.content)
+        val queue = ArrayDeque<android.view.View>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            when (val view = queue.removeFirst()) {
+                is PdfView -> return view
+                is android.view.ViewGroup -> (0 until view.childCount).forEach { queue.add(view.getChildAt(it)) }
+            }
+        }
+        throw AssertionError("PdfView를 찾을 수 없습니다")
+    }
+
+    private fun ReaderActivity.readerPdfFragment(): ReaderPdfFragment =
+        supportFragmentManager.fragments.filterIsInstance<ReaderPdfFragment>().single()
+
     private fun createPdf(directory: File, name: String, text: String): File {
         val file = File(directory, name)
         val document = PdfDocument()
@@ -320,10 +429,34 @@ class ReaderInteractionTest {
         return file
     }
 
+    private fun createColorPagesPdf(directory: File, name: String): File {
+        val file = File(directory, name)
+        val document = PdfDocument()
+        listOf(PAGE_ONE_COLOR, PAGE_TWO_COLOR, PAGE_THREE_COLOR).forEachIndexed { index, color ->
+            val page = document.startPage(PdfDocument.PageInfo.Builder(840, 1188, index + 1).create())
+            page.canvas.drawColor(color)
+            document.finishPage(page)
+        }
+        FileOutputStream(file).use(document::writeTo)
+        document.close()
+        return file
+    }
+
+    private fun Int.isNear(target: Int, tolerance: Int = 12): Boolean =
+        kotlin.math.abs(Color.red(this) - Color.red(target)) <= tolerance &&
+            kotlin.math.abs(Color.green(this) - Color.green(target)) <= tolerance &&
+            kotlin.math.abs(Color.blue(this) - Color.blue(target)) <= tolerance
+
     private fun openDocument(activity: ReaderActivity, uri: Uri) {
         ReaderActivity::class.java
             .getDeclaredMethod("showDocument", Uri::class.java, Boolean::class.javaPrimitiveType)
             .apply { isAccessible = true }
             .invoke(activity, uri, true)
+    }
+
+    private companion object {
+        val PAGE_ONE_COLOR: Int = Color.rgb(198, 36, 72)
+        val PAGE_TWO_COLOR: Int = Color.rgb(37, 168, 89)
+        val PAGE_THREE_COLOR: Int = Color.rgb(45, 79, 198)
     }
 }
