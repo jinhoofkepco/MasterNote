@@ -5,6 +5,7 @@ import android.graphics.Paint
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.view.Gravity
 import android.view.InputDevice
 import android.view.MotionEvent
@@ -36,7 +37,6 @@ import com.studyink.document.pdf.ReaderPdfFragment
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
-import java.security.MessageDigest
 
 class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private val viewModel: ReaderViewModel by viewModels()
@@ -56,7 +56,6 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var loadedPageCount by mutableStateOf(1)
     private var stylusMenuExpanded by mutableStateOf(false)
     private var stylusButtonPressed = false
-    private var pendingUri: Uri? = null
 
     private val openPdf = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -145,7 +144,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             }
         }
 
-        if (savedInstanceState == null) showDocument(Uri.fromFile(ensureSamplePdf()))
+        if (savedInstanceState == null) {
+            showDocument(Uri.fromFile(ensureSamplePdf()), replaceViewer = false)
+        }
     }
 
     override fun onPdfViewReady(view: androidx.pdf.view.PdfView) {
@@ -159,8 +160,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         currentPage = 0
         dryInkView.activePage = 0
         viewport.showPage(0)
-        val label = uri.lastPathSegment?.substringAfterLast('/') ?: "PDF 문서"
-        viewModel.loadDocument(documentId(uri), label, pageCount)
+        val label = documentLabel(uri)
+        viewModel.loadDocument(uri, label, pageCount)
         dryInkView.invalidate()
         Toast.makeText(this, "$pageCount 페이지를 열었습니다", Toast.LENGTH_SHORT).show()
     }
@@ -169,8 +170,17 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         Toast.makeText(this, "PDF를 열 수 없습니다: ${error.message}", Toast.LENGTH_LONG).show()
     }
 
-    private fun showDocument(uri: Uri) {
-        pendingUri = uri
+    private fun showDocument(uri: Uri, replaceViewer: Boolean = true) {
+        stylusMenuExpanded = false
+        if (replaceViewer) {
+            pdfFragment.listener = null
+            pdfFragment = ReaderPdfFragment().also { replacement ->
+                replacement.listener = this
+                supportFragmentManager.beginTransaction()
+                    .replace(PDF_CONTAINER_ID, replacement, PDF_FRAGMENT_TAG)
+                    .commitNow()
+            }
+        }
         pdfFragment.documentUri = uri
     }
 
@@ -235,7 +245,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 onResetZoom = viewport::resetZoom,
                 onUndo = viewModel::undo,
                 onRedo = viewModel::redo,
-                onDismissRequest = {},
+                onDismissRequest = { stylusMenuExpanded = false },
             )
         }
     }
@@ -246,20 +256,23 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        if (stylusMenuExpanded && event.isPageStylusDown()) {
+        if (stylusMenuExpanded && event.isMenuDismissContact()) {
             stylusMenuExpanded = false
         }
         if (handleStylusButton(event)) return true
         return super.dispatchTouchEvent(event)
     }
 
-    private fun MotionEvent.isPageStylusDown(): Boolean {
+    private fun MotionEvent.isMenuDismissContact(): Boolean {
         if (actionMasked != MotionEvent.ACTION_DOWN || pointerCount == 0) return false
         val buttonMask = MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_STYLUS_SECONDARY
         if (buttonState and buttonMask != 0) return false
-        val index = actionIndex.coerceIn(0, pointerCount - 1)
-        val type = getToolType(index)
-        return type == MotionEvent.TOOL_TYPE_STYLUS || type == MotionEvent.TOOL_TYPE_ERASER
+        return when (getToolType(actionIndex.coerceIn(0, pointerCount - 1))) {
+            MotionEvent.TOOL_TYPE_FINGER,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            MotionEvent.TOOL_TYPE_ERASER -> true
+            else -> false
+        }
     }
 
     private fun handleStylusButton(event: MotionEvent): Boolean {
@@ -352,9 +365,15 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         return file
     }
 
-    private fun documentId(uri: Uri): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(uri.toString().toByteArray())
-        return digest.take(16).joinToString("") { "%02x".format(it) }
+    private fun documentLabel(uri: Uri): String {
+        if (uri.scheme == "content") {
+            runCatching {
+                contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) return cursor.getString(0)
+                }
+            }
+        }
+        return uri.lastPathSegment?.substringAfterLast('/') ?: "PDF 문서"
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
