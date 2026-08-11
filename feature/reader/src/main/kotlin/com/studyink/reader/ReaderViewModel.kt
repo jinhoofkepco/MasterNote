@@ -1,6 +1,7 @@
 package com.studyink.reader
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.studyink.annotation.engine.AnnotationDocument
@@ -29,13 +30,24 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     private val store = AtomicAnnotationStore(application)
     private val mutationMutex = Mutex()
     private var document = AnnotationDocument(AnnotationSnapshot.empty("sample"))
+    private var documentLoadGeneration = 0L
     private val _uiState = MutableStateFlow(ReaderUiState())
     val uiState: StateFlow<ReaderUiState> = _uiState.asStateFlow()
 
-    fun loadDocument(documentId: String, label: String, pageCount: Int) {
+    fun loadDocument(uri: Uri, label: String, pageCount: Int) {
+        val generation = ++documentLoadGeneration
+        _uiState.value = ReaderUiState(
+            snapshot = AnnotationSnapshot.empty("loading-$generation"),
+            documentLabel = label,
+            pageCount = pageCount,
+            busy = true,
+            status = "PDF 필기 불러오는 중…",
+        )
         viewModelScope.launch(Dispatchers.IO) {
+            val documentId = DocumentIdentity.create(getApplication(), uri)
+            val loaded = store.load(documentId)
             mutationMutex.withLock {
-                val loaded = store.load(documentId)
+                if (generation != documentLoadGeneration) return@withLock
                 document = AnnotationDocument(loaded)
                 _uiState.value = ReaderUiState(
                     snapshot = loaded,

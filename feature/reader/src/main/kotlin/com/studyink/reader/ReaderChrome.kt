@@ -62,7 +62,7 @@ import androidx.compose.ui.window.PopupProperties
 import kotlin.math.PI
 import kotlin.math.atan2
 import kotlin.math.cos
-import kotlin.math.min
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -141,7 +141,7 @@ fun StylusToolMenu(
             properties = PopupProperties(
                 focusable = false,
                 dismissOnBackPress = false,
-                dismissOnClickOutside = false,
+                dismissOnClickOutside = true,
                 clippingEnabled = true,
             ),
         ) {
@@ -153,9 +153,12 @@ fun StylusToolMenu(
                         selectedColorArgb = selectedColorArgb,
                         currentPage = currentPage,
                         pageCount = pageCount,
-                        onOpenPen = {
-                            onSelectTool(ReaderTool.PEN)
-                            menuPage = RadialMenuPage.PEN
+                        onPenClick = {
+                            if (selectedTool == ReaderTool.PEN) {
+                                menuPage = RadialMenuPage.PEN
+                            } else {
+                                onSelectTool(ReaderTool.PEN)
+                            }
                         },
                         onOpenColors = { menuPage = RadialMenuPage.COLORS },
                         onSelectTool = onSelectTool,
@@ -192,7 +195,7 @@ private fun MainRadialMenu(
     selectedColorArgb: Int,
     currentPage: Int,
     pageCount: Int,
-    onOpenPen: () -> Unit,
+    onPenClick: () -> Unit,
     onOpenColors: () -> Unit,
     onSelectTool: (ReaderTool) -> Unit,
     onPreviousPage: () -> Unit,
@@ -228,7 +231,7 @@ private fun MainRadialMenu(
                 label = "펜",
                 selected = selectedTool == ReaderTool.PEN,
                 size = 44,
-            ) { onOpenPen() }
+            ) { onPenClick() }
             3 -> RadialActionButton(
                 icon = Icons.Rounded.Brush,
                 label = "형광펜",
@@ -301,13 +304,26 @@ private fun PenRadialMenu(
     onSelectOpacity: (Float) -> Unit,
 ) {
     val widths = listOf(6.4f, 4.8f, 3.2f, 2.4f, 1.6f)
+    CurvedOpacitySlider(
+        color = Color(selectedColorArgb),
+        widthDp = selectedWidthDp,
+        opacity = selectedOpacity,
+        centerX = FanOriginX,
+        centerY = FanOriginY,
+        radius = CompactFanRadius,
+        startAngle = 294f,
+        sweepAngle = 66f,
+        onOpacityChange = onSelectOpacity,
+        modifier = Modifier.fillMaxSize(),
+    )
     RadialFan(
         itemCount = widths.size,
         originX = FanOriginX,
         originY = FanOriginY,
         radius = CompactFanRadius,
         startAngleDegrees = 180f,
-        sweepAngleDegrees = 180f,
+        sweepAngleDegrees = 100f,
+        itemSize = 44,
         animationKey = "pen-widths",
     ) { index ->
         StrokeWidthChoice(
@@ -316,13 +332,6 @@ private fun PenRadialMenu(
             onSelect = onSelectWidth,
         )
     }
-    CurvedOpacitySlider(
-        color = Color(selectedColorArgb),
-        widthDp = selectedWidthDp,
-        opacity = selectedOpacity,
-        onOpacityChange = onSelectOpacity,
-        modifier = Modifier.offset(x = 80.dp, y = 112.dp).size(width = 110.dp, height = 72.dp),
-    )
 }
 
 /**
@@ -338,6 +347,7 @@ private fun RadialFan(
     radius: Int,
     startAngleDegrees: Float,
     sweepAngleDegrees: Float,
+    itemSize: Int = 50,
     animationKey: Any,
     content: @Composable (Int) -> Unit,
 ) {
@@ -354,7 +364,6 @@ private fun RadialFan(
     }
 
     val density = LocalDensity.current
-    val itemSize = 50
     repeat(itemCount) { index ->
         val angleDegrees = if (itemCount == 1) {
             startAngleDegrees
@@ -389,15 +398,13 @@ private fun RadialFan(
 private fun RadialActionButton(
     icon: ImageVector,
     label: String,
-    x: Int = 0,
-    y: Int = 0,
     selected: Boolean = false,
     enabled: Boolean = true,
     size: Int = 48,
     onClick: () -> Unit,
 ) {
     Surface(
-        modifier = Modifier.offset(x.dp, y.dp).size(size.dp).alpha(if (enabled) 1f else 0.36f),
+        modifier = Modifier.size(size.dp).alpha(if (enabled) 1f else 0.36f),
         shape = CircleShape,
         color = if (selected) MaterialTheme.colorScheme.inverseSurface
         else MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
@@ -419,12 +426,10 @@ private fun RadialActionButton(
 @Composable
 private fun PaletteButton(
     selectedColorArgb: Int,
-    x: Int = 0,
-    y: Int = 0,
     onClick: () -> Unit,
 ) {
     Surface(
-        modifier = Modifier.offset(x.dp, y.dp).size(46.dp),
+        modifier = Modifier.size(46.dp),
         shape = CircleShape,
         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
         shadowElevation = 7.dp,
@@ -522,16 +527,28 @@ private fun CurvedOpacitySlider(
     color: Color,
     widthDp: Float,
     opacity: Float,
+    centerX: Int,
+    centerY: Int,
+    radius: Int,
+    startAngle: Float,
+    sweepAngle: Float,
     onOpacityChange: (Float) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val startAngle = 210f
-    val sweepAngle = 150f
-    val updateOpacity: (Offset, Float, Float) -> Unit = { position, width, height ->
-        val center = Offset(width * 0.5f, height * 0.9f)
+    val density = LocalDensity.current
+    val center = Offset(
+        x = with(density) { centerX.dp.toPx() },
+        y = with(density) { centerY.dp.toPx() },
+    )
+    val radiusPx = with(density) { radius.dp.toPx() }
+    val touchTolerance = with(density) { 26.dp.toPx() }
+    fun updateOpacity(position: Offset) {
         var angle = (atan2(position.y - center.y, position.x - center.x) * 180f / PI.toFloat())
         if (angle < 0f) angle += 360f
         if (angle < 90f) angle += 360f
+        val distance = hypot(position.x - center.x, position.y - center.y)
+        if (kotlin.math.abs(distance - radiusPx) > touchTolerance) return
+        if (angle < startAngle - 8f || angle > startAngle + sweepAngle + 8f) return
         val fraction = ((angle - startAngle) / sweepAngle).coerceIn(0f, 1f)
         onOpacityChange(0.15f + fraction * 0.85f)
     }
@@ -539,32 +556,30 @@ private fun CurvedOpacitySlider(
         .semantics { contentDescription = "펜 투명도 ${(opacity * 100).roundToInt()}%" }
         .pointerInput(onOpacityChange) {
             detectTapGestures { position ->
-                updateOpacity(position, size.width.toFloat(), size.height.toFloat())
+                updateOpacity(position)
             }
         }
         .pointerInput(onOpacityChange) {
             detectDragGestures(
                 onDragStart = { position ->
-                    updateOpacity(position, size.width.toFloat(), size.height.toFloat())
+                    updateOpacity(position)
                 },
                 onDrag = { change, _ ->
                     change.consume()
-                    updateOpacity(change.position, size.width.toFloat(), size.height.toFloat())
+                    updateOpacity(change.position)
                 },
             )
         }
     val previewSurface = MaterialTheme.colorScheme.surface
     Canvas(modifier = inputModifier) {
-        val center = Offset(size.width * 0.5f, size.height * 0.9f)
-        val radius = min(size.width * 0.45f, size.height * 0.72f)
         val strokeWidth = (widthDp * 4.6f).dp.toPx().coerceIn(12.dp.toPx(), 30.dp.toPx())
         drawArc(
             color = color.copy(alpha = 0.15f),
             startAngle = startAngle,
             sweepAngle = sweepAngle,
             useCenter = false,
-            topLeft = Offset(center.x - radius, center.y - radius),
-            size = androidx.compose.ui.geometry.Size(radius * 2f, radius * 2f),
+            topLeft = Offset(center.x - radiusPx, center.y - radiusPx),
+            size = androidx.compose.ui.geometry.Size(radiusPx * 2f, radiusPx * 2f),
             style = Stroke(width = strokeWidth, cap = StrokeCap.Round),
         )
         val progress = ((opacity - 0.15f) / 0.85f).coerceIn(0f, 1f)
@@ -573,8 +588,8 @@ private fun CurvedOpacitySlider(
             startAngle = startAngle,
             sweepAngle = sweepAngle * progress,
             useCenter = false,
-            topLeft = Offset(center.x - radius, center.y - radius),
-            size = androidx.compose.ui.geometry.Size(radius * 2f, radius * 2f),
+            topLeft = Offset(center.x - radiusPx, center.y - radiusPx),
+            size = androidx.compose.ui.geometry.Size(radiusPx * 2f, radiusPx * 2f),
             style = Stroke(
                 width = strokeWidth,
                 cap = StrokeCap.Round,
@@ -582,8 +597,8 @@ private fun CurvedOpacitySlider(
         )
         val thumbAngle = Math.toRadians((startAngle + sweepAngle * progress).toDouble())
         val thumbCenter = Offset(
-            x = center.x + radius * cos(thumbAngle).toFloat(),
-            y = center.y + radius * sin(thumbAngle).toFloat(),
+            x = center.x + radiusPx * cos(thumbAngle).toFloat(),
+            y = center.y + radiusPx * sin(thumbAngle).toFloat(),
         )
         drawCircle(
             color = previewSurface,

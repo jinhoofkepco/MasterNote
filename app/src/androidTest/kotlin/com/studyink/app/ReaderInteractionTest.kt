@@ -3,6 +3,9 @@ package com.studyink.app
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
+import android.graphics.Paint
+import android.graphics.pdf.PdfDocument
+import android.net.Uri
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -18,6 +21,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.io.File
+import java.io.FileOutputStream
 
 @RunWith(AndroidJUnit4::class)
 class ReaderInteractionTest {
@@ -76,27 +81,9 @@ class ReaderInteractionTest {
             scenario.onActivity { activity -> page = activity.findDryInkView().activePage }
             if (page == 1) {
                 assertTrue("페이지 이동 후에도 메뉴가 유지되어야 합니다", device.hasObject(By.desc("펜")))
-                dispatchStroke(
-                    InputDevice.SOURCE_TOUCHSCREEN,
-                    MotionEvent.TOOL_TYPE_FINGER,
-                    300f,
-                    720f,
-                    360f,
-                    740f,
-                )
-                SystemClock.sleep(250)
-                assertTrue("손가락 터치로 메뉴가 닫히면 안 됩니다", device.hasObject(By.desc("펜")))
-
-                dispatchStroke(
-                    InputDevice.SOURCE_STYLUS,
-                    MotionEvent.TOOL_TYPE_STYLUS,
-                    330f,
-                    760f,
-                    390f,
-                    780f,
-                )
+                dispatchStroke(InputDevice.SOURCE_TOUCHSCREEN, MotionEvent.TOOL_TYPE_FINGER, 300f, 720f, 360f, 740f)
                 assertTrue(
-                    "S Pen이 페이지에 닿으면 메뉴가 닫혀야 합니다",
+                    "메뉴 밖을 손가락으로 누르면 메뉴가 닫혀야 합니다",
                     device.wait(Until.gone(By.desc("펜")), 3_000),
                 )
                 return
@@ -132,6 +119,75 @@ class ReaderInteractionTest {
             assertEquals(StrokeTool.HIGHLIGHTER, stroke.tool)
             assertEquals(0x66FFE45C, stroke.colorArgb)
         }
+    }
+
+    @Test
+    fun penSettingsOpenOnlyWhenTheSelectedPenIsTappedAgain() {
+        openStylusMenu()
+        device.findObject(By.desc("형광펜")).click()
+        device.findObject(By.desc("펜")).click()
+        assertTrue("첫 번째 펜 탭은 펜 선택만 해야 합니다", device.hasObject(By.desc("지우개")))
+        assertTrue(!device.hasObject(By.descContains("선 굵기")))
+
+        device.findObject(By.desc("펜")).click()
+        assertTrue(device.wait(Until.hasObject(By.descContains("선 굵기")), 3_000))
+        assertTrue(device.hasObject(By.descContains("펜 투명도")))
+    }
+
+    @Test
+    fun openPdfButtonLaunchesTheSystemDocumentPicker() {
+        device.findObject(By.text("PDF 열기")).click()
+        assertTrue(
+            "PDF 열기는 시스템 문서 선택기를 열어야 합니다",
+            waitForSystemDocumentPicker(),
+        )
+        device.pressBack()
+    }
+
+    @Test
+    fun annotationsAreIsolatedAndRestoredPerPdf() {
+        lateinit var firstPdf: File
+        lateinit var secondPdf: File
+        var initialId = ""
+        scenario.onActivity { activity ->
+            initialId = activity.findDryInkView().snapshot.documentId
+            firstPdf = createPdf(activity.filesDir, "isolation-a-${System.nanoTime()}.pdf", "Document A")
+            secondPdf = createPdf(activity.filesDir, "isolation-b-${System.nanoTime()}.pdf", "Document B")
+            openDocument(activity, Uri.fromFile(firstPdf))
+        }
+        val firstId = waitForStableDocumentId(excluding = initialId)
+        val before = revision()
+        dispatchStroke(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 340f, 780f, 520f, 820f)
+        assertTrue(waitForRevisionAfter(before))
+
+        scenario.onActivity { activity -> openDocument(activity, Uri.fromFile(secondPdf)) }
+        val secondId = waitForStableDocumentId(excluding = firstId)
+        assertTrue("PDF마다 서로 다른 필기 저장소를 사용해야 합니다", secondId != firstId)
+        scenario.onActivity { activity ->
+            assertTrue(activity.findDryInkView().snapshot.activeStrokes.isEmpty())
+        }
+
+        scenario.onActivity { activity -> openDocument(activity, Uri.fromFile(firstPdf)) }
+        waitForStableDocumentId(expected = firstId)
+        scenario.onActivity { activity ->
+            assertTrue("첫 PDF를 다시 열면 그 PDF의 필기만 복원되어야 합니다", activity.findDryInkView().snapshot.activeStrokes.isNotEmpty())
+        }
+    }
+
+    private fun openStylusMenu() {
+        val eventTime = SystemClock.uptimeMillis()
+        val event = motionEvent(
+            action = MotionEvent.ACTION_BUTTON_PRESS,
+            source = InputDevice.SOURCE_STYLUS,
+            toolType = MotionEvent.TOOL_TYPE_STYLUS,
+            x = 520f,
+            y = 920f,
+            buttonState = MotionEvent.BUTTON_STYLUS_PRIMARY,
+            eventTime = eventTime,
+        )
+        scenario.onActivity { activity -> assertTrue(activity.dispatchGenericMotionEvent(event)) }
+        event.recycle()
+        assertTrue(device.wait(Until.hasObject(By.desc("펜")), 3_000))
     }
 
     private fun dispatchStroke(
@@ -193,12 +249,37 @@ class ReaderInteractionTest {
         repeat(80) {
             var ready = false
             scenario.onActivity { activity ->
-                ready = activity.findDryInkView().snapshot.documentId != "sample"
+                val id = activity.findDryInkView().snapshot.documentId
+                ready = id != "sample" && !id.startsWith("loading-")
             }
             if (ready) return
             SystemClock.sleep(100)
         }
         throw AssertionError("PDF와 주석 문서가 준비되지 않았습니다")
+    }
+
+    private fun waitForSystemDocumentPicker(): Boolean {
+        repeat(30) {
+            if (
+                device.hasObject(By.pkg("com.android.documentsui")) ||
+                device.hasObject(By.pkg("com.google.android.documentsui"))
+            ) {
+                return true
+            }
+            SystemClock.sleep(100)
+        }
+        return false
+    }
+
+    private fun waitForStableDocumentId(excluding: String? = null, expected: String? = null): String {
+        repeat(100) {
+            var id = ""
+            scenario.onActivity { activity -> id = activity.findDryInkView().snapshot.documentId }
+            val stable = id.isNotBlank() && id != "sample" && !id.startsWith("loading-")
+            if (stable && (excluding == null || id != excluding) && (expected == null || id == expected)) return id
+            SystemClock.sleep(100)
+        }
+        throw AssertionError("PDF별 필기 문서가 준비되지 않았습니다")
     }
 
     private fun waitForRevisionAfter(revision: Long): Boolean {
@@ -226,5 +307,23 @@ class ReaderInteractionTest {
             }
         }
         throw AssertionError("DryInkView를 찾을 수 없습니다")
+    }
+
+    private fun createPdf(directory: File, name: String, text: String): File {
+        val file = File(directory, name)
+        val document = PdfDocument()
+        val page = document.startPage(PdfDocument.PageInfo.Builder(840, 1188, 1).create())
+        page.canvas.drawText(text, 72f, 120f, Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 36f })
+        document.finishPage(page)
+        FileOutputStream(file).use(document::writeTo)
+        document.close()
+        return file
+    }
+
+    private fun openDocument(activity: ReaderActivity, uri: Uri) {
+        ReaderActivity::class.java
+            .getDeclaredMethod("showDocument", Uri::class.java, Boolean::class.javaPrimitiveType)
+            .apply { isAccessible = true }
+            .invoke(activity, uri, true)
     }
 }
