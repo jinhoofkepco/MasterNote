@@ -18,7 +18,9 @@ kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarg
 
 dependencies {
     api(project(":core:model"))
-    api("androidx.pdf:pdf-viewer-fragment:1.0.0-alpha19")
+    implementation("androidx.pdf:pdf-core:1.0.0-alpha19")
+    implementation("androidx.pdf:pdf-document-service:1.0.0-alpha19")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
     implementation("androidx.fragment:fragment-ktx:1.8.9")
+    testImplementation("junit:junit:4.13.2")
 }

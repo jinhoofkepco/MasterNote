@@ -34,6 +34,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.studyink.document.pdf.PdfViewportAdapter
 import com.studyink.document.pdf.ReaderPdfFragment
+import com.studyink.document.pdf.SinglePagePdfView
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
@@ -129,6 +130,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
         pdfFragment = supportFragmentManager.findFragmentByTag(PDF_FRAGMENT_TAG) as? ReaderPdfFragment
             ?: ReaderPdfFragment().also { fragment ->
+                fragment.listener = this
                 supportFragmentManager.beginTransaction()
                     .replace(PDF_CONTAINER_ID, fragment, PDF_FRAGMENT_TAG)
                     .commitNow()
@@ -145,11 +147,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         }
 
         if (savedInstanceState == null) {
-            showDocument(Uri.fromFile(ensureSamplePdf()), replaceViewer = false)
+            showDocument(Uri.fromFile(ensureSamplePdf()))
         }
     }
 
-    override fun onPdfViewReady(view: androidx.pdf.view.PdfView) {
+    override fun onPdfViewReady(view: SinglePagePdfView) {
         viewport.attach(view)
         dryInkView.invalidate()
     }
@@ -170,17 +172,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         Toast.makeText(this, "PDF를 열 수 없습니다: ${error.message}", Toast.LENGTH_LONG).show()
     }
 
-    private fun showDocument(uri: Uri, replaceViewer: Boolean = true) {
+    private fun showDocument(uri: Uri) {
         stylusMenuExpanded = false
-        if (replaceViewer) {
-            pdfFragment.listener = null
-            pdfFragment = ReaderPdfFragment().also { replacement ->
-                replacement.listener = this
-                supportFragmentManager.beginTransaction()
-                    .replace(PDF_CONTAINER_ID, replacement, PDF_FRAGMENT_TAG)
-                    .commitNow()
-            }
-        }
         pdfFragment.documentUri = uri
     }
 

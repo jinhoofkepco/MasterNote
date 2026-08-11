@@ -2,12 +2,12 @@ package com.studyink.app
 
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.PointF
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
-import androidx.pdf.view.PdfView
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -15,7 +15,7 @@ import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
 import com.studyink.core.model.StrokeTool
-import com.studyink.document.pdf.ReaderPdfFragment
+import com.studyink.document.pdf.SinglePagePdfView
 import com.studyink.reader.DryInkView
 import com.studyink.reader.ReaderActivity
 import org.junit.After
@@ -178,7 +178,27 @@ class ReaderInteractionTest {
     }
 
     @Test
-    fun zoomAndVerticalScrollStayOnTheSelectedPageWithoutThePdfEditButton() {
+    fun pdfCoordinatesRemainAttachedToThePageAcrossZoom() {
+        scenario.onActivity { activity ->
+            val view = activity.findPdfView()
+            val pdfPoint = PointF(360f, 500f)
+            val before = requireNotNull(view.pdfToViewPoint(view.activePage, pdfPoint))
+
+            view.setZoom(2f)
+
+            val after = requireNotNull(view.pdfToViewPoint(view.activePage, pdfPoint))
+            assertTrue(
+                "확대하면 PDF 위의 같은 좌표가 화면에서도 함께 이동해야 합니다",
+                kotlin.math.abs(before.x - after.x) + kotlin.math.abs(before.y - after.y) > 10f,
+            )
+            val restored = requireNotNull(view.viewToPdfPoint(after.x, after.y))
+            assertEquals(pdfPoint.x, restored.x, 0.5f)
+            assertEquals(pdfPoint.y, restored.y, 0.5f)
+        }
+    }
+
+    @Test
+    fun zoomAndVerticalScrollStayOnTheSelectedPageWithoutBuiltInEditorUi() {
         var initialId = ""
         scenario.onActivity { activity ->
             initialId = activity.findDryInkView().snapshot.documentId
@@ -192,19 +212,12 @@ class ReaderInteractionTest {
                 .getDeclaredMethod("showPage", Int::class.javaPrimitiveType)
                 .apply { isAccessible = true }
                 .invoke(activity, 1)
-
-            activity.readerPdfFragment().onRequestImmersiveMode(false)
-            assertTrue(
-                "AndroidX PDF 편집 버튼은 항상 숨겨져야 합니다",
-                !activity.readerPdfFragment().isToolboxVisible,
-            )
+            assertEquals(1, activity.findPdfView().activePage)
         }
 
         repeat(3) {
             scenario.onActivity { activity ->
-                activity.findPdfView().apply {
-                    zoom = maxOf(minZoom * 2.5f, 1.5f).coerceAtMost(maxZoom)
-                }
+                activity.findPdfView().setZoom(2.5f)
             }
             SystemClock.sleep(400)
             repeat(2) { device.swipe(540, 1_700, 540, 450, 20) }
@@ -214,17 +227,11 @@ class ReaderInteractionTest {
             assertOnlySelectedPageColorIsVisible()
 
             scenario.onActivity { activity ->
-                activity.findPdfView().apply { zoom = minZoom }
+                activity.findPdfView().resetZoom()
             }
             SystemClock.sleep(300)
         }
-
-        scenario.onActivity { activity ->
-            assertTrue(
-                "확대·축소 후에도 PDF 편집 버튼이 나타나면 안 됩니다",
-                !activity.readerPdfFragment().isToolboxVisible,
-            )
-        }
+        assertTrue("내장 PDF 편집 버튼이 없어야 합니다", !device.hasObject(By.descContains("PDF 편집")))
     }
 
     private fun openStylusMenu() {
@@ -402,21 +409,18 @@ class ReaderInteractionTest {
         throw AssertionError("DryInkView를 찾을 수 없습니다")
     }
 
-    private fun ReaderActivity.findPdfView(): PdfView {
+    private fun ReaderActivity.findPdfView(): SinglePagePdfView {
         val root = findViewById<android.view.ViewGroup>(android.R.id.content)
         val queue = ArrayDeque<android.view.View>()
         queue.add(root)
         while (queue.isNotEmpty()) {
             when (val view = queue.removeFirst()) {
-                is PdfView -> return view
+                is SinglePagePdfView -> return view
                 is android.view.ViewGroup -> (0 until view.childCount).forEach { queue.add(view.getChildAt(it)) }
             }
         }
-        throw AssertionError("PdfView를 찾을 수 없습니다")
+        throw AssertionError("SinglePagePdfView를 찾을 수 없습니다")
     }
-
-    private fun ReaderActivity.readerPdfFragment(): ReaderPdfFragment =
-        supportFragmentManager.fragments.filterIsInstance<ReaderPdfFragment>().single()
 
     private fun createPdf(directory: File, name: String, text: String): File {
         val file = File(directory, name)
@@ -449,9 +453,9 @@ class ReaderInteractionTest {
 
     private fun openDocument(activity: ReaderActivity, uri: Uri) {
         ReaderActivity::class.java
-            .getDeclaredMethod("showDocument", Uri::class.java, Boolean::class.javaPrimitiveType)
+            .getDeclaredMethod("showDocument", Uri::class.java)
             .apply { isAccessible = true }
-            .invoke(activity, uri, true)
+            .invoke(activity, uri)
     }
 
     private companion object {
