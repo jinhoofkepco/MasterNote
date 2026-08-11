@@ -6,11 +6,15 @@ const val CANONICAL_PAGE_WIDTH = 1000f
 
 @JvmInline value class StrokeId(val value: String)
 @JvmInline value class OperationId(val value: String)
+@JvmInline value class DocumentId(val value: String)
+@JvmInline value class PageId(val value: String)
+@JvmInline value class LayerId(val value: String)
 
 data class PagePoint(
     val x: Float,
     val y: Float,
     val pressure: Float = 1f,
+    val elapsedTimeMillis: Long = 0L,
 )
 
 data class PageBounds(
@@ -37,6 +41,9 @@ data class PageBounds(
 }
 
 enum class StrokeTool { PEN, HIGHLIGHTER }
+enum class AnnotationOperationType { ADD_STROKE, REMOVE_STROKES, REPLACE_STROKES }
+enum class AnnotationLayerType { STUDENT_WORKING, TEACHER_PREP, TEACHER_FEEDBACK, REMOTE_EPHEMERAL }
+enum class AnnotationOwnerType { STUDENT, TEACHER, REMOTE }
 
 data class StrokeAsset(
     val id: StrokeId = StrokeId(UUID.randomUUID().toString()),
@@ -53,19 +60,36 @@ data class StrokeAsset(
 
 sealed interface AnnotationOperation {
     val id: OperationId
+    val pageNumber: Int
+    val operationType: AnnotationOperationType
+    val baseRevision: Long
+    val resultRevision: Long
     val removedStrokeIds: Set<StrokeId>
     val addedStrokeIds: Set<StrokeId>
+    val createdAtEpochMillis: Long
 }
 
 data class AssetOperation(
     override val id: OperationId = OperationId(UUID.randomUUID().toString()),
+    override val pageNumber: Int,
+    override val operationType: AnnotationOperationType,
+    override val baseRevision: Long,
+    override val resultRevision: Long = baseRevision + 1L,
     override val removedStrokeIds: Set<StrokeId>,
     override val addedStrokeIds: Set<StrokeId>,
+    override val createdAtEpochMillis: Long = System.currentTimeMillis(),
 ) : AnnotationOperation
+
+data class AnnotationMutation(
+    val snapshot: AnnotationSnapshot,
+    val operation: AssetOperation,
+    val addedAssets: List<StrokeAsset>,
+)
 
 data class AnnotationSnapshot(
     val documentId: String,
     val revision: Long,
+    val pageRevisions: Map<Int, Long> = emptyMap(),
     val assets: Map<StrokeId, StrokeAsset>,
     val activeStrokeIds: Set<StrokeId>,
     val undoStack: List<AssetOperation> = emptyList(),
@@ -75,6 +99,11 @@ data class AnnotationSnapshot(
         get() = activeStrokeIds.mapNotNull(assets::get).sortedBy { it.createdAtEpochMillis }
 
     companion object {
-        fun empty(documentId: String) = AnnotationSnapshot(documentId, 0L, emptyMap(), emptySet())
+        fun empty(documentId: String) = AnnotationSnapshot(
+            documentId = documentId,
+            revision = 0L,
+            assets = emptyMap(),
+            activeStrokeIds = emptySet(),
+        )
     }
 }

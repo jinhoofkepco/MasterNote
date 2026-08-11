@@ -74,7 +74,10 @@ class InkInputView(context: Context) : View(context) {
         }
         downAtMillis = event.eventTime
         currentPoints.clear()
-        currentPoints += mapped.point.copy(pressure = event.pressure.coerceIn(0f, 1f))
+        currentPoints += mapped.point.copy(
+            pressure = event.pressure.coerceIn(0f, 1f),
+            elapsedTimeMillis = 0L,
+        )
         strokeWidthCanonical = viewport.viewWidthToCanonical(
             currentPage,
             if (activeTool == ReaderTool.HIGHLIGHTER) dp(18f) else dp(penWidthDp),
@@ -106,7 +109,7 @@ class InkInputView(context: Context) : View(context) {
 
     private fun finish(event: MotionEvent): Boolean {
         if (currentPointer < 0) return false
-        collectPoint(event.x, event.y, event.pressure)
+        collectPoint(event.x, event.y, event.pressure, event.eventTime)
         if (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) {
             wetInkView.finishStroke(event, currentPointer)
             if (currentPoints.isNotEmpty()) {
@@ -143,15 +146,19 @@ class InkInputView(context: Context) : View(context) {
                 event.getHistoricalX(pointerIndex, history),
                 event.getHistoricalY(pointerIndex, history),
                 event.getHistoricalPressure(pointerIndex, history),
+                event.getHistoricalEventTime(history),
             )
         }
-        collectPoint(event.getX(pointerIndex), event.getY(pointerIndex), event.getPressure(pointerIndex))
+        collectPoint(event.getX(pointerIndex), event.getY(pointerIndex), event.getPressure(pointerIndex), event.eventTime)
     }
 
-    private fun collectPoint(x: Float, y: Float, pressure: Float) {
+    private fun collectPoint(x: Float, y: Float, pressure: Float, eventTime: Long = downAtMillis) {
         val mapped = viewport.viewToCanonical(x, y) ?: return
         if (mapped.pageNumber != currentPage) return
-        val point = mapped.point.copy(pressure = pressure.coerceIn(0f, 1f))
+        val point = mapped.point.copy(
+            pressure = pressure.coerceIn(0f, 1f),
+            elapsedTimeMillis = (eventTime - downAtMillis).coerceAtLeast(0L),
+        )
         val previous = currentPoints.lastOrNull()
         if (previous == null || kotlin.math.abs(previous.x - point.x) + kotlin.math.abs(previous.y - point.y) > 0.15f) {
             currentPoints += point

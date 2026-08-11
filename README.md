@@ -11,7 +11,9 @@
 - 파란 미리보기 구간만 제거하는 부분 지우개
 - 실행 취소/다시 실행
 - 한 페이지 단위 이동과 손가락 확대·이동
-- PDF별 자동 저장과 앱 재실행 후 복원
+- Room 기반 PDF별 자동 저장과 앱 재실행 후 복원
+- 필기 추가·삭제·부분 교체 연산 로그와 원자적 부분 지우개 저장
+- Jetpack Ink 1.0 안정 버전 포맷을 이용한 필기 입력 직렬화
 - 원본 PDF와 완전히 분리된 불변 필기 자산
 
 앱을 처음 열면 내장 예제 PDF가 자동으로 표시됩니다. 상단의 `PDF 열기`로 기기의 다른 PDF를 선택할 수 있습니다.
@@ -32,7 +34,7 @@
 
 - `core:model`: Canonical Page Space(가로 1000) 데이터 모델
 - `annotation:engine`: 불변 자산, 연산 기록, undo/redo, 부분 지우개 계산
-- `annotation:storage`: PDF별 원자적 자동 저장
+- `annotation:storage`: Room 트랜잭션, Ink 직렬화, PDF별 자동 저장 및 기존 JSON 가져오기
 - `document:pdf-androidx`: AndroidX PDF와 공개 좌표 API를 감싼 어댑터
 - `feature:reader`: PDF/필기 레이어 조립 및 사용자 화면
 - `app`: 설치 패키지

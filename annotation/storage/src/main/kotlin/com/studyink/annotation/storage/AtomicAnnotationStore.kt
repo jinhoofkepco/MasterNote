@@ -3,6 +3,7 @@ package com.studyink.annotation.storage
 import android.content.Context
 import android.util.AtomicFile
 import com.studyink.core.model.AnnotationSnapshot
+import com.studyink.core.model.AnnotationOperationType
 import com.studyink.core.model.AssetOperation
 import com.studyink.core.model.OperationId
 import com.studyink.core.model.PageBounds
@@ -26,6 +27,7 @@ class AtomicAnnotationStore(context: Context) {
             AnnotationSnapshot(
                 documentId = documentId,
                 revision = root.optLong("revision", 0L),
+                pageRevisions = root.optJSONObject("pageRevisions")?.toPageRevisions().orEmpty(),
                 assets = assets,
                 activeStrokeIds = root.getJSONArray("activeStrokeIds").toStrokeIds(),
                 undoStack = root.optJSONArray("undo")?.toOperations().orEmpty(),
@@ -34,11 +36,16 @@ class AtomicAnnotationStore(context: Context) {
         }.getOrElse { AnnotationSnapshot.empty(documentId) }
     }
 
+    fun exists(documentId: String): Boolean = fileFor(documentId).baseFile.exists()
+
     fun save(snapshot: AnnotationSnapshot) {
         val root = JSONObject()
             .put("formatVersion", 1)
             .put("documentId", snapshot.documentId)
             .put("revision", snapshot.revision)
+            .put("pageRevisions", JSONObject().apply {
+                snapshot.pageRevisions.forEach { (page, revision) -> put(page.toString(), revision) }
+            })
             .put("assets", JSONArray().apply { snapshot.assets.values.forEach { put(it.toJson()) } })
             .put("activeStrokeIds", JSONArray().apply { snapshot.activeStrokeIds.forEach { put(it.value) } })
             .put("undo", JSONArray().apply { snapshot.undoStack.forEach { put(it.toJson()) } })
@@ -70,7 +77,13 @@ private fun StrokeAsset.toJson() = JSONObject()
     .put("width", width.toDouble())
     .put("points", JSONArray().apply {
         points.forEach { point ->
-            put(JSONArray().put(point.x.toDouble()).put(point.y.toDouble()).put(point.pressure.toDouble()))
+            put(
+                JSONArray()
+                    .put(point.x.toDouble())
+                    .put(point.y.toDouble())
+                    .put(point.pressure.toDouble())
+                    .put(point.elapsedTimeMillis)
+            )
         }
     })
     .put("createdAtEpochMillis", createdAtEpochMillis)
@@ -79,8 +92,13 @@ private fun StrokeAsset.toJson() = JSONObject()
 
 private fun AssetOperation.toJson() = JSONObject()
     .put("id", id.value)
+    .put("pageNumber", pageNumber)
+    .put("operationType", operationType.name)
+    .put("baseRevision", baseRevision)
+    .put("resultRevision", resultRevision)
     .put("removed", JSONArray().apply { removedStrokeIds.forEach { put(it.value) } })
     .put("added", JSONArray().apply { addedStrokeIds.forEach { put(it.value) } })
+    .put("createdAtEpochMillis", createdAtEpochMillis)
 
 private fun JSONArray.toStrokeAssets(): List<StrokeAsset> = buildList {
     for (index in 0 until length()) {
@@ -89,7 +107,14 @@ private fun JSONArray.toStrokeAssets(): List<StrokeAsset> = buildList {
         val points = buildList {
             for (pointIndex in 0 until pointsJson.length()) {
                 val point = pointsJson.getJSONArray(pointIndex)
-                add(PagePoint(point.getDouble(0).toFloat(), point.getDouble(1).toFloat(), point.optDouble(2, 1.0).toFloat()))
+                add(
+                    PagePoint(
+                        x = point.getDouble(0).toFloat(),
+                        y = point.getDouble(1).toFloat(),
+                        pressure = point.optDouble(2, 1.0).toFloat(),
+                        elapsedTimeMillis = point.optLong(3, pointIndex.toLong()),
+                    )
+                )
             }
         }
         add(
@@ -119,9 +144,25 @@ private fun JSONArray.toOperations(): List<AssetOperation> = buildList {
         add(
             AssetOperation(
                 id = OperationId(item.getString("id")),
+                pageNumber = item.optInt("pageNumber", 0),
+                operationType = item.optString("operationType")
+                    .takeIf(String::isNotBlank)
+                    ?.let(AnnotationOperationType::valueOf)
+                    ?: when {
+                        item.getJSONArray("removed").length() == 0 -> AnnotationOperationType.ADD_STROKE
+                        item.getJSONArray("added").length() == 0 -> AnnotationOperationType.REMOVE_STROKES
+                        else -> AnnotationOperationType.REPLACE_STROKES
+                    },
+                baseRevision = item.optLong("baseRevision", 0L),
+                resultRevision = item.optLong("resultRevision", 1L),
                 removedStrokeIds = item.getJSONArray("removed").toStrokeIds(),
                 addedStrokeIds = item.getJSONArray("added").toStrokeIds(),
+                createdAtEpochMillis = item.optLong("createdAtEpochMillis", 0L),
             )
         )
     }
+}
+
+private fun JSONObject.toPageRevisions(): Map<Int, Long> = buildMap {
+    keys().forEach { page -> put(page.toInt(), getLong(page)) }
 }

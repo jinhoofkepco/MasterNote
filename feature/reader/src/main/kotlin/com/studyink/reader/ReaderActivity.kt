@@ -174,6 +174,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun showDocument(uri: Uri) {
         stylusMenuExpanded = false
+        viewModel.flushAsync()
         pdfFragment.documentUri = uri
     }
 
@@ -206,6 +207,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private fun showPage(pageNumber: Int) {
+        viewModel.flushAsync()
         val target = pageNumber.coerceIn(0, (loadedPageCount - 1).coerceAtLeast(0))
         currentPage = target
         dryInkView.activePage = target
@@ -304,6 +306,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private fun handOffFinishedWetInk(strokes: Map<InProgressStrokeId, Stroke>) {
         // The dry snapshot is normally visible within one frame. A short overlap avoids a wet/dry gap.
         wetInkView.postDelayed({ wetInkView.removeFinishedStrokes(strokes.keys) }, 80L)
+    }
+
+    override fun onStop() {
+        viewModel.flushAsync()
+        super.onStop()
     }
 
     private fun contentLayoutParams() = FrameLayout.LayoutParams(MATCH, MATCH).apply {

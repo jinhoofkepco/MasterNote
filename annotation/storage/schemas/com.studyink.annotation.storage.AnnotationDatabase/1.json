@@ -1,0 +1,539 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 1,
+    "identityHash": "74ff960b038ae13e3a4db068be5e8963",
+    "entities": [
+      {
+        "tableName": "annotation_documents",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`documentId` TEXT NOT NULL, `currentRevision` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`documentId`))",
+        "fields": [
+          {
+            "fieldPath": "documentId",
+            "columnName": "documentId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currentRevision",
+            "columnName": "currentRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "documentId"
+          ]
+        }
+      },
+      {
+        "tableName": "annotation_pages",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`pageId` TEXT NOT NULL, `documentId` TEXT NOT NULL, `pageNumber` INTEGER NOT NULL, `currentRevision` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`pageId`), FOREIGN KEY(`documentId`) REFERENCES `annotation_documents`(`documentId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "documentId",
+            "columnName": "documentId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageNumber",
+            "columnName": "pageNumber",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currentRevision",
+            "columnName": "currentRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "pageId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_annotation_pages_documentId",
+            "unique": false,
+            "columnNames": [
+              "documentId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_annotation_pages_documentId` ON `${TABLE_NAME}` (`documentId`)"
+          },
+          {
+            "name": "index_annotation_pages_documentId_pageNumber",
+            "unique": true,
+            "columnNames": [
+              "documentId",
+              "pageNumber"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_annotation_pages_documentId_pageNumber` ON `${TABLE_NAME}` (`documentId`, `pageNumber`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "annotation_documents",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "documentId"
+            ],
+            "referencedColumns": [
+              "documentId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "annotation_layers",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`layerId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `attemptId` TEXT, `layerType` TEXT NOT NULL, `ownerType` TEXT NOT NULL, `currentRevision` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`layerId`), FOREIGN KEY(`pageId`) REFERENCES `annotation_pages`(`pageId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "layerId",
+            "columnName": "layerId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "attemptId",
+            "columnName": "attemptId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "layerType",
+            "columnName": "layerType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ownerType",
+            "columnName": "ownerType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currentRevision",
+            "columnName": "currentRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "layerId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_annotation_layers_pageId",
+            "unique": false,
+            "columnNames": [
+              "pageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_annotation_layers_pageId` ON `${TABLE_NAME}` (`pageId`)"
+          },
+          {
+            "name": "index_annotation_layers_attemptId",
+            "unique": false,
+            "columnNames": [
+              "attemptId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_annotation_layers_attemptId` ON `${TABLE_NAME}` (`attemptId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "annotation_pages",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "pageId"
+            ],
+            "referencedColumns": [
+              "pageId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "stroke_assets",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`strokeId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `pageNumber` INTEGER NOT NULL, `encodedInput` BLOB NOT NULL, `brushPresetId` TEXT NOT NULL, `colorArgb` INTEGER NOT NULL, `brushSize` REAL NOT NULL, `boundsLeft` REAL NOT NULL, `boundsTop` REAL NOT NULL, `boundsRight` REAL NOT NULL, `boundsBottom` REAL NOT NULL, `parentStrokeId` TEXT, `formatVersion` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`strokeId`), FOREIGN KEY(`pageId`) REFERENCES `annotation_pages`(`pageId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "strokeId",
+            "columnName": "strokeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageNumber",
+            "columnName": "pageNumber",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "encodedInput",
+            "columnName": "encodedInput",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "brushPresetId",
+            "columnName": "brushPresetId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "colorArgb",
+            "columnName": "colorArgb",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "brushSize",
+            "columnName": "brushSize",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "boundsLeft",
+            "columnName": "boundsLeft",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "boundsTop",
+            "columnName": "boundsTop",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "boundsRight",
+            "columnName": "boundsRight",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "boundsBottom",
+            "columnName": "boundsBottom",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "parentStrokeId",
+            "columnName": "parentStrokeId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "formatVersion",
+            "columnName": "formatVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "strokeId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_stroke_assets_pageId",
+            "unique": false,
+            "columnNames": [
+              "pageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_stroke_assets_pageId` ON `${TABLE_NAME}` (`pageId`)"
+          },
+          {
+            "name": "index_stroke_assets_parentStrokeId",
+            "unique": false,
+            "columnNames": [
+              "parentStrokeId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_stroke_assets_parentStrokeId` ON `${TABLE_NAME}` (`parentStrokeId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "annotation_pages",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "pageId"
+            ],
+            "referencedColumns": [
+              "pageId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "layer_strokes",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`layerId` TEXT NOT NULL, `strokeId` TEXT NOT NULL, `zOrder` INTEGER NOT NULL, `active` INTEGER NOT NULL, `linkedByOperationId` TEXT, `unlinkedByOperationId` TEXT, PRIMARY KEY(`layerId`, `strokeId`), FOREIGN KEY(`layerId`) REFERENCES `annotation_layers`(`layerId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`strokeId`) REFERENCES `stroke_assets`(`strokeId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "layerId",
+            "columnName": "layerId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "strokeId",
+            "columnName": "strokeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "zOrder",
+            "columnName": "zOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "active",
+            "columnName": "active",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "linkedByOperationId",
+            "columnName": "linkedByOperationId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "unlinkedByOperationId",
+            "columnName": "unlinkedByOperationId",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "layerId",
+            "strokeId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_layer_strokes_strokeId",
+            "unique": false,
+            "columnNames": [
+              "strokeId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_layer_strokes_strokeId` ON `${TABLE_NAME}` (`strokeId`)"
+          },
+          {
+            "name": "index_layer_strokes_layerId_active",
+            "unique": false,
+            "columnNames": [
+              "layerId",
+              "active"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_layer_strokes_layerId_active` ON `${TABLE_NAME}` (`layerId`, `active`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "annotation_layers",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "layerId"
+            ],
+            "referencedColumns": [
+              "layerId"
+            ]
+          },
+          {
+            "table": "stroke_assets",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "strokeId"
+            ],
+            "referencedColumns": [
+              "strokeId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "annotation_operations",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`operationId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `layerId` TEXT NOT NULL, `operationType` TEXT NOT NULL, `baseRevision` INTEGER NOT NULL, `resultRevision` INTEGER NOT NULL, `payloadJson` TEXT NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`operationId`), FOREIGN KEY(`pageId`) REFERENCES `annotation_pages`(`pageId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`layerId`) REFERENCES `annotation_layers`(`layerId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "operationId",
+            "columnName": "operationId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "layerId",
+            "columnName": "layerId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "operationType",
+            "columnName": "operationType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "baseRevision",
+            "columnName": "baseRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "resultRevision",
+            "columnName": "resultRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadJson",
+            "columnName": "payloadJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "operationId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_annotation_operations_pageId",
+            "unique": false,
+            "columnNames": [
+              "pageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_annotation_operations_pageId` ON `${TABLE_NAME}` (`pageId`)"
+          },
+          {
+            "name": "index_annotation_operations_layerId",
+            "unique": false,
+            "columnNames": [
+              "layerId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_annotation_operations_layerId` ON `${TABLE_NAME}` (`layerId`)"
+          },
+          {
+            "name": "index_annotation_operations_layerId_resultRevision",
+            "unique": true,
+            "columnNames": [
+              "layerId",
+              "resultRevision"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_annotation_operations_layerId_resultRevision` ON `${TABLE_NAME}` (`layerId`, `resultRevision`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "annotation_pages",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "pageId"
+            ],
+            "referencedColumns": [
+              "pageId"
+            ]
+          },
+          {
+            "table": "annotation_layers",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "layerId"
+            ],
+            "referencedColumns": [
+              "layerId"
+            ]
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '74ff960b038ae13e3a4db068be5e8963')"
+    ]
+  }
+}

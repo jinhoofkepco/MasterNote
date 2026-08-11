@@ -14,10 +14,13 @@ import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
+import androidx.lifecycle.ViewModelProvider
 import com.studyink.core.model.StrokeTool
 import com.studyink.document.pdf.SinglePagePdfView
 import com.studyink.reader.DryInkView
 import com.studyink.reader.ReaderActivity
+import com.studyink.reader.ReaderViewModel
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -174,6 +177,30 @@ class ReaderInteractionTest {
         waitForStableDocumentId(expected = firstId)
         scenario.onActivity { activity ->
             assertTrue("첫 PDF를 다시 열면 그 PDF의 필기만 복원되어야 합니다", activity.findDryInkView().snapshot.activeStrokes.isNotEmpty())
+        }
+    }
+
+    @Test
+    fun completedStrokeRestoresAfterActivityRecreation() {
+        lateinit var pdf: File
+        var initialId = ""
+        scenario.onActivity { activity ->
+            initialId = activity.findDryInkView().snapshot.documentId
+            pdf = createPdf(activity.filesDir, "recreate-${System.nanoTime()}.pdf", "Recreation")
+            openDocument(activity, Uri.fromFile(pdf))
+        }
+        val documentId = waitForStableDocumentId(excluding = initialId)
+        val before = revision()
+        dispatchStroke(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 340f, 780f, 520f, 820f)
+        assertTrue(waitForRevisionAfter(before))
+        flushPendingWrites()
+
+        scenario.recreate()
+        waitForStableDocumentId(expected = documentId)
+
+        scenario.onActivity { activity ->
+            assertEquals(documentId, activity.findDryInkView().snapshot.documentId)
+            assertEquals(1, activity.findDryInkView().snapshot.activeStrokes.size)
         }
     }
 
@@ -348,6 +375,14 @@ class ReaderInteractionTest {
             SystemClock.sleep(100)
         }
         return false
+    }
+
+    private fun flushPendingWrites() {
+        lateinit var viewModel: ReaderViewModel
+        scenario.onActivity { activity ->
+            viewModel = ViewModelProvider(activity)[ReaderViewModel::class.java]
+        }
+        runBlocking { viewModel.flush() }
     }
 
     private fun assertOnlySelectedPageColorIsVisible() {
