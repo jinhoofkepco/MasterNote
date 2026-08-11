@@ -20,7 +20,15 @@ class ReaderPdfFragment : PdfViewerFragment() {
 
     override fun onPdfViewCreated(pdfView: PdfView) {
         super.onPdfViewCreated(pdfView)
+        isToolboxVisible = false
         listener?.onPdfViewReady(pdfView)
+    }
+
+    override fun onRequestImmersiveMode(enterImmersive: Boolean) {
+        super.onRequestImmersiveMode(enterImmersive)
+        // MasterNote supplies its own S Pen tools. The AndroidX PDF toolbox would otherwise
+        // reappear as a floating pencil button whenever a zoom gesture ends.
+        isToolboxVisible = false
     }
 
     override fun onLoadDocumentSuccess(document: PdfDocument) {
