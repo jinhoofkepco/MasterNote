@@ -4,6 +4,7 @@ plugins {
 }
 
 val masterNoteKeystorePath = providers.environmentVariable("MASTERNOTE_KEYSTORE_PATH").orNull
+val masterNoteBuildNumber = providers.environmentVariable("MASTERNOTE_BUILD_NUMBER").orNull?.toIntOrNull()
 
 android {
     namespace = "com.studyink.app"
@@ -14,8 +15,8 @@ android {
         applicationId = "com.studyink.app"
         minSdk = 31
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0-kernel"
+        versionCode = masterNoteBuildNumber?.let { 10_000 + it } ?: 2
+        versionName = "0.2.${masterNoteBuildNumber ?: 0}-test"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -32,7 +33,9 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }

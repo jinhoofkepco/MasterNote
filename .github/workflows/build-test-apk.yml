@@ -46,15 +46,17 @@ jobs:
           echo "MASTERNOTE_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
 
       - name: Build and test
+        env:
+          MASTERNOTE_BUILD_NUMBER: ${{ github.run_number }}
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleDebug testDebugUnitTest
+          ./gradlew :app:assembleRelease testDebugUnitTest
 
       - name: Verify signing certificate
         env:
           EXPECTED_CERT_SHA256: d511edca8bcc955e687df75a51e4c741f7636a612238e508d209b0fc1f162983
         run: |
-          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
           ACTUAL_CERT_SHA256="$("$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$APK_PATH" | awk -F': ' '/SHA-256 digest/ {print $2; exit}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]:')"
           echo "Signing certificate SHA-256: $ACTUAL_CERT_SHA256"
           test "$ACTUAL_CERT_SHA256" = "$EXPECTED_CERT_SHA256"
