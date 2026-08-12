@@ -23,3 +23,13 @@ Nearby and generated protobuf types remain inside adapters and never cross into 
   in Room and never blocks Ink input.
 - A duplicate message can advance the contiguous sequence without applying its operation twice.
 - A gap buffer holds at most 32 envelopes; overflow requests a page checkpoint instead of growing.
+
+## Checkpoint invariants
+
+- Page digests hash sorted stroke IDs together with revision and active count.
+- A checkpoint contains one page only and is split into chunks of at most 64 KiB.
+- Assemblies are bounded to 256 chunks; inconsistent metadata, corrupt protobuf, or a hash mismatch
+  discards the candidate without changing the visible replica.
+- A complete verified page replaces old replica rows in one Room transaction.
+- `ReadOnlyRemoteLayer` is the only Reader source for a remote replica and cannot become the scene's
+  editable source.

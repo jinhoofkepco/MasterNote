@@ -24,5 +24,6 @@ internal fun ReaderScene.requiresTeacherAccess(): Boolean = visibleLayerSources.
         is EditableLiveLayer -> source.target is LiveLayerTarget.TeacherPreparation || source.target is LiveLayerTarget.TeacherFeedback
         is ReadOnlyLiveLayer -> true
         is ReadOnlySnapshot -> source.target is SnapshotTarget.PublishedReview
+        is ReadOnlyRemoteLayer -> true
     }
 }

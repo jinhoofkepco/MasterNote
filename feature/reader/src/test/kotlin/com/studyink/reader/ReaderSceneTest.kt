@@ -31,4 +31,13 @@ class ReaderSceneTest {
         }.exceptionOrNull()
         assertTrue(error is IllegalArgumentException)
     }
+
+    @Test fun remoteReplicaSceneIsReadOnlyByConstruction() {
+        val scene = ReaderScene.remoteObservation(
+            BookRevisionId("revision"), "remote-session", PageId("page"),
+        )
+        assertTrue(scene.editableLayerSource == null)
+        assertTrue(scene.visibleLayerSources.single() is ReadOnlyRemoteLayer)
+        assertTrue(scene.interactionPolicy == ReaderInteractionPolicy.OBSERVE)
+    }
 }

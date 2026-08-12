@@ -55,6 +55,28 @@ class ProtobufRemoteMessageCodec : RemoteMessageCodec {
     }
 }
 
+/** Binary checkpoint body. Generated protobuf types remain private to this module. */
+object RemoteStrokeAssetListCodec {
+    fun encode(strokes: List<RemoteStrokeAsset>): ByteArray = DurableOperationBatch.newBuilder()
+        .addOperations(
+            DurableOperation.newBuilder()
+                .setOperationId("checkpoint")
+                .setType(OperationType.SESSION_CONTROL)
+                .addAllAddedStrokes(strokes.map(RemoteStrokeAsset::toWire))
+                .build()
+        )
+        .build()
+        .toByteArray()
+
+    fun decode(bytes: ByteArray): List<RemoteStrokeAsset> = try {
+        DurableOperationBatch.parseFrom(bytes).operationsList.singleOrNull()
+            ?.addedStrokesList?.map(StrokeAsset::toDomain)
+            ?: throw RemoteProtocolException("Invalid checkpoint body")
+    } catch (error: InvalidProtocolBufferException) {
+        throw RemoteProtocolException("Corrupt checkpoint body", error)
+    }
+}
+
 private fun RemoteEnvelope.toWire(): Envelope {
     val builder = Envelope.newBuilder()
         .setProtocolVersion(protocolVersion)

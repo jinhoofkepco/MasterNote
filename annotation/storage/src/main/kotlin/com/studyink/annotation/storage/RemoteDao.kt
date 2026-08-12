@@ -43,4 +43,34 @@ internal interface RemoteDao {
 
     @Query("SELECT COALESCE(MAX(durableSequence), 0) FROM remote_inbox_sequences WHERE sessionId = :sessionId")
     suspend fun maxInboxSequence(sessionId: String): Long
+
+    @Query("SELECT * FROM remote_replica_pages WHERE sessionId = :sessionId AND pageId = :pageId")
+    suspend fun replicaPage(sessionId: String, pageId: String): RemoteReplicaPageEntity?
+
+    @Query("SELECT * FROM remote_replica_pages WHERE sessionId = :sessionId ORDER BY pageNumber")
+    suspend fun replicaPages(sessionId: String): List<RemoteReplicaPageEntity>
+
+    @Query("SELECT * FROM remote_replica_strokes WHERE sessionId = :sessionId AND pageId = :pageId ORDER BY zOrder")
+    suspend fun replicaStrokes(sessionId: String, pageId: String): List<RemoteReplicaStrokeEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertReplicaPage(entity: RemoteReplicaPageEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertReplicaStrokes(entities: List<RemoteReplicaStrokeEntity>)
+
+    @Query("DELETE FROM remote_replica_strokes WHERE sessionId = :sessionId AND pageId = :pageId")
+    suspend fun deleteReplicaPageStrokes(sessionId: String, pageId: String)
+
+    @Query("DELETE FROM remote_replica_strokes WHERE sessionId = :sessionId AND pageId = :pageId AND strokeId IN (:strokeIds)")
+    suspend fun deleteReplicaStrokes(sessionId: String, pageId: String, strokeIds: List<String>)
+
+    @Query("SELECT COALESCE(MAX(zOrder), -1) FROM remote_replica_strokes WHERE sessionId = :sessionId AND pageId = :pageId")
+    suspend fun maxReplicaZOrder(sessionId: String, pageId: String): Long
+
+    @Query("DELETE FROM remote_replica_strokes WHERE sessionId = :sessionId")
+    suspend fun deleteReplicaSessionStrokes(sessionId: String)
+
+    @Query("DELETE FROM remote_replica_pages WHERE sessionId = :sessionId")
+    suspend fun deleteReplicaSessionPages(sessionId: String)
 }
