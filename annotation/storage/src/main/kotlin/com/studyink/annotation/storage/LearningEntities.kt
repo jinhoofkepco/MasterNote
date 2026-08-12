@@ -1,6 +1,7 @@
 package com.studyink.annotation.storage
 
 import androidx.room.Entity
+import androidx.room.ColumnInfo
 import androidx.room.ForeignKey
 import androidx.room.Index
 
@@ -109,6 +110,7 @@ internal data class AttemptEntity(
     val startedAtEpochMillis: Long,
     val updatedAtEpochMillis: Long,
     val submittedAtEpochMillis: Long?,
+    @ColumnInfo(defaultValue = "NULL") val sourceReviewId: String? = null,
 )
 
 @Entity(

@@ -63,6 +63,7 @@ data class Attempt(
     val startedAtEpochMillis: Long,
     val updatedAtEpochMillis: Long,
     val submittedAtEpochMillis: Long?,
+    val sourceReviewId: ReviewId? = null,
 )
 
 data class AttemptSession(

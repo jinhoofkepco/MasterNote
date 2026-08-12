@@ -1,6 +1,7 @@
 package com.studyink.annotation.storage
 
 import androidx.room.Entity
+import androidx.room.ColumnInfo
 import androidx.room.ForeignKey
 import androidx.room.Index
 
@@ -53,6 +54,7 @@ data class AnnotationLayerEntity(
     val ownerType: String,
     val currentRevision: Long,
     val createdAtEpochMillis: Long,
+    @ColumnInfo(defaultValue = "0") val locked: Boolean = false,
 )
 
 @Entity(
