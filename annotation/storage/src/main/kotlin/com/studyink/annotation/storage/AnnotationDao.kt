@@ -7,6 +7,8 @@ import androidx.room.Query
 
 @Dao
 internal interface AnnotationDao {
+    @Query("SELECT * FROM annotation_pages WHERE pageId = :pageId")
+    suspend fun page(pageId: String): AnnotationPageEntity?
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertDocument(entity: AnnotationDocumentEntity): Long
 

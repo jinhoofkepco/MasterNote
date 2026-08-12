@@ -110,3 +110,44 @@ must be pinned, licensed, isolated behind a MasterNote-owned API, and validated 
 - License: Apache-2.0
 - Adoption: instrumentation-test dependency only
 - Validation: v1 database creation, v2 migration, schema validation, and old-row preservation
+
+## REF-TEACHER-001
+
+- Capability: immutable ViewModel state composed from saved selection and repository Flow
+- Source: `android/nowinandroid`
+- Commit: `7d45eae4f8720a0c77f507712ba2437ff974b6ed`
+- Paths: `feature/interests/impl/.../InterestsViewModel.kt`, `InterestsViewModelTest.kt`
+- License: Apache-2.0
+- Adoption: state ownership and test pattern only; no source copied
+- MasterNote target: teacher review ViewModel and supporting-pane state
+- Validation: upstream implementation and test inspected at the pinned revision
+- Excluded: Hilt, Navigation 3 routes, topic domain, and repository implementation
+
+## REF-TEACHER-002
+
+- Capability: main/supporting pane separation and back navigation
+- Source: `android/compose-samples`
+- Commit: `84788c81186acd5bf0d280100992c8a9c04120ad`
+- Path: `Jetcaster/mobile/src/main/java/com/example/jetcaster/ui/home/Home.kt`
+- License: Apache-2.0
+- Adoption: layout/state separation pattern only; no source copied
+- MasterNote target: teacher review tablet layout
+- Validation: upstream implementation and root license inspected at the pinned revision
+- Differences: initial implementation uses a stable `Row` with a fixed supporting pane because the project has no Material3 Adaptive dependency; no Navigation migration is introduced
+
+## REF-TEACHER-003
+
+- Capability: atomic review creation and publication
+- Source: AndroidX Room `@Transaction` / `withTransaction`
+- Version: Room 2.8.4, pinned by REF-ANNOTATION-002
+- License: Apache-2.0
+- Adoption: direct dependency API behind `RoomTeacherRepository`
+- Validation: duplicate creation/publication and phase-specific rollback tests
+
+## REF-TEACHER-004
+
+- Capability: system teacher-mode authentication and device-credential fallback
+- Source: AndroidX BiometricPrompt official API
+- Version: dependency pin and device validation recorded in PR 3E
+- License: Apache-2.0
+- Adoption: planned behind `TeacherAccessAuthenticator`; no custom PIN

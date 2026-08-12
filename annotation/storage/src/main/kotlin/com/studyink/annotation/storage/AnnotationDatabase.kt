@@ -24,14 +24,21 @@ import androidx.room.RoomDatabase
         SubmissionStrokeRefEntity::class,
         DraftAnswerEntity::class,
         SubmissionAnswerEntity::class,
+        TeacherProfileEntity::class,
+        TeacherPrepPageEntity::class,
+        SubmissionReviewEntity::class,
+        ReviewPageEntity::class,
+        ReviewStrokeRefEntity::class,
+        ReviewAnswerEvaluationEntity::class,
     ],
-    version = 2,
-    autoMigrations = [AutoMigration(from = 1, to = 2)],
+    version = 3,
+    autoMigrations = [AutoMigration(from = 1, to = 2), AutoMigration(from = 2, to = 3)],
     exportSchema = true,
 )
 internal abstract class AnnotationDatabase : RoomDatabase() {
     abstract fun annotationDao(): AnnotationDao
     abstract fun learningDao(): LearningDao
+    abstract fun teacherDao(): TeacherDao
 
     companion object {
         const val NAME = "master-note-annotations.db"

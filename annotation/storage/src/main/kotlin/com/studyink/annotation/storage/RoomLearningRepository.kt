@@ -303,6 +303,7 @@ private fun AttemptEntity.toDomain() = Attempt(
     startedAtEpochMillis = startedAtEpochMillis,
     updatedAtEpochMillis = updatedAtEpochMillis,
     submittedAtEpochMillis = submittedAtEpochMillis,
+    sourceReviewId = sourceReviewId?.let { com.studyink.core.model.ReviewId(it) },
 )
 
 private fun ActivityProgressRow.toDomain() = ActivityProgress(
