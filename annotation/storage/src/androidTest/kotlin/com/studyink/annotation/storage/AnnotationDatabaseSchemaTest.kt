@@ -11,6 +11,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import kotlinx.coroutines.runBlocking
 
 @RunWith(AndroidJUnit4::class)
 class AnnotationDatabaseSchemaTest {
@@ -26,8 +27,16 @@ class AnnotationDatabaseSchemaTest {
     }
 
     @Test
-    fun exportedVersionOneSchemaCreatesAndOpensWithoutDestructiveFallback() {
-        migrationHelper.createDatabase(TEST_DATABASE, 1).close()
+    fun versionOneMigratesToVersionTwoAndPreservesAnnotationRows() {
+        migrationHelper.createDatabase(TEST_DATABASE, 1).apply {
+            execSQL(
+                """
+                INSERT INTO annotation_documents(documentId, currentRevision, createdAtEpochMillis)
+                VALUES('preserved-document', 7, 1234)
+                """.trimIndent()
+            )
+            close()
+        }
 
         val database = Room.databaseBuilder(
             ApplicationProvider.getApplicationContext(),
@@ -35,6 +44,14 @@ class AnnotationDatabaseSchemaTest {
             TEST_DATABASE,
         ).build()
         database.openHelper.writableDatabase.query("PRAGMA user_version").use { cursor ->
+            cursor.moveToFirst()
+            assertEquals(2, cursor.getInt(0))
+        }
+        val preserved = runBlocking { database.annotationDao().document("preserved-document") }
+        assertEquals(7L, preserved?.currentRevision)
+        database.openHelper.writableDatabase.query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='attempts'"
+        ).use { cursor ->
             cursor.moveToFirst()
             assertEquals(1, cursor.getInt(0))
         }
