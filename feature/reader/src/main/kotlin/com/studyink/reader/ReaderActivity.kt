@@ -288,6 +288,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                     null
                 },
                 onAnswer = if (latestState.scene?.requiresTeacherAccess() == true) ::openAnswerViewer else null,
+                onResources = if (latestState.scene?.requiresTeacherAccess() == true) ::openTeachingResources else null,
             )
         }
         paletteAnchor.setContent {
@@ -327,6 +328,16 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             .putExtra("com.studyink.answer.TEACHER", com.studyink.annotation.storage.RoomTeacherRepository.DEFAULT_TEACHER_ID)
         activity?.let { target.putExtra("com.studyink.answer.ACTIVITY", it) }
         startActivity(target)
+    }
+
+    private fun openTeachingResources() {
+        val revision = latestState.scene?.documentRevisionId?.value ?: latestState.attemptSession?.attempt?.revisionId?.value ?: return
+        val page = latestState.currentPageId?.value ?: latestState.scene?.initialPageId?.value ?: return
+        startActivity(
+            android.content.Intent().setClassName(packageName, "com.studyink.teacher.TeachingResourceActivity")
+                .putExtra("com.studyink.resource.REVISION", revision)
+                .putExtra("com.studyink.resource.PAGE", page)
+        )
     }
 
     private fun setupReviewPane(root: FrameLayout, fragmentContainer: View) {
