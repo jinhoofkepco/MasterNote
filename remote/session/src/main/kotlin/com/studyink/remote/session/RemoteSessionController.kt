@@ -191,6 +191,14 @@ class RemoteSessionController(
         if (snapshot.value.state == RemoteSessionState.INITIAL_SYNC) transition(RemoteSessionState.LIVE)
     }
 
+    suspend fun sendApplication(payload: com.studyink.remote.protocol.RemotePayload) {
+        val endpoint = snapshot.value.endpointId ?: return
+        transport.send(endpoint, codec.encode(RemoteEnvelope(
+            sessionId = sessionId, senderDeviceId = deviceId, messageId = UUID.randomUUID().toString(),
+            lane = RemoteLane.EPHEMERAL, sentElapsedRealtimeMs = elapsedRealtimeMs(), payload = payload,
+        )))
+    }
+
     private suspend fun send(endpointId: String, payload: com.studyink.remote.protocol.RemotePayload) {
         transport.send(endpointId, codec.encode(RemoteEnvelope(
             sessionId = sessionId, senderDeviceId = deviceId, messageId = UUID.randomUUID().toString(),

@@ -114,6 +114,16 @@ data class RemoteCheckpointChunk(
 data class RemotePing(val nonce: Long) : RemotePayload
 data class RemotePong(val nonce: Long) : RemotePayload
 data class RemoteProtocolError(val code: String, val message: String) : RemotePayload
+data class RemoteResourceOffer(val assetHash: String, val mimeType: String, val title: String, val byteSize: Long) : RemotePayload
+data class RemoteResourceNeed(val assetHash: String) : RemotePayload
+data class RemoteResourceChunk(val transferId: String, val assetHash: String, val chunkIndex: Int, val chunkCount: Int, val data: ByteArray) : RemotePayload {
+    init { require(data.size <= CHECKPOINT_CHUNK_BYTES); require(chunkIndex in 0 until chunkCount) }
+    override fun equals(other: Any?) = other is RemoteResourceChunk && transferId == other.transferId && assetHash == other.assetHash && chunkIndex == other.chunkIndex && chunkCount == other.chunkCount && data.contentEquals(other.data)
+    override fun hashCode() = 31 * transferId.hashCode() + chunkIndex
+}
+data class RemoteResourceReady(val assetHash: String) : RemotePayload
+data class RemotePresentResource(val assetHash: String, val title: String, val textContent: String, val mimeType: String) : RemotePayload
+data class RemoteDismissResource(val assetHash: String) : RemotePayload
 
 class RemoteProtocolException(message: String, cause: Throwable? = null) : IllegalArgumentException(message, cause)
 

@@ -31,6 +31,12 @@ message Envelope {
     Ping ping = 32;
     Pong pong = 33;
     ProtocolError protocol_error = 34;
+    ResourceOffer resource_offer = 35;
+    ResourceNeed resource_need = 36;
+    ResourceChunk resource_chunk = 37;
+    ResourceReady resource_ready = 38;
+    PresentResource present_resource = 39;
+    DismissResource dismiss_resource = 40;
   }
 }
 
@@ -88,3 +94,9 @@ message CheckpointChunk {
 message Ping { uint64 nonce = 1; }
 message Pong { uint64 nonce = 1; }
 message ProtocolError { string code = 1; string message = 2; }
+message ResourceOffer { string asset_hash = 1; string mime_type = 2; string title = 3; uint64 byte_size = 4; }
+message ResourceNeed { string asset_hash = 1; }
+message ResourceChunk { string transfer_id = 1; string asset_hash = 2; uint32 chunk_index = 3; uint32 chunk_count = 4; bytes data = 5; }
+message ResourceReady { string asset_hash = 1; }
+message PresentResource { string asset_hash = 1; string title = 2; string text_content = 3; string mime_type = 4; }
+message DismissResource { string asset_hash = 1; }

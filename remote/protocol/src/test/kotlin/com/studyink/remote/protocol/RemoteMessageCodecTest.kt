@@ -55,6 +55,9 @@ class RemoteMessageCodecTest {
             RemotePageDigest("page", 2, 1, byteArrayOf(1, 2)), RemoteCheckpointRequest("page", 2),
             RemoteCheckpointChunk("snapshot", "page", 2, 0, 1, byteArrayOf(3), byteArrayOf(4)),
             RemotePing(7), RemotePong(7), RemoteProtocolError("bad", "message"),
+            RemoteResourceOffer("hash", "image/png", "설명", 3), RemoteResourceNeed("hash"),
+            RemoteResourceChunk("transfer", "hash", 0, 1, byteArrayOf(1, 2, 3)), RemoteResourceReady("hash"),
+            RemotePresentResource("hash", "설명", "내용", "text/plain"), RemoteDismissResource("hash"),
         )
     }
 }

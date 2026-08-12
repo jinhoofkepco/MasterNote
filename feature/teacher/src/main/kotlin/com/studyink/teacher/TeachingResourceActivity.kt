@@ -55,6 +55,7 @@ class TeachingResourceActivity : ComponentActivity() {
                     selected?.let { content ->
                         content.text?.let { Text(it, Modifier.padding(vertical = 12.dp)) }
                         image?.let { Image(it, "설명 자료", Modifier.fillMaxWidth()) }
+                        Button(onClick = { presentToStudent(content) }) { Text("학생에게 보여주기") }
                         HorizontalDivider(Modifier.padding(vertical = 12.dp))
                     }
                     LazyColumn { items(resources, key = { it.resourceId }) { item ->
@@ -74,6 +75,18 @@ class TeachingResourceActivity : ComponentActivity() {
             image = content.imageAssetId?.let { id ->
                 withContext(Dispatchers.IO) { BitmapFactory.decodeFile(assets.open(id).file.path)?.asImageBitmap() }
             }
+        }
+    }
+
+    private fun presentToStudent(content: TeachingResourceContent) {
+        lifecycleScope.launch {
+            val file = content.imageAssetId?.let { assets.open(it).file }
+            com.studyink.remote.feature.RemoteSessionRuntime.offerTeachingResource(
+                title = resources.firstOrNull { it.currentRevisionId == content.revisionId }?.title ?: "설명 자료",
+                text = content.text.orEmpty(),
+                mimeType = if (file == null) "text/plain" else assets.open(requireNotNull(content.imageAssetId)).asset.mimeType,
+                file = file,
+            )
         }
     }
 
