@@ -1,0 +1,3444 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 10,
+    "identityHash": "85aa4a8d200b1d8de4864ff163f64418",
+    "entities": [
+      {
+        "tableName": "annotation_documents",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`documentId` TEXT NOT NULL, `currentRevision` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`documentId`))",
+        "fields": [
+          {
+            "fieldPath": "documentId",
+            "columnName": "documentId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currentRevision",
+            "columnName": "currentRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "documentId"
+          ]
+        }
+      },
+      {
+        "tableName": "annotation_pages",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`pageId` TEXT NOT NULL, `documentId` TEXT NOT NULL, `pageNumber` INTEGER NOT NULL, `currentRevision` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`pageId`), FOREIGN KEY(`documentId`) REFERENCES `annotation_documents`(`documentId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "documentId",
+            "columnName": "documentId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageNumber",
+            "columnName": "pageNumber",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currentRevision",
+            "columnName": "currentRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "pageId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_annotation_pages_documentId",
+            "unique": false,
+            "columnNames": [
+              "documentId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_annotation_pages_documentId` ON `${TABLE_NAME}` (`documentId`)"
+          },
+          {
+            "name": "index_annotation_pages_documentId_pageNumber",
+            "unique": true,
+            "columnNames": [
+              "documentId",
+              "pageNumber"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_annotation_pages_documentId_pageNumber` ON `${TABLE_NAME}` (`documentId`, `pageNumber`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "annotation_documents",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "documentId"
+            ],
+            "referencedColumns": [
+              "documentId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "annotation_layers",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`layerId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `attemptId` TEXT, `layerType` TEXT NOT NULL, `ownerType` TEXT NOT NULL, `currentRevision` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, `locked` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`layerId`), FOREIGN KEY(`pageId`) REFERENCES `annotation_pages`(`pageId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "layerId",
+            "columnName": "layerId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "attemptId",
+            "columnName": "attemptId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "layerType",
+            "columnName": "layerType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ownerType",
+            "columnName": "ownerType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currentRevision",
+            "columnName": "currentRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "locked",
+            "columnName": "locked",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "layerId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_annotation_layers_pageId",
+            "unique": false,
+            "columnNames": [
+              "pageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_annotation_layers_pageId` ON `${TABLE_NAME}` (`pageId`)"
+          },
+          {
+            "name": "index_annotation_layers_attemptId",
+            "unique": false,
+            "columnNames": [
+              "attemptId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_annotation_layers_attemptId` ON `${TABLE_NAME}` (`attemptId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "annotation_pages",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "pageId"
+            ],
+            "referencedColumns": [
+              "pageId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "stroke_assets",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`strokeId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `pageNumber` INTEGER NOT NULL, `encodedInput` BLOB NOT NULL, `brushPresetId` TEXT NOT NULL, `colorArgb` INTEGER NOT NULL, `brushSize` REAL NOT NULL, `boundsLeft` REAL NOT NULL, `boundsTop` REAL NOT NULL, `boundsRight` REAL NOT NULL, `boundsBottom` REAL NOT NULL, `parentStrokeId` TEXT, `formatVersion` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`strokeId`), FOREIGN KEY(`pageId`) REFERENCES `annotation_pages`(`pageId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "strokeId",
+            "columnName": "strokeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageNumber",
+            "columnName": "pageNumber",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "encodedInput",
+            "columnName": "encodedInput",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "brushPresetId",
+            "columnName": "brushPresetId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "colorArgb",
+            "columnName": "colorArgb",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "brushSize",
+            "columnName": "brushSize",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "boundsLeft",
+            "columnName": "boundsLeft",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "boundsTop",
+            "columnName": "boundsTop",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "boundsRight",
+            "columnName": "boundsRight",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "boundsBottom",
+            "columnName": "boundsBottom",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "parentStrokeId",
+            "columnName": "parentStrokeId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "formatVersion",
+            "columnName": "formatVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "strokeId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_stroke_assets_pageId",
+            "unique": false,
+            "columnNames": [
+              "pageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_stroke_assets_pageId` ON `${TABLE_NAME}` (`pageId`)"
+          },
+          {
+            "name": "index_stroke_assets_parentStrokeId",
+            "unique": false,
+            "columnNames": [
+              "parentStrokeId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_stroke_assets_parentStrokeId` ON `${TABLE_NAME}` (`parentStrokeId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "annotation_pages",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "pageId"
+            ],
+            "referencedColumns": [
+              "pageId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "layer_strokes",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`layerId` TEXT NOT NULL, `strokeId` TEXT NOT NULL, `zOrder` INTEGER NOT NULL, `active` INTEGER NOT NULL, `linkedByOperationId` TEXT, `unlinkedByOperationId` TEXT, PRIMARY KEY(`layerId`, `strokeId`), FOREIGN KEY(`layerId`) REFERENCES `annotation_layers`(`layerId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`strokeId`) REFERENCES `stroke_assets`(`strokeId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "layerId",
+            "columnName": "layerId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "strokeId",
+            "columnName": "strokeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "zOrder",
+            "columnName": "zOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "active",
+            "columnName": "active",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "linkedByOperationId",
+            "columnName": "linkedByOperationId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "unlinkedByOperationId",
+            "columnName": "unlinkedByOperationId",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "layerId",
+            "strokeId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_layer_strokes_strokeId",
+            "unique": false,
+            "columnNames": [
+              "strokeId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_layer_strokes_strokeId` ON `${TABLE_NAME}` (`strokeId`)"
+          },
+          {
+            "name": "index_layer_strokes_layerId_active",
+            "unique": false,
+            "columnNames": [
+              "layerId",
+              "active"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_layer_strokes_layerId_active` ON `${TABLE_NAME}` (`layerId`, `active`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "annotation_layers",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "layerId"
+            ],
+            "referencedColumns": [
+              "layerId"
+            ]
+          },
+          {
+            "table": "stroke_assets",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "strokeId"
+            ],
+            "referencedColumns": [
+              "strokeId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "annotation_operations",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`operationId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `layerId` TEXT NOT NULL, `operationType` TEXT NOT NULL, `baseRevision` INTEGER NOT NULL, `resultRevision` INTEGER NOT NULL, `payloadJson` TEXT NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`operationId`), FOREIGN KEY(`pageId`) REFERENCES `annotation_pages`(`pageId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`layerId`) REFERENCES `annotation_layers`(`layerId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "operationId",
+            "columnName": "operationId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "layerId",
+            "columnName": "layerId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "operationType",
+            "columnName": "operationType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "baseRevision",
+            "columnName": "baseRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "resultRevision",
+            "columnName": "resultRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadJson",
+            "columnName": "payloadJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "operationId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_annotation_operations_pageId",
+            "unique": false,
+            "columnNames": [
+              "pageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_annotation_operations_pageId` ON `${TABLE_NAME}` (`pageId`)"
+          },
+          {
+            "name": "index_annotation_operations_layerId",
+            "unique": false,
+            "columnNames": [
+              "layerId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_annotation_operations_layerId` ON `${TABLE_NAME}` (`layerId`)"
+          },
+          {
+            "name": "index_annotation_operations_layerId_resultRevision",
+            "unique": true,
+            "columnNames": [
+              "layerId",
+              "resultRevision"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_annotation_operations_layerId_resultRevision` ON `${TABLE_NAME}` (`layerId`, `resultRevision`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "annotation_pages",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "pageId"
+            ],
+            "referencedColumns": [
+              "pageId"
+            ]
+          },
+          {
+            "table": "annotation_layers",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "layerId"
+            ],
+            "referencedColumns": [
+              "layerId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "learner_profiles",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `displayName` TEXT NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`profileId`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "displayName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId"
+          ]
+        }
+      },
+      {
+        "tableName": "book_revisions",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`revisionId` TEXT NOT NULL, `bookId` TEXT NOT NULL, `documentId` TEXT NOT NULL, `revisionNumber` INTEGER NOT NULL, `contentHash` TEXT NOT NULL, `title` TEXT NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`revisionId`))",
+        "fields": [
+          {
+            "fieldPath": "revisionId",
+            "columnName": "revisionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bookId",
+            "columnName": "bookId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "documentId",
+            "columnName": "documentId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "revisionNumber",
+            "columnName": "revisionNumber",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "contentHash",
+            "columnName": "contentHash",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "revisionId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_book_revisions_bookId_revisionNumber",
+            "unique": true,
+            "columnNames": [
+              "bookId",
+              "revisionNumber"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_book_revisions_bookId_revisionNumber` ON `${TABLE_NAME}` (`bookId`, `revisionNumber`)"
+          },
+          {
+            "name": "index_book_revisions_documentId",
+            "unique": false,
+            "columnNames": [
+              "documentId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_book_revisions_documentId` ON `${TABLE_NAME}` (`documentId`)"
+          }
+        ]
+      },
+      {
+        "tableName": "learning_activities",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`activityId` TEXT NOT NULL, `revisionId` TEXT NOT NULL, `title` TEXT NOT NULL, `sortOrder` INTEGER NOT NULL, `submissionMode` TEXT NOT NULL, PRIMARY KEY(`activityId`), FOREIGN KEY(`revisionId`) REFERENCES `book_revisions`(`revisionId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "activityId",
+            "columnName": "activityId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "revisionId",
+            "columnName": "revisionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sortOrder",
+            "columnName": "sortOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "submissionMode",
+            "columnName": "submissionMode",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "activityId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_learning_activities_revisionId",
+            "unique": false,
+            "columnNames": [
+              "revisionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_learning_activities_revisionId` ON `${TABLE_NAME}` (`revisionId`)"
+          },
+          {
+            "name": "index_learning_activities_revisionId_sortOrder",
+            "unique": true,
+            "columnNames": [
+              "revisionId",
+              "sortOrder"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_learning_activities_revisionId_sortOrder` ON `${TABLE_NAME}` (`revisionId`, `sortOrder`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "book_revisions",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "revisionId"
+            ],
+            "referencedColumns": [
+              "revisionId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "activity_page_refs",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`activityId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `pageNumber` INTEGER NOT NULL, `pageOrder` INTEGER NOT NULL, PRIMARY KEY(`activityId`, `pageId`), FOREIGN KEY(`activityId`) REFERENCES `learning_activities`(`activityId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "activityId",
+            "columnName": "activityId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageNumber",
+            "columnName": "pageNumber",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageOrder",
+            "columnName": "pageOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "activityId",
+            "pageId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_activity_page_refs_activityId",
+            "unique": false,
+            "columnNames": [
+              "activityId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_activity_page_refs_activityId` ON `${TABLE_NAME}` (`activityId`)"
+          },
+          {
+            "name": "index_activity_page_refs_activityId_pageOrder",
+            "unique": true,
+            "columnNames": [
+              "activityId",
+              "pageOrder"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_activity_page_refs_activityId_pageOrder` ON `${TABLE_NAME}` (`activityId`, `pageOrder`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "learning_activities",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "activityId"
+            ],
+            "referencedColumns": [
+              "activityId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "attempts",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`attemptId` TEXT NOT NULL, `profileId` TEXT NOT NULL, `activityId` TEXT NOT NULL, `revisionId` TEXT NOT NULL, `attemptNumber` INTEGER NOT NULL, `status` TEXT NOT NULL, `lastVisitedPageId` TEXT, `startedAtEpochMillis` INTEGER NOT NULL, `updatedAtEpochMillis` INTEGER NOT NULL, `submittedAtEpochMillis` INTEGER, `sourceReviewId` TEXT DEFAULT NULL, PRIMARY KEY(`attemptId`), FOREIGN KEY(`profileId`) REFERENCES `learner_profiles`(`profileId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`activityId`) REFERENCES `learning_activities`(`activityId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`revisionId`) REFERENCES `book_revisions`(`revisionId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "attemptId",
+            "columnName": "attemptId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activityId",
+            "columnName": "activityId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "revisionId",
+            "columnName": "revisionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "attemptNumber",
+            "columnName": "attemptNumber",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastVisitedPageId",
+            "columnName": "lastVisitedPageId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "startedAtEpochMillis",
+            "columnName": "startedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAtEpochMillis",
+            "columnName": "updatedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "submittedAtEpochMillis",
+            "columnName": "submittedAtEpochMillis",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "sourceReviewId",
+            "columnName": "sourceReviewId",
+            "affinity": "TEXT",
+            "defaultValue": "NULL"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "attemptId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_attempts_profileId",
+            "unique": false,
+            "columnNames": [
+              "profileId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_attempts_profileId` ON `${TABLE_NAME}` (`profileId`)"
+          },
+          {
+            "name": "index_attempts_activityId",
+            "unique": false,
+            "columnNames": [
+              "activityId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_attempts_activityId` ON `${TABLE_NAME}` (`activityId`)"
+          },
+          {
+            "name": "index_attempts_revisionId",
+            "unique": false,
+            "columnNames": [
+              "revisionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_attempts_revisionId` ON `${TABLE_NAME}` (`revisionId`)"
+          },
+          {
+            "name": "index_attempts_profileId_activityId_attemptNumber",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "activityId",
+              "attemptNumber"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_attempts_profileId_activityId_attemptNumber` ON `${TABLE_NAME}` (`profileId`, `activityId`, `attemptNumber`)"
+          },
+          {
+            "name": "index_attempts_profileId_activityId_status",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "activityId",
+              "status"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_attempts_profileId_activityId_status` ON `${TABLE_NAME}` (`profileId`, `activityId`, `status`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "learner_profiles",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "profileId"
+            ],
+            "referencedColumns": [
+              "profileId"
+            ]
+          },
+          {
+            "table": "learning_activities",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "activityId"
+            ],
+            "referencedColumns": [
+              "activityId"
+            ]
+          },
+          {
+            "table": "book_revisions",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "revisionId"
+            ],
+            "referencedColumns": [
+              "revisionId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "attempt_pages",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`attemptId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `workingLayerId` TEXT NOT NULL, `lastViewedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`attemptId`, `pageId`), FOREIGN KEY(`attemptId`) REFERENCES `attempts`(`attemptId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`workingLayerId`) REFERENCES `annotation_layers`(`layerId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "attemptId",
+            "columnName": "attemptId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "workingLayerId",
+            "columnName": "workingLayerId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastViewedAtEpochMillis",
+            "columnName": "lastViewedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "attemptId",
+            "pageId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_attempt_pages_attemptId",
+            "unique": false,
+            "columnNames": [
+              "attemptId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_attempt_pages_attemptId` ON `${TABLE_NAME}` (`attemptId`)"
+          },
+          {
+            "name": "index_attempt_pages_workingLayerId",
+            "unique": true,
+            "columnNames": [
+              "workingLayerId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_attempt_pages_workingLayerId` ON `${TABLE_NAME}` (`workingLayerId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "attempts",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "attemptId"
+            ],
+            "referencedColumns": [
+              "attemptId"
+            ]
+          },
+          {
+            "table": "annotation_layers",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "workingLayerId"
+            ],
+            "referencedColumns": [
+              "layerId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "submissions",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`submissionId` TEXT NOT NULL, `attemptId` TEXT NOT NULL, `submittedAtEpochMillis` INTEGER NOT NULL, `annotationRevision` INTEGER NOT NULL, PRIMARY KEY(`submissionId`), FOREIGN KEY(`attemptId`) REFERENCES `attempts`(`attemptId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "submissionId",
+            "columnName": "submissionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "attemptId",
+            "columnName": "attemptId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "submittedAtEpochMillis",
+            "columnName": "submittedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "annotationRevision",
+            "columnName": "annotationRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "submissionId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_submissions_attemptId",
+            "unique": true,
+            "columnNames": [
+              "attemptId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_submissions_attemptId` ON `${TABLE_NAME}` (`attemptId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "attempts",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "attemptId"
+            ],
+            "referencedColumns": [
+              "attemptId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "submission_stroke_refs",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`submissionId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `strokeId` TEXT NOT NULL, `zOrder` INTEGER NOT NULL, PRIMARY KEY(`submissionId`, `pageId`, `strokeId`), FOREIGN KEY(`submissionId`) REFERENCES `submissions`(`submissionId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`strokeId`) REFERENCES `stroke_assets`(`strokeId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "submissionId",
+            "columnName": "submissionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "strokeId",
+            "columnName": "strokeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "zOrder",
+            "columnName": "zOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "submissionId",
+            "pageId",
+            "strokeId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_submission_stroke_refs_submissionId",
+            "unique": false,
+            "columnNames": [
+              "submissionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_submission_stroke_refs_submissionId` ON `${TABLE_NAME}` (`submissionId`)"
+          },
+          {
+            "name": "index_submission_stroke_refs_strokeId",
+            "unique": false,
+            "columnNames": [
+              "strokeId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_submission_stroke_refs_strokeId` ON `${TABLE_NAME}` (`strokeId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "submissions",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "submissionId"
+            ],
+            "referencedColumns": [
+              "submissionId"
+            ]
+          },
+          {
+            "table": "stroke_assets",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "strokeId"
+            ],
+            "referencedColumns": [
+              "strokeId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "draft_answers",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`attemptId` TEXT NOT NULL, `fieldId` TEXT NOT NULL, `answerType` TEXT NOT NULL, `valueJson` TEXT NOT NULL, `updatedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`attemptId`, `fieldId`), FOREIGN KEY(`attemptId`) REFERENCES `attempts`(`attemptId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "attemptId",
+            "columnName": "attemptId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fieldId",
+            "columnName": "fieldId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "answerType",
+            "columnName": "answerType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "valueJson",
+            "columnName": "valueJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAtEpochMillis",
+            "columnName": "updatedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "attemptId",
+            "fieldId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_draft_answers_attemptId",
+            "unique": false,
+            "columnNames": [
+              "attemptId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_draft_answers_attemptId` ON `${TABLE_NAME}` (`attemptId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "attempts",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "attemptId"
+            ],
+            "referencedColumns": [
+              "attemptId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "submission_answers",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`submissionId` TEXT NOT NULL, `fieldId` TEXT NOT NULL, `answerType` TEXT NOT NULL, `valueJson` TEXT NOT NULL, PRIMARY KEY(`submissionId`, `fieldId`), FOREIGN KEY(`submissionId`) REFERENCES `submissions`(`submissionId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "submissionId",
+            "columnName": "submissionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fieldId",
+            "columnName": "fieldId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "answerType",
+            "columnName": "answerType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "valueJson",
+            "columnName": "valueJson",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "submissionId",
+            "fieldId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_submission_answers_submissionId",
+            "unique": false,
+            "columnNames": [
+              "submissionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_submission_answers_submissionId` ON `${TABLE_NAME}` (`submissionId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "submissions",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "submissionId"
+            ],
+            "referencedColumns": [
+              "submissionId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "teacher_profiles",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`teacherId` TEXT NOT NULL, `displayName` TEXT NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`teacherId`))",
+        "fields": [
+          {
+            "fieldPath": "teacherId",
+            "columnName": "teacherId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "displayName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "teacherId"
+          ]
+        }
+      },
+      {
+        "tableName": "teacher_prep_pages",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`teacherId` TEXT NOT NULL, `bookRevisionId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `prepLayerId` TEXT NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, `updatedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`teacherId`, `bookRevisionId`, `pageId`), FOREIGN KEY(`teacherId`) REFERENCES `teacher_profiles`(`teacherId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`bookRevisionId`) REFERENCES `book_revisions`(`revisionId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`prepLayerId`) REFERENCES `annotation_layers`(`layerId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "teacherId",
+            "columnName": "teacherId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bookRevisionId",
+            "columnName": "bookRevisionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "prepLayerId",
+            "columnName": "prepLayerId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAtEpochMillis",
+            "columnName": "updatedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "teacherId",
+            "bookRevisionId",
+            "pageId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_teacher_prep_pages_bookRevisionId",
+            "unique": false,
+            "columnNames": [
+              "bookRevisionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_teacher_prep_pages_bookRevisionId` ON `${TABLE_NAME}` (`bookRevisionId`)"
+          },
+          {
+            "name": "index_teacher_prep_pages_pageId",
+            "unique": false,
+            "columnNames": [
+              "pageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_teacher_prep_pages_pageId` ON `${TABLE_NAME}` (`pageId`)"
+          },
+          {
+            "name": "index_teacher_prep_pages_prepLayerId",
+            "unique": true,
+            "columnNames": [
+              "prepLayerId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_teacher_prep_pages_prepLayerId` ON `${TABLE_NAME}` (`prepLayerId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "teacher_profiles",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "teacherId"
+            ],
+            "referencedColumns": [
+              "teacherId"
+            ]
+          },
+          {
+            "table": "book_revisions",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "bookRevisionId"
+            ],
+            "referencedColumns": [
+              "revisionId"
+            ]
+          },
+          {
+            "table": "annotation_layers",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "prepLayerId"
+            ],
+            "referencedColumns": [
+              "layerId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "submission_reviews",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`reviewId` TEXT NOT NULL, `submissionId` TEXT NOT NULL, `reviewerId` TEXT NOT NULL, `reviewNumber` INTEGER NOT NULL, `status` TEXT NOT NULL, `decision` TEXT NOT NULL, `summaryText` TEXT NOT NULL, `lastVisitedPageId` TEXT, `supersedesReviewId` TEXT, `startedAtEpochMillis` INTEGER NOT NULL, `updatedAtEpochMillis` INTEGER NOT NULL, `publishedAtEpochMillis` INTEGER, PRIMARY KEY(`reviewId`), FOREIGN KEY(`submissionId`) REFERENCES `submissions`(`submissionId`) ON UPDATE NO ACTION ON DELETE RESTRICT , FOREIGN KEY(`reviewerId`) REFERENCES `teacher_profiles`(`teacherId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "reviewId",
+            "columnName": "reviewId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "submissionId",
+            "columnName": "submissionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "reviewerId",
+            "columnName": "reviewerId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "reviewNumber",
+            "columnName": "reviewNumber",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "decision",
+            "columnName": "decision",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "summaryText",
+            "columnName": "summaryText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastVisitedPageId",
+            "columnName": "lastVisitedPageId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "supersedesReviewId",
+            "columnName": "supersedesReviewId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "startedAtEpochMillis",
+            "columnName": "startedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAtEpochMillis",
+            "columnName": "updatedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "publishedAtEpochMillis",
+            "columnName": "publishedAtEpochMillis",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "reviewId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_submission_reviews_submissionId",
+            "unique": false,
+            "columnNames": [
+              "submissionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_submission_reviews_submissionId` ON `${TABLE_NAME}` (`submissionId`)"
+          },
+          {
+            "name": "index_submission_reviews_reviewerId",
+            "unique": false,
+            "columnNames": [
+              "reviewerId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_submission_reviews_reviewerId` ON `${TABLE_NAME}` (`reviewerId`)"
+          },
+          {
+            "name": "index_submission_reviews_supersedesReviewId",
+            "unique": false,
+            "columnNames": [
+              "supersedesReviewId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_submission_reviews_supersedesReviewId` ON `${TABLE_NAME}` (`supersedesReviewId`)"
+          },
+          {
+            "name": "index_submission_reviews_submissionId_reviewNumber",
+            "unique": true,
+            "columnNames": [
+              "submissionId",
+              "reviewNumber"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_submission_reviews_submissionId_reviewNumber` ON `${TABLE_NAME}` (`submissionId`, `reviewNumber`)"
+          },
+          {
+            "name": "index_submission_reviews_submissionId_reviewerId_status",
+            "unique": false,
+            "columnNames": [
+              "submissionId",
+              "reviewerId",
+              "status"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_submission_reviews_submissionId_reviewerId_status` ON `${TABLE_NAME}` (`submissionId`, `reviewerId`, `status`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "submissions",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "submissionId"
+            ],
+            "referencedColumns": [
+              "submissionId"
+            ]
+          },
+          {
+            "table": "teacher_profiles",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "reviewerId"
+            ],
+            "referencedColumns": [
+              "teacherId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "review_pages",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`reviewId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `pageNumber` INTEGER NOT NULL, `feedbackLayerId` TEXT, `checkStatus` TEXT NOT NULL, `lastVisitedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`reviewId`, `pageId`), FOREIGN KEY(`reviewId`) REFERENCES `submission_reviews`(`reviewId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`feedbackLayerId`) REFERENCES `annotation_layers`(`layerId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "reviewId",
+            "columnName": "reviewId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageNumber",
+            "columnName": "pageNumber",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "feedbackLayerId",
+            "columnName": "feedbackLayerId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "checkStatus",
+            "columnName": "checkStatus",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastVisitedAtEpochMillis",
+            "columnName": "lastVisitedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "reviewId",
+            "pageId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_review_pages_reviewId",
+            "unique": false,
+            "columnNames": [
+              "reviewId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_review_pages_reviewId` ON `${TABLE_NAME}` (`reviewId`)"
+          },
+          {
+            "name": "index_review_pages_pageId",
+            "unique": false,
+            "columnNames": [
+              "pageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_review_pages_pageId` ON `${TABLE_NAME}` (`pageId`)"
+          },
+          {
+            "name": "index_review_pages_feedbackLayerId",
+            "unique": true,
+            "columnNames": [
+              "feedbackLayerId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_review_pages_feedbackLayerId` ON `${TABLE_NAME}` (`feedbackLayerId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "submission_reviews",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "reviewId"
+            ],
+            "referencedColumns": [
+              "reviewId"
+            ]
+          },
+          {
+            "table": "annotation_layers",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "feedbackLayerId"
+            ],
+            "referencedColumns": [
+              "layerId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "review_stroke_refs",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`reviewId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `strokeId` TEXT NOT NULL, `zOrder` INTEGER NOT NULL, PRIMARY KEY(`reviewId`, `pageId`, `strokeId`), FOREIGN KEY(`reviewId`) REFERENCES `submission_reviews`(`reviewId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`strokeId`) REFERENCES `stroke_assets`(`strokeId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "reviewId",
+            "columnName": "reviewId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "strokeId",
+            "columnName": "strokeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "zOrder",
+            "columnName": "zOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "reviewId",
+            "pageId",
+            "strokeId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_review_stroke_refs_reviewId",
+            "unique": false,
+            "columnNames": [
+              "reviewId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_review_stroke_refs_reviewId` ON `${TABLE_NAME}` (`reviewId`)"
+          },
+          {
+            "name": "index_review_stroke_refs_strokeId",
+            "unique": false,
+            "columnNames": [
+              "strokeId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_review_stroke_refs_strokeId` ON `${TABLE_NAME}` (`strokeId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "submission_reviews",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "reviewId"
+            ],
+            "referencedColumns": [
+              "reviewId"
+            ]
+          },
+          {
+            "table": "stroke_assets",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "strokeId"
+            ],
+            "referencedColumns": [
+              "strokeId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "review_answer_evaluations",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`reviewId` TEXT NOT NULL, `fieldId` TEXT NOT NULL, `verdict` TEXT NOT NULL, `commentText` TEXT NOT NULL, `updatedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`reviewId`, `fieldId`), FOREIGN KEY(`reviewId`) REFERENCES `submission_reviews`(`reviewId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "reviewId",
+            "columnName": "reviewId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fieldId",
+            "columnName": "fieldId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "verdict",
+            "columnName": "verdict",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "commentText",
+            "columnName": "commentText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAtEpochMillis",
+            "columnName": "updatedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "reviewId",
+            "fieldId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_review_answer_evaluations_reviewId",
+            "unique": false,
+            "columnNames": [
+              "reviewId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_review_answer_evaluations_reviewId` ON `${TABLE_NAME}` (`reviewId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "submission_reviews",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "reviewId"
+            ],
+            "referencedColumns": [
+              "reviewId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "remote_outbox",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sessionId` TEXT NOT NULL, `durableSequence` INTEGER NOT NULL, `operationId` TEXT NOT NULL, `messageId` TEXT NOT NULL, `messageType` TEXT NOT NULL, `encodedEnvelope` BLOB NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, `lastSentAtEpochMillis` INTEGER, `sendAttemptCount` INTEGER NOT NULL, `acknowledgedAtEpochMillis` INTEGER, PRIMARY KEY(`sessionId`, `durableSequence`))",
+        "fields": [
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "durableSequence",
+            "columnName": "durableSequence",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "operationId",
+            "columnName": "operationId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "messageId",
+            "columnName": "messageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "messageType",
+            "columnName": "messageType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "encodedEnvelope",
+            "columnName": "encodedEnvelope",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastSentAtEpochMillis",
+            "columnName": "lastSentAtEpochMillis",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "sendAttemptCount",
+            "columnName": "sendAttemptCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "acknowledgedAtEpochMillis",
+            "columnName": "acknowledgedAtEpochMillis",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "sessionId",
+            "durableSequence"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_remote_outbox_sessionId_operationId",
+            "unique": true,
+            "columnNames": [
+              "sessionId",
+              "operationId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_remote_outbox_sessionId_operationId` ON `${TABLE_NAME}` (`sessionId`, `operationId`)"
+          },
+          {
+            "name": "index_remote_outbox_sessionId_messageId",
+            "unique": true,
+            "columnNames": [
+              "sessionId",
+              "messageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_remote_outbox_sessionId_messageId` ON `${TABLE_NAME}` (`sessionId`, `messageId`)"
+          },
+          {
+            "name": "index_remote_outbox_sessionId_acknowledgedAtEpochMillis",
+            "unique": false,
+            "columnNames": [
+              "sessionId",
+              "acknowledgedAtEpochMillis"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_remote_outbox_sessionId_acknowledgedAtEpochMillis` ON `${TABLE_NAME}` (`sessionId`, `acknowledgedAtEpochMillis`)"
+          }
+        ]
+      },
+      {
+        "tableName": "remote_inbox_sequences",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sessionId` TEXT NOT NULL, `durableSequence` INTEGER NOT NULL, `messageId` TEXT NOT NULL, `appliedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`sessionId`, `durableSequence`))",
+        "fields": [
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "durableSequence",
+            "columnName": "durableSequence",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "messageId",
+            "columnName": "messageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "appliedAtEpochMillis",
+            "columnName": "appliedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "sessionId",
+            "durableSequence"
+          ]
+        }
+      },
+      {
+        "tableName": "remote_applied_operations",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sessionId` TEXT NOT NULL, `operationId` TEXT NOT NULL, `appliedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`sessionId`, `operationId`))",
+        "fields": [
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "operationId",
+            "columnName": "operationId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "appliedAtEpochMillis",
+            "columnName": "appliedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "sessionId",
+            "operationId"
+          ]
+        }
+      },
+      {
+        "tableName": "remote_replica_pages",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sessionId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `pageNumber` INTEGER NOT NULL, `layerRevision` INTEGER NOT NULL, `lastAppliedSequence` INTEGER NOT NULL, `lastUpdatedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`sessionId`, `pageId`))",
+        "fields": [
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageNumber",
+            "columnName": "pageNumber",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "layerRevision",
+            "columnName": "layerRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastAppliedSequence",
+            "columnName": "lastAppliedSequence",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastUpdatedAtEpochMillis",
+            "columnName": "lastUpdatedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "sessionId",
+            "pageId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_remote_replica_pages_sessionId_lastUpdatedAtEpochMillis",
+            "unique": false,
+            "columnNames": [
+              "sessionId",
+              "lastUpdatedAtEpochMillis"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_remote_replica_pages_sessionId_lastUpdatedAtEpochMillis` ON `${TABLE_NAME}` (`sessionId`, `lastUpdatedAtEpochMillis`)"
+          }
+        ]
+      },
+      {
+        "tableName": "remote_replica_strokes",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sessionId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `strokeId` TEXT NOT NULL, `zOrder` INTEGER NOT NULL, `encodedStroke` BLOB NOT NULL, PRIMARY KEY(`sessionId`, `pageId`, `strokeId`))",
+        "fields": [
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "strokeId",
+            "columnName": "strokeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "zOrder",
+            "columnName": "zOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "encodedStroke",
+            "columnName": "encodedStroke",
+            "affinity": "BLOB",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "sessionId",
+            "pageId",
+            "strokeId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_remote_replica_strokes_sessionId_pageId_zOrder",
+            "unique": false,
+            "columnNames": [
+              "sessionId",
+              "pageId",
+              "zOrder"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_remote_replica_strokes_sessionId_pageId_zOrder` ON `${TABLE_NAME}` (`sessionId`, `pageId`, `zOrder`)"
+          }
+        ]
+      },
+      {
+        "tableName": "managed_assets",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`assetId` TEXT NOT NULL, `sha256` TEXT NOT NULL, `mimeType` TEXT NOT NULL, `originalFileName` TEXT NOT NULL, `byteSize` INTEGER NOT NULL, `relativePath` TEXT NOT NULL, `widthPx` INTEGER, `heightPx` INTEGER, `pageCount` INTEGER, `createdAtEpochMillis` INTEGER NOT NULL, `lastVerifiedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`assetId`))",
+        "fields": [
+          {
+            "fieldPath": "assetId",
+            "columnName": "assetId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sha256",
+            "columnName": "sha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "mimeType",
+            "columnName": "mimeType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "originalFileName",
+            "columnName": "originalFileName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "byteSize",
+            "columnName": "byteSize",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "relativePath",
+            "columnName": "relativePath",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "widthPx",
+            "columnName": "widthPx",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "heightPx",
+            "columnName": "heightPx",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "pageCount",
+            "columnName": "pageCount",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastVerifiedAtEpochMillis",
+            "columnName": "lastVerifiedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "assetId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_managed_assets_sha256",
+            "unique": true,
+            "columnNames": [
+              "sha256"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_managed_assets_sha256` ON `${TABLE_NAME}` (`sha256`)"
+          },
+          {
+            "name": "index_managed_assets_createdAtEpochMillis",
+            "unique": false,
+            "columnNames": [
+              "createdAtEpochMillis"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_managed_assets_createdAtEpochMillis` ON `${TABLE_NAME}` (`createdAtEpochMillis`)"
+          }
+        ]
+      },
+      {
+        "tableName": "answer_documents",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`answerDocumentId` TEXT NOT NULL, `bookRevisionId` TEXT NOT NULL, `assetId` TEXT NOT NULL, `documentType` TEXT NOT NULL, `answerKind` TEXT NOT NULL, `pageCount` INTEGER NOT NULL, `displayName` TEXT NOT NULL, `isActive` INTEGER NOT NULL, `linkedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`answerDocumentId`), FOREIGN KEY(`bookRevisionId`) REFERENCES `book_revisions`(`revisionId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`assetId`) REFERENCES `managed_assets`(`assetId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "answerDocumentId",
+            "columnName": "answerDocumentId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bookRevisionId",
+            "columnName": "bookRevisionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "assetId",
+            "columnName": "assetId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "documentType",
+            "columnName": "documentType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "answerKind",
+            "columnName": "answerKind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageCount",
+            "columnName": "pageCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "displayName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isActive",
+            "columnName": "isActive",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "linkedAtEpochMillis",
+            "columnName": "linkedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "answerDocumentId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_answer_documents_bookRevisionId",
+            "unique": false,
+            "columnNames": [
+              "bookRevisionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_answer_documents_bookRevisionId` ON `${TABLE_NAME}` (`bookRevisionId`)"
+          },
+          {
+            "name": "index_answer_documents_assetId",
+            "unique": false,
+            "columnNames": [
+              "assetId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_answer_documents_assetId` ON `${TABLE_NAME}` (`assetId`)"
+          },
+          {
+            "name": "index_answer_documents_bookRevisionId_assetId_answerKind",
+            "unique": true,
+            "columnNames": [
+              "bookRevisionId",
+              "assetId",
+              "answerKind"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_answer_documents_bookRevisionId_assetId_answerKind` ON `${TABLE_NAME}` (`bookRevisionId`, `assetId`, `answerKind`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "book_revisions",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "bookRevisionId"
+            ],
+            "referencedColumns": [
+              "revisionId"
+            ]
+          },
+          {
+            "table": "managed_assets",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "assetId"
+            ],
+            "referencedColumns": [
+              "assetId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "answer_page_links",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`linkId` TEXT NOT NULL, `bookRevisionId` TEXT NOT NULL, `answerDocumentId` TEXT NOT NULL, `activityId` TEXT, `problemPageId` TEXT, `problemLeft` REAL, `problemTop` REAL, `problemRight` REAL, `problemBottom` REAL, `answerPageIndex` INTEGER NOT NULL, `answerLeft` REAL, `answerTop` REAL, `answerRight` REAL, `answerBottom` REAL, `sortOrder` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, `updatedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`linkId`), FOREIGN KEY(`bookRevisionId`) REFERENCES `book_revisions`(`revisionId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`answerDocumentId`) REFERENCES `answer_documents`(`answerDocumentId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "linkId",
+            "columnName": "linkId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bookRevisionId",
+            "columnName": "bookRevisionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "answerDocumentId",
+            "columnName": "answerDocumentId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activityId",
+            "columnName": "activityId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "problemPageId",
+            "columnName": "problemPageId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "problemLeft",
+            "columnName": "problemLeft",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "problemTop",
+            "columnName": "problemTop",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "problemRight",
+            "columnName": "problemRight",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "problemBottom",
+            "columnName": "problemBottom",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "answerPageIndex",
+            "columnName": "answerPageIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "answerLeft",
+            "columnName": "answerLeft",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "answerTop",
+            "columnName": "answerTop",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "answerRight",
+            "columnName": "answerRight",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "answerBottom",
+            "columnName": "answerBottom",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "sortOrder",
+            "columnName": "sortOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAtEpochMillis",
+            "columnName": "updatedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "linkId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_answer_page_links_bookRevisionId",
+            "unique": false,
+            "columnNames": [
+              "bookRevisionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_answer_page_links_bookRevisionId` ON `${TABLE_NAME}` (`bookRevisionId`)"
+          },
+          {
+            "name": "index_answer_page_links_answerDocumentId",
+            "unique": false,
+            "columnNames": [
+              "answerDocumentId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_answer_page_links_answerDocumentId` ON `${TABLE_NAME}` (`answerDocumentId`)"
+          },
+          {
+            "name": "index_answer_page_links_activityId",
+            "unique": false,
+            "columnNames": [
+              "activityId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_answer_page_links_activityId` ON `${TABLE_NAME}` (`activityId`)"
+          },
+          {
+            "name": "index_answer_page_links_problemPageId",
+            "unique": false,
+            "columnNames": [
+              "problemPageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_answer_page_links_problemPageId` ON `${TABLE_NAME}` (`problemPageId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "book_revisions",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "bookRevisionId"
+            ],
+            "referencedColumns": [
+              "revisionId"
+            ]
+          },
+          {
+            "table": "answer_documents",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "answerDocumentId"
+            ],
+            "referencedColumns": [
+              "answerDocumentId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "answer_bookmarks",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`teacherId` TEXT NOT NULL, `answerDocumentId` TEXT NOT NULL, `pageIndex` INTEGER NOT NULL, `normalizedCenterX` REAL NOT NULL, `normalizedCenterY` REAL NOT NULL, `zoomScale` REAL NOT NULL, `updatedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`teacherId`, `answerDocumentId`), FOREIGN KEY(`teacherId`) REFERENCES `teacher_profiles`(`teacherId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`answerDocumentId`) REFERENCES `answer_documents`(`answerDocumentId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "teacherId",
+            "columnName": "teacherId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "answerDocumentId",
+            "columnName": "answerDocumentId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageIndex",
+            "columnName": "pageIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "normalizedCenterX",
+            "columnName": "normalizedCenterX",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "normalizedCenterY",
+            "columnName": "normalizedCenterY",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "zoomScale",
+            "columnName": "zoomScale",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAtEpochMillis",
+            "columnName": "updatedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "teacherId",
+            "answerDocumentId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_answer_bookmarks_answerDocumentId",
+            "unique": false,
+            "columnNames": [
+              "answerDocumentId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_answer_bookmarks_answerDocumentId` ON `${TABLE_NAME}` (`answerDocumentId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "teacher_profiles",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "teacherId"
+            ],
+            "referencedColumns": [
+              "teacherId"
+            ]
+          },
+          {
+            "table": "answer_documents",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "answerDocumentId"
+            ],
+            "referencedColumns": [
+              "answerDocumentId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "teaching_resources",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`resourceId` TEXT NOT NULL, `bookRevisionId` TEXT NOT NULL, `resourceType` TEXT NOT NULL, `category` TEXT NOT NULL, `title` TEXT NOT NULL, `visibility` TEXT NOT NULL, `status` TEXT NOT NULL, `sourceType` TEXT NOT NULL, `currentRevisionId` TEXT, `createdByTeacherId` TEXT NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, `updatedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`resourceId`), FOREIGN KEY(`bookRevisionId`) REFERENCES `book_revisions`(`revisionId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`createdByTeacherId`) REFERENCES `teacher_profiles`(`teacherId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "resourceId",
+            "columnName": "resourceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bookRevisionId",
+            "columnName": "bookRevisionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "resourceType",
+            "columnName": "resourceType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "category",
+            "columnName": "category",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "visibility",
+            "columnName": "visibility",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceType",
+            "columnName": "sourceType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currentRevisionId",
+            "columnName": "currentRevisionId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "createdByTeacherId",
+            "columnName": "createdByTeacherId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAtEpochMillis",
+            "columnName": "updatedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "resourceId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_teaching_resources_bookRevisionId",
+            "unique": false,
+            "columnNames": [
+              "bookRevisionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_teaching_resources_bookRevisionId` ON `${TABLE_NAME}` (`bookRevisionId`)"
+          },
+          {
+            "name": "index_teaching_resources_createdByTeacherId",
+            "unique": false,
+            "columnNames": [
+              "createdByTeacherId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_teaching_resources_createdByTeacherId` ON `${TABLE_NAME}` (`createdByTeacherId`)"
+          },
+          {
+            "name": "index_teaching_resources_currentRevisionId",
+            "unique": false,
+            "columnNames": [
+              "currentRevisionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_teaching_resources_currentRevisionId` ON `${TABLE_NAME}` (`currentRevisionId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "book_revisions",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "bookRevisionId"
+            ],
+            "referencedColumns": [
+              "revisionId"
+            ]
+          },
+          {
+            "table": "teacher_profiles",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "createdByTeacherId"
+            ],
+            "referencedColumns": [
+              "teacherId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "teaching_resource_revisions",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`revisionId` TEXT NOT NULL, `resourceId` TEXT NOT NULL, `revisionNumber` INTEGER NOT NULL, `textContent` TEXT, `structuredContentJson` TEXT, `imageAssetId` TEXT, `sourcePrompt` TEXT, `providerName` TEXT, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`revisionId`), FOREIGN KEY(`resourceId`) REFERENCES `teaching_resources`(`resourceId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`imageAssetId`) REFERENCES `managed_assets`(`assetId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "revisionId",
+            "columnName": "revisionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "resourceId",
+            "columnName": "resourceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "revisionNumber",
+            "columnName": "revisionNumber",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "textContent",
+            "columnName": "textContent",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "structuredContentJson",
+            "columnName": "structuredContentJson",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "imageAssetId",
+            "columnName": "imageAssetId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "sourcePrompt",
+            "columnName": "sourcePrompt",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "providerName",
+            "columnName": "providerName",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "revisionId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_teaching_resource_revisions_resourceId_revisionNumber",
+            "unique": true,
+            "columnNames": [
+              "resourceId",
+              "revisionNumber"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_teaching_resource_revisions_resourceId_revisionNumber` ON `${TABLE_NAME}` (`resourceId`, `revisionNumber`)"
+          },
+          {
+            "name": "index_teaching_resource_revisions_imageAssetId",
+            "unique": false,
+            "columnNames": [
+              "imageAssetId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_teaching_resource_revisions_imageAssetId` ON `${TABLE_NAME}` (`imageAssetId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "teaching_resources",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "resourceId"
+            ],
+            "referencedColumns": [
+              "resourceId"
+            ]
+          },
+          {
+            "table": "managed_assets",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "imageAssetId"
+            ],
+            "referencedColumns": [
+              "assetId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "book_page_resource_links",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`linkId` TEXT NOT NULL, `bookRevisionId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `resourceId` TEXT NOT NULL, `anchorLeft` REAL, `anchorTop` REAL, `anchorRight` REAL, `anchorBottom` REAL, `triggerType` TEXT NOT NULL, `sortOrder` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`linkId`), FOREIGN KEY(`bookRevisionId`) REFERENCES `book_revisions`(`revisionId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`resourceId`) REFERENCES `teaching_resources`(`resourceId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "linkId",
+            "columnName": "linkId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bookRevisionId",
+            "columnName": "bookRevisionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "resourceId",
+            "columnName": "resourceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "anchorLeft",
+            "columnName": "anchorLeft",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "anchorTop",
+            "columnName": "anchorTop",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "anchorRight",
+            "columnName": "anchorRight",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "anchorBottom",
+            "columnName": "anchorBottom",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "triggerType",
+            "columnName": "triggerType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sortOrder",
+            "columnName": "sortOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "linkId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_book_page_resource_links_bookRevisionId_pageId_resourceId",
+            "unique": true,
+            "columnNames": [
+              "bookRevisionId",
+              "pageId",
+              "resourceId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_book_page_resource_links_bookRevisionId_pageId_resourceId` ON `${TABLE_NAME}` (`bookRevisionId`, `pageId`, `resourceId`)"
+          },
+          {
+            "name": "index_book_page_resource_links_resourceId",
+            "unique": false,
+            "columnNames": [
+              "resourceId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_book_page_resource_links_resourceId` ON `${TABLE_NAME}` (`resourceId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "book_revisions",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "bookRevisionId"
+            ],
+            "referencedColumns": [
+              "revisionId"
+            ]
+          },
+          {
+            "table": "teaching_resources",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "resourceId"
+            ],
+            "referencedColumns": [
+              "resourceId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "assistant_prompt_templates",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`templateId` TEXT NOT NULL, `name` TEXT NOT NULL, `category` TEXT NOT NULL, `promptBody` TEXT NOT NULL, `outputPreference` TEXT NOT NULL, `version` INTEGER NOT NULL, PRIMARY KEY(`templateId`))",
+        "fields": [
+          {
+            "fieldPath": "templateId",
+            "columnName": "templateId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "category",
+            "columnName": "category",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "promptBody",
+            "columnName": "promptBody",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outputPreference",
+            "columnName": "outputPreference",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "version",
+            "columnName": "version",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "templateId"
+          ]
+        }
+      },
+      {
+        "tableName": "assistant_jobs",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`assistantJobId` TEXT NOT NULL, `bookRevisionId` TEXT NOT NULL, `pageId` TEXT NOT NULL, `selectionLeft` REAL NOT NULL, `selectionTop` REAL NOT NULL, `selectionRight` REAL NOT NULL, `selectionBottom` REAL NOT NULL, `requestType` TEXT NOT NULL, `promptTemplateId` TEXT NOT NULL, `promptText` TEXT NOT NULL, `requestImageAssetId` TEXT, `providerType` TEXT NOT NULL, `status` TEXT NOT NULL, `includeStudentInk` INTEGER NOT NULL, `includeTeacherFeedback` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, `externalOpenedAtEpochMillis` INTEGER, `resultImportedAtEpochMillis` INTEGER, PRIMARY KEY(`assistantJobId`), FOREIGN KEY(`bookRevisionId`) REFERENCES `book_revisions`(`revisionId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`requestImageAssetId`) REFERENCES `managed_assets`(`assetId`) ON UPDATE NO ACTION ON DELETE SET NULL )",
+        "fields": [
+          {
+            "fieldPath": "assistantJobId",
+            "columnName": "assistantJobId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bookRevisionId",
+            "columnName": "bookRevisionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageId",
+            "columnName": "pageId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "selectionLeft",
+            "columnName": "selectionLeft",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "selectionTop",
+            "columnName": "selectionTop",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "selectionRight",
+            "columnName": "selectionRight",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "selectionBottom",
+            "columnName": "selectionBottom",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "requestType",
+            "columnName": "requestType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "promptTemplateId",
+            "columnName": "promptTemplateId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "promptText",
+            "columnName": "promptText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "requestImageAssetId",
+            "columnName": "requestImageAssetId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "providerType",
+            "columnName": "providerType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "includeStudentInk",
+            "columnName": "includeStudentInk",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "includeTeacherFeedback",
+            "columnName": "includeTeacherFeedback",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "externalOpenedAtEpochMillis",
+            "columnName": "externalOpenedAtEpochMillis",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "resultImportedAtEpochMillis",
+            "columnName": "resultImportedAtEpochMillis",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "assistantJobId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_assistant_jobs_bookRevisionId",
+            "unique": false,
+            "columnNames": [
+              "bookRevisionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_assistant_jobs_bookRevisionId` ON `${TABLE_NAME}` (`bookRevisionId`)"
+          },
+          {
+            "name": "index_assistant_jobs_pageId",
+            "unique": false,
+            "columnNames": [
+              "pageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_assistant_jobs_pageId` ON `${TABLE_NAME}` (`pageId`)"
+          },
+          {
+            "name": "index_assistant_jobs_requestImageAssetId",
+            "unique": false,
+            "columnNames": [
+              "requestImageAssetId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_assistant_jobs_requestImageAssetId` ON `${TABLE_NAME}` (`requestImageAssetId`)"
+          },
+          {
+            "name": "index_assistant_jobs_status",
+            "unique": false,
+            "columnNames": [
+              "status"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_assistant_jobs_status` ON `${TABLE_NAME}` (`status`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "book_revisions",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "bookRevisionId"
+            ],
+            "referencedColumns": [
+              "revisionId"
+            ]
+          },
+          {
+            "table": "managed_assets",
+            "onDelete": "SET NULL",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "requestImageAssetId"
+            ],
+            "referencedColumns": [
+              "assetId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "library_folders",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`folderId` TEXT NOT NULL, `parentFolderId` TEXT, `displayName` TEXT NOT NULL, `normalizedName` TEXT NOT NULL, `position` INTEGER NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, `updatedAtEpochMillis` INTEGER NOT NULL, `deletedAtEpochMillis` INTEGER, PRIMARY KEY(`folderId`))",
+        "fields": [
+          {
+            "fieldPath": "folderId",
+            "columnName": "folderId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "parentFolderId",
+            "columnName": "parentFolderId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "displayName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "normalizedName",
+            "columnName": "normalizedName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "position",
+            "columnName": "position",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAtEpochMillis",
+            "columnName": "updatedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deletedAtEpochMillis",
+            "columnName": "deletedAtEpochMillis",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "folderId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_library_folders_parentFolderId",
+            "unique": false,
+            "columnNames": [
+              "parentFolderId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_library_folders_parentFolderId` ON `${TABLE_NAME}` (`parentFolderId`)"
+          },
+          {
+            "name": "index_library_folders_parentFolderId_normalizedName",
+            "unique": true,
+            "columnNames": [
+              "parentFolderId",
+              "normalizedName"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_library_folders_parentFolderId_normalizedName` ON `${TABLE_NAME}` (`parentFolderId`, `normalizedName`)"
+          }
+        ]
+      },
+      {
+        "tableName": "library_books",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`bookId` TEXT NOT NULL, `title` TEXT NOT NULL, `subtitle` TEXT, `coverAssetId` TEXT, `currentRevisionId` TEXT NOT NULL, `status` TEXT NOT NULL, `createdAtEpochMillis` INTEGER NOT NULL, `updatedAtEpochMillis` INTEGER NOT NULL, `archivedAtEpochMillis` INTEGER, PRIMARY KEY(`bookId`))",
+        "fields": [
+          {
+            "fieldPath": "bookId",
+            "columnName": "bookId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "subtitle",
+            "columnName": "subtitle",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "coverAssetId",
+            "columnName": "coverAssetId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "currentRevisionId",
+            "columnName": "currentRevisionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMillis",
+            "columnName": "createdAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAtEpochMillis",
+            "columnName": "updatedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "archivedAtEpochMillis",
+            "columnName": "archivedAtEpochMillis",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "bookId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_library_books_currentRevisionId",
+            "unique": false,
+            "columnNames": [
+              "currentRevisionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_library_books_currentRevisionId` ON `${TABLE_NAME}` (`currentRevisionId`)"
+          }
+        ]
+      },
+      {
+        "tableName": "book_placements",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`bookId` TEXT NOT NULL, `folderId` TEXT NOT NULL, `position` INTEGER NOT NULL, `placedAtEpochMillis` INTEGER NOT NULL, PRIMARY KEY(`bookId`), FOREIGN KEY(`bookId`) REFERENCES `library_books`(`bookId`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`folderId`) REFERENCES `library_folders`(`folderId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "bookId",
+            "columnName": "bookId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "folderId",
+            "columnName": "folderId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "position",
+            "columnName": "position",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "placedAtEpochMillis",
+            "columnName": "placedAtEpochMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "bookId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_book_placements_folderId",
+            "unique": false,
+            "columnNames": [
+              "folderId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_book_placements_folderId` ON `${TABLE_NAME}` (`folderId`)"
+          },
+          {
+            "name": "index_book_placements_folderId_position",
+            "unique": true,
+            "columnNames": [
+              "folderId",
+              "position"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_book_placements_folderId_position` ON `${TABLE_NAME}` (`folderId`, `position`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "library_books",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "bookId"
+            ],
+            "referencedColumns": [
+              "bookId"
+            ]
+          },
+          {
+            "table": "library_folders",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "folderId"
+            ],
+            "referencedColumns": [
+              "folderId"
+            ]
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '85aa4a8d200b1d8de4864ff163f64418')"
+    ]
+  }
+}
