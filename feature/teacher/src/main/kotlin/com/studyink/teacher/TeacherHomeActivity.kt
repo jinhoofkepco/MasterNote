@@ -84,6 +84,7 @@ private fun TeacherHomeScreen(
             }
             Row(Modifier.fillMaxWidth().padding(vertical = 16.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(onClick = openPreparation) { Text("교재 준비") }
+                Button(onClick = { context.startActivity(Intent(context, AnswerSetupActivity::class.java)) }) { Text("정답지 설정") }
                 Button(onClick = {
                     context.startActivity(com.studyink.remote.feature.RemoteSessionActivity.intent(
                         context, com.studyink.remote.session.RemoteSessionRole.TEACHER,

@@ -32,6 +32,10 @@
             android:theme="@style/Theme.StudyInk"
             android:screenOrientation="fullSensor" />
         <activity
+            android:name="com.studyink.teacher.AnswerSetupActivity"
+            android:exported="false"
+            android:screenOrientation="fullSensor" />
+        <activity
             android:name="com.studyink.teacher.TeachingResourceActivity"
             android:exported="false"
             android:screenOrientation="fullSensor" />

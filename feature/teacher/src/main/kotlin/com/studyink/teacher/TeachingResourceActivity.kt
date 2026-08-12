@@ -31,6 +31,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.max
 
 class TeachingResourceActivity : ComponentActivity() {
     private lateinit var repository: TeachingResourceRepository
@@ -73,9 +74,18 @@ class TeachingResourceActivity : ComponentActivity() {
             val content = repository.getResourceRevision(revisionId)
             selected = content
             image = content.imageAssetId?.let { id ->
-                withContext(Dispatchers.IO) { BitmapFactory.decodeFile(assets.open(id).file.path)?.asImageBitmap() }
+                withContext(Dispatchers.IO) { decodePreview(assets.open(id).file.path)?.asImageBitmap() }
             }
         }
+    }
+
+    private fun decodePreview(path: String, maxEdgePx: Int = 2_048): android.graphics.Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (max(bounds.outWidth / sample, bounds.outHeight / sample) > maxEdgePx * 2) sample *= 2
+        return BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
     }
 
     private fun presentToStudent(content: TeachingResourceContent) {
