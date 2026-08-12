@@ -73,6 +73,12 @@ class PdfViewportAdapter {
 
     fun activePageBounds(): RectF? = pdfView?.pageBounds
 
+    fun viewToNormalized(x: Float, y: Float): PointF? {
+        val bounds = pdfView?.pageBounds ?: return null
+        if (!bounds.contains(x, y)) return null
+        return PointF(((x - bounds.left) / bounds.width()).coerceIn(0f, 1f), ((y - bounds.top) / bounds.height()).coerceIn(0f, 1f))
+    }
+
     fun state(): PdfViewportState? {
         val view = pdfView ?: return null
         val bounds = view.pageBounds ?: return null

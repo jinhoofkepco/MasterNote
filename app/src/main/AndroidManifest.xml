@@ -35,5 +35,9 @@
             android:name="com.studyink.teacher.TeachingResourceActivity"
             android:exported="false"
             android:screenOrientation="fullSensor" />
+        <activity
+            android:name="com.studyink.teacher.AssistantJobActivity"
+            android:exported="false"
+            android:screenOrientation="fullSensor" />
     </application>
 </manifest>

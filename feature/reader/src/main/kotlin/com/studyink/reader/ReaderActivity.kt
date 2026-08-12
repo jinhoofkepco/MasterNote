@@ -37,6 +37,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import java.io.File
+import java.io.FileOutputStream
 import com.studyink.annotation.storage.RoomTeacherRepository
 import com.studyink.core.model.ReviewDecision
 import com.studyink.core.model.ReviewId
@@ -72,6 +73,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var reviewSaveJob: Job? = null
     private var reviewRepository: RoomTeacherRepository? = null
     private var reviewExpanded = false
+    private var currentDocumentUri: Uri? = null
+    private var selectionOverlay: PageSelectionOverlay? = null
 
     private val openPdf = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -197,6 +200,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     override fun onDocumentReady(uri: Uri, pageWidths: Map<Int, Float>, pageCount: Int) {
+        currentDocumentUri = uri
         viewport.setPageWidths(pageWidths)
         loadedPageCount = pageCount
         currentPage = 0
@@ -215,6 +219,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private fun showDocument(uri: Uri) {
         stylusMenuExpanded = false
         viewModel.flushAsync()
+        currentDocumentUri = uri
         pdfFragment.documentUri = uri
     }
 
@@ -289,6 +294,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 },
                 onAnswer = if (latestState.scene?.requiresTeacherAccess() == true) ::openAnswerViewer else null,
                 onResources = if (latestState.scene?.requiresTeacherAccess() == true) ::openTeachingResources else null,
+                onAssistant = if (latestState.scene?.requiresTeacherAccess() == true) ::startAssistantSelection else null,
             )
         }
         paletteAnchor.setContent {
@@ -338,6 +344,58 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 .putExtra("com.studyink.resource.REVISION", revision)
                 .putExtra("com.studyink.resource.PAGE", page)
         )
+    }
+
+    private fun startAssistantSelection() {
+        if (selectionOverlay != null) return
+        Toast.makeText(this, "설명할 문제 영역을 사각형으로 드래그하세요", Toast.LENGTH_SHORT).show()
+        val root = findViewById<FrameLayout>(android.R.id.content).getChildAt(0) as FrameLayout
+        selectionOverlay = PageSelectionOverlay(this).also { overlay ->
+            overlay.viewport = viewport
+            overlay.onSelected = { bounds ->
+                root.removeView(overlay)
+                selectionOverlay = null
+                prepareAssistantJob(bounds)
+            }
+            root.addView(overlay, FrameLayout.LayoutParams(MATCH, MATCH).apply { topMargin = dp(TOP_BAR_HEIGHT) })
+        }
+    }
+
+    private fun prepareAssistantJob(bounds: android.graphics.RectF) {
+        val revision = latestState.scene?.documentRevisionId?.value ?: return
+        val pageId = latestState.currentPageId?.value ?: latestState.scene?.initialPageId?.value ?: return
+        val sourceUri = currentDocumentUri ?: return
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val workspace = com.studyink.annotation.storage.AssistantWorkspace.open(this@ReaderActivity)
+            val assets = com.studyink.annotation.storage.ManagedAssetRepository.open(this@ReaderActivity)
+            val tempDir = File(cacheDir, "assistant-capture").apply { mkdirs() }
+            val copiedSource = sourceUri.scheme != "file"
+            val source = if (!copiedSource) File(requireNotNull(sourceUri.path)) else File(tempDir, "source-${System.nanoTime()}.pdf").also { target ->
+                contentResolver.openInputStream(sourceUri).use { input ->
+                    requireNotNull(input)
+                    FileOutputStream(target).use { output -> input.copyTo(output, 64 * 1024) }
+                }
+            }
+            val crop = File(tempDir, "request-${System.nanoTime()}.png")
+            runCatching {
+                workspace.ensureDefaultTemplates()
+                val selection = com.studyink.annotation.storage.PageSelection(revision, pageId, com.studyink.annotation.storage.CanonicalRect(bounds.left, bounds.top, bounds.right, bounds.bottom))
+                val job = workspace.prepareJob(selection, com.studyink.annotation.storage.AssistantRequestType.EASY_EXPLANATION, "easy-child")
+                com.studyink.document.pdf.PdfCropRenderer.render(source, currentPage, com.studyink.document.pdf.NormalizedPageRect(bounds.left, bounds.top, bounds.right, bounds.bottom), crop)
+                val asset = crop.inputStream().use { assets.importStream(it, "assistant-request.png", "image/png") }
+                workspace.attachRequestImage(job, asset.assetId)
+                job
+            }.onSuccess { job ->
+                launch(kotlinx.coroutines.Dispatchers.Main) {
+                    startActivity(android.content.Intent().setClassName(packageName, "com.studyink.teacher.AssistantJobActivity").putExtra("assistantJobId", job))
+                }
+            }.onFailure { error ->
+                launch(kotlinx.coroutines.Dispatchers.Main) { Toast.makeText(this@ReaderActivity, "요청 이미지 생성 실패: ${error.message}", Toast.LENGTH_LONG).show() }
+            }
+            crop.delete()
+            if (copiedSource) source.delete()
+            workspace.close(); assets.close()
+        }
     }
 
     private fun setupReviewPane(root: FrameLayout, fragmentContainer: View) {
