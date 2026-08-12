@@ -84,6 +84,7 @@ fun TopReaderBar(
     onSubmit: (() -> Unit)? = null,
     onAnswer: (() -> Unit)? = null,
     onResources: (() -> Unit)? = null,
+    onAssistant: (() -> Unit)? = null,
 ) {
     MaterialTheme {
         Surface(tonalElevation = 3.dp, shadowElevation = 3.dp) {
@@ -114,6 +115,9 @@ fun TopReaderBar(
                 }
                 if (onResources != null) {
                     TextButton(onClick = onResources) { Text("자료") }
+                }
+                if (onAssistant != null) {
+                    TextButton(onClick = onAssistant) { Text("GPT 질문") }
                 }
             }
         }
