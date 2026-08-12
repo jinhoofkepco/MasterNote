@@ -223,6 +223,8 @@ must be pinned, licensed, isolated behind a MasterNote-owned API, and validated 
 - License: Apache-2.0
 - Adoption: lifecycle pattern only; no source copied
 - Excluded: automatic WebView fallback and Activity-owned business state
+- Local dependency: `androidx.browser:browser:1.10.0`, pinned after checking the AndroidX stable release table
+- Local validation: compile, lint, process-restorable AssistantJob flow, and external-launch contract tests pass
 
 ## REF-ASSISTANT-002
 
@@ -239,3 +241,19 @@ must be pinned, licensed, isolated behind a MasterNote-owned API, and validated 
 - Adoption: policy only
 - Validation: official guidance checked 2026-08-12
 - Rule: no OpenAI API key in APK, resources, BuildConfig, mobile storage, or repository; future direct automation requires a backend adapter
+
+## REF-RESOURCE-001
+
+- Capability: canonical PDF crop and bounded image presentation
+- Source: Android `PdfRenderer` and bitmap decoding APIs
+- License: Android SDK terms; documentation CC BY 4.0
+- Adoption: source-page crop in normalized page coordinates and power-of-two sampled preview decode
+- Validation: API 36 instrumented test renders a synthetic two-color PDF and confirms the selected half, output dimensions, and viewport independence
+
+## REF-RESOURCE-002
+
+- Capability: remote teaching-resource presentation without contaminating annotation state
+- Source: Maternote remote chunk/checkpoint protocol introduced in PR 4D
+- Adoption: hash-addressed session cache and ephemeral offer/present/dismiss messages
+- Validation: codec round trip, missing-chunk rejection, complete-hash verification, and cache reuse tests
+- Boundary: no TeachingResource, answer, or annotation rows are written on the student device

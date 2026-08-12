@@ -18,11 +18,14 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.studyink.remote.session.RemoteSessionRole
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.UUID
 import android.app.Dialog
 import android.graphics.BitmapFactory
 import android.view.Gravity
 import android.widget.ImageView
+import kotlin.math.max
 
 class RemoteSessionActivity : ComponentActivity() {
     private lateinit var status: TextView
@@ -101,14 +104,19 @@ class RemoteSessionActivity : ComponentActivity() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 RemoteSessionRuntime.presentedResource.collect { resource ->
-                    if (resource != null && role == RemoteSessionRole.STUDENT) showResource(resource)
+                    if (resource != null && role == RemoteSessionRole.STUDENT) {
+                        val bitmap = resource.imageFile?.let { file ->
+                            withContext(Dispatchers.IO) { decodePreview(file.path) }
+                        }
+                        showResource(resource, bitmap)
+                    }
                 }
             }
         }
     }
 
     private var resourceDialog: Dialog? = null
-    private fun showResource(resource: RemotePresentedResource) {
+    private fun showResource(resource: RemotePresentedResource, bitmap: android.graphics.Bitmap?) {
         resourceDialog?.dismiss()
         val dialog = Dialog(this).apply dialog@ {
             setTitle(resource.title)
@@ -116,7 +124,7 @@ class RemoteSessionActivity : ComponentActivity() {
                 orientation = LinearLayout.VERTICAL; setPadding(32, 24, 32, 24); gravity = Gravity.CENTER
                 addView(TextView(context).apply { text = resource.title; textSize = 22f })
                 if (resource.text.isNotBlank()) addView(TextView(context).apply { text = resource.text; textSize = 18f; setPadding(0, 20, 0, 20) })
-                resource.imageFile?.let { file -> addView(ImageView(context).apply { adjustViewBounds = true; setImageBitmap(BitmapFactory.decodeFile(file.path)) }) }
+                bitmap?.let { addView(ImageView(context).apply { adjustViewBounds = true; setImageBitmap(it) }) }
                 addView(Button(context).apply { text = "닫기"; setOnClickListener {
                     this@dialog.dismiss()
                     RemoteSessionRuntime.dismiss(resource.assetHash)
@@ -128,6 +136,15 @@ class RemoteSessionActivity : ComponentActivity() {
         }
         resourceDialog = dialog
         dialog.show()
+    }
+
+    private fun decodePreview(path: String, maxEdgePx: Int = 2_048): android.graphics.Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (max(bounds.outWidth / sample, bounds.outHeight / sample) > maxEdgePx * 2) sample *= 2
+        return BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
     }
 
     private var pendingSessionCode: String? = null
