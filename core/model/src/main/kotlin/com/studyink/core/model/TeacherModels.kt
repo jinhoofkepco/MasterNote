@@ -24,6 +24,14 @@ data class TeacherPrepPage(
     val updatedAtEpochMillis: Long,
 )
 
+data class TeacherPreparationSession(
+    val teacherId: TeacherId,
+    val bookRevisionId: BookRevisionId,
+    val documentId: String,
+    val initialPageId: PageId,
+    val pages: List<ActivityPage>,
+)
+
 data class SubmissionReview(
     val reviewId: ReviewId,
     val submissionId: SubmissionId,

@@ -78,6 +78,23 @@ class RoomTeacherRepositoryTest {
         assertEquals(2, next.review.reviewNumber)
     }
 
+    @Test fun preparationSessionUsesAllRevisionPagesAndCreatesLayersLazily() = runTest {
+        val (learning, teacher) = repositories()
+        learning.ensureContent(seed())
+        database.teacherDao().insertTeacher(TeacherProfileEntity(TEACHER.value, "선생님", 1L))
+
+        val session = teacher.getPreparationSession(TEACHER, REVISION, PAGE_TWO)
+        assertEquals(listOf(PAGE_ONE, PAGE_TWO), session.pages.map { it.pageId })
+        assertEquals(PAGE_TWO, session.initialPageId)
+        assertTrue(database.teacherDao().prepPages(TEACHER.value, REVISION.value).isEmpty())
+
+        val first = teacher.getOrCreatePrepLayer(TEACHER, REVISION, PAGE_ONE)
+        val same = teacher.getOrCreatePrepLayer(TEACHER, REVISION, PAGE_ONE)
+        assertEquals(first.prepLayerId, same.prepLayerId)
+        assertTrue(teacher.deleteEmptyPrepPage(TEACHER, REVISION, PAGE_ONE))
+        assertTrue(database.teacherDao().prepPages(TEACHER.value, REVISION.value).isEmpty())
+    }
+
     private fun repositories(vararg ids: String): Pair<RoomLearningRepository, RoomTeacherRepository> {
         val iterator = ids.iterator()
         val generator = LearningIdGenerator(iterator::next)

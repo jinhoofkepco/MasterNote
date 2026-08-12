@@ -98,6 +98,36 @@ internal interface AnnotationDao {
 
     @Query(
         """
+        SELECT DISTINCT stroke_assets.* FROM stroke_assets
+        INNER JOIN layer_strokes ON layer_strokes.strokeId = stroke_assets.strokeId
+        WHERE layer_strokes.layerId IN (:layerIds)
+        ORDER BY layer_strokes.zOrder
+        """
+    )
+    suspend fun strokeAssetsForLayers(layerIds: List<String>): List<StrokeAssetEntity>
+
+    @Query(
+        """
+        SELECT layer_strokes.* FROM layer_strokes
+        WHERE layer_strokes.layerId IN (:layerIds)
+        ORDER BY layer_strokes.zOrder
+        """
+    )
+    suspend fun strokesForLayers(layerIds: List<String>): List<LayerStrokeEntity>
+
+    @Query(
+        """
+        SELECT annotation_pages.pageNumber AS pageNumber,
+               annotation_layers.currentRevision AS currentRevision
+        FROM annotation_layers
+        INNER JOIN annotation_pages ON annotation_pages.pageId = annotation_layers.pageId
+        WHERE annotation_layers.layerId IN (:layerIds)
+        """
+    )
+    suspend fun revisionsForLayers(layerIds: List<String>): List<LayerPageRevisionRow>
+
+    @Query(
+        """
         SELECT stroke_assets.* FROM submission_stroke_refs
         INNER JOIN stroke_assets ON stroke_assets.strokeId = submission_stroke_refs.strokeId
         WHERE submission_stroke_refs.submissionId = :submissionId
@@ -162,6 +192,12 @@ internal interface AnnotationDao {
 
     @Query("SELECT * FROM layer_strokes WHERE layerId = :layerId ORDER BY zOrder")
     suspend fun layerStrokes(layerId: String): List<LayerStrokeEntity>
+
+    @Query("SELECT COUNT(*) FROM layer_strokes WHERE layerId = :layerId")
+    suspend fun layerStrokeCount(layerId: String): Int
+
+    @Query("DELETE FROM annotation_layers WHERE layerId = :layerId")
+    suspend fun deleteLayer(layerId: String): Int
 
     @Query("UPDATE stroke_assets SET encodedInput = :payload WHERE strokeId = :strokeId")
     suspend fun replaceEncodedInputForTest(strokeId: String, payload: ByteArray)

@@ -25,6 +25,7 @@ import com.studyink.core.model.SubmissionSnapshot
 import com.studyink.core.model.SubmissionStroke
 import com.studyink.core.model.TeacherId
 import com.studyink.core.model.TeacherPrepPage
+import com.studyink.core.model.TeacherPreparationSession
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -45,6 +46,23 @@ class RoomTeacherRepository internal constructor(
     override suspend fun ensureDefaultTeacher() = withContext(dispatcher) {
         teacherDao.insertTeacher(TeacherProfileEntity(DEFAULT_TEACHER_ID, "선생님", clock.nowEpochMillis()))
         Unit
+    }
+
+    override suspend fun getPreparationSession(
+        teacherId: TeacherId,
+        bookRevisionId: BookRevisionId,
+        initialPageId: PageId?,
+    ): TeacherPreparationSession = withContext(dispatcher) {
+        val revision = requireNotNull(learningDao.bookRevision(bookRevisionId.value))
+        val pages = teacherDao.revisionPages(bookRevisionId.value).mapIndexed { order, row ->
+            com.studyink.core.model.ActivityPage(PageId(row.pageId), row.pageNumber, order)
+        }
+        require(pages.isNotEmpty())
+        TeacherPreparationSession(
+            teacherId, bookRevisionId, revision.documentId,
+            initialPageId?.takeIf { candidate -> pages.any { it.pageId == candidate } } ?: pages.first().pageId,
+            pages,
+        )
     }
 
     override suspend fun getOrCreatePrepLayer(
@@ -68,7 +86,16 @@ class RoomTeacherRepository internal constructor(
         teacherId: TeacherId,
         bookRevisionId: BookRevisionId,
         pageId: PageId,
-    ): Boolean = false // Empty-layer cleanup is implemented with scene persistence in PR 3B.
+    ): Boolean = withContext(dispatcher) {
+        database.withTransaction {
+            val prep = teacherDao.prepPage(teacherId.value, bookRevisionId.value, pageId.value)
+                ?: return@withTransaction false
+            if (annotationDao.layerStrokeCount(prep.prepLayerId) != 0) return@withTransaction false
+            check(teacherDao.deletePrepPage(teacherId.value, bookRevisionId.value, pageId.value) == 1)
+            check(annotationDao.deleteLayer(prep.prepLayerId) == 1)
+            true
+        }
+    }
 
     override suspend fun getOrCreateDraftReview(
         submissionId: SubmissionId,
@@ -146,9 +173,10 @@ class RoomTeacherRepository internal constructor(
 
     private suspend fun createPrepPage(teacherId: TeacherId, revisionId: BookRevisionId, pageId: PageId): TeacherPrepPage {
         val revision = requireNotNull(learningDao.bookRevision(revisionId.value))
-        val page = requireNotNull(annotationDao.page(pageId.value)) { "Page must be registered before teacher preparation" }
-        check(page.documentId == revision.documentId)
+        val revisionPage = requireNotNull(teacherDao.revisionPages(revisionId.value).firstOrNull { it.pageId == pageId.value })
         val now = clock.nowEpochMillis()
+        annotationDao.insertDocument(AnnotationDocumentEntity(revision.documentId, 0L, now))
+        annotationDao.insertPage(AnnotationPageEntity(pageId.value, revision.documentId, revisionPage.pageNumber, 0L, now))
         val layerId = LayerId("${pageId.value}:teacher:${teacherId.value}:prep")
         annotationDao.insertLayer(
             AnnotationLayerEntity(

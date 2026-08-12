@@ -35,4 +35,5 @@ dependencies {
     implementation("androidx.ink:ink-authoring:1.0.0")
     implementation("androidx.ink:ink-brush:1.0.0")
     implementation("androidx.ink:ink-strokes:1.0.0")
+    testImplementation("junit:junit:4.13.2")
 }

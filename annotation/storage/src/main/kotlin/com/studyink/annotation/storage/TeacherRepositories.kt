@@ -8,9 +8,11 @@ import com.studyink.core.model.ReviewSession
 import com.studyink.core.model.SubmissionId
 import com.studyink.core.model.TeacherId
 import com.studyink.core.model.TeacherPrepPage
+import com.studyink.core.model.TeacherPreparationSession
 import kotlinx.coroutines.flow.Flow
 
 interface TeacherPreparationRepository {
+    suspend fun getPreparationSession(teacherId: TeacherId, bookRevisionId: BookRevisionId, initialPageId: PageId? = null): TeacherPreparationSession
     suspend fun getOrCreatePrepLayer(teacherId: TeacherId, bookRevisionId: BookRevisionId, pageId: PageId): TeacherPrepPage
     fun observePreparedPages(teacherId: TeacherId, bookRevisionId: BookRevisionId): Flow<List<TeacherPrepPage>>
     suspend fun deleteEmptyPrepPage(teacherId: TeacherId, bookRevisionId: BookRevisionId, pageId: PageId): Boolean
