@@ -35,13 +35,15 @@ import androidx.room.RoomDatabase
         RemoteAppliedOperationEntity::class,
         RemoteReplicaPageEntity::class,
         RemoteReplicaStrokeEntity::class,
+        ManagedAssetEntity::class,
     ],
-    version = 5,
+    version = 6,
     autoMigrations = [
         AutoMigration(from = 1, to = 2),
         AutoMigration(from = 2, to = 3),
         AutoMigration(from = 3, to = 4),
         AutoMigration(from = 4, to = 5),
+        AutoMigration(from = 5, to = 6),
     ],
     exportSchema = true,
 )
@@ -50,6 +52,7 @@ internal abstract class AnnotationDatabase : RoomDatabase() {
     abstract fun learningDao(): LearningDao
     abstract fun teacherDao(): TeacherDao
     abstract fun remoteDao(): RemoteDao
+    abstract fun managedAssetDao(): ManagedAssetDao
 
     companion object {
         const val NAME = "master-note-annotations.db"

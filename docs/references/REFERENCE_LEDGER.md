@@ -192,3 +192,50 @@ must be pinned, licensed, isolated behind a MasterNote-owned API, and validated 
 - License: documentation CC BY 4.0; code samples Apache-2.0
 - Adoption: manifest/service lifecycle pattern
 - Validation: required `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_CONNECTED_DEVICE` declarations checked 2026-08-12
+
+## REF-ASSET-001
+
+- Capability: system document/image selection and IO-dispatched temporary files
+- Source: `android/platform-samples`
+- Commit: `f751f682aa96a061a39ed4399c697ba513ac93d6`
+- Path: `samples/privacy/permissions/src/main/java/com/example/platform/privacy/permissions/Permissionless.kt`
+- License: Apache-2.0
+- Adoption: Activity Result and FileProvider pattern only; no source copied
+- MasterNote target: managed asset import UI and shareable asset handles
+- Validation: pinned source and root license inspected; local import instrumentation tests pass
+- Excluded: URI-only state, demo Toasts, Coil, and direct UI-layer resolver work
+
+## REF-ASSET-002
+
+- Capability: all-or-nothing managed file publication
+- Source: AndroidX `AtomicFile` API contract and Java NIO atomic move
+- License: Apache-2.0 / standard library
+- Adoption: behavior pattern; large assets use streamed staging, fd sync, and atomic rename guarded by a hash mutex
+- Validation: duplicate import, injected post-commit DB failure, and orphan cleanup tests
+- Difference: large PDFs and images are never buffered into an `AtomicFile` byte array
+
+## REF-ASSISTANT-001
+
+- Capability: Custom Tabs service warm-up, session, launch, and lifecycle
+- Source: `GoogleChrome/android-browser-helper`
+- Commit: `a3638f23537189f82165ff96fb2a60431b03f34c`
+- Path: `demos/custom-tabs-example-app/src/main/java/org/chromium/customtabsdemos/CustomTabActivityHelper.java`
+- License: Apache-2.0
+- Adoption: lifecycle pattern only; no source copied
+- Excluded: automatic WebView fallback and Activity-owned business state
+
+## REF-ASSISTANT-002
+
+- Capability: WebView scheme/host validation and file-access hardening
+- Source: Android WebView security guidance
+- License: documentation CC BY 4.0; samples Apache-2.0
+- Adoption: isolated lab policy only
+- Validation: allowlist, HTTPS, file access, universal access, and mixed-content unit/instrumentation checks
+
+## REF-ASSISTANT-003
+
+- Capability: OpenAI API credential boundary
+- Source: OpenAI API Key Safety official help article
+- Adoption: policy only
+- Validation: official guidance checked 2026-08-12
+- Rule: no OpenAI API key in APK, resources, BuildConfig, mobile storage, or repository; future direct automation requires a backend adapter
