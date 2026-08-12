@@ -9,3 +9,6 @@ Nearby and generated protobuf types remain inside adapters and never cross into 
 - Student annotation persistence is authoritative and must complete without transport availability.
 - The archived connectivity sample contributes callback/lifecycle ideas only. Current permissions,
   authentication, dependency versions, and service ownership follow current official documentation.
+- Runtime requests use `NEARBY_WIFI_DEVICES` from API 33, where the platform constant exists. The
+  current Nearby guide's `minSdkVersion=32` manifest example is retained as documentation context,
+  but requesting that permission on API 32 would reference a permission unavailable on that release.
