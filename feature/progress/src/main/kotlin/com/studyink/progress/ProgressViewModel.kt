@@ -2,12 +2,15 @@ package com.studyink.progress
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.studyink.annotation.storage.OpenActivityUseCase
 import com.studyink.annotation.storage.RoomLearningRepository
 import com.studyink.core.model.LearningActivityId
 import com.studyink.core.model.ProfileId
 import com.studyink.core.model.ActivityProgressState
+import com.studyink.core.model.BookRevisionId
+import com.studyink.core.model.LearnerProfile
 import com.studyink.reader.ReaderLaunchArgs
 import com.studyink.reader.SampleLearningContent
 import kotlinx.coroutines.CancellationException
@@ -39,12 +42,15 @@ data class ActivityProgressUi(
     val enabled: Boolean = true,
 )
 
-class ProgressViewModel(application: Application) : AndroidViewModel(application) {
+class ProgressViewModel(application: Application, savedStateHandle: SavedStateHandle) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow<ProgressUiState>(ProgressUiState.Loading)
     val uiState: StateFlow<ProgressUiState> = _uiState.asStateFlow()
     private val _readerLaunches = MutableSharedFlow<ReaderLaunchArgs>(extraBufferCapacity = 1)
     val readerLaunches: SharedFlow<ReaderLaunchArgs> = _readerLaunches.asSharedFlow()
     private var repository: RoomLearningRepository? = null
+    private val requestedRevisionId: String? = savedStateHandle[ProgressActivity.EXTRA_REVISION_ID]
+    private val requestedBookTitle: String? = savedStateHandle[ProgressActivity.EXTRA_BOOK_TITLE]
+    private val documentUri: String? = savedStateHandle[ProgressActivity.EXTRA_DOCUMENT_URI]
 
     init {
         load()
@@ -67,6 +73,7 @@ class ProgressViewModel(application: Application) : AndroidViewModel(application
                     activityId = session.attempt.activityId,
                     attemptId = session.attempt.attemptId,
                     initialPageId = session.initialPageId,
+                    documentUri = documentUri,
                 )
             }.onSuccess { _readerLaunches.emit(it) }
                 .onFailure { _uiState.value = ProgressUiState.Error(it.message ?: "학습 항목을 열 수 없습니다", true) }
@@ -77,14 +84,14 @@ class ProgressViewModel(application: Application) : AndroidViewModel(application
         _uiState.value = ProgressUiState.Loading
         viewModelScope.launch {
             try {
-                val seed = withContext(Dispatchers.IO) {
-                    SampleLearningContent.createSeed(getApplication())
-                }
-                repository().ensureContent(seed)
-                repository().observeActivitiesWithProgress(seed.profile.profileId, seed.bookRevision.revisionId)
+                val seed = if(requestedRevisionId==null) withContext(Dispatchers.IO){SampleLearningContent.createSeed(getApplication())} else null
+                val profile=seed?.profile?:LearnerProfile(ProfileId(SampleLearningContent.PROFILE_ID),"학생",System.currentTimeMillis())
+                if(seed!=null) repository().ensureContent(seed) else repository().ensureProfile(profile)
+                val revision=seed?.bookRevision?.revisionId?:BookRevisionId(requireNotNull(requestedRevisionId))
+                repository().observeActivitiesWithProgress(profile.profileId, revision)
                     .collect { activities ->
                         _uiState.value = ProgressUiState.Content(
-                            bookTitle = seed.bookRevision.title,
+                            bookTitle = requestedBookTitle ?: seed?.bookRevision?.title ?: "학습 진도",
                             activities = activities.map { progress ->
                                 ActivityProgressUi(
                                     activityId = progress.activityId,

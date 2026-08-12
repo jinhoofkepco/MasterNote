@@ -53,6 +53,7 @@ dependencies {
     implementation(project(":feature:reader"))
     implementation(project(":feature:teacher"))
     implementation(project(":feature:remote-session"))
+    implementation(project(":feature:library"))
     androidTestImplementation(project(":annotation:storage"))
     androidTestImplementation("androidx.test:core-ktx:1.7.0")
     androidTestImplementation("androidx.test.ext:junit-ktx:1.3.0")

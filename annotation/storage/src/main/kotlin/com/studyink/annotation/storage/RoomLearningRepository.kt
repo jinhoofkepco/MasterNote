@@ -58,6 +58,8 @@ class RoomLearningRepository internal constructor(
     private val dao = database.learningDao()
     private val annotationDao = database.annotationDao()
 
+    suspend fun ensureProfile(profile: com.studyink.core.model.LearnerProfile) = withContext(dispatcher) { dao.insertProfile(profile.toEntity()) }
+
     override suspend fun ensureContent(seed: LearningContentSeed) = withContext(dispatcher) {
         database.withTransaction {
             dao.insertProfile(seed.profile.toEntity())

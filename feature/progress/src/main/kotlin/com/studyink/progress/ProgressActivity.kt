@@ -78,6 +78,10 @@ class ProgressActivity : ComponentActivity() {
             )
         }
     }
+    companion object {
+        const val EXTRA_REVISION_ID="revisionId";const val EXTRA_BOOK_TITLE="bookTitle";const val EXTRA_DOCUMENT_URI="documentUri"
+        fun intent(context:android.content.Context,revisionId:String,title:String,documentUri:String)=Intent(context,ProgressActivity::class.java).putExtra(EXTRA_REVISION_ID,revisionId).putExtra(EXTRA_BOOK_TITLE,title).putExtra(EXTRA_DOCUMENT_URI,documentUri)
+    }
 }
 
 @Composable

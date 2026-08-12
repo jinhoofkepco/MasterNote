@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.Flow
     @Update suspend fun updateBook(value: LibraryBookEntity)
     @Query("SELECT * FROM library_books WHERE bookId=:id") suspend fun book(id: String): LibraryBookEntity?
     @Query("SELECT * FROM library_books WHERE currentRevisionId=:revisionId LIMIT 1") suspend fun bookByRevision(revisionId: String): LibraryBookEntity?
+    @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertRevisionSource(value: LibraryRevisionSourceEntity)
+    @Query("SELECT * FROM library_revision_sources WHERE revisionId=:revisionId") suspend fun revisionSource(revisionId: String): LibraryRevisionSourceEntity?
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun placeBook(value: BookPlacementEntity)
     @Query("SELECT * FROM book_placements WHERE bookId=:bookId") suspend fun placement(bookId: String): BookPlacementEntity?
     @Query("SELECT COALESCE(MAX(position), -1) + 1 FROM book_placements WHERE folderId=:folderId") suspend fun nextBookPosition(folderId: String): Int

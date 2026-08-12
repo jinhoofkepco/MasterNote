@@ -13,6 +13,7 @@ data class ReaderLaunchArgs(
     val attemptId: AttemptId,
     val initialPageId: PageId,
     val submissionId: SubmissionId? = null,
+    val documentUri: String? = null,
 ) {
     fun putInto(intent: Intent): Intent = intent
         .putExtra(EXTRA_PROFILE_ID, profileId.value)
@@ -20,6 +21,7 @@ data class ReaderLaunchArgs(
         .putExtra(EXTRA_ATTEMPT_ID, attemptId.value)
         .putExtra(EXTRA_INITIAL_PAGE_ID, initialPageId.value)
         .also { target -> submissionId?.let { target.putExtra(EXTRA_SUBMISSION_ID, it.value) } }
+        .also { target -> documentUri?.let { target.putExtra(EXTRA_DOCUMENT_URI, it) } }
 
     companion object {
         private const val EXTRA_PROFILE_ID = "com.studyink.reader.PROFILE_ID"
@@ -27,6 +29,7 @@ data class ReaderLaunchArgs(
         private const val EXTRA_ATTEMPT_ID = "com.studyink.reader.ATTEMPT_ID"
         private const val EXTRA_INITIAL_PAGE_ID = "com.studyink.reader.INITIAL_PAGE_ID"
         private const val EXTRA_SUBMISSION_ID = "com.studyink.reader.SUBMISSION_ID"
+        private const val EXTRA_DOCUMENT_URI = "com.studyink.reader.DOCUMENT_URI"
 
         fun from(intent: Intent): ReaderLaunchArgs? {
             val profileId = intent.getStringExtra(EXTRA_PROFILE_ID) ?: return null
@@ -39,6 +42,7 @@ data class ReaderLaunchArgs(
                 AttemptId(attemptId),
                 PageId(initialPageId),
                 intent.getStringExtra(EXTRA_SUBMISSION_ID)?.let(::SubmissionId),
+                intent.getStringExtra(EXTRA_DOCUMENT_URI),
             )
         }
     }

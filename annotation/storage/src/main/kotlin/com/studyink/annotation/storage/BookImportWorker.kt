@@ -52,6 +52,7 @@ class BookImportRepository internal constructor(private val context: Context, pr
             update(requireNotNull(dao.session(id)).copy(bookId=bookId,revisionId=revisionId),ImportState.COMMITTING)
             database.withTransaction {
                 check(database.learningDao().insertBookRevision(BookRevisionEntity(revisionId,bookId,documentId,1,sourceHandle.asset.sha256,session.title ?: "가져온 책",now())) != -1L)
+                database.libraryDao().insertRevisionSource(LibraryRevisionSourceEntity(revisionId,handle.asset.assetId.value,sourceHandle.asset.assetId.value,type.name,"1.0",null,null,now()))
                 val activityId="$revisionId:all"; database.learningDao().insertActivity(LearningActivityEntity(activityId,revisionId,"전체 학습",0,"INK_AND_STRUCTURED"))
                 database.learningDao().insertActivityPages((0 until requireNotNull(handle.asset.pageCount)).map { ActivityPageRefEntity(activityId,"$documentId:page:$it",it,it) })
                 val library=LibraryRepository(database,now); library.ensureRoot(); library.registerBook(bookId,session.title ?: "가져온 책",revisionId,session.requestedFolderId)
@@ -72,6 +73,7 @@ class BookImportRepository internal constructor(private val context: Context, pr
         update(requireNotNull(dao.session(id)),ImportState.COMMITTING);val documentId=documentIdentity(documentHandle.file);val t=now()
         database.withTransaction {
             database.learningDao().insertBookRevision(BookRevisionEntity(m.book.revisionId,m.book.bookId,documentId,m.book.revisionNumber,source.asset.sha256,m.book.title,t))
+            database.libraryDao().insertRevisionSource(LibraryRevisionSourceEntity(m.book.revisionId,documentAsset.assetId.value,source.asset.assetId.value,ImportSourceType.MATERNOTE_PACKAGE.name,"${m.formatVersion.major}.${m.formatVersion.minor}",m.packageId,m.book.previousRevisionId,t))
             m.activities.forEach{a->database.learningDao().insertActivity(LearningActivityEntity(a.activityId,m.book.revisionId,a.title,a.position,a.submissionMode));database.learningDao().insertActivityPages(a.pageIds.mapIndexed{i,pageId->val page=requireNotNull(m.pages.find{it.pageId==pageId});ActivityPageRefEntity(a.activityId,pageId,requireNotNull(page.source.pageIndex),i)})}
             database.teacherDao().insertTeacher(TeacherProfileEntity("package-author","Package Author",t))
             m.answerDocuments.forEach{a->val asset=requireNotNull(imported[a.assetId]);database.answerDao().insertDocument(AnswerDocumentEntity(a.answerDocumentId,m.book.revisionId,asset.assetId.value,if(asset.mimeType=="application/pdf")"PDF" else "IMAGE_SEQUENCE",a.type,asset.pageCount?:1,a.answerDocumentId,true,t))}
@@ -83,6 +85,8 @@ class BookImportRepository internal constructor(private val context: Context, pr
         session=requireNotNull(dao.session(id));dao.update(session.copy(state=ImportState.SUCCEEDED.name,completedAtEpochMillis=now(),updatedAtEpochMillis=now()))
     }
     private fun documentIdentity(file: java.io.File): String { val d=MessageDigest.getInstance("SHA-256"); d.update(Uri.fromFile(file).normalizeScheme().toString().toByteArray()); d.update(0); FileInputStream(file).use{input->val b=ByteArray(64*1024);while(true){val n=input.read(b);if(n<0)break;d.update(b,0,n)}};return d.digest().joinToString(""){"%02x".format(it)} }
+    fun close()=database.close()
+    companion object{fun open(context:Context)=BookImportRepository(context,AnnotationDatabase.open(context))}
 }
 private fun ImportSessionEntity.model()=ImportSession(importSessionId,sourceUri,requestedFolderId,detectedSourceType?.let(ImportSourceType::valueOf),ImportState.valueOf(state),progressCurrent,progressTotal,title,bookId,revisionId,errorCode,errorDetail)
 
@@ -91,5 +95,5 @@ class BookImportWorker(context: Context, params: WorkerParameters): CoroutineWor
     companion object { const val KEY="importSessionId" }
 }
 object BookImportScheduler {
-    fun enqueue(context:Context,id:String)=WorkManager.getInstance(context).enqueueUniqueWork("import-book:$id",ExistingWorkPolicy.KEEP,OneTimeWorkRequestBuilder<BookImportWorker>().setInputData(workDataOf(BookImportWorker.KEY to id)).build())
+    fun enqueue(context:Context,id:String) { WorkManager.getInstance(context).enqueueUniqueWork("import-book:$id",ExistingWorkPolicy.KEEP,OneTimeWorkRequestBuilder<BookImportWorker>().setInputData(workDataOf(BookImportWorker.KEY to id)).build()) }
 }
