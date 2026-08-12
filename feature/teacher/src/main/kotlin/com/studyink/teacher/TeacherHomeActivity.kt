@@ -75,6 +75,7 @@ private fun TeacherHomeScreen(
     openPreparation: () -> Unit,
     exitTeacherMode: () -> Unit,
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     MaterialTheme {
         Column(Modifier.fillMaxSize().padding(24.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -83,6 +84,11 @@ private fun TeacherHomeScreen(
             }
             Row(Modifier.fillMaxWidth().padding(vertical = 16.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(onClick = openPreparation) { Text("교재 준비") }
+                Button(onClick = {
+                    context.startActivity(com.studyink.remote.feature.RemoteSessionActivity.intent(
+                        context, com.studyink.remote.session.RemoteSessionRole.TEACHER,
+                    ))
+                }) { Text("원격 수업") }
             }
             Text("제출 검토", style = MaterialTheme.typography.titleMedium)
             when (state) {

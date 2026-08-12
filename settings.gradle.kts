@@ -30,4 +30,5 @@ include(
     ":remote:session",
     ":remote:storage",
     ":remote:sync",
+    ":feature:remote-session",
 )

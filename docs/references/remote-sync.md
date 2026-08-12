@@ -43,3 +43,16 @@ Nearby and generated protobuf types remain inside adapters and never cross into 
   preview only when the durable stroke arrives; stale previews also expire after two seconds.
 - Follow mode can be disabled without stopping background replica updates. The latest student page
   remains visible as metadata while the teacher inspects another page.
+
+## Service lifecycle invariants
+
+- `RemoteSessionService` owns Nearby, transport callbacks, retry jobs, Outbox polling, and ephemeral
+  collectors; Activity and ViewModel recreation do not own or restart the connection.
+- The service is started only through a visible user action, uses the `connectedDevice` foreground
+  type, returns `START_NOT_STICKY`, and exposes an ongoing notification with an explicit stop action.
+- Retry discovery uses 0.5/1/2/4/8-second backoff capped at eight seconds and moves to manual retry
+  after sixty seconds.
+- Stop always clears Reader hooks, calls Nearby cleanup, closes Room handles, removes the foreground
+  notification, and cancels the service coroutine scope. No wake lock is held.
+- Hello rejects mismatched session, protocol, book revision, content hash, page count, Attempt, or page
+  geometry before a remote overlay can enter live state.

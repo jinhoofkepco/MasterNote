@@ -20,6 +20,7 @@ kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarg
 
 dependencies {
     implementation(project(":feature:reader"))
+    implementation(project(":feature:remote-session"))
     implementation(project(":annotation:storage"))
     val composeBom = platform("androidx.compose:compose-bom:2026.06.00")
     implementation(composeBom)

@@ -26,6 +26,7 @@ class DurableReceiver(
     private val applyOperation: suspend (RemoteDurableOperation) -> Unit,
     private val nowEpochMillis: () -> Long,
     private val codec: RemoteMessageCodec = ProtobufRemoteMessageCodec(),
+    private val receiptOwnedByApplyOperation: Boolean = false,
 ) {
     private val gaps = TreeMap<Long, RemoteEnvelope>()
 
@@ -56,6 +57,9 @@ class DurableReceiver(
     private suspend fun applyEnvelope(envelope: RemoteEnvelope) {
         val batch = envelope.payload as? RemoteDurableOperationBatch
             ?: error("Durable lane requires an operation batch")
+        if (receiptOwnedByApplyOperation) require(batch.operations.size == 1) {
+            "Atomic replica application currently requires one operation per durable envelope"
+        }
         val newlyApplied = mutableListOf<String>()
         batch.operations.forEach { operation ->
             if (!inbox.hasOperation(sessionId, operation.operationId)) {
@@ -63,10 +67,12 @@ class DurableReceiver(
                 newlyApplied += operation.operationId
             }
         }
-        check(inbox.markApplied(
-            sessionId, envelope.durableSequence, envelope.messageId,
-            newlyApplied, nowEpochMillis(),
-        ))
+        if (!receiptOwnedByApplyOperation) {
+            check(inbox.markApplied(
+                sessionId, envelope.durableSequence, envelope.messageId,
+                newlyApplied, nowEpochMillis(),
+            ))
+        }
     }
 }
 

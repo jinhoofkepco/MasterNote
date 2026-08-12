@@ -42,6 +42,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.studyink.reader.ReaderActivity
 import com.studyink.core.model.ActivityProgressState
+import com.studyink.remote.feature.RemoteSessionActivity
+import com.studyink.remote.session.RemoteSessionRole
 
 class ProgressActivity : ComponentActivity() {
     private val viewModel: ProgressViewModel by viewModels()
@@ -70,6 +72,9 @@ class ProgressActivity : ComponentActivity() {
                         )
                     )
                 },
+                onRemoteLesson = {
+                    startActivity(RemoteSessionActivity.intent(this@ProgressActivity, RemoteSessionRole.STUDENT))
+                },
             )
         }
     }
@@ -81,6 +86,7 @@ fun ProgressScreen(
     onActivityClick: (com.studyink.core.model.LearningActivityId) -> Unit,
     onRetry: () -> Unit,
     onTeacherMode: (() -> Unit)? = null,
+    onRemoteLesson: (() -> Unit)? = null,
 ) {
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFFF5F6FA)) {
@@ -107,6 +113,7 @@ fun ProgressScreen(
                             fontWeight = FontWeight.Bold,
                             modifier = Modifier.weight(1f),
                         )
+                        onRemoteLesson?.let { Button(onClick = it) { Text("원격 연결") } }
                         onTeacherMode?.let { Button(onClick = it) { Text("선생 모드") } }
                     }
                     HorizontalDivider(color = Color(0xFFE0E3EB))
