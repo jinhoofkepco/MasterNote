@@ -10,8 +10,10 @@ import androidx.ink.brush.Brush
 import androidx.ink.brush.StockBrushes
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
+import com.studyink.core.model.StrokeId
 import com.studyink.core.model.StrokeTool
 import com.studyink.document.pdf.PdfViewportAdapter
+import java.util.UUID
 
 enum class ReaderTool { PAN, PEN, HIGHLIGHTER, PARTIAL_ERASER, WHOLE_ERASER }
 
@@ -23,6 +25,8 @@ class InkInputView(context: Context) : View(context) {
     var penWidthDp: Float = 3.2f
     var penOpacity: Float = 1f
     var onStroke: (StrokeAsset) -> Unit = {}
+    var onStrokePreview: (String, Int, List<PagePoint>, Long) -> Unit = { _, _, _, _ -> }
+    var onStrokePreviewFinished: (String) -> Unit = {}
     var onStylusContact: () -> Unit = {}
     var onEraserPreview: (EraserPreview?) -> Unit = {}
     var onErase: (Int, List<PagePoint>, Float, Boolean) -> Unit = { _, _, _, _ -> }
@@ -34,6 +38,7 @@ class InkInputView(context: Context) : View(context) {
     private var strokeWidthCanonical = 4f
     private var eraserRadiusCanonical = 18f
     private var downAtMillis = 0L
+    private var previewId: String? = null
 
     init {
         setBackgroundColor(Color.TRANSPARENT)
@@ -74,6 +79,7 @@ class InkInputView(context: Context) : View(context) {
         }
         downAtMillis = event.eventTime
         currentPoints.clear()
+        previewId = UUID.randomUUID().toString()
         currentPoints += mapped.point.copy(
             pressure = event.pressure.coerceIn(0f, 1f),
             elapsedTimeMillis = 0L,
@@ -90,6 +96,7 @@ class InkInputView(context: Context) : View(context) {
                 StockBrushes.marker(), color, if (activeTool == ReaderTool.HIGHLIGHTER) dp(18f) else dp(penWidthDp), 0.1f
             )
             wetInkView.startStroke(event, currentPointer, brush, Matrix(), Matrix())
+            onStrokePreview(requireNotNull(previewId), currentPage, currentPoints.toList(), event.eventTime)
         } else {
             onEraserPreview(EraserPreview(currentPage, currentPoints.toList(), eraserRadiusCanonical))
         }
@@ -101,6 +108,7 @@ class InkInputView(context: Context) : View(context) {
         collectHistory(event)
         if (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) {
             wetInkView.addToStroke(event, currentPointer, null)
+            onStrokePreview(requireNotNull(previewId), currentPage, currentPoints.toList(), event.eventTime)
         } else {
             onEraserPreview(EraserPreview(currentPage, currentPoints.toList(), eraserRadiusCanonical))
         }
@@ -115,6 +123,7 @@ class InkInputView(context: Context) : View(context) {
             if (currentPoints.isNotEmpty()) {
                 onStroke(
                     StrokeAsset(
+                        id = StrokeId(requireNotNull(previewId)),
                         pageNumber = currentPage,
                         tool = if (activeTool == ReaderTool.PEN) StrokeTool.PEN else StrokeTool.HIGHLIGHTER,
                         colorArgb = if (activeTool == ReaderTool.PEN) penColorWithOpacity() else 0x66FFE45C,
@@ -122,6 +131,7 @@ class InkInputView(context: Context) : View(context) {
                         points = currentPoints.toList(),
                     )
                 )
+                onStrokePreviewFinished(requireNotNull(previewId))
             }
         } else {
             onErase(currentPage, currentPoints.toList(), eraserRadiusCanonical, activeTool == ReaderTool.WHOLE_ERASER)
@@ -169,6 +179,7 @@ class InkInputView(context: Context) : View(context) {
         currentPointer = -1
         currentPage = -1
         currentPoints.clear()
+        previewId = null
         parent.requestDisallowInterceptTouchEvent(false)
     }
 

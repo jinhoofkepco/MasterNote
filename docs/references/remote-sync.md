@@ -33,3 +33,13 @@ Nearby and generated protobuf types remain inside adapters and never cross into 
 - A complete verified page replaces old replica rows in one Room transaction.
 - `ReadOnlyRemoteLayer` is the only Reader source for a remote replica and cannot become the scene's
   editable source.
+
+## Ephemeral lane invariants
+
+- Preview sampling is limited to one update per 100 ms and 24 canonical page points per message.
+- Preview, page, and viewport streams retain one latest value; they are never written to Room and
+  never enter the durable retry window.
+- A final stroke uses its preview ID as the immutable stroke ID so the teacher removes the temporary
+  preview only when the durable stroke arrives; stale previews also expire after two seconds.
+- Follow mode can be disabled without stopping background replica updates. The latest student page
+  remains visible as metadata while the teacher inspects another page.
