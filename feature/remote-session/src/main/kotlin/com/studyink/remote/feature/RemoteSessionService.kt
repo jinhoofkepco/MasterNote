@@ -25,11 +25,19 @@ import com.studyink.remote.protocol.RemoteNack
 import com.studyink.remote.protocol.RemoteLiveStrokePreview
 import com.studyink.remote.protocol.RemotePageState
 import com.studyink.remote.protocol.RemoteViewportState
+import com.studyink.remote.protocol.RemotePageDigest
+import com.studyink.remote.protocol.RemoteCheckpointRequest
+import com.studyink.remote.protocol.RemoteCheckpointChunk
 import com.studyink.remote.sync.DurableOutboxSender
 import com.studyink.remote.sync.DurableReceiveResult
 import com.studyink.remote.sync.DurableReceiver
 import com.studyink.remote.sync.RemoteEphemeralSender
 import com.studyink.remote.sync.RemoteLivePublisher
+import com.studyink.remote.sync.CheckpointAssembler
+import com.studyink.remote.sync.CheckpointProducer
+import com.studyink.remote.sync.CheckpointReceiveResult
+import com.studyink.remote.sync.matches
+import com.studyink.remote.sync.pageDigest
 import com.studyink.remote.session.RemoteSessionController
 import com.studyink.remote.session.RemoteSessionRole
 import com.studyink.remote.session.RemoteSessionState
@@ -43,6 +51,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.util.UUID
 
 class RemoteSessionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -74,9 +83,9 @@ class RemoteSessionService : Service() {
         remoteStore = persisted
         replicaStore = replica
         val livePublisher = RemoteLivePublisher()
-        if (role == RemoteSessionRole.STUDENT) {
-            ReaderRemoteBridge.sink = ServiceReaderSink(sessionId, deviceId, livePublisher)
-        }
+        val readerSink = if (role == RemoteSessionRole.STUDENT) {
+            ServiceReaderSink(sessionId, deviceId, livePublisher).also { ReaderRemoteBridge.sink = it }
+        } else null
         val created = RemoteSessionController(
             role, sessionId, deviceId, localName, transport, serviceScope,
             elapsedRealtimeMs = SystemClock::elapsedRealtime,
@@ -90,6 +99,11 @@ class RemoteSessionService : Service() {
         val endpoint = { created.snapshot.value.endpointId }
         val durableSender = DurableOutboxSender(sessionId, endpoint, persisted, transport, System::currentTimeMillis)
         val ephemeralSender = RemoteEphemeralSender(sessionId, deviceId, endpoint, transport, SystemClock::elapsedRealtime, codec)
+        val pageNumbers = mutableMapOf<String, Int>()
+        val checkpointAssembler = CheckpointAssembler(
+            sessionId, replica, { pageId -> pageNumbers[pageId] ?: pageId.substringAfterLast('-').toIntOrNull() ?: 0 },
+            System::currentTimeMillis,
+        )
         val durableReceiver = DurableReceiver(
             sessionId, persisted,
             applyOperation = { operation ->
@@ -106,7 +120,12 @@ class RemoteSessionService : Service() {
                 RemoteSessionRuntime.update(snapshot)
                 if (snapshot.state == RemoteSessionState.RECONNECTING) startReconnect(created)
                 if (snapshot.state == RemoteSessionState.LIVE) reconnectJob?.cancel()
-                if (snapshot.state == RemoteSessionState.INITIAL_SYNC) created.initialSyncComplete()
+                if (snapshot.state == RemoteSessionState.INITIAL_SYNC && role == RemoteSessionRole.STUDENT) {
+                    readerSink?.pageSnapshot?.value?.let { page ->
+                        ephemeralSender.sendLatest(pageDigest(page.pageId, page.revision, page.strokes))
+                        created.initialSyncComplete()
+                    }
+                }
             }
         }
         serviceScope.launch {
@@ -123,14 +142,48 @@ class RemoteSessionService : Service() {
                     is RemoteDurableOperationBatch -> {
                         val result = durableReceiver.receive(bytes)
                         when (result) {
-                            is DurableReceiveResult.Acknowledged -> ephemeralSender.sendLatest(RemoteAck(result.highestContiguousSequence))
+                            is DurableReceiveResult.Acknowledged -> {
+                                RemoteSessionRuntime.finishPreviews(payload.operations.flatMap { operation ->
+                                    operation.addedStrokes.map { it.strokeId }
+                                })
+                                ephemeralSender.sendLatest(RemoteAck(result.highestContiguousSequence))
+                            }
                             is DurableReceiveResult.Missing -> ephemeralSender.sendLatest(RemoteNack(result.expectedSequence))
-                            is DurableReceiveResult.CheckpointRequired -> Unit
+                            is DurableReceiveResult.CheckpointRequired -> result.pageId?.let {
+                                ephemeralSender.sendLatest(RemoteCheckpointRequest(it, 0))
+                            }
                         }
                     }
-                    is RemoteLiveStrokePreview -> Unit
-                    is RemotePageState -> Unit
-                    is RemoteViewportState -> Unit
+                    is RemoteLiveStrokePreview -> RemoteSessionRuntime.receivePreview(payload, SystemClock.elapsedRealtime())
+                    is RemotePageState -> {
+                        pageNumbers[payload.pageId] = payload.pageOrder
+                        RemoteSessionRuntime.follow.onPage(payload)
+                    }
+                    is RemoteViewportState -> RemoteSessionRuntime.follow.onViewport(payload)
+                    is RemotePageDigest -> if (role == RemoteSessionRole.TEACHER) {
+                        val local = replica.page(sessionId, payload.pageId)
+                        val localDigest = local?.let { pageDigest(it.pageId, it.layerRevision, it.strokes) }
+                        if (localDigest != null && localDigest.matches(payload)) {
+                            if (created.snapshot.value.state == RemoteSessionState.INITIAL_SYNC) created.initialSyncComplete()
+                        } else {
+                            ephemeralSender.sendLatest(RemoteCheckpointRequest(payload.pageId, local?.layerRevision ?: 0))
+                        }
+                    }
+                    is RemoteCheckpointRequest -> if (role == RemoteSessionRole.STUDENT) {
+                        readerSink?.pageSnapshot?.value?.takeIf { it.pageId == payload.pageId }?.let { page ->
+                            CheckpointProducer.create(UUID.randomUUID().toString(), page.pageId, page.revision, page.strokes)
+                                .forEach { ephemeralSender.sendLatest(it) }
+                        }
+                    }
+                    is RemoteCheckpointChunk -> if (role == RemoteSessionRole.TEACHER) {
+                        when (val result = checkpointAssembler.receive(payload)) {
+                            is CheckpointReceiveResult.Applied -> if (created.snapshot.value.state == RemoteSessionState.INITIAL_SYNC) {
+                                created.initialSyncComplete()
+                            }
+                            is CheckpointReceiveResult.Rejected -> RemoteSessionRuntime.diagnostics?.lastError = result.reason
+                            is CheckpointReceiveResult.Pending -> Unit
+                        }
+                    }
                     else -> Unit
                 }
             }
@@ -144,6 +197,24 @@ class RemoteSessionService : Service() {
         serviceScope.launch { livePublisher.preview.collectLatest { if (created.snapshot.value.state == RemoteSessionState.LIVE) ephemeralSender.sendLatest(it) } }
         serviceScope.launch { livePublisher.pageState.collectLatest { if (created.snapshot.value.state == RemoteSessionState.LIVE) ephemeralSender.sendLatest(it) } }
         serviceScope.launch { livePublisher.viewportState.collectLatest { if (created.snapshot.value.state == RemoteSessionState.LIVE) ephemeralSender.sendLatest(it) } }
+        readerSink?.let { sink ->
+            serviceScope.launch {
+                sink.pageSnapshot.collectLatest { page ->
+                    page ?: return@collectLatest
+                    if (created.snapshot.value.state in setOf(RemoteSessionState.INITIAL_SYNC, RemoteSessionState.LIVE)) {
+                        ephemeralSender.sendLatest(pageDigest(page.pageId, page.revision, page.strokes))
+                        if (created.snapshot.value.state == RemoteSessionState.INITIAL_SYNC) created.initialSyncComplete()
+                    }
+                }
+            }
+        }
+        serviceScope.launch {
+            while (true) {
+                livePublisher.expirePreview(SystemClock.elapsedRealtime())
+                RemoteSessionRuntime.expirePreviews(SystemClock.elapsedRealtime())
+                delay(500)
+            }
+        }
         created.start()
         return START_NOT_STICKY
     }

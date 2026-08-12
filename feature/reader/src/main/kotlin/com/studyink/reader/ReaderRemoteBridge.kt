@@ -12,6 +12,7 @@ interface ReaderRemoteEventSink {
     fun onStrokeFinished(previewId: String)
     fun onPageChanged(pageNumber: Int)
     fun onViewportChanged(state: com.studyink.document.pdf.PdfViewportState)
+    fun onPageSnapshot(pageId: String, pageNumber: Int, revision: Long, strokes: List<com.studyink.core.model.StrokeAsset>) = Unit
     fun outboxRequest(): com.studyink.annotation.storage.RemoteOutboxRequest? = null
 }
 

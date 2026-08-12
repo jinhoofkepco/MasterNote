@@ -144,6 +144,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         val session = activeSession ?: return
         val page = session.pages.firstOrNull { it.pageNumber == pageNumber } ?: return
         selectedPageId = page.pageId
+        publishRemotePageSnapshot(page.pageId, pageNumber)
         val attemptId = session.attempt.attemptId
         check(commands.trySend(Command.PreparePage(attemptId, page.pageId)).isSuccess)
         resumePageJob?.cancel()
@@ -419,6 +420,9 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         }
             .onSuccess {
                 val savedAt = System.currentTimeMillis()
+                val pageId = scenePages.firstOrNull { it.pageNumber == mutation.operation.pageNumber }?.pageId
+                    ?: activeSession?.pages?.firstOrNull { it.pageNumber == mutation.operation.pageNumber }?.pageId
+                pageId?.let { publishRemotePageSnapshot(it, mutation.operation.pageNumber) }
                 finishMutation(command, "자동 저장됨 · 리비전 ${mutation.snapshot.revision}", savedAt)
             }
             .onFailure { error ->
@@ -428,6 +432,16 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 )
                 finishMutation(command, "저장 실패 · 변경 취소: ${error.message}")
             }
+    }
+
+    private fun publishRemotePageSnapshot(pageId: PageId, pageNumber: Int) {
+        val snapshot = document.snapshot()
+        ReaderRemoteBridge.sink?.onPageSnapshot(
+            pageId.value,
+            pageNumber,
+            snapshot.pageRevisions[pageNumber] ?: 0L,
+            snapshot.activeStrokes.filter { it.pageNumber == pageNumber },
+        )
     }
 
     private suspend fun finishMutation(

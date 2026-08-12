@@ -188,8 +188,7 @@ class RemoteSessionController(
     }
 
     fun initialSyncComplete() {
-        check(snapshot.value.state == RemoteSessionState.INITIAL_SYNC)
-        transition(RemoteSessionState.LIVE)
+        if (snapshot.value.state == RemoteSessionState.INITIAL_SYNC) transition(RemoteSessionState.LIVE)
     }
 
     private suspend fun send(endpointId: String, payload: com.studyink.remote.protocol.RemotePayload) {
