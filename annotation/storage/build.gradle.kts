@@ -32,6 +32,7 @@ dependencies {
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.room:room-ktx:$roomVersion")
     implementation("androidx.core:core-ktx:1.17.0")
+    implementation("androidx.work:work-runtime-ktx:2.11.1")
     ksp("androidx.room:room-compiler:$roomVersion")
 
     implementation("androidx.ink:ink-brush:1.0.0")
@@ -44,4 +45,5 @@ dependencies {
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     androidTestImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.work:work-testing:2.11.1")
 }
