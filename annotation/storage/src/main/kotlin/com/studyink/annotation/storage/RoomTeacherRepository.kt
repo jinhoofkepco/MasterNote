@@ -31,6 +31,8 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import com.studyink.core.model.ReviewQueueItem
+import com.studyink.core.model.TeacherQueueStatus
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
@@ -210,6 +212,9 @@ class RoomTeacherRepository internal constructor(
         }
     }
 
+    override fun observeReviewQueue(teacherId: TeacherId): Flow<List<ReviewQueueItem>> =
+        teacherDao.observeReviewQueue(teacherId.value).map { rows -> rows.map(ReviewQueueRow::toDomain) }
+
     fun close() = database.close()
 
     private suspend fun createPrepPage(teacherId: TeacherId, revisionId: BookRevisionId, pageId: PageId): TeacherPrepPage {
@@ -314,4 +319,23 @@ private fun AttemptEntity.toDomain() = Attempt(
 
 private fun ReviewAnswerEvaluationEntity.toDomain() = ReviewAnswerEvaluation(
     ReviewId(reviewId), fieldId, AnswerVerdict.valueOf(verdict), commentText, updatedAtEpochMillis,
+)
+
+private fun ReviewQueueRow.toDomain() = ReviewQueueItem(
+    submissionId = SubmissionId(submissionId),
+    attemptId = AttemptId(attemptId),
+    profileId = ProfileId(profileId),
+    learnerName = learnerName,
+    bookTitle = bookTitle,
+    activityTitle = activityTitle,
+    attemptNumber = attemptNumber,
+    submittedAtEpochMillis = submittedAtEpochMillis,
+    status = when {
+        reviewStatus == ReviewStatus.DRAFT.name -> TeacherQueueStatus.IN_REVIEW
+        reviewStatus == ReviewStatus.PUBLISHED.name && reviewDecision == ReviewDecision.ACCEPTED.name -> TeacherQueueStatus.REVIEWED_ACCEPTED
+        reviewStatus == ReviewStatus.PUBLISHED.name && reviewDecision == ReviewDecision.RETRY_REQUESTED.name -> TeacherQueueStatus.REVIEWED_RETRY
+        else -> TeacherQueueStatus.UNREVIEWED
+    },
+    latestReviewId = reviewId?.let(::ReviewId),
+    lastVisitedPageId = lastVisitedPageId?.let(::PageId),
 )

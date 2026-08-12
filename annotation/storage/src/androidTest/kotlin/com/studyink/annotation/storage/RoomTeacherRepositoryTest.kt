@@ -24,6 +24,9 @@ import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.flow.first
+import com.studyink.core.model.ActivityProgressState
+import com.studyink.core.model.TeacherQueueStatus
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
@@ -163,6 +166,47 @@ class RoomTeacherRepositoryTest {
                 isolated.close()
             }
         }
+    }
+
+    @Test fun reviewQueueProgressAndRetryAttemptAreDerivedFromReviewHistory() = runTest {
+        val (learning, teacher) = repositories("attempt-1", "submission-1", "review-1", "attempt-2")
+        val submission = submittedAttempt(learning)
+        assertEquals(TeacherQueueStatus.UNREVIEWED, teacher.observeReviewQueue(TEACHER).first().single().status)
+
+        val review = teacher.getOrCreateDraftReview(submission, TEACHER)
+        assertEquals(TeacherQueueStatus.IN_REVIEW, teacher.observeReviewQueue(TEACHER).first().single().status)
+        assertEquals(
+            ActivityProgressState.SUBMITTED,
+            learning.observeActivitiesWithProgress(PROFILE, REVISION).first().single().state,
+        )
+
+        teacher.publishReview(review.review.reviewId, ReviewDecision.RETRY_REQUESTED)
+        assertEquals(TeacherQueueStatus.REVIEWED_RETRY, teacher.observeReviewQueue(TEACHER).first().single().status)
+        assertEquals(
+            ActivityProgressState.RETRY_REQUIRED,
+            learning.observeActivitiesWithProgress(PROFILE, REVISION).first().single().state,
+        )
+
+        val retry = learning.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+        assertEquals(review.review.reviewId, retry.attempt.sourceReviewId)
+        assertEquals(2, retry.attempt.attemptNumber)
+        assertEquals(
+            ActivityProgressState.IN_PROGRESS,
+            learning.observeActivitiesWithProgress(PROFILE, REVISION).first().single().state,
+        )
+    }
+
+    @Test fun acceptedPublishedReviewCompletesProgress() = runTest {
+        val (learning, teacher) = repositories("attempt-1", "submission-1", "review-1")
+        val submission = submittedAttempt(learning)
+        val review = teacher.getOrCreateDraftReview(submission, TEACHER)
+        teacher.publishReview(review.review.reviewId, ReviewDecision.ACCEPTED)
+
+        assertEquals(TeacherQueueStatus.REVIEWED_ACCEPTED, teacher.observeReviewQueue(TEACHER).first().single().status)
+        assertEquals(
+            ActivityProgressState.COMPLETED,
+            learning.observeActivitiesWithProgress(PROFILE, REVISION).first().single().state,
+        )
     }
 
     private fun repositories(vararg ids: String): Pair<RoomLearningRepository, RoomTeacherRepository> {

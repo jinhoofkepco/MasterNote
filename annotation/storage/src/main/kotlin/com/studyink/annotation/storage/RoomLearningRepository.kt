@@ -107,6 +107,19 @@ class RoomLearningRepository internal constructor(
         }
     }
 
+    override suspend fun startRetryAttempt(
+        profileId: ProfileId,
+        activityId: LearningActivityId,
+        sourceReviewId: com.studyink.core.model.ReviewId,
+    ): AttemptSession = withContext(dispatcher) {
+        database.withTransaction {
+            check(dao.activeAttempt(profileId.value, activityId.value) == null)
+            val latest = requireNotNull(dao.latestPublishedReview(profileId.value, activityId.value))
+            check(latest.reviewId == sourceReviewId.value && latest.decision == com.studyink.core.model.ReviewDecision.RETRY_REQUESTED.name)
+            createAttempt(profileId, activityId, sourceReviewId)
+        }
+    }
+
     override suspend fun getAttemptSession(attemptId: AttemptId): AttemptSession = withContext(dispatcher) {
         database.withTransaction {
             session(requireNotNull(dao.attempt(attemptId.value)) { "Unknown attempt ${attemptId.value}" })
@@ -210,11 +223,16 @@ class RoomLearningRepository internal constructor(
     private suspend fun createAttempt(
         profileId: ProfileId,
         activityId: LearningActivityId,
+        explicitSourceReviewId: com.studyink.core.model.ReviewId? = null,
     ): AttemptSession {
         val activity = requireNotNull(dao.activity(activityId.value)) { "Unknown activity ${activityId.value}" }
         val pages = dao.activityPages(activityId.value)
         require(pages.isNotEmpty()) { "Activity ${activityId.value} has no pages" }
         val now = clock.nowEpochMillis()
+        val latestReview = dao.latestPublishedReview(profileId.value, activityId.value)
+        val sourceReviewId = explicitSourceReviewId?.value ?: latestReview
+            ?.takeIf { it.decision == com.studyink.core.model.ReviewDecision.RETRY_REQUESTED.name }
+            ?.reviewId
         val entity = AttemptEntity(
             attemptId = idGenerator.nextId(),
             profileId = profileId.value,
@@ -226,6 +244,7 @@ class RoomLearningRepository internal constructor(
             startedAtEpochMillis = now,
             updatedAtEpochMillis = now,
             submittedAtEpochMillis = null,
+            sourceReviewId = sourceReviewId,
         )
         dao.insertAttempt(entity)
         ensureAttemptPage(entity, pages.first().pageId, now)
@@ -316,4 +335,5 @@ private fun ActivityProgressRow.toDomain() = ActivityProgress(
     latestAttemptId = latestAttemptId?.let(::AttemptId),
     lastOpenedAtEpochMillis = lastOpenedAtEpochMillis,
     lastSubmittedAtEpochMillis = lastSubmittedAtEpochMillis,
+    latestReviewDecision = latestReviewDecision?.let(com.studyink.core.model.ReviewDecision::valueOf),
 )

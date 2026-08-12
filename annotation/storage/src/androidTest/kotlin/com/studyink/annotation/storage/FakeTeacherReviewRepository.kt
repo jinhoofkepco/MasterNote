@@ -9,6 +9,9 @@ import com.studyink.core.model.TeacherId
 import com.studyink.core.model.LayerId
 import com.studyink.core.model.PublishedReview
 import com.studyink.core.model.ReviewDecision
+import com.studyink.core.model.ReviewQueueItem
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 
 /** Small deterministic fake for teacher ViewModel tests; it never exposes a DAO. */
 class FakeTeacherReviewRepository(
@@ -21,6 +24,7 @@ class FakeTeacherReviewRepository(
     val evaluations = linkedMapOf<Pair<ReviewId, String>, Pair<AnswerVerdict, String>>()
     val feedbackLayers = linkedMapOf<Pair<ReviewId, PageId>, LayerId>()
     val publishedReviews = linkedMapOf<ReviewId, PublishedReview>()
+    val reviewQueue = MutableStateFlow<List<ReviewQueueItem>>(emptyList())
 
     override suspend fun ensureDefaultTeacher() = Unit
 
@@ -62,4 +66,6 @@ class FakeTeacherReviewRepository(
         publishedReviews.getValue(reviewId)
 
     override suspend fun getPublishedReview(reviewId: ReviewId): PublishedReview = publishedReviews.getValue(reviewId)
+
+    override fun observeReviewQueue(teacherId: TeacherId): Flow<List<ReviewQueueItem>> = reviewQueue
 }

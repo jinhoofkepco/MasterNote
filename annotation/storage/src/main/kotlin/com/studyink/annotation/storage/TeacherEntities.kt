@@ -118,3 +118,18 @@ internal data class RevisionPageRow(
     val pageId: String,
     val pageNumber: Int,
 )
+
+internal data class ReviewQueueRow(
+    val submissionId: String,
+    val attemptId: String,
+    val profileId: String,
+    val learnerName: String,
+    val bookTitle: String,
+    val activityTitle: String,
+    val attemptNumber: Int,
+    val submittedAtEpochMillis: Long,
+    val reviewId: String?,
+    val reviewStatus: String?,
+    val reviewDecision: String?,
+    val lastVisitedPageId: String?,
+)

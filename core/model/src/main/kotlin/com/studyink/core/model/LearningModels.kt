@@ -9,7 +9,7 @@ package com.studyink.core.model
 enum class SubmissionMode { INK_ONLY, STRUCTURED_ONLY, INK_AND_STRUCTURED }
 enum class AttemptStatus { IN_PROGRESS, SUBMITTED, ABANDONED }
 enum class AnswerType { TEXT, NUMBER, BOOLEAN, JSON }
-enum class ActivityProgressState { NOT_STARTED, IN_PROGRESS, SUBMITTED }
+enum class ActivityProgressState { NOT_STARTED, IN_PROGRESS, SUBMITTED, RETRY_REQUIRED, COMPLETED }
 
 data class LearnerProfile(
     val profileId: ProfileId,
@@ -112,9 +112,12 @@ data class ActivityProgress(
     val latestAttemptId: AttemptId?,
     val lastOpenedAtEpochMillis: Long?,
     val lastSubmittedAtEpochMillis: Long?,
+    val latestReviewDecision: ReviewDecision? = null,
 ) {
     val state: ActivityProgressState = when {
         hasDraft -> ActivityProgressState.IN_PROGRESS
+        latestReviewDecision == ReviewDecision.RETRY_REQUESTED -> ActivityProgressState.RETRY_REQUIRED
+        latestReviewDecision == ReviewDecision.ACCEPTED -> ActivityProgressState.COMPLETED
         submissionCount > 0 -> ActivityProgressState.SUBMITTED
         else -> ActivityProgressState.NOT_STARTED
     }

@@ -41,6 +41,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.studyink.reader.ReaderActivity
+import com.studyink.core.model.ActivityProgressState
 
 class ProgressActivity : ComponentActivity() {
     private val viewModel: ProgressViewModel by viewModels()
@@ -117,7 +118,24 @@ private fun ActivityProgressRow(activity: ActivityProgressUi, onClick: () -> Uni
             .padding(horizontal = 22.dp, vertical = 18.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(activity.title, modifier = Modifier.weight(1f), fontWeight = FontWeight.Medium)
+        Column(modifier = Modifier.weight(1f)) {
+            Text(activity.title, fontWeight = FontWeight.Medium)
+            Text(
+                text = when (activity.state) {
+                    ActivityProgressState.NOT_STARTED -> "시작 전"
+                    ActivityProgressState.IN_PROGRESS -> "풀이 중"
+                    ActivityProgressState.SUBMITTED -> "검토 대기"
+                    ActivityProgressState.RETRY_REQUIRED -> "다시 풀기"
+                    ActivityProgressState.COMPLETED -> "완료"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = when (activity.state) {
+                    ActivityProgressState.RETRY_REQUIRED -> Color(0xFFD14343)
+                    ActivityProgressState.COMPLETED -> Color(0xFF16845B)
+                    else -> Color(0xFF73798A)
+                },
+            )
+        }
         Row(
             modifier = Modifier.semantics { contentDescription = progressDescription },
             horizontalArrangement = Arrangement.spacedBy(5.dp),

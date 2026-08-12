@@ -31,6 +31,12 @@ interface LearningRepository {
         activityId: LearningActivityId,
     ): AttemptSession
 
+    suspend fun startRetryAttempt(
+        profileId: ProfileId,
+        activityId: LearningActivityId,
+        sourceReviewId: com.studyink.core.model.ReviewId,
+    ): AttemptSession
+
     suspend fun getAttemptSession(attemptId: AttemptId): AttemptSession
 
     suspend fun prepareAttemptPage(attemptId: AttemptId, pageId: PageId)
