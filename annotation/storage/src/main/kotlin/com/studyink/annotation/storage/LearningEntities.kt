@@ -235,3 +235,9 @@ internal data class ActivityProgressRow(
     val lastOpenedAtEpochMillis: Long?,
     val lastSubmittedAtEpochMillis: Long?,
 )
+
+internal data class AttemptActiveStrokeRow(
+    val pageId: String,
+    val strokeId: String,
+    val zOrder: Long,
+)

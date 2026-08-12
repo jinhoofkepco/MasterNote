@@ -88,6 +88,29 @@ internal interface LearningDao {
     )
     suspend fun touchAttemptPage(attemptId: String, pageId: String, viewedAtEpochMillis: Long): Int
 
+    @Query(
+        """
+        SELECT attempt_pages.pageId AS pageId,
+               layer_strokes.strokeId AS strokeId,
+               layer_strokes.zOrder AS zOrder
+        FROM attempt_pages
+        INNER JOIN layer_strokes ON layer_strokes.layerId = attempt_pages.workingLayerId
+        WHERE attempt_pages.attemptId = :attemptId AND layer_strokes.active = 1
+        ORDER BY attempt_pages.pageId, layer_strokes.zOrder
+        """
+    )
+    suspend fun activeStrokesForAttempt(attemptId: String): List<AttemptActiveStrokeRow>
+
+    @Query(
+        """
+        SELECT COALESCE(SUM(annotation_layers.currentRevision), 0)
+        FROM attempt_pages
+        INNER JOIN annotation_layers ON annotation_layers.layerId = attempt_pages.workingLayerId
+        WHERE attempt_pages.attemptId = :attemptId
+        """
+    )
+    suspend fun annotationRevisionForAttempt(attemptId: String): Long
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertDraftAnswer(entity: DraftAnswerEntity)
 

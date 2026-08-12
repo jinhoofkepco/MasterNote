@@ -6,6 +6,9 @@
 | Stable Ink 1.0 codec | `inkCodecRoundTripsInputsUsingStableStreamApi` | reopen pressure-sensitive pen strokes |
 | Room v1 → v2 migration | `AnnotationDatabaseSchemaTest` preserves annotation rows and validates new tables | Database Inspector schema spot-check |
 | Learning fixture and empty progress | `LearningDaoTest` | fixed three-page book smoke test |
+| Attempt create/reuse/profile/abandon | `RoomLearningRepositoryTest` | open the same activity repeatedly |
+| Attempt working-layer isolation | `RoomLearningRepositoryTest.workingLayersAreIsolatedBetweenAttempts` | submit then start a new attempt |
+| Resume page plus working ink | `ReaderAttemptSessionTest` | close on page 3 and reopen |
 | Partial erase is atomic | success and injected-failure tests in `RoomAnnotationStoreTest` | erase repeatedly, force-stop immediately |
 | Undo restores original asset | `AnnotationDocumentTest.undoAfterPartialEraseRestoresTheImmutableOriginalStroke` | erase, undo, force-stop, reopen |
 | One corrupt payload is isolated | `corruptStrokeBlobIsSkippedWithoutBlockingOtherStrokes` | import diagnostic corrupt fixture |

@@ -31,6 +31,10 @@ interface LearningRepository {
         activityId: LearningActivityId,
     ): AttemptSession
 
+    suspend fun getAttemptSession(attemptId: AttemptId): AttemptSession
+
+    suspend fun prepareAttemptPage(attemptId: AttemptId, pageId: PageId)
+
     suspend fun updateResumePage(attemptId: AttemptId, pageId: PageId)
     suspend fun abandonAttempt(attemptId: AttemptId)
     suspend fun upsertDraftAnswer(answer: DraftAnswer)

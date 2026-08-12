@@ -1,8 +1,6 @@
 package com.studyink.reader
 
 import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.pdf.PdfDocument
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -37,10 +35,10 @@ import com.studyink.document.pdf.ReaderPdfFragment
 import com.studyink.document.pdf.SinglePagePdfView
 import kotlinx.coroutines.launch
 import java.io.File
-import java.io.FileOutputStream
 
 class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private val viewModel: ReaderViewModel by viewModels()
+    private val launchArgs by lazy { ReaderLaunchArgs.from(intent) }
     private val viewport = PdfViewportAdapter()
     private lateinit var dryInkView: DryInkView
     private lateinit var wetInkView: InProgressStrokesView
@@ -57,6 +55,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var loadedPageCount by mutableStateOf(1)
     private var stylusMenuExpanded by mutableStateOf(false)
     private var stylusButtonPressed = false
+    private var appliedInitialAttemptId: String? = null
 
     private val openPdf = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -142,6 +141,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 viewModel.uiState.collect { state ->
                     latestState = state
                     dryInkView.snapshot = state.snapshot
+                    val session = state.attemptSession
+                    if (session != null && appliedInitialAttemptId != session.attempt.attemptId.value) {
+                        appliedInitialAttemptId = session.attempt.attemptId.value
+                        showPage(state.initialPageNumber)
+                    }
                 }
             }
         }
@@ -163,7 +167,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         dryInkView.activePage = 0
         viewport.showPage(0)
         val label = documentLabel(uri)
-        viewModel.loadDocument(uri, label, pageCount)
+        viewModel.loadDocument(uri, label, pageCount, launchArgs)
         dryInkView.invalidate()
         Toast.makeText(this, "$pageCount 페이지를 열었습니다", Toast.LENGTH_SHORT).show()
     }
@@ -212,13 +216,18 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         currentPage = target
         dryInkView.activePage = target
         viewport.showPage(target)
+        viewModel.onPageSelected(target)
     }
 
     private fun refreshChrome() {
         topBar.setContent {
             TopReaderBar(
                 state = latestState,
-                onOpenPdf = { openPdf.launch(arrayOf("application/pdf")) },
+                onOpenPdf = if (launchArgs == null) {
+                    { openPdf.launch(arrayOf("application/pdf")) }
+                } else {
+                    null
+                },
             )
         }
         paletteAnchor.setContent {
@@ -340,29 +349,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private fun ensureSamplePdf(): File {
-        val file = File(filesDir, "study-ink-sample.pdf")
-        if (file.exists() && file.length() > 0L) return file
-        val document = PdfDocument()
-        val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(25, 39, 70); textSize = 34f }
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(55, 62, 77); textSize = 20f }
-        val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(205, 210, 220); strokeWidth = 2f }
-        repeat(3) { index ->
-            val page = document.startPage(PdfDocument.PageInfo.Builder(840, 1188, index + 1).create())
-            val canvas = page.canvas
-            canvas.drawColor(Color.WHITE)
-            canvas.drawText("Study Ink Practice  ${index + 1}", 72f, 100f, titlePaint)
-            canvas.drawText("Write an answer with the pen. Try both erasers, undo, zoom, and reopen the app.", 72f, 150f, textPaint)
-            canvas.drawText("${index + 3} + ${index + 5} =", 96f, 260f, titlePaint)
-            for (line in 0 until 12) {
-                val y = 360f + line * 58f
-                canvas.drawLine(72f, y, 768f, y, linePaint)
-            }
-            canvas.drawText("Page ${index + 1} / 3", 650f, 1120f, textPaint)
-            document.finishPage(page)
-        }
-        FileOutputStream(file).use(document::writeTo)
-        document.close()
-        return file
+        return SampleLearningContent.ensurePdf(this)
     }
 
     private fun documentLabel(uri: Uri): String {

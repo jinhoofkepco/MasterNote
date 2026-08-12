@@ -142,3 +142,8 @@ data class AnnotationOperationEntity(
     val payloadJson: String,
     val createdAtEpochMillis: Long,
 )
+
+internal data class LayerPageRevisionRow(
+    val pageNumber: Int,
+    val currentRevision: Long,
+)

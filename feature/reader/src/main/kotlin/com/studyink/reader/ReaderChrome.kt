@@ -80,7 +80,7 @@ private enum class RadialMenuPage { MAIN, COLORS, PEN }
 @Composable
 fun TopReaderBar(
     state: ReaderUiState,
-    onOpenPdf: () -> Unit,
+    onOpenPdf: (() -> Unit)?,
 ) {
     MaterialTheme {
         Surface(tonalElevation = 3.dp, shadowElevation = 3.dp) {
@@ -100,7 +100,9 @@ fun TopReaderBar(
                     color = if (state.busy) Color(0xFFE57700) else Color(0xFF16834A),
                     style = MaterialTheme.typography.labelSmall,
                 )
-                TextButton(onClick = onOpenPdf) { Text("PDF 열기") }
+                if (onOpenPdf != null) {
+                    TextButton(onClick = onOpenPdf) { Text("PDF 열기") }
+                }
             }
         }
     }
