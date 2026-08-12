@@ -113,3 +113,8 @@ internal data class ReviewActiveStrokeRow(
     val strokeId: String,
     val zOrder: Long,
 )
+
+internal data class RevisionPageRow(
+    val pageId: String,
+    val pageNumber: Int,
+)

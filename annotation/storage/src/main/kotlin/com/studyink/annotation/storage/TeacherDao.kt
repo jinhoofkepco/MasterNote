@@ -20,6 +20,23 @@ internal interface TeacherDao {
     @Query("SELECT * FROM teacher_prep_pages WHERE teacherId = :teacherId AND bookRevisionId = :revisionId ORDER BY pageId")
     fun observePrepPages(teacherId: String, revisionId: String): Flow<List<TeacherPrepPageEntity>>
 
+    @Query("SELECT * FROM teacher_prep_pages WHERE teacherId = :teacherId AND bookRevisionId = :revisionId ORDER BY pageId")
+    suspend fun prepPages(teacherId: String, revisionId: String): List<TeacherPrepPageEntity>
+
+    @Query("DELETE FROM teacher_prep_pages WHERE teacherId = :teacherId AND bookRevisionId = :revisionId AND pageId = :pageId")
+    suspend fun deletePrepPage(teacherId: String, revisionId: String, pageId: String): Int
+
+    @Query(
+        """
+        SELECT DISTINCT refs.pageId AS pageId, refs.pageNumber AS pageNumber
+        FROM activity_page_refs refs
+        INNER JOIN learning_activities activity ON activity.activityId = refs.activityId
+        WHERE activity.revisionId = :revisionId
+        ORDER BY refs.pageNumber
+        """
+    )
+    suspend fun revisionPages(revisionId: String): List<RevisionPageRow>
+
     @Query("SELECT * FROM submission_reviews WHERE submissionId = :submissionId AND reviewerId = :teacherId AND status = 'DRAFT' ORDER BY reviewNumber DESC LIMIT 1")
     suspend fun draftReview(submissionId: String, teacherId: String): SubmissionReviewEntity?
 

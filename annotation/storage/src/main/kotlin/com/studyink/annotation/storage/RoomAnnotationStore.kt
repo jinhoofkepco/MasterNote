@@ -40,12 +40,22 @@ class RoomAnnotationStore internal constructor(
         }
     }
 
-    suspend fun applyMutation(mutation: AnnotationMutation, attemptId: String? = null) = withContext(Dispatchers.IO) {
+    suspend fun applyMutation(mutation: AnnotationMutation, attemptId: String? = null) =
+        applyMutationInternal(mutation, attemptId, null)
+
+    suspend fun applyMutationToLayer(mutation: AnnotationMutation, layerId: String) =
+        applyMutationInternal(mutation, null, layerId)
+
+    private suspend fun applyMutationInternal(
+        mutation: AnnotationMutation,
+        attemptId: String?,
+        explicitLayerId: String?,
+    ) = withContext(Dispatchers.IO) {
         val snapshot = mutation.snapshot
         val operation = mutation.operation
         val documentId = snapshot.documentId
         val pageId = pageId(documentId, operation.pageNumber)
-        val layerId = attemptId?.let { AnnotationIds.attemptLayerId(pageId, it) } ?: layerId(pageId)
+        val layerId = explicitLayerId ?: attemptId?.let { AnnotationIds.attemptLayerId(pageId, it) } ?: layerId(pageId)
         val now = operation.createdAtEpochMillis
 
         database.withTransaction {
@@ -53,6 +63,11 @@ class RoomAnnotationStore internal constructor(
                 check(learningDao.attempt(attemptId)?.status == com.studyink.core.model.AttemptStatus.IN_PROGRESS.name) {
                     "Submitted or abandoned attempts are immutable"
                 }
+            }
+            if (explicitLayerId != null) {
+                val layer = requireNotNull(dao.layer(explicitLayerId))
+                check(!layer.locked) { "Published layers are immutable" }
+                check(layer.pageId == pageId) { "Editable layer does not belong to the stroke page" }
             }
             dao.insertDocument(
                 AnnotationDocumentEntity(
@@ -70,7 +85,7 @@ class RoomAnnotationStore internal constructor(
                     createdAtEpochMillis = now,
                 )
             )
-            if (attemptId == null) {
+            if (attemptId == null && explicitLayerId == null) {
                 dao.insertLayer(
                     AnnotationLayerEntity(
                         layerId = layerId,
@@ -82,7 +97,7 @@ class RoomAnnotationStore internal constructor(
                         createdAtEpochMillis = now,
                     )
                 )
-            } else {
+            } else if (attemptId != null) {
                 check(dao.layer(layerId)?.attemptId == attemptId) {
                     "Attempt page must be opened before writing annotations"
                 }
@@ -130,7 +145,7 @@ class RoomAnnotationStore internal constructor(
             check(dao.advanceLayerRevision(layerId, operation.baseRevision, operation.resultRevision) == 1) {
                 "Layer revision conflict for $layerId"
             }
-            if (attemptId == null) {
+            if (attemptId == null && explicitLayerId == null) {
                 check(dao.advancePageRevision(pageId, operation.baseRevision, operation.resultRevision) == 1) {
                     "Page revision conflict for $pageId"
                 }
@@ -145,6 +160,24 @@ class RoomAnnotationStore internal constructor(
                 check(dao.incrementPageRevision(pageId) == 1)
                 check(dao.incrementDocumentRevision(documentId) == 1)
             }
+        }
+    }
+
+    suspend fun loadLayers(documentId: String, layerIds: List<String>): AnnotationSnapshot = withContext(Dispatchers.IO) {
+        if (layerIds.isEmpty()) return@withContext AnnotationSnapshot.empty(documentId)
+        database.withTransaction {
+            val assets = linkedMapOf<StrokeId, StrokeAsset>()
+            dao.strokeAssetsForLayers(layerIds).forEach { entity ->
+                runCatching { entity.toDomain() }.onSuccess { assets[it.id] = it }
+            }
+            val activeIds = dao.strokesForLayers(layerIds).asSequence()
+                .filter(LayerStrokeEntity::active)
+                .map { StrokeId(it.strokeId) }
+                .filter(assets::containsKey)
+                .toSet()
+            val revisions = dao.revisionsForLayers(layerIds).groupBy(LayerPageRevisionRow::pageNumber)
+                .mapValues { (_, rows) -> rows.sumOf(LayerPageRevisionRow::currentRevision) }
+            AnnotationSnapshot(documentId, revisions.values.sum(), revisions, assets, activeIds)
         }
     }
 

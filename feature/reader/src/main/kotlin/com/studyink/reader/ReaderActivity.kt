@@ -39,6 +39,7 @@ import java.io.File
 class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private val viewModel: ReaderViewModel by viewModels()
     private val launchArgs by lazy { ReaderLaunchArgs.from(intent) }
+    private val readerScene by lazy { ReaderSceneIntentCodec.from(intent) }
     private val viewport = PdfViewportAdapter()
     private lateinit var dryInkView: DryInkView
     private lateinit var wetInkView: InProgressStrokesView
@@ -56,6 +57,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var stylusMenuExpanded by mutableStateOf(false)
     private var stylusButtonPressed = false
     private var appliedInitialAttemptId: String? = null
+    private var appliedSceneKey: String? = null
 
     private val openPdf = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -146,6 +148,12 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                     if (session != null && appliedInitialAttemptId != session.attempt.attemptId.value) {
                         appliedInitialAttemptId = session.attempt.attemptId.value
                         showPage(state.initialPageNumber)
+                    } else if (state.scene != null) {
+                        val key = "${state.scene.documentRevisionId.value}:${state.scene.initialPageId.value}:${state.scene.interactionPolicy}"
+                        if (appliedSceneKey != key) {
+                            appliedSceneKey = key
+                            showPage(state.initialPageNumber)
+                        }
                     }
                 }
             }
@@ -168,7 +176,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         dryInkView.activePage = 0
         viewport.showPage(0)
         val label = documentLabel(uri)
-        viewModel.loadDocument(uri, label, pageCount, launchArgs)
+        viewModel.loadDocument(uri, label, pageCount, launchArgs, readerScene)
         dryInkView.invalidate()
         Toast.makeText(this, "$pageCount 페이지를 열었습니다", Toast.LENGTH_SHORT).show()
     }
@@ -225,7 +233,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         topBar.setContent {
             TopReaderBar(
                 state = latestState,
-                onOpenPdf = if (launchArgs == null) {
+                onOpenPdf = if (launchArgs == null && readerScene == null) {
                     { openPdf.launch(arrayOf("application/pdf")) }
                 } else {
                     null
