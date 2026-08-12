@@ -55,6 +55,9 @@ class LibraryRepository internal constructor(private val database: AnnotationDat
     }
     suspend fun moveBook(bookId: String, folderId: String) = database.withTransaction { requireNotNull(dao.book(bookId)); requireNotNull(dao.folder(folderId)); dao.placeBook(BookPlacementEntity(bookId, folderId, dao.nextBookPosition(folderId), now())) }
     suspend fun setBookStatus(bookId: String, status: LibraryBookStatus) = database.withTransaction { val b = requireNotNull(dao.book(bookId)); dao.updateBook(b.copy(status = status.name, archivedAtEpochMillis = if (status == LibraryBookStatus.ACTIVE) null else now(), updatedAtEpochMillis = now())) }
+    suspend fun currentDocumentAssetId(bookId: String): ManagedAssetId { val book=requireNotNull(dao.book(bookId)); return ManagedAssetId(requireNotNull(dao.revisionSource(book.currentRevisionId)).documentAssetId) }
+    suspend fun hasBook(bookId:String)=dao.book(bookId)!=null
+    suspend fun registerRevisionSource(revisionId:String,documentAssetId:ManagedAssetId,sourceType:String="RAW_PDF")=database.withTransaction{if(dao.revisionSource(revisionId)==null)dao.insertRevisionSource(LibraryRevisionSourceEntity(revisionId,documentAssetId.value,documentAssetId.value,sourceType,"1.0",null,null,now()))}
 
     companion object {
         const val ROOT_ID = "ROOT"; private const val ROOT_NAME = "root"
@@ -62,6 +65,7 @@ class LibraryRepository internal constructor(private val database: AnnotationDat
         fun normalizeName(value: String) = Normalizer.normalize(cleanName(value), Normalizer.Form.NFC).lowercase(Locale.ROOT)
         private fun cleanName(value: String) = value.trim().replace(Regex("\\s+"), " ")
     }
+    fun close() = database.close()
 }
 private fun LibraryFolderEntity.model() = LibraryFolder(folderId, parentFolderId, displayName, position, deletedAtEpochMillis)
 private fun LibraryBookEntity.model() = LibraryBook(bookId, title, subtitle, coverAssetId, currentRevisionId, LibraryBookStatus.valueOf(status))

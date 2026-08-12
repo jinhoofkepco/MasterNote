@@ -22,6 +22,7 @@ dependencies {
     implementation(project(":feature:reader"))
     implementation(project(":feature:remote-session"))
     implementation(project(":annotation:storage"))
+    implementation(project(":feature:library"))
     val composeBom = platform("androidx.compose:compose-bom:2026.06.00")
     implementation(composeBom)
     implementation("androidx.activity:activity-compose:1.13.0")

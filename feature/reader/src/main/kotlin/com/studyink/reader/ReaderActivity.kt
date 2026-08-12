@@ -190,7 +190,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         }
 
         if (savedInstanceState == null) {
-            showDocument(Uri.fromFile(ensureSamplePdf()))
+            showDocument(launchArgs?.documentUri?.let(Uri::parse) ?: Uri.fromFile(ensureSamplePdf()))
         }
     }
 

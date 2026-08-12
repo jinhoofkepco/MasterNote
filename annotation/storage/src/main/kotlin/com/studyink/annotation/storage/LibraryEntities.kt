@@ -25,3 +25,9 @@ internal data class LibraryBookEntity(
     indices = [Index("folderId"), Index(value = ["folderId", "position"], unique = true)],
 )
 internal data class BookPlacementEntity(val bookId: String, val folderId: String, val position: Int, val placedAtEpochMillis: Long)
+
+@Entity(tableName = "library_revision_sources", primaryKeys = ["revisionId"], indices = [Index("documentAssetId"), Index("sourceAssetId")])
+internal data class LibraryRevisionSourceEntity(
+    val revisionId: String, val documentAssetId: String, val sourceAssetId: String, val sourceType: String,
+    val formatVersion: String, val packageId: String?, val previousRevisionId: String?, val importedAtEpochMillis: Long,
+)
