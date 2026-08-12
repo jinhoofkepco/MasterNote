@@ -34,11 +34,26 @@ fun interface LearningClock {
     fun nowEpochMillis(): Long
 }
 
+enum class SubmissionFailurePoint {
+    AFTER_SUBMISSION_INSERT,
+    AFTER_STROKE_REFERENCES,
+    AFTER_ANSWER_SNAPSHOT,
+}
+
+fun interface SubmissionFaultInjector {
+    fun check(point: SubmissionFailurePoint)
+
+    companion object {
+        val NONE = SubmissionFaultInjector {}
+    }
+}
+
 class RoomLearningRepository internal constructor(
     private val database: AnnotationDatabase,
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val clock: LearningClock = LearningClock(System::currentTimeMillis),
     private val idGenerator: LearningIdGenerator = LearningIdGenerator { UUID.randomUUID().toString() },
+    private val submissionFaultInjector: SubmissionFaultInjector = SubmissionFaultInjector.NONE,
 ) : LearningRepository {
     private val dao = database.learningDao()
     private val annotationDao = database.annotationDao()
@@ -156,14 +171,17 @@ class RoomLearningRepository internal constructor(
                     annotationRevision = dao.annotationRevisionForAttempt(attemptId.value),
                 )
             )
+            submissionFaultInjector.check(SubmissionFailurePoint.AFTER_SUBMISSION_INSERT)
             val strokes = dao.activeStrokesForAttempt(attemptId.value).map { row ->
                 SubmissionStrokeRefEntity(submissionId.value, row.pageId, row.strokeId, row.zOrder)
             }
             if (strokes.isNotEmpty()) dao.insertSubmissionStrokeRefs(strokes)
+            submissionFaultInjector.check(SubmissionFailurePoint.AFTER_STROKE_REFERENCES)
             val answers = dao.draftAnswers(attemptId.value).map { answer ->
                 SubmissionAnswerEntity(submissionId.value, answer.fieldId, answer.answerType, answer.valueJson)
             }
             if (answers.isNotEmpty()) dao.insertSubmissionAnswers(answers)
+            submissionFaultInjector.check(SubmissionFailurePoint.AFTER_ANSWER_SNAPSHOT)
             check(dao.markAttemptSubmitted(attemptId.value, now) == 1)
             submissionId
         }

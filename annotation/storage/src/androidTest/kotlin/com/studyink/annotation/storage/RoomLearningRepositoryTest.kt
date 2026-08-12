@@ -6,9 +6,11 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.studyink.annotation.engine.AnnotationDocument
 import com.studyink.core.model.ActivityPage
+import com.studyink.core.model.AnswerType
 import com.studyink.core.model.AttemptStatus
 import com.studyink.core.model.BookRevision
 import com.studyink.core.model.BookRevisionId
+import com.studyink.core.model.DraftAnswer
 import com.studyink.core.model.LearnerProfile
 import com.studyink.core.model.LearningActivity
 import com.studyink.core.model.LearningActivityId
@@ -30,6 +32,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.concurrent.atomic.AtomicLong
+import java.io.IOException
 
 @RunWith(AndroidJUnit4::class)
 class RoomLearningRepositoryTest {
@@ -126,11 +129,116 @@ class RoomLearningRepositoryTest {
         assertTrue(secondRestored.activeStrokes.isEmpty())
     }
 
-    private fun repository(vararg ids: String) = RoomLearningRepository(
+    @Test
+    fun duplicateSubmitReturnsOneImmutableSnapshotWithoutCopyingStrokeBlobs() = runTest {
+        val repository = repository("attempt-1", "submission-1", "attempt-2")
+        repository.ensureContent(seed())
+        val annotationStore = RoomAnnotationStore(database)
+        val first = repository.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+        val document = AnnotationDocument(annotationStore.load(DOCUMENT_ID, first.attempt.attemptId.value))
+        annotationStore.applyMutation(document.addStroke(stroke()), first.attempt.attemptId.value)
+        annotationStore.applyMutation(
+            document.addStroke(stroke()),
+            first.attempt.attemptId.value,
+        )
+        repository.upsertDraftAnswer(
+            DraftAnswer(first.attempt.attemptId, "answer-1", AnswerType.TEXT, "\"first\"", 2_000L)
+        )
+        val blobCountBefore = database.learningDao().strokeAssetCount()
+
+        val submitted = repository.submitAttempt(first.attempt.attemptId)
+        val duplicate = repository.submitAttempt(first.attempt.attemptId)
+
+        assertEquals(submitted, duplicate)
+        assertEquals(1, database.learningDao().submissionCountForAttempt(first.attempt.attemptId.value))
+        assertEquals(2, database.learningDao().submissionStrokeRefCount(submitted.value))
+        assertEquals(1, database.learningDao().submissionAnswerCount(submitted.value))
+        assertEquals(blobCountBefore, database.learningDao().strokeAssetCount())
+        val snapshot = repository.getSubmission(submitted)
+        assertEquals("\"first\"", snapshot.answers.single().valueJson)
+        assertEquals(2, snapshot.strokes.size)
+
+        val second = repository.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+        repository.upsertDraftAnswer(
+            DraftAnswer(second.attempt.attemptId, "answer-1", AnswerType.TEXT, "\"second\"", 3_000L)
+        )
+        assertEquals("\"first\"", repository.getSubmission(submitted).answers.single().valueJson)
+    }
+
+    @Test
+    fun everyInjectedSubmissionFailureRollsBackTheWholeTransaction() = runTest {
+        val repository = repository("attempt-1")
+        repository.ensureContent(seed())
+        val attempt = repository.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+        repository.upsertDraftAnswer(
+            DraftAnswer(attempt.attempt.attemptId, "answer", AnswerType.TEXT, "\"draft\"", 2_000L)
+        )
+        val annotationStore = RoomAnnotationStore(database)
+        val document = AnnotationDocument(annotationStore.load(DOCUMENT_ID, attempt.attempt.attemptId.value))
+        annotationStore.applyMutation(document.addStroke(stroke()), attempt.attempt.attemptId.value)
+
+        SubmissionFailurePoint.entries.forEachIndexed { index, failurePoint ->
+            val failing = repository(
+                "submission-failure-$index",
+                injector = SubmissionFaultInjector { point ->
+                    if (point == failurePoint) throw IOException("injected $point")
+                },
+            )
+            val error = runCatching { failing.submitAttempt(attempt.attempt.attemptId) }.exceptionOrNull()
+
+            assertTrue(error is IOException)
+            assertEquals(0, database.learningDao().submissionCountForAttempt(attempt.attempt.attemptId.value))
+            assertEquals(AttemptStatus.IN_PROGRESS, repository.getAttemptSession(attempt.attempt.attemptId).attempt.status)
+        }
+    }
+
+    @Test
+    fun submittedLayerRejectsFurtherMutationAndReadOnlySnapshotKeepsOriginalStroke() = runTest {
+        val repository = repository("attempt-1", "submission-1")
+        repository.ensureContent(seed())
+        val annotationStore = RoomAnnotationStore(database)
+        val attempt = repository.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+        val document = AnnotationDocument(annotationStore.load(DOCUMENT_ID, attempt.attempt.attemptId.value))
+        val original = stroke()
+        annotationStore.applyMutation(document.addStroke(original), attempt.attempt.attemptId.value)
+        val submissionId = repository.submitAttempt(attempt.attempt.attemptId)
+
+        val mutationAfterSubmit = document.addStroke(stroke())
+        val failure = runCatching {
+            annotationStore.applyMutation(mutationAfterSubmit, attempt.attempt.attemptId.value)
+        }.exceptionOrNull()
+        val submittedSnapshot = annotationStore.loadSubmission(DOCUMENT_ID, submissionId.value)
+
+        assertTrue(failure is IllegalStateException)
+        assertEquals(setOf(original.id), submittedSnapshot.activeStrokeIds)
+    }
+
+    @Test
+    fun flushFailurePreventsSubmissionTransactionFromStarting() = runTest {
+        val repository = repository("attempt-1", "unused-submission")
+        repository.ensureContent(seed())
+        val attempt = repository.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+
+        val failure = runCatching {
+            SubmitAttemptUseCase(repository).invoke(attempt.attempt.attemptId) {
+                throw IOException("flush failed")
+            }
+        }.exceptionOrNull()
+
+        assertTrue(failure is IOException)
+        assertEquals(0, database.learningDao().submissionCountForAttempt(attempt.attempt.attemptId.value))
+        assertEquals(AttemptStatus.IN_PROGRESS, repository.getAttemptSession(attempt.attempt.attemptId).attempt.status)
+    }
+
+    private fun repository(
+        vararg ids: String,
+        injector: SubmissionFaultInjector = SubmissionFaultInjector.NONE,
+    ) = RoomLearningRepository(
         database = database,
         dispatcher = Dispatchers.Unconfined,
         clock = LearningClock { now.getAndIncrement() },
         idGenerator = LearningIdGenerator(ids.iterator()::next),
+        submissionFaultInjector = injector,
     )
 
     private fun seed(profileId: ProfileId = PROFILE): LearningContentSeed = LearningContentSeed(

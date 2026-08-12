@@ -141,6 +141,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 viewModel.uiState.collect { state ->
                     latestState = state
                     dryInkView.snapshot = state.snapshot
+                    inputView.visibility = if (state.readOnly) View.INVISIBLE else View.VISIBLE
                     val session = state.attemptSession
                     if (session != null && appliedInitialAttemptId != session.attempt.attemptId.value) {
                         appliedInitialAttemptId = session.attempt.attemptId.value
@@ -183,6 +184,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private fun selectTool(tool: ReaderTool) {
+        if (latestState.readOnly) return
         selectedTool = tool
         inputView.tool = tool
         inputView.visibility = View.VISIBLE
@@ -225,6 +227,19 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 state = latestState,
                 onOpenPdf = if (launchArgs == null) {
                     { openPdf.launch(arrayOf("application/pdf")) }
+                } else {
+                    null
+                },
+                onSubmit = if (latestState.attemptSession != null && !latestState.readOnly) {
+                    {
+                        viewModel.submit { submissionId ->
+                            setResult(
+                                RESULT_OK,
+                                android.content.Intent().putExtra("submissionId", submissionId.value),
+                            )
+                            finish()
+                        }
+                    }
                 } else {
                     null
                 },
@@ -280,6 +295,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private fun handleStylusButton(event: MotionEvent): Boolean {
+        if (latestState.readOnly) return false
         val isStylus = event.isFromSource(InputDevice.SOURCE_STYLUS) ||
             (0 until event.pointerCount).any { index ->
                 val type = event.getToolType(index)

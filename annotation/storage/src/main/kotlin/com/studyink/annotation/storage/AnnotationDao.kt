@@ -94,6 +94,16 @@ internal interface AnnotationDao {
     )
     suspend fun attemptLayerRevisions(attemptId: String): List<LayerPageRevisionRow>
 
+    @Query(
+        """
+        SELECT stroke_assets.* FROM submission_stroke_refs
+        INNER JOIN stroke_assets ON stroke_assets.strokeId = submission_stroke_refs.strokeId
+        WHERE submission_stroke_refs.submissionId = :submissionId
+        ORDER BY submission_stroke_refs.pageId, submission_stroke_refs.zOrder
+        """
+    )
+    suspend fun submissionStrokeAssets(submissionId: String): List<StrokeAssetEntity>
+
     @Query("SELECT COALESCE(MAX(zOrder), -1) FROM layer_strokes WHERE layerId = :layerId")
     suspend fun maxZOrder(layerId: String): Long
 

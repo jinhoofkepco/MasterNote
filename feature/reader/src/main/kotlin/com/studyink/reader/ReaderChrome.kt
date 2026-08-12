@@ -81,6 +81,7 @@ private enum class RadialMenuPage { MAIN, COLORS, PEN }
 fun TopReaderBar(
     state: ReaderUiState,
     onOpenPdf: (() -> Unit)?,
+    onSubmit: (() -> Unit)? = null,
 ) {
     MaterialTheme {
         Surface(tonalElevation = 3.dp, shadowElevation = 3.dp) {
@@ -102,6 +103,9 @@ fun TopReaderBar(
                 )
                 if (onOpenPdf != null) {
                     TextButton(onClick = onOpenPdf) { Text("PDF 열기") }
+                }
+                if (onSubmit != null) {
+                    TextButton(onClick = onSubmit, enabled = !state.busy) { Text("답안 제출") }
                 }
             }
         }

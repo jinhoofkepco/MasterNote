@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.studyink.annotation.engine.AnnotationDocument
 import com.studyink.annotation.storage.RoomAnnotationStore
 import com.studyink.annotation.storage.RoomLearningRepository
+import com.studyink.annotation.storage.SubmitAttemptUseCase
 import com.studyink.core.model.AnnotationMutation
 import com.studyink.core.model.AnnotationSnapshot
 import com.studyink.core.model.AttemptId
@@ -14,6 +15,7 @@ import com.studyink.core.model.AttemptSession
 import com.studyink.core.model.PageId
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
+import com.studyink.core.model.SubmissionId
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -36,6 +38,8 @@ data class ReaderUiState(
     val lastSavedAtEpochMillis: Long? = null,
     val attemptSession: AttemptSession? = null,
     val initialPageNumber: Int = 0,
+    val readOnly: Boolean = false,
+    val submissionId: SubmissionId? = null,
 )
 
 class ReaderViewModel(application: Application) : AndroidViewModel(application) {
@@ -57,6 +61,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         data class Flush(val completion: CompletableDeferred<Unit>) : Command
         data class PreparePage(val attemptId: AttemptId, val pageId: PageId) : Command
         data class PersistResumePage(val attemptId: AttemptId, val pageId: PageId) : Command
+        data class Submit(val onSubmitted: (SubmissionId) -> Unit) : Command
     }
 
     private val commands = Channel<Command>(Channel.UNLIMITED)
@@ -80,9 +85,13 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     is Command.Mutate -> handleMutation(command)
                     is Command.Flush -> {
                         resumePageJob?.cancel()
-                        persistSelectedPage()
-                        runCatching { annotationStore().flush() }
-                        command.completion.complete(Unit)
+                        runCatching {
+                            if (!_uiState.value.readOnly) persistSelectedPageOrThrow()
+                            annotationStore().flush()
+                        }.fold(
+                            onSuccess = { command.completion.complete(Unit) },
+                            onFailure = command.completion::completeExceptionally,
+                        )
                     }
                     is Command.PreparePage -> runCatching {
                         learningRepository().prepareAttemptPage(command.attemptId, command.pageId)
@@ -90,6 +99,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     is Command.PersistResumePage -> runCatching {
                         learningRepository().updateResumePage(command.attemptId, command.pageId)
                     }
+                    is Command.Submit -> handleSubmit(command)
                 }
             }
         }
@@ -114,6 +124,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun onPageSelected(pageNumber: Int) {
+        if (_uiState.value.readOnly) return
         val session = activeSession ?: return
         val page = session.pages.firstOrNull { it.pageNumber == pageNumber } ?: return
         selectedPageId = page.pageId
@@ -143,6 +154,12 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     fun undo() = enqueueMutation("되돌리는 중…") { undo() }
     fun redo() = enqueueMutation("다시 실행 중…") { redo() }
 
+    fun submit(onSubmitted: (SubmissionId) -> Unit) {
+        if (_uiState.value.readOnly || activeAttemptId == null) return
+        _uiState.value = _uiState.value.copy(busy = true, status = "제출 준비 중…")
+        check(commands.trySend(Command.Submit(onSubmitted)).isSuccess)
+    }
+
     suspend fun flush() {
         val completion = CompletableDeferred<Unit>()
         commands.send(Command.Flush(completion))
@@ -150,7 +167,11 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun flushAsync() {
-        viewModelScope.launch { flush() }
+        viewModelScope.launch {
+            runCatching { flush() }.onFailure { error ->
+                _uiState.value = _uiState.value.copy(status = "저장 실패: ${error.message}")
+            }
+        }
     }
 
     private fun enqueueMutation(
@@ -158,6 +179,10 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         onComplete: (() -> Unit)? = null,
         block: AnnotationDocument.() -> AnnotationMutation?,
     ) {
+        if (_uiState.value.readOnly) {
+            onComplete?.invoke()
+            return
+        }
         val pending = pendingOperations.incrementAndGet()
         _uiState.value = _uiState.value.copy(
             pendingSaveOperations = pending,
@@ -168,24 +193,29 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
 
     private suspend fun handleLoad(command: Command.LoadDocument) {
         val loadResult = runCatching {
+            val launchArgs = command.launchArgs
             val documentId = withContext(Dispatchers.IO) {
                 DocumentIdentity.create(getApplication(), command.uri)
             }
-            val session = command.launchArgs?.let { args ->
+            val session = launchArgs?.let { args ->
                 learningRepository().getAttemptSession(args.attemptId).also {
                     check(it.attempt.profileId == args.profileId)
                     check(it.attempt.activityId == args.activityId)
                     check(it.documentId == documentId) { "Activity PDF does not match its book revision" }
                 }
             }
-            val initialPageId = command.launchArgs?.initialPageId
+            val initialPageId = launchArgs?.initialPageId
                 ?.takeIf { requested -> session?.pages?.any { it.pageId == requested } == true }
                 ?: session?.initialPageId
-            if (session != null && initialPageId != null) {
+            if (session != null && initialPageId != null && launchArgs.submissionId == null) {
                 learningRepository().prepareAttemptPage(session.attempt.attemptId, initialPageId)
             }
             Triple(
-                annotationStore().load(documentId, session?.attempt?.attemptId?.value),
+                if (launchArgs?.submissionId != null) {
+                    annotationStore().loadSubmission(documentId, launchArgs.submissionId.value)
+                } else {
+                    annotationStore().load(documentId, session?.attempt?.attemptId?.value)
+                },
                 session,
                 initialPageId,
             )
@@ -213,6 +243,9 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             pendingSaveOperations = pendingOperations.get(),
             attemptSession = session,
             initialPageNumber = initialPageNumber,
+            readOnly = command.launchArgs?.submissionId != null ||
+                (session != null && session.attempt.status != com.studyink.core.model.AttemptStatus.IN_PROGRESS),
+            submissionId = command.launchArgs?.submissionId,
         )
     }
 
@@ -263,6 +296,31 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         withContext(Dispatchers.Main.immediate) { command.onComplete?.invoke() }
     }
 
+    private suspend fun handleSubmit(command: Command.Submit) {
+        val attemptId = activeAttemptId ?: return
+        resumePageJob?.cancel()
+        val result = runCatching {
+            SubmitAttemptUseCase(learningRepository()).invoke(attemptId) {
+                persistSelectedPageOrThrow()
+                annotationStore().flush()
+            }
+        }
+        result.onSuccess { submissionId ->
+            _uiState.value = _uiState.value.copy(
+                busy = false,
+                readOnly = true,
+                submissionId = submissionId,
+                status = "제출 완료",
+            )
+            withContext(Dispatchers.Main.immediate) { command.onSubmitted(submissionId) }
+        }.onFailure { error ->
+            _uiState.value = _uiState.value.copy(
+                busy = false,
+                status = "제출 실패: ${error.message}",
+            )
+        }
+    }
+
     private suspend fun annotationStore(): RoomAnnotationStore {
         store?.let { return it }
         return RoomAnnotationStore.open(getApplication()).also { store = it }
@@ -273,10 +331,10 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         return RoomLearningRepository.open(getApplication()).also { learningStore = it }
     }
 
-    private suspend fun persistSelectedPage() {
+    private suspend fun persistSelectedPageOrThrow() {
         val attemptId = activeAttemptId ?: return
         val pageId = selectedPageId ?: return
-        runCatching { learningRepository().updateResumePage(attemptId, pageId) }
+        learningRepository().updateResumePage(attemptId, pageId)
     }
 
     private companion object {

@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
+import android.view.View
 import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
@@ -13,7 +14,9 @@ import com.studyink.annotation.storage.OpenActivityUseCase
 import com.studyink.annotation.storage.RoomLearningRepository
 import com.studyink.core.model.LearningActivityId
 import com.studyink.core.model.ProfileId
+import com.studyink.core.model.SubmissionId
 import com.studyink.reader.DryInkView
+import com.studyink.reader.InkInputView
 import com.studyink.reader.ReaderActivity
 import com.studyink.reader.ReaderLaunchArgs
 import com.studyink.reader.ReaderViewModel
@@ -84,12 +87,58 @@ class ReaderAttemptSessionTest {
         }
     }
 
-    private fun launch(attemptId: String, initialPageId: String) {
+    @Test
+    fun submittedAttemptReopensAsAnImmutableReadOnlySnapshot() {
+        runBlocking {
+            val session = OpenActivityUseCase(repository)(
+                ProfileId(SampleLearningContent.PROFILE_ID),
+                LearningActivityId("sample-review"),
+            )
+            launch(session.attempt.attemptId.value, session.initialPageId.value)
+            waitForReady(expectedPage = 0)
+            dispatchStylusStroke()
+
+            var submittedId: SubmissionId? = null
+            scenario!!.onActivity { activity ->
+                ViewModelProvider(activity)[ReaderViewModel::class.java].submit { submittedId = it }
+            }
+            for (attempt in 0 until 100) {
+                if (submittedId != null) break
+                SystemClock.sleep(100)
+            }
+            val submissionId = checkNotNull(submittedId) { "제출이 완료되지 않았습니다" }
+            assertEquals(submissionId, repository.submitAttempt(session.attempt.attemptId))
+            assertEquals(1, repository.getSubmission(submissionId).strokes.size)
+
+            scenario!!.close()
+            scenario = null
+            launch(
+                session.attempt.attemptId.value,
+                session.initialPageId.value,
+                submissionId,
+            )
+            waitForReady(expectedPage = 0)
+            scenario!!.onActivity { activity ->
+                val state = ViewModelProvider(activity)[ReaderViewModel::class.java].uiState.value
+                assertTrue(state.readOnly)
+                assertEquals(submissionId, state.submissionId)
+                assertEquals(1, activity.findDryInkView().snapshot.activeStrokes.size)
+                assertEquals(View.INVISIBLE, activity.findInkInputView().visibility)
+            }
+        }
+    }
+
+    private fun launch(
+        attemptId: String,
+        initialPageId: String,
+        submissionId: SubmissionId? = null,
+    ) {
         val intent = ReaderLaunchArgs(
             profileId = ProfileId(SampleLearningContent.PROFILE_ID),
             activityId = LearningActivityId("sample-review"),
             attemptId = com.studyink.core.model.AttemptId(attemptId),
             initialPageId = com.studyink.core.model.PageId(initialPageId),
+            submissionId = submissionId,
         ).putInto(Intent(context, ReaderActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         scenario = ActivityScenario.launch(intent)
     }
@@ -179,5 +228,18 @@ class ReaderAttemptSessionTest {
             }
         }
         throw AssertionError("DryInkView를 찾을 수 없습니다")
+    }
+
+    private fun ReaderActivity.findInkInputView(): InkInputView {
+        val root = findViewById<android.view.ViewGroup>(android.R.id.content)
+        val queue = ArrayDeque<android.view.View>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            when (val view = queue.removeFirst()) {
+                is InkInputView -> return view
+                is android.view.ViewGroup -> (0 until view.childCount).forEach { queue.add(view.getChildAt(it)) }
+            }
+        }
+        throw AssertionError("InkInputView를 찾을 수 없습니다")
     }
 }
