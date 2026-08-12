@@ -31,6 +31,7 @@ dependencies {
     val roomVersion = "2.8.4"
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.room:room-ktx:$roomVersion")
+    implementation("androidx.core:core-ktx:1.17.0")
     ksp("androidx.room:room-compiler:$roomVersion")
 
     implementation("androidx.ink:ink-brush:1.0.0")

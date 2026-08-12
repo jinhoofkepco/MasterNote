@@ -1,5 +1,16 @@
 # Third-party notice ledger
 
+## Android platform samples
+
+Patterns from `android/platform-samples` commit `f751f682aa96a061a39ed4399c697ba513ac93d6`
+were inspected for Activity Result and FileProvider integration. Licensed under Apache-2.0. No
+source was copied.
+
+## Android Browser Helper
+
+Patterns from `GoogleChrome/android-browser-helper` commit
+`a3638f23537189f82165ff96fb2a60431b03f34c` were inspected for Custom Tabs lifecycle management.
+Licensed under Apache-2.0. No source was copied.
 The canonical human-readable notices currently live in `THIRD_PARTY_NOTICES.md`.
 
 ## Annotation persistence
