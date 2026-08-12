@@ -169,7 +169,16 @@ internal interface LearningDao {
                 ORDER BY latest.updatedAtEpochMillis DESC, latest.attemptNumber DESC LIMIT 1
             ) AS latestAttemptId,
             MAX(attempt.updatedAtEpochMillis) AS lastOpenedAtEpochMillis,
-            MAX(attempt.submittedAtEpochMillis) AS lastSubmittedAtEpochMillis
+            MAX(attempt.submittedAtEpochMillis) AS lastSubmittedAtEpochMillis,
+            (
+                SELECT review.decision FROM submission_reviews review
+                INNER JOIN submissions reviewed_submission ON reviewed_submission.submissionId = review.submissionId
+                INNER JOIN attempts reviewed_attempt ON reviewed_attempt.attemptId = reviewed_submission.attemptId
+                WHERE reviewed_attempt.profileId = :profileId
+                  AND reviewed_attempt.activityId = activity.activityId
+                  AND review.status = 'PUBLISHED'
+                ORDER BY review.publishedAtEpochMillis DESC, review.reviewNumber DESC LIMIT 1
+            ) AS latestReviewDecision
         FROM learning_activities activity
         LEFT JOIN attempts attempt
           ON attempt.activityId = activity.activityId AND attempt.profileId = :profileId
@@ -191,4 +200,17 @@ internal interface LearningDao {
 
     @Query("SELECT COUNT(*) FROM stroke_assets")
     suspend fun strokeAssetCount(): Int
+
+    @Query(
+        """
+        SELECT review.reviewId AS reviewId, review.decision AS decision
+        FROM submission_reviews review
+        INNER JOIN submissions submission ON submission.submissionId = review.submissionId
+        INNER JOIN attempts attempt ON attempt.attemptId = submission.attemptId
+        WHERE attempt.profileId = :profileId AND attempt.activityId = :activityId
+          AND review.status = 'PUBLISHED'
+        ORDER BY review.publishedAtEpochMillis DESC, review.reviewNumber DESC LIMIT 1
+        """
+    )
+    suspend fun latestPublishedReview(profileId: String, activityId: String): LatestReviewRow?
 }

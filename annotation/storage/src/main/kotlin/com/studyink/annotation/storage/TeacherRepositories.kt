@@ -13,6 +13,7 @@ import com.studyink.core.model.TeacherId
 import com.studyink.core.model.TeacherPrepPage
 import com.studyink.core.model.TeacherPreparationSession
 import kotlinx.coroutines.flow.Flow
+import com.studyink.core.model.ReviewQueueItem
 
 interface TeacherPreparationRepository {
     suspend fun getPreparationSession(teacherId: TeacherId, bookRevisionId: BookRevisionId, initialPageId: PageId? = null): TeacherPreparationSession
@@ -32,6 +33,7 @@ interface TeacherReviewRepository {
     suspend fun cancelDraftReview(reviewId: ReviewId)
     suspend fun publishReview(reviewId: ReviewId, decision: ReviewDecision): PublishedReview
     suspend fun getPublishedReview(reviewId: ReviewId): PublishedReview
+    fun observeReviewQueue(teacherId: TeacherId): Flow<List<ReviewQueueItem>>
 }
 
 enum class ReviewPublishPhase { AFTER_REFS, AFTER_LAYER_LOCK, BEFORE_STATUS_CHANGE }

@@ -236,7 +236,10 @@ internal data class ActivityProgressRow(
     val latestAttemptId: String?,
     val lastOpenedAtEpochMillis: Long?,
     val lastSubmittedAtEpochMillis: Long?,
+    val latestReviewDecision: String?,
 )
+
+internal data class LatestReviewRow(val reviewId: String, val decision: String)
 
 internal data class AttemptActiveStrokeRow(
     val pageId: String,

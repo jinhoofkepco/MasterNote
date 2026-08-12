@@ -77,3 +77,17 @@ data class PublishedReview(
     val strokes: List<SubmissionStroke>,
     val evaluations: List<ReviewAnswerEvaluation>,
 )
+
+data class ReviewQueueItem(
+    val submissionId: SubmissionId,
+    val attemptId: AttemptId,
+    val profileId: ProfileId,
+    val learnerName: String,
+    val bookTitle: String,
+    val activityTitle: String,
+    val attemptNumber: Int,
+    val submittedAtEpochMillis: Long,
+    val status: TeacherQueueStatus,
+    val latestReviewId: ReviewId?,
+    val lastVisitedPageId: PageId?,
+)

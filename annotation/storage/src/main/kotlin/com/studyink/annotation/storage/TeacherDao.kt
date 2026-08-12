@@ -104,4 +104,35 @@ internal interface TeacherDao {
 
     @Query("SELECT attempts.* FROM submissions INNER JOIN attempts ON attempts.attemptId = submissions.attemptId WHERE submissions.submissionId = :submissionId")
     suspend fun attemptForSubmission(submissionId: String): AttemptEntity?
+
+    @Query(
+        """
+        SELECT submission.submissionId AS submissionId,
+               attempt.attemptId AS attemptId,
+               attempt.profileId AS profileId,
+               profile.displayName AS learnerName,
+               revision.title AS bookTitle,
+               activity.title AS activityTitle,
+               attempt.attemptNumber AS attemptNumber,
+               submission.submittedAtEpochMillis AS submittedAtEpochMillis,
+               review.reviewId AS reviewId,
+               review.status AS reviewStatus,
+               review.decision AS reviewDecision,
+               review.lastVisitedPageId AS lastVisitedPageId
+        FROM submissions submission
+        INNER JOIN attempts attempt ON attempt.attemptId = submission.attemptId
+        INNER JOIN learner_profiles profile ON profile.profileId = attempt.profileId
+        INNER JOIN learning_activities activity ON activity.activityId = attempt.activityId
+        INNER JOIN book_revisions revision ON revision.revisionId = attempt.revisionId
+        LEFT JOIN submission_reviews review ON review.reviewId = (
+            SELECT candidate.reviewId FROM submission_reviews candidate
+            WHERE candidate.submissionId = submission.submissionId
+              AND candidate.reviewerId = :teacherId
+              AND candidate.status != 'CANCELLED'
+            ORDER BY candidate.reviewNumber DESC LIMIT 1
+        )
+        ORDER BY submission.submittedAtEpochMillis DESC
+        """
+    )
+    fun observeReviewQueue(teacherId: String): Flow<List<ReviewQueueRow>>
 }

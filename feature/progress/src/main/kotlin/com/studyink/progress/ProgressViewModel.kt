@@ -7,6 +7,7 @@ import com.studyink.annotation.storage.OpenActivityUseCase
 import com.studyink.annotation.storage.RoomLearningRepository
 import com.studyink.core.model.LearningActivityId
 import com.studyink.core.model.ProfileId
+import com.studyink.core.model.ActivityProgressState
 import com.studyink.reader.ReaderLaunchArgs
 import com.studyink.reader.SampleLearningContent
 import kotlinx.coroutines.CancellationException
@@ -34,6 +35,7 @@ data class ActivityProgressUi(
     val title: String,
     val markerCount: Int,
     val hasDraftMarker: Boolean,
+    val state: ActivityProgressState,
     val enabled: Boolean = true,
 )
 
@@ -89,6 +91,7 @@ class ProgressViewModel(application: Application) : AndroidViewModel(application
                                     title = progress.title,
                                     markerCount = progress.submissionCount,
                                     hasDraftMarker = progress.hasDraft,
+                                    state = progress.state,
                                 )
                             },
                         )
