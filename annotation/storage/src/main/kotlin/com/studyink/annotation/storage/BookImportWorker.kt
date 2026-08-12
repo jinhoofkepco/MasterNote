@@ -39,15 +39,18 @@ class BookImportRepository internal constructor(private val context: Context, pr
                 session=requireNotNull(dao.session(id)).copy(managedAssetId=imported.assetId.value,detectedSourceType=type.name,progressCurrent=imported.byteSize,progressTotal=imported.byteSize,title=imported.originalFileName.substringBeforeLast('.'),updatedAtEpochMillis=now()); dao.update(session)
             }
             session=requireNotNull(dao.session(id)); val type=ImportSourceType.valueOf(requireNotNull(session.detectedSourceType))
-            if (type != ImportSourceType.RAW_PDF) { update(session, ImportState.WAITING_USER_CONFIRMATION); return@withContext }
-            update(session, ImportState.PROBING_DOCUMENT)
-            val handle=assets.open(ManagedAssetId(requireNotNull(session.managedAssetId))); require((handle.asset.pageCount ?: 0)>0) { "IMPORT_PDF_PROBE_FAILED" }
+            update(session, if(type==ImportSourceType.RAW_IMAGE_ZIP) ImportState.INVENTORY else ImportState.PROBING_DOCUMENT)
+            val sourceHandle=assets.open(ManagedAssetId(requireNotNull(session.managedAssetId))); require((sourceHandle.asset.pageCount ?: 0)>0) { "IMPORT_DOCUMENT_PROBE_FAILED" }
             if (!session.confirmed) { update(requireNotNull(dao.session(id)),ImportState.WAITING_USER_CONFIRMATION); return@withContext }
             update(requireNotNull(dao.session(id)),ImportState.MATERIALIZING)
+            val handle = if (type == ImportSourceType.RAW_IMAGE_ZIP) {
+                val generated=java.io.File(context.cacheDir,"imports/$id.pdf")
+                try { ImageZipImporter.materialize(sourceHandle.file,generated); val asset=java.io.FileInputStream(generated).use { assets.importStream(it,"${session.title ?: "images"}.pdf","application/pdf") }; assets.open(asset.assetId) } finally { generated.delete() }
+            } else sourceHandle
             val bookId=session.bookId ?: UUID.randomUUID().toString(); val revisionId=session.revisionId ?: UUID.randomUUID().toString(); val documentId=documentIdentity(handle.file)
             update(requireNotNull(dao.session(id)).copy(bookId=bookId,revisionId=revisionId),ImportState.COMMITTING)
             database.withTransaction {
-                check(database.learningDao().insertBookRevision(BookRevisionEntity(revisionId,bookId,documentId,1,handle.asset.sha256,session.title ?: "가져온 책",now())) != -1L)
+                check(database.learningDao().insertBookRevision(BookRevisionEntity(revisionId,bookId,documentId,1,sourceHandle.asset.sha256,session.title ?: "가져온 책",now())) != -1L)
                 val activityId="$revisionId:all"; database.learningDao().insertActivity(LearningActivityEntity(activityId,revisionId,"전체 학습",0,"INK_AND_STRUCTURED"))
                 database.learningDao().insertActivityPages((0 until requireNotNull(handle.asset.pageCount)).map { ActivityPageRefEntity(activityId,"$documentId:page:$it",it,it) })
                 val library=LibraryRepository(database,now); library.ensureRoot(); library.registerBook(bookId,session.title ?: "가져온 책",revisionId,session.requestedFolderId)
