@@ -13,6 +13,8 @@
 | Submission transaction rollback | `RoomLearningRepositoryTest.everyInjectedSubmissionFailureRollsBackTheWholeTransaction` | interrupt submission during a diagnostic fault run |
 | Flush failure blocks submission | `RoomLearningRepositoryTest.flushFailurePreventsSubmissionTransactionFromStarting` | simulate unavailable storage before submit |
 | Immutable read-only submission | repository and `ReaderAttemptSessionTest.submittedAttemptReopensAsAnImmutableReadOnlySnapshot` | submit, reopen snapshot, attempt to write |
+| Progress projection 0/□/■/■□/■■■ | `RoomLearningRepositoryTest.progressIsProjectedFromAttemptsAndSubmissionsWithoutMutableCounters` | submit three attempts and compare markers |
+| Vertical activity → Reader → submit flow | `ProgressFlowTest.activityCreatesAttemptSubmitsAndUpdatesProgressProjection` | open Unit 1, submit, return to list |
 | Partial erase is atomic | success and injected-failure tests in `RoomAnnotationStoreTest` | erase repeatedly, force-stop immediately |
 | Undo restores original asset | `AnnotationDocumentTest.undoAfterPartialEraseRestoresTheImmutableOriginalStroke` | erase, undo, force-stop, reopen |
 | One corrupt payload is isolated | `corruptStrokeBlobIsSkippedWithoutBlockingOtherStrokes` | import diagnostic corrupt fixture |

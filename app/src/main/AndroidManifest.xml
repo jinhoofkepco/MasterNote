@@ -8,6 +8,10 @@
         <activity
             android:name="com.studyink.reader.ReaderActivity"
             android:configChanges="keyboardHidden|orientation|screenSize"
+            android:exported="false"
+            android:screenOrientation="fullSensor" />
+        <activity
+            android:name="com.studyink.progress.ProgressActivity"
             android:exported="true"
             android:screenOrientation="fullSensor">
             <intent-filter>

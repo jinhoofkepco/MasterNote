@@ -38,6 +38,7 @@ internal abstract class AnnotationDatabase : RoomDatabase() {
 
         fun open(context: Context): AnnotationDatabase =
             Room.databaseBuilder(context.applicationContext, AnnotationDatabase::class.java, NAME)
+                .enableMultiInstanceInvalidation()
                 .build()
     }
 }
