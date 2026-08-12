@@ -25,6 +25,12 @@ import com.studyink.remote.protocol.wire.SessionRejected
 import com.studyink.remote.protocol.wire.StrokeAsset
 import com.studyink.remote.protocol.wire.StrokePoint
 import com.studyink.remote.protocol.wire.ViewportState
+import com.studyink.remote.protocol.wire.ResourceOffer
+import com.studyink.remote.protocol.wire.ResourceNeed
+import com.studyink.remote.protocol.wire.ResourceChunk
+import com.studyink.remote.protocol.wire.ResourceReady
+import com.studyink.remote.protocol.wire.PresentResource
+import com.studyink.remote.protocol.wire.DismissResource
 
 interface RemoteMessageCodec {
     fun encode(envelope: RemoteEnvelope): ByteArray
@@ -35,7 +41,7 @@ class ProtobufRemoteMessageCodec : RemoteMessageCodec {
     override fun encode(envelope: RemoteEnvelope): ByteArray {
         val bytes = envelope.toWire().toByteArray()
         if (bytes.size > MAX_MESSAGE_BYTES) throw RemoteProtocolException("Message exceeds $MAX_MESSAGE_BYTES bytes")
-        if (envelope.payload !is RemoteCheckpointChunk && bytes.size > MAX_GENERAL_MESSAGE_BYTES) {
+        if (envelope.payload !is RemoteCheckpointChunk && envelope.payload !is RemoteResourceChunk && bytes.size > MAX_GENERAL_MESSAGE_BYTES) {
             throw RemoteProtocolException("General message exceeds $MAX_GENERAL_MESSAGE_BYTES bytes")
         }
         return bytes
@@ -48,7 +54,7 @@ class ProtobufRemoteMessageCodec : RemoteMessageCodec {
         }
         if (wire.protocolVersion <= 0) throw RemoteProtocolException("Missing protocol version")
         return wire.toDomain().also {
-            if (it.payload !is RemoteCheckpointChunk && bytes.size > MAX_GENERAL_MESSAGE_BYTES) {
+            if (it.payload !is RemoteCheckpointChunk && it.payload !is RemoteResourceChunk && bytes.size > MAX_GENERAL_MESSAGE_BYTES) {
                 throw RemoteProtocolException("General message exceeds $MAX_GENERAL_MESSAGE_BYTES bytes")
             }
         }
@@ -112,6 +118,12 @@ private fun RemoteEnvelope.toWire(): Envelope {
         is RemotePing -> builder.ping = Ping.newBuilder().setNonce(value.nonce).build()
         is RemotePong -> builder.pong = Pong.newBuilder().setNonce(value.nonce).build()
         is RemoteProtocolError -> builder.protocolError = ProtocolError.newBuilder().setCode(value.code).setMessage(value.message).build()
+        is RemoteResourceOffer -> builder.resourceOffer = ResourceOffer.newBuilder().setAssetHash(value.assetHash).setMimeType(value.mimeType).setTitle(value.title).setByteSize(value.byteSize).build()
+        is RemoteResourceNeed -> builder.resourceNeed = ResourceNeed.newBuilder().setAssetHash(value.assetHash).build()
+        is RemoteResourceChunk -> builder.resourceChunk = ResourceChunk.newBuilder().setTransferId(value.transferId).setAssetHash(value.assetHash).setChunkIndex(value.chunkIndex).setChunkCount(value.chunkCount).setData(ByteString.copyFrom(value.data)).build()
+        is RemoteResourceReady -> builder.resourceReady = ResourceReady.newBuilder().setAssetHash(value.assetHash).build()
+        is RemotePresentResource -> builder.presentResource = PresentResource.newBuilder().setAssetHash(value.assetHash).setTitle(value.title).setTextContent(value.textContent).setMimeType(value.mimeType).build()
+        is RemoteDismissResource -> builder.dismissResource = DismissResource.newBuilder().setAssetHash(value.assetHash).build()
     }
     return builder.build()
 }
@@ -158,6 +170,12 @@ private fun Envelope.toDomain() = RemoteEnvelope(
         Envelope.PayloadCase.PING -> RemotePing(ping.nonce)
         Envelope.PayloadCase.PONG -> RemotePong(pong.nonce)
         Envelope.PayloadCase.PROTOCOL_ERROR -> RemoteProtocolError(protocolError.code, protocolError.message)
+        Envelope.PayloadCase.RESOURCE_OFFER -> RemoteResourceOffer(resourceOffer.assetHash, resourceOffer.mimeType, resourceOffer.title, resourceOffer.byteSize)
+        Envelope.PayloadCase.RESOURCE_NEED -> RemoteResourceNeed(resourceNeed.assetHash)
+        Envelope.PayloadCase.RESOURCE_CHUNK -> RemoteResourceChunk(resourceChunk.transferId, resourceChunk.assetHash, resourceChunk.chunkIndex, resourceChunk.chunkCount, resourceChunk.data.toByteArray())
+        Envelope.PayloadCase.RESOURCE_READY -> RemoteResourceReady(resourceReady.assetHash)
+        Envelope.PayloadCase.PRESENT_RESOURCE -> RemotePresentResource(presentResource.assetHash, presentResource.title, presentResource.textContent, presentResource.mimeType)
+        Envelope.PayloadCase.DISMISS_RESOURCE -> RemoteDismissResource(dismissResource.assetHash)
         else -> throw RemoteProtocolException("Missing or unknown payload")
     },
 )

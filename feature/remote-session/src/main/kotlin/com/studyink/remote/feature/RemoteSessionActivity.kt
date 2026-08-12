@@ -19,6 +19,10 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.studyink.remote.session.RemoteSessionRole
 import kotlinx.coroutines.launch
 import java.util.UUID
+import android.app.Dialog
+import android.graphics.BitmapFactory
+import android.view.Gravity
+import android.widget.ImageView
 
 class RemoteSessionActivity : ComponentActivity() {
     private lateinit var status: TextView
@@ -94,6 +98,36 @@ class RemoteSessionActivity : ComponentActivity() {
                 }
             }
         }
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                RemoteSessionRuntime.presentedResource.collect { resource ->
+                    if (resource != null && role == RemoteSessionRole.STUDENT) showResource(resource)
+                }
+            }
+        }
+    }
+
+    private var resourceDialog: Dialog? = null
+    private fun showResource(resource: RemotePresentedResource) {
+        resourceDialog?.dismiss()
+        val dialog = Dialog(this).apply dialog@ {
+            setTitle(resource.title)
+            val content = LinearLayout(this@RemoteSessionActivity).apply {
+                orientation = LinearLayout.VERTICAL; setPadding(32, 24, 32, 24); gravity = Gravity.CENTER
+                addView(TextView(context).apply { text = resource.title; textSize = 22f })
+                if (resource.text.isNotBlank()) addView(TextView(context).apply { text = resource.text; textSize = 18f; setPadding(0, 20, 0, 20) })
+                resource.imageFile?.let { file -> addView(ImageView(context).apply { adjustViewBounds = true; setImageBitmap(BitmapFactory.decodeFile(file.path)) }) }
+                addView(Button(context).apply { text = "닫기"; setOnClickListener {
+                    this@dialog.dismiss()
+                    RemoteSessionRuntime.dismiss(resource.assetHash)
+                    lifecycleScope.launch { RemoteSessionRuntime.dismissTeachingResource(resource.assetHash) }
+                } })
+            }
+            setContentView(content)
+            setOnDismissListener { resourceDialog = null }
+        }
+        resourceDialog = dialog
+        dialog.show()
     }
 
     private var pendingSessionCode: String? = null

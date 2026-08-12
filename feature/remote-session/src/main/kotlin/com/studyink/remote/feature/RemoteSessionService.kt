@@ -28,6 +28,12 @@ import com.studyink.remote.protocol.RemoteViewportState
 import com.studyink.remote.protocol.RemotePageDigest
 import com.studyink.remote.protocol.RemoteCheckpointRequest
 import com.studyink.remote.protocol.RemoteCheckpointChunk
+import com.studyink.remote.protocol.RemoteResourceOffer
+import com.studyink.remote.protocol.RemoteResourceNeed
+import com.studyink.remote.protocol.RemoteResourceChunk
+import com.studyink.remote.protocol.RemoteResourceReady
+import com.studyink.remote.protocol.RemotePresentResource
+import com.studyink.remote.protocol.RemoteDismissResource
 import com.studyink.remote.sync.DurableOutboxSender
 import com.studyink.remote.sync.DurableReceiveResult
 import com.studyink.remote.sync.DurableReceiver
@@ -38,6 +44,9 @@ import com.studyink.remote.sync.CheckpointProducer
 import com.studyink.remote.sync.CheckpointReceiveResult
 import com.studyink.remote.sync.matches
 import com.studyink.remote.sync.pageDigest
+import com.studyink.remote.sync.RemoteTeachingAssetCache
+import com.studyink.remote.sync.ResourceChunkResult
+import com.studyink.remote.sync.TeachingResourceChunker
 import com.studyink.remote.session.RemoteSessionController
 import com.studyink.remote.session.RemoteSessionRole
 import com.studyink.remote.session.RemoteSessionState
@@ -59,6 +68,7 @@ class RemoteSessionService : Service() {
     private var reconnectJob: Job? = null
     private var remoteStore: RoomRemoteStore? = null
     private var replicaStore: RoomRemoteReplicaStore? = null
+    private var teachingCache: RemoteTeachingAssetCache? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -72,6 +82,7 @@ class RemoteSessionService : Service() {
         }
         if (controller != null) return START_NOT_STICKY
         val sessionId = intent?.getStringExtra(EXTRA_SESSION_ID) ?: return stopInvalid()
+        teachingCache = RemoteTeachingAssetCache(java.io.File(cacheDir, "remote-teaching-assets/$sessionId"))
         val deviceId = intent.getStringExtra(EXTRA_DEVICE_ID) ?: return stopInvalid()
         val localName = intent.getStringExtra(EXTRA_LOCAL_NAME) ?: return stopInvalid()
         val role = runCatching { RemoteSessionRole.valueOf(intent.getStringExtra(EXTRA_ROLE).orEmpty()) }.getOrNull()
@@ -184,6 +195,27 @@ class RemoteSessionService : Service() {
                             is CheckpointReceiveResult.Pending -> Unit
                         }
                     }
+                    is RemoteResourceOffer -> {
+                        val cache = requireNotNull(teachingCache)
+                        if (payload.byteSize == 0L || cache.has(payload.assetHash)) created.sendApplication(RemoteResourceReady(payload.assetHash))
+                        else created.sendApplication(RemoteResourceNeed(payload.assetHash))
+                    }
+                    is RemoteResourceNeed -> RemoteSessionRuntime.offered(payload.assetHash)?.file?.let { file ->
+                        TeachingResourceChunker.chunks(file, payload.assetHash).forEach { created.sendApplication(it) }
+                    }
+                    is RemoteResourceChunk -> when (val result = requireNotNull(teachingCache).receive(payload)) {
+                        is ResourceChunkResult.Ready -> created.sendApplication(RemoteResourceReady(payload.assetHash))
+                        is ResourceChunkResult.Rejected -> RemoteSessionRuntime.diagnostics?.lastError = result.reason
+                        is ResourceChunkResult.Pending -> Unit
+                    }
+                    is RemoteResourceReady -> RemoteSessionRuntime.offered(payload.assetHash)?.let { offered ->
+                        created.sendApplication(RemotePresentResource(payload.assetHash, offered.offer.title, offered.text, offered.offer.mimeType))
+                    }
+                    is RemotePresentResource -> {
+                        val file = if (payload.mimeType.startsWith("image/")) teachingCache?.open(payload.assetHash) else null
+                        if (!payload.mimeType.startsWith("image/") || file != null) RemoteSessionRuntime.present(payload, file)
+                    }
+                    is RemoteDismissResource -> RemoteSessionRuntime.dismiss(payload.assetHash)
                     else -> Unit
                 }
             }
@@ -273,6 +305,8 @@ class RemoteSessionService : Service() {
         ReaderRemoteBridge.sink = null
         RemoteSessionRuntime.diagnostics?.endedAtEpochMillis = System.currentTimeMillis()
         RemoteSessionRuntime.clear()
+        teachingCache?.clear()
+        teachingCache = null
         remoteStore?.close(); remoteStore = null
         replicaStore?.close(); replicaStore = null
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
