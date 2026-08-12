@@ -257,3 +257,28 @@ must be pinned, licensed, isolated behind a MasterNote-owned API, and validated 
 - Adoption: hash-addressed session cache and ephemeral offer/present/dismiss messages
 - Validation: codec round trip, missing-chunk rejection, complete-hash verification, and cache reuse tests
 - Boundary: no TeachingResource, answer, or annotation rows are written on the student device
+
+## REF-PACKAGE-001
+
+- Capability: module responsibility and minimal public API boundaries
+- Source: `android/nowinandroid`
+- Commit: `7d45eae4f8720a0c77f507712ba2437ff974b6ed`
+- Path: `docs/ModularizationLearningJourney.md`
+- License: Apache-2.0
+- Adoption: pattern only; `package-format` and `studio` are independent Gradle builds
+
+## REF-PACKAGE-002
+
+- Capability: versioned JSON codec
+- Source: `Kotlin/kotlinx.serialization`
+- Commit: `6956af2e6073347c7832c3c5b374fa3b5a345956`
+- Runtime: `kotlinx-serialization-json:1.11.0`
+- License: Apache-2.0
+- Validation: Kotlin 2.3.21/JVM 17 compile and reader/strict round-trip tests pass
+
+## REF-PACKAGE-003
+
+- Capability: safe ZIP inventory and path traversal rejection
+- Source: Android ZIP path traversal security guidance
+- License: documentation CC BY 4.0; samples Apache-2.0
+- Adoption: inventory-before-extract, absolute/`..`/duplicate/nested archive rejection, bounded sizes and ratio
