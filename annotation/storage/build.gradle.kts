@@ -25,6 +25,8 @@ room { schemaDirectory("$projectDir/schemas") }
 
 dependencies {
     api(project(":annotation:engine"))
+    implementation(project(":remote:protocol"))
+    api(project(":remote:storage"))
 
     val roomVersion = "2.8.4"
     implementation("androidx.room:room-runtime:$roomVersion")

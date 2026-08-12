@@ -45,7 +45,7 @@ class AnnotationDatabaseSchemaTest {
         ).build()
         database.openHelper.writableDatabase.query("PRAGMA user_version").use { cursor ->
             cursor.moveToFirst()
-            assertEquals(3, cursor.getInt(0))
+            assertEquals(4, cursor.getInt(0))
         }
         val preserved = runBlocking { database.annotationDao().document("preserved-document") }
         assertEquals(7L, preserved?.currentRevision)
@@ -59,7 +59,7 @@ class AnnotationDatabaseSchemaTest {
     }
 
     @Test
-    fun versionTwoMigratesToThreeWithTeacherTablesAndNullableRetrySource() {
+    fun versionTwoMigratesToLatestWithTeacherAndRemoteTables() {
         migrationHelper.createDatabase(TEST_DATABASE, 2).apply { close() }
 
         val database = Room.databaseBuilder(
@@ -69,9 +69,12 @@ class AnnotationDatabaseSchemaTest {
         ).build()
         database.openHelper.writableDatabase.query("PRAGMA user_version").use { cursor ->
             cursor.moveToFirst()
-            assertEquals(3, cursor.getInt(0))
+            assertEquals(4, cursor.getInt(0))
         }
-        listOf("teacher_profiles", "teacher_prep_pages", "submission_reviews", "review_pages", "review_stroke_refs")
+        listOf(
+            "teacher_profiles", "teacher_prep_pages", "submission_reviews", "review_pages",
+            "review_stroke_refs", "remote_outbox", "remote_inbox_sequences", "remote_applied_operations",
+        )
             .forEach { table ->
                 database.openHelper.writableDatabase.query(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='$table'"

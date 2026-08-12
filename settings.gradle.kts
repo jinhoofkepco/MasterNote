@@ -28,4 +28,6 @@ include(
     ":remote:transport-api",
     ":remote:transport-nearby",
     ":remote:session",
+    ":remote:storage",
+    ":remote:sync",
 )
