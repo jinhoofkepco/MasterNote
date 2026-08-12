@@ -31,4 +31,5 @@ include(
     ":remote:storage",
     ":remote:sync",
     ":feature:remote-session",
+    ":lab:remote-simulator",
 )
