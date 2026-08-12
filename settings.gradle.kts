@@ -23,4 +23,5 @@ include(
     ":document:pdf-androidx",
     ":feature:reader",
     ":feature:progress",
+    ":feature:teacher",
 )

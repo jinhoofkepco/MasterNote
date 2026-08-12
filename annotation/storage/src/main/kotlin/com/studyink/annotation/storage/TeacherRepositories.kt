@@ -28,6 +28,7 @@ interface TeacherReviewRepository {
     suspend fun getReview(reviewId: ReviewId): ReviewSession
     suspend fun getOrCreateFeedbackLayer(reviewId: ReviewId, pageId: PageId): LayerId
     suspend fun markPageChecked(reviewId: ReviewId, pageId: PageId, checked: Boolean)
+    suspend fun updateReviewResumePage(reviewId: ReviewId, pageId: PageId)
     suspend fun updateSummary(reviewId: ReviewId, text: String)
     suspend fun updateAnswerEvaluation(reviewId: ReviewId, fieldId: String, verdict: AnswerVerdict, comment: String)
     suspend fun cancelDraftReview(reviewId: ReviewId)

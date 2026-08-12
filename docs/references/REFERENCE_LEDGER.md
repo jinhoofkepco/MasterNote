@@ -147,7 +147,9 @@ must be pinned, licensed, isolated behind a MasterNote-owned API, and validated 
 ## REF-TEACHER-004
 
 - Capability: system teacher-mode authentication and device-credential fallback
-- Source: AndroidX BiometricPrompt official API
-- Version: dependency pin and device validation recorded in PR 3E
+- Source: AndroidX BiometricPrompt official API and Android identity guide
+- Version: stable `androidx.biometric:biometric:1.1.0` (official stable table checked 2026-08-12)
 - License: Apache-2.0
-- Adoption: planned behind `TeacherAccessAuthenticator`; no custom PIN
+- Adoption: direct dependency behind `TeacherAccessAuthenticator`; no custom PIN
+- Validation: success/cancel coordinator tests, process-memory expiry tests, API 36 route-guard smoke test
+- Allowed authenticators: `BIOMETRIC_WEAK | DEVICE_CREDENTIAL`

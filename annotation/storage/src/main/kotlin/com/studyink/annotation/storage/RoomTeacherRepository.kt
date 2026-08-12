@@ -162,6 +162,11 @@ class RoomTeacherRepository internal constructor(
         ) == 1)
     }
 
+    override suspend fun updateReviewResumePage(reviewId: ReviewId, pageId: PageId) = withContext(dispatcher) {
+        check(teacherDao.reviewPage(reviewId.value, pageId.value) != null)
+        check(teacherDao.updateResumePage(reviewId.value, pageId.value, clock.nowEpochMillis()) == 1)
+    }
+
     override suspend fun updateSummary(reviewId: ReviewId, text: String) = withContext(dispatcher) {
         check(teacherDao.updateSummary(reviewId.value, text, clock.nowEpochMillis()) == 1) { "Only a draft review can change" }
     }
