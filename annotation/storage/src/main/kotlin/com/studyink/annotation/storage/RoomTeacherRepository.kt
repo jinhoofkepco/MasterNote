@@ -17,6 +17,7 @@ import com.studyink.core.model.ReviewDecision
 import com.studyink.core.model.ReviewId
 import com.studyink.core.model.ReviewPage
 import com.studyink.core.model.ReviewPageCheckStatus
+import com.studyink.core.model.PublishedReview
 import com.studyink.core.model.ReviewSession
 import com.studyink.core.model.ReviewStatus
 import com.studyink.core.model.SubmissionAnswer
@@ -38,6 +39,7 @@ class RoomTeacherRepository internal constructor(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val clock: LearningClock = LearningClock(System::currentTimeMillis),
     private val idGenerator: LearningIdGenerator = LearningIdGenerator { UUID.randomUUID().toString() },
+    private val publishFaultInjector: ReviewPublishFaultInjector = ReviewPublishFaultInjector.NONE,
 ) : TeacherPreparationRepository, TeacherReviewRepository {
     private val teacherDao = database.teacherDao()
     private val learningDao = database.learningDao()
@@ -140,6 +142,15 @@ class RoomTeacherRepository internal constructor(
         database.withTransaction { session(requireNotNull(teacherDao.review(reviewId.value))) }
     }
 
+    override suspend fun getOrCreateFeedbackLayer(reviewId: ReviewId, pageId: PageId): LayerId = withContext(dispatcher) {
+        database.withTransaction {
+            val review = requireNotNull(teacherDao.review(reviewId.value))
+            check(review.status == ReviewStatus.DRAFT.name) { "Published reviews are immutable" }
+            teacherDao.reviewPage(reviewId.value, pageId.value)?.feedbackLayerId?.let(::LayerId)
+                ?: createFeedbackLayer(review, pageId)
+        }
+    }
+
     override suspend fun markPageChecked(reviewId: ReviewId, pageId: PageId, checked: Boolean) = withContext(dispatcher) {
         check(teacherDao.updatePageCheck(
             reviewId.value,
@@ -169,6 +180,36 @@ class RoomTeacherRepository internal constructor(
         check(teacherDao.cancelDraft(reviewId.value, clock.nowEpochMillis()) == 1)
     }
 
+    override suspend fun publishReview(reviewId: ReviewId, decision: ReviewDecision): PublishedReview = withContext(dispatcher) {
+        require(decision != ReviewDecision.NONE) { "A published review needs a decision" }
+        database.withTransaction {
+            val review = requireNotNull(teacherDao.review(reviewId.value))
+            if (review.status == ReviewStatus.PUBLISHED.name) {
+                check(review.decision == decision.name) { "Published review decision cannot be changed" }
+                return@withTransaction published(review)
+            }
+            check(review.status == ReviewStatus.DRAFT.name) { "Only a draft review can be published" }
+            val refs = teacherDao.activeFeedbackStrokes(reviewId.value).map {
+                ReviewStrokeRefEntity(reviewId.value, it.pageId, it.strokeId, it.zOrder)
+            }
+            if (refs.isNotEmpty()) teacherDao.insertReviewStrokeRefs(refs)
+            publishFaultInjector.at(ReviewPublishPhase.AFTER_REFS)
+            teacherDao.lockFeedbackLayers(reviewId.value)
+            publishFaultInjector.at(ReviewPublishPhase.AFTER_LAYER_LOCK)
+            publishFaultInjector.at(ReviewPublishPhase.BEFORE_STATUS_CHANGE)
+            check(teacherDao.publishReview(reviewId.value, decision.name, clock.nowEpochMillis()) == 1)
+            published(requireNotNull(teacherDao.review(reviewId.value)))
+        }
+    }
+
+    override suspend fun getPublishedReview(reviewId: ReviewId): PublishedReview = withContext(dispatcher) {
+        database.withTransaction {
+            val review = requireNotNull(teacherDao.review(reviewId.value))
+            check(review.status == ReviewStatus.PUBLISHED.name)
+            published(review)
+        }
+    }
+
     fun close() = database.close()
 
     private suspend fun createPrepPage(teacherId: TeacherId, revisionId: BookRevisionId, pageId: PageId): TeacherPrepPage {
@@ -189,6 +230,34 @@ class RoomTeacherRepository internal constructor(
         return TeacherPrepPageEntity(teacherId.value, revisionId.value, pageId.value, layerId.value, now, now)
             .also { teacherDao.insertPrepPage(it) }.toDomain()
     }
+
+    private suspend fun createFeedbackLayer(review: SubmissionReviewEntity, pageId: PageId): LayerId {
+        val page = requireNotNull(teacherDao.reviewPage(review.reviewId, pageId.value))
+        val attempt = requireNotNull(teacherDao.attemptForSubmission(review.submissionId))
+        val revision = requireNotNull(learningDao.bookRevision(attempt.revisionId))
+        val now = clock.nowEpochMillis()
+        annotationDao.insertDocument(AnnotationDocumentEntity(revision.documentId, 0L, now))
+        annotationDao.insertPage(AnnotationPageEntity(pageId.value, revision.documentId, page.pageNumber, 0L, now))
+        val layerId = LayerId("${pageId.value}:review:${review.reviewId}:feedback")
+        annotationDao.insertLayer(
+            AnnotationLayerEntity(
+                layerId.value, pageId.value, null,
+                com.studyink.core.model.AnnotationLayerType.TEACHER_FEEDBACK.name,
+                com.studyink.core.model.AnnotationOwnerType.TEACHER.name,
+                0L, now,
+            )
+        )
+        check(teacherDao.attachFeedbackLayer(review.reviewId, pageId.value, layerId.value, now) == 1)
+        return layerId
+    }
+
+    private suspend fun published(review: SubmissionReviewEntity): PublishedReview = PublishedReview(
+        review.toDomain(),
+        teacherDao.reviewStrokeRefs(review.reviewId).map {
+            SubmissionStroke(PageId(it.pageId), com.studyink.core.model.StrokeId(it.strokeId), it.zOrder)
+        },
+        teacherDao.evaluations(review.reviewId).map(ReviewAnswerEvaluationEntity::toDomain),
+    )
 
     private suspend fun session(review: SubmissionReviewEntity): ReviewSession {
         val submission = requireNotNull(learningDao.submission(review.submissionId))

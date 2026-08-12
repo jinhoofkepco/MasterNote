@@ -58,6 +58,32 @@ internal interface TeacherDao {
     @Query("SELECT * FROM review_pages WHERE reviewId = :reviewId AND pageId = :pageId")
     suspend fun reviewPage(reviewId: String, pageId: String): ReviewPageEntity?
 
+    @Query("UPDATE review_pages SET feedbackLayerId = :layerId, lastVisitedAtEpochMillis = :updatedAt WHERE reviewId = :reviewId AND pageId = :pageId AND feedbackLayerId IS NULL AND EXISTS (SELECT 1 FROM submission_reviews WHERE reviewId = :reviewId AND status = 'DRAFT')")
+    suspend fun attachFeedbackLayer(reviewId: String, pageId: String, layerId: String, updatedAt: Long): Int
+
+    @Query(
+        """
+        SELECT review_pages.pageId AS pageId, layer_strokes.strokeId AS strokeId, layer_strokes.zOrder AS zOrder
+        FROM review_pages
+        INNER JOIN layer_strokes ON layer_strokes.layerId = review_pages.feedbackLayerId
+        WHERE review_pages.reviewId = :reviewId AND layer_strokes.active = 1
+        ORDER BY review_pages.pageNumber, layer_strokes.zOrder
+        """
+    )
+    suspend fun activeFeedbackStrokes(reviewId: String): List<ReviewActiveStrokeRow>
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertReviewStrokeRefs(entities: List<ReviewStrokeRefEntity>)
+
+    @Query("SELECT * FROM review_stroke_refs WHERE reviewId = :reviewId ORDER BY pageId, zOrder")
+    suspend fun reviewStrokeRefs(reviewId: String): List<ReviewStrokeRefEntity>
+
+    @Query("UPDATE annotation_layers SET locked = 1 WHERE layerId IN (SELECT feedbackLayerId FROM review_pages WHERE reviewId = :reviewId AND feedbackLayerId IS NOT NULL)")
+    suspend fun lockFeedbackLayers(reviewId: String): Int
+
+    @Query("UPDATE submission_reviews SET status = 'PUBLISHED', decision = :decision, publishedAtEpochMillis = :publishedAt, updatedAtEpochMillis = :publishedAt WHERE reviewId = :reviewId AND status = 'DRAFT'")
+    suspend fun publishReview(reviewId: String, decision: String, publishedAt: Long): Int
+
     @Query("UPDATE submission_reviews SET summaryText = :text, updatedAtEpochMillis = :updatedAt WHERE reviewId = :reviewId AND status = 'DRAFT'")
     suspend fun updateSummary(reviewId: String, text: String, updatedAt: Long): Int
 
