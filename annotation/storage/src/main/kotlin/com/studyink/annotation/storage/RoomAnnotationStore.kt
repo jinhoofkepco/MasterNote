@@ -202,6 +202,17 @@ class RoomAnnotationStore internal constructor(
             }
         }
 
+    suspend fun loadPublishedReview(documentId: String, reviewId: String): AnnotationSnapshot =
+        withContext(Dispatchers.IO) {
+            database.withTransaction {
+                val assets = linkedMapOf<StrokeId, StrokeAsset>()
+                dao.reviewStrokeAssets(reviewId).forEach { entity ->
+                    runCatching { entity.toDomain() }.onSuccess { assets[it.id] = it }
+                }
+                AnnotationSnapshot(documentId, assets.size.toLong(), assets = assets, activeStrokeIds = assets.keys)
+            }
+        }
+
     fun close() = database.close()
 
     private suspend fun loadRoomSnapshot(documentId: String): AnnotationSnapshot {

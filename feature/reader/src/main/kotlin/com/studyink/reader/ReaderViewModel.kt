@@ -74,6 +74,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     private var learningStore: RoomLearningRepository? = null
     private var teacherStore: RoomTeacherRepository? = null
     private var document = AnnotationDocument(AnnotationSnapshot.empty("sample"))
+    private var readOnlySceneSnapshot = AnnotationSnapshot.empty("sample")
     private var activeAttemptId: AttemptId? = null
     private var activeSession: AttemptSession? = null
     private var activeScene: ReaderScene? = null
@@ -93,7 +94,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     is Command.Flush -> {
                         resumePageJob?.cancel()
                         runCatching {
-                            if (!_uiState.value.readOnly) persistSelectedPageOrThrow()
+                            if (!_uiState.value.readOnly && activeScene == null) persistSelectedPageOrThrow()
                             annotationStore().flush()
                         }.fold(
                             onSuccess = { command.completion.complete(Unit) },
@@ -211,7 +212,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             }
             command.scene?.let { scene ->
                 val sceneLoad = loadScene(documentId, scene)
-                return@runCatching Triple(sceneLoad.snapshot, sceneLoad.session, sceneLoad.initialPageId)
+                return@runCatching Triple(sceneLoad, sceneLoad.session, sceneLoad.initialPageId)
             }
             val session = launchArgs?.let { args ->
                 learningRepository().getAttemptSession(args.attemptId).also {
@@ -226,15 +227,12 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             if (session != null && initialPageId != null && launchArgs.submissionId == null) {
                 learningRepository().prepareAttemptPage(session.attempt.attemptId, initialPageId)
             }
-            Triple(
-                if (launchArgs?.submissionId != null) {
+            val loaded = if (launchArgs?.submissionId != null) {
                     annotationStore().loadSubmission(documentId, launchArgs.submissionId.value)
                 } else {
                     annotationStore().load(documentId, session?.attempt?.attemptId?.value)
-                },
-                session,
-                initialPageId,
-            )
+                }
+            Triple(SceneLoad(loaded, loaded, AnnotationSnapshot.empty(documentId), session, requireNotNull(initialPageId ?: session?.initialPageId ?: PageId("$documentId:page:0"))), session, initialPageId)
         }.getOrElse { error ->
             if (command.generation == documentLoadGeneration) {
                 _uiState.value = _uiState.value.copy(
@@ -245,11 +243,13 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
         if (command.generation != documentLoadGeneration) return
-        val (loaded, session, initialPageId) = loadResult
-        document = AnnotationDocument(loaded)
+        val (sceneLoad, session, initialPageId) = loadResult
+        val loaded = sceneLoad.snapshot
+        document = AnnotationDocument(sceneLoad.editableSnapshot)
+        readOnlySceneSnapshot = sceneLoad.readOnlySnapshot
         activeScene = command.scene
         activeSession = session
-        activeAttemptId = session?.attempt?.attemptId
+        activeAttemptId = session?.attempt?.attemptId.takeIf { command.scene == null }
         selectedPageId = initialPageId
         val initialPageNumber = (if (command.scene != null) scenePages else session?.pages.orEmpty())
             .firstOrNull { it.pageId == initialPageId }?.pageNumber ?: 0
@@ -261,9 +261,9 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             pendingSaveOperations = pendingOperations.get(),
             attemptSession = session,
             initialPageNumber = initialPageNumber,
-            readOnly = command.scene?.interactionPolicy?.let { it != ReaderInteractionPolicy.EDIT } == true ||
-                command.launchArgs?.submissionId != null ||
-                (session != null && session.attempt.status != com.studyink.core.model.AttemptStatus.IN_PROGRESS),
+            readOnly = command.scene?.let { it.interactionPolicy != ReaderInteractionPolicy.EDIT }
+                ?: (command.launchArgs?.submissionId != null ||
+                    (session != null && session.attempt.status != com.studyink.core.model.AttemptStatus.IN_PROGRESS)),
             submissionId = command.launchArgs?.submissionId,
             scene = command.scene,
         )
@@ -271,46 +271,81 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
 
     private data class SceneLoad(
         val snapshot: AnnotationSnapshot,
+        val editableSnapshot: AnnotationSnapshot,
+        val readOnlySnapshot: AnnotationSnapshot,
         val session: AttemptSession?,
         val initialPageId: PageId,
     )
 
-    private suspend fun loadScene(documentId: String, scene: ReaderScene): SceneLoad =
-        when (val source = scene.visibleLayerSources.singleOrNull()) {
-            is EditableLiveLayer -> when (val target = source.target) {
-                is LiveLayerTarget.TeacherPreparation -> {
-                    val preparation = teacherRepository().getPreparationSession(
-                        target.teacherId, target.revisionId, scene.initialPageId,
-                    )
-                    check(preparation.documentId == documentId)
-                    scenePages = preparation.pages
-                    val layers = teacherRepository().observePreparedPages(target.teacherId, target.revisionId)
-                        .first().map { it.prepLayerId.value }
-                    SceneLoad(annotationStore().loadLayers(documentId, layers), null, preparation.initialPageId)
+    private suspend fun loadScene(documentId: String, scene: ReaderScene): SceneLoad {
+        var session: AttemptSession? = null
+        var pages: List<com.studyink.core.model.ActivityPage> = emptyList()
+        var editable = AnnotationSnapshot.empty(documentId)
+        val readOnlyParts = mutableListOf<AnnotationSnapshot>()
+        for (source in scene.visibleLayerSources) {
+            val loaded = when (source) {
+                is EditableLiveLayer -> loadLiveTarget(documentId, source.target).also {
+                    session = it.second ?: session
+                    if (it.third.isNotEmpty()) pages = it.third
+                }.first
+                is ReadOnlyLiveLayer -> loadLiveTarget(documentId, source.target).also {
+                    session = it.second ?: session
+                    if (it.third.isNotEmpty()) pages = it.third
+                }.first
+                is ReadOnlySnapshot -> when (val target = source.target) {
+                    is SnapshotTarget.StudentSubmission -> {
+                        val submission = learningRepository().getSubmission(target.submissionId)
+                        learningRepository().getAttemptSession(submission.attemptId).let {
+                            check(it.documentId == documentId)
+                            session = it
+                            pages = it.pages
+                        }
+                        annotationStore().loadSubmission(documentId, target.submissionId.value)
+                    }
+                    is SnapshotTarget.PublishedReview -> {
+                        val review = teacherRepository().getReview(target.reviewId)
+                        check(review.documentId == documentId)
+                        pages = review.pages.map { com.studyink.core.model.ActivityPage(it.pageId, it.pageNumber, it.pageNumber) }
+                        annotationStore().loadPublishedReview(documentId, target.reviewId.value)
+                    }
                 }
-                else -> error("Editable scene target is not available yet")
             }
-            is ReadOnlyLiveLayer -> when (val target = source.target) {
-                is LiveLayerTarget.StudentAttempt -> {
-                    val session = learningRepository().getAttemptSession(target.attemptId)
-                    check(session.documentId == documentId)
-                    scenePages = session.pages
-                    SceneLoad(annotationStore().load(documentId, target.attemptId.value), session, scene.initialPageId)
-                }
-                else -> error("Read-only live target is not available yet")
-            }
-            is ReadOnlySnapshot -> when (val target = source.target) {
-                is SnapshotTarget.StudentSubmission -> {
-                    val submission = learningRepository().getSubmission(target.submissionId)
-                    val session = learningRepository().getAttemptSession(submission.attemptId)
-                    check(session.documentId == documentId)
-                    scenePages = session.pages
-                    SceneLoad(annotationStore().loadSubmission(documentId, target.submissionId.value), session, scene.initialPageId)
-                }
-                else -> error("Published review target is not available yet")
-            }
-            null -> error("ReaderScene requires one layer source")
+            if (source is EditableLiveLayer) editable = loaded
+            else if (source.visibleByDefault) readOnlyParts += loaded
         }
+        require(pages.isNotEmpty()) { "ReaderScene has no pages" }
+        scenePages = pages
+        val readOnly = mergeSnapshots(documentId, readOnlyParts)
+        return SceneLoad(mergeSnapshots(documentId, listOf(readOnly, editable)), editable, readOnly, session, scene.initialPageId)
+    }
+
+    private suspend fun loadLiveTarget(
+        documentId: String,
+        target: LiveLayerTarget,
+    ): Triple<AnnotationSnapshot, AttemptSession?, List<com.studyink.core.model.ActivityPage>> = when (target) {
+        is LiveLayerTarget.TeacherPreparation -> {
+            val preparation = teacherRepository().getPreparationSession(target.teacherId, target.revisionId)
+            check(preparation.documentId == documentId)
+            val layers = teacherRepository().observePreparedPages(target.teacherId, target.revisionId)
+                .first().map { it.prepLayerId.value }
+            Triple(annotationStore().loadLayers(documentId, layers), null, preparation.pages)
+        }
+        is LiveLayerTarget.StudentAttempt -> {
+            val session = learningRepository().getAttemptSession(target.attemptId)
+            check(session.documentId == documentId)
+            Triple(annotationStore().load(documentId, target.attemptId.value), session, session.pages)
+        }
+        is LiveLayerTarget.TeacherFeedback -> {
+            val review = teacherRepository().getReview(target.reviewId)
+            check(review.documentId == documentId)
+            val layers = review.pages.mapNotNull { it.feedbackLayerId?.value }
+            Triple(
+                annotationStore().loadLayers(documentId, layers),
+                null,
+                review.pages.map { com.studyink.core.model.ActivityPage(it.pageId, it.pageNumber, it.pageNumber) },
+            )
+        }
+    }
 
     private suspend fun handleMutation(command: Command.Mutate) {
         val before = document.snapshot()
@@ -327,17 +362,22 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         _uiState.value = _uiState.value.copy(
-            snapshot = mutation.snapshot,
+            snapshot = mergeSnapshots(mutation.snapshot.documentId, listOf(readOnlySceneSnapshot, mutation.snapshot)),
             busy = false,
             status = "저장 대기 중…",
         )
 
         runCatching {
             val prep = activeScene?.editableLayerSource?.target as? LiveLayerTarget.TeacherPreparation
+            val feedback = activeScene?.editableLayerSource?.target as? LiveLayerTarget.TeacherFeedback
             if (prep != null) {
                 val pageId = requireNotNull(scenePages.firstOrNull { it.pageNumber == mutation.operation.pageNumber }?.pageId)
                 val prepPage = teacherRepository().getOrCreatePrepLayer(prep.teacherId, prep.revisionId, pageId)
                 annotationStore().applyMutationToLayer(mutation, prepPage.prepLayerId.value)
+            } else if (feedback != null) {
+                val pageId = requireNotNull(scenePages.firstOrNull { it.pageNumber == mutation.operation.pageNumber }?.pageId)
+                val layerId = teacherRepository().getOrCreateFeedbackLayer(feedback.reviewId, pageId)
+                annotationStore().applyMutationToLayer(mutation, layerId.value)
             } else {
                 annotationStore().applyMutation(mutation, activeAttemptId?.value)
             }
@@ -348,7 +388,9 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             }
             .onFailure { error ->
                 document = AnnotationDocument(before)
-                _uiState.value = _uiState.value.copy(snapshot = before)
+                _uiState.value = _uiState.value.copy(
+                    snapshot = mergeSnapshots(before.documentId, listOf(readOnlySceneSnapshot, before)),
+                )
                 finishMutation(command, "저장 실패 · 변경 취소: ${error.message}")
             }
     }
@@ -424,4 +466,25 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     private companion object {
         const val RESUME_PAGE_DEBOUNCE_MILLIS = 750L
     }
+}
+
+internal fun mergeSnapshots(documentId: String, snapshots: List<AnnotationSnapshot>): AnnotationSnapshot {
+    val assets = linkedMapOf<com.studyink.core.model.StrokeId, StrokeAsset>()
+    val active = linkedSetOf<com.studyink.core.model.StrokeId>()
+    val pageRevisions = linkedMapOf<Int, Long>()
+    snapshots.forEach { snapshot ->
+        check(snapshot.documentId == documentId)
+        assets.putAll(snapshot.assets)
+        active += snapshot.activeStrokeIds
+        snapshot.pageRevisions.forEach { (page, revision) ->
+            pageRevisions[page] = pageRevisions.getOrDefault(page, 0L) + revision
+        }
+    }
+    return AnnotationSnapshot(
+        documentId = documentId,
+        revision = snapshots.sumOf(AnnotationSnapshot::revision),
+        pageRevisions = pageRevisions,
+        assets = assets,
+        activeStrokeIds = active,
+    )
 }

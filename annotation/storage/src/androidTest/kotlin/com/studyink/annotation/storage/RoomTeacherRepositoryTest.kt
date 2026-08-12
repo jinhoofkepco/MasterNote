@@ -16,6 +16,12 @@ import com.studyink.core.model.PageId
 import com.studyink.core.model.ProfileId
 import com.studyink.core.model.SubmissionMode
 import com.studyink.core.model.TeacherId
+import com.studyink.core.model.ReviewDecision
+import com.studyink.annotation.engine.AnnotationDocument
+import com.studyink.core.model.AnnotationSnapshot
+import com.studyink.core.model.PagePoint
+import com.studyink.core.model.StrokeAsset
+import com.studyink.core.model.StrokeTool
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.test.runTest
 import org.junit.After
@@ -26,6 +32,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.concurrent.atomic.AtomicLong
+import java.io.IOException
 
 @RunWith(AndroidJUnit4::class)
 class RoomTeacherRepositoryTest {
@@ -95,6 +102,69 @@ class RoomTeacherRepositoryTest {
         assertTrue(database.teacherDao().prepPages(TEACHER.value, REVISION.value).isEmpty())
     }
 
+    @Test fun publishingSnapshotsFeedbackLocksLayerAndIsIdempotent() = runTest {
+        val (learning, teacher) = repositories("attempt-1", "submission-1", "review-1")
+        val submission = submittedAttempt(learning)
+        val review = teacher.getOrCreateDraftReview(submission, TEACHER)
+        val layer = teacher.getOrCreateFeedbackLayer(review.review.reviewId, PAGE_ONE)
+        val store = RoomAnnotationStore(database)
+        val document = AnnotationDocument(AnnotationSnapshot.empty(DOCUMENT))
+        val feedback = stroke("feedback")
+        store.applyMutationToLayer(document.addStroke(feedback), layer.value)
+
+        val first = teacher.publishReview(review.review.reviewId, ReviewDecision.ACCEPTED)
+        val second = teacher.publishReview(review.review.reviewId, ReviewDecision.ACCEPTED)
+
+        assertEquals(first, second)
+        assertEquals(listOf(feedback.id), first.strokes.map { it.strokeId })
+        assertTrue(requireNotNull(database.annotationDao().layer(layer.value)).locked)
+        assertEquals(setOf(feedback.id), store.loadPublishedReview(DOCUMENT, review.review.reviewId.value).activeStrokeIds)
+        assertTrue(runCatching {
+            teacher.publishReview(review.review.reviewId, ReviewDecision.RETRY_REQUESTED)
+        }.exceptionOrNull() is IllegalStateException)
+        assertTrue(runCatching {
+            store.applyMutationToLayer(document.addStroke(stroke("late")), layer.value)
+        }.exceptionOrNull() is IllegalStateException)
+    }
+
+    @Test fun everyInjectedPublishFailureRollsBackRefsLockAndStatus() = runTest {
+        ReviewPublishPhase.entries.forEach { phase ->
+            val isolated = Room.inMemoryDatabaseBuilder(
+                ApplicationProvider.getApplicationContext<Context>(), AnnotationDatabase::class.java,
+            ).build()
+            try {
+                val ids = listOf("attempt-$phase", "submission-$phase", "review-$phase").iterator()
+                val generator = LearningIdGenerator(ids::next)
+                val clock = LearningClock { now.getAndIncrement() }
+                val learning = RoomLearningRepository(isolated, Dispatchers.Unconfined, clock, generator)
+                val teacher = RoomTeacherRepository(
+                    isolated, Dispatchers.Unconfined, clock, generator,
+                    ReviewPublishFaultInjector { reached -> if (reached == phase) throw IOException("injected") },
+                )
+                learning.ensureContent(seed())
+                isolated.teacherDao().insertTeacher(TeacherProfileEntity(TEACHER.value, "선생님", 1L))
+                val attempt = learning.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+                val submission = learning.submitAttempt(attempt.attempt.attemptId)
+                val review = teacher.getOrCreateDraftReview(submission, TEACHER)
+                val layer = teacher.getOrCreateFeedbackLayer(review.review.reviewId, PAGE_ONE)
+                val store = RoomAnnotationStore(isolated)
+                store.applyMutationToLayer(
+                    AnnotationDocument(AnnotationSnapshot.empty(DOCUMENT)).addStroke(stroke("stroke-$phase")),
+                    layer.value,
+                )
+
+                assertTrue(runCatching {
+                    teacher.publishReview(review.review.reviewId, ReviewDecision.ACCEPTED)
+                }.exceptionOrNull() is IOException)
+                assertEquals("DRAFT", isolated.teacherDao().review(review.review.reviewId.value)?.status)
+                assertTrue(isolated.teacherDao().reviewStrokeRefs(review.review.reviewId.value).isEmpty())
+                assertTrue(!requireNotNull(isolated.annotationDao().layer(layer.value)).locked)
+            } finally {
+                isolated.close()
+            }
+        }
+    }
+
     private fun repositories(vararg ids: String): Pair<RoomLearningRepository, RoomTeacherRepository> {
         val iterator = ids.iterator()
         val generator = LearningIdGenerator(iterator::next)
@@ -117,6 +187,12 @@ class RoomTeacherRepositoryTest {
             LearningActivity(ACTIVITY, REVISION, "Unit", 0, SubmissionMode.INK_ONLY),
             listOf(ActivityPage(PAGE_ONE, 0, 0), ActivityPage(PAGE_TWO, 1, 1)),
         )),
+    )
+
+    private fun stroke(id: String) = StrokeAsset(
+        id = com.studyink.core.model.StrokeId(id), pageNumber = 0, tool = StrokeTool.PEN,
+        colorArgb = 0xffcc2233.toInt(), width = 3f,
+        points = listOf(PagePoint(10f, 10f), PagePoint(50f, 50f)),
     )
 
     private companion object {

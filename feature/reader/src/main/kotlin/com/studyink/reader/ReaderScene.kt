@@ -61,6 +61,40 @@ class ReaderScene private constructor(
             listOf(ReadOnlyLiveLayer(LiveLayerTarget.StudentAttempt(attemptId))),
             ReaderInteractionPolicy.OBSERVE,
         )
+
+        fun submissionReview(
+            revisionId: BookRevisionId,
+            submissionId: SubmissionId,
+            reviewId: ReviewId,
+            pageId: PageId,
+            teacherId: TeacherId? = null,
+        ) = create(
+            revisionId,
+            pageId,
+            buildList {
+                add(ReadOnlySnapshot(SnapshotTarget.StudentSubmission(submissionId)))
+                teacherId?.let {
+                    add(ReadOnlyLiveLayer(LiveLayerTarget.TeacherPreparation(it, revisionId), visibleByDefault = false))
+                }
+                add(EditableLiveLayer(LiveLayerTarget.TeacherFeedback(reviewId)))
+            },
+            ReaderInteractionPolicy.EDIT,
+        )
+
+        fun publishedReview(
+            revisionId: BookRevisionId,
+            submissionId: SubmissionId,
+            reviewId: ReviewId,
+            pageId: PageId,
+        ) = create(
+            revisionId,
+            pageId,
+            listOf(
+                ReadOnlySnapshot(SnapshotTarget.StudentSubmission(submissionId)),
+                ReadOnlySnapshot(SnapshotTarget.PublishedReview(reviewId)),
+            ),
+            ReaderInteractionPolicy.REVIEW,
+        )
     }
 }
 
@@ -69,19 +103,7 @@ object ReaderSceneIntentCodec {
         intent.putExtra(KEY_REVISION, scene.documentRevisionId.value)
         intent.putExtra(KEY_PAGE, scene.initialPageId.value)
         intent.putExtra(KEY_POLICY, scene.interactionPolicy.name)
-        val source = scene.visibleLayerSources.singleOrNull()
-        when (source) {
-            is EditableLiveLayer -> putLive(intent, "EDITABLE", source.target)
-            is ReadOnlyLiveLayer -> putLive(intent, "READ_ONLY_LIVE", source.target)
-            is ReadOnlySnapshot -> {
-                intent.putExtra(KEY_SOURCE_KIND, "SNAPSHOT")
-                when (val target = source.target) {
-                    is SnapshotTarget.StudentSubmission -> intent.putExtra(KEY_TARGET_KIND, "SUBMISSION").putExtra(KEY_TARGET_ID, target.submissionId.value)
-                    is SnapshotTarget.PublishedReview -> intent.putExtra(KEY_TARGET_KIND, "PUBLISHED_REVIEW").putExtra(KEY_TARGET_ID, target.reviewId.value)
-                }
-            }
-            null -> intent.putExtra(KEY_SOURCE_KIND, "NONE")
-        }
+        intent.putStringArrayListExtra(KEY_SOURCES, ArrayList(scene.visibleLayerSources.map(::encodeSource)))
         return intent
     }
 
@@ -89,44 +111,54 @@ object ReaderSceneIntentCodec {
         val revision = intent.getStringExtra(KEY_REVISION) ?: return null
         val page = intent.getStringExtra(KEY_PAGE) ?: return null
         val policy = ReaderInteractionPolicy.valueOf(intent.getStringExtra(KEY_POLICY) ?: return null)
-        val source = when (intent.getStringExtra(KEY_SOURCE_KIND)) {
-            "EDITABLE" -> EditableLiveLayer(readLive(intent))
-            "READ_ONLY_LIVE" -> ReadOnlyLiveLayer(readLive(intent))
-            "SNAPSHOT" -> ReadOnlySnapshot(when (intent.getStringExtra(KEY_TARGET_KIND)) {
-                "SUBMISSION" -> SnapshotTarget.StudentSubmission(SubmissionId(requireNotNull(intent.getStringExtra(KEY_TARGET_ID))))
-                "PUBLISHED_REVIEW" -> SnapshotTarget.PublishedReview(ReviewId(requireNotNull(intent.getStringExtra(KEY_TARGET_ID))))
-                else -> error("Unknown snapshot target")
-            })
-            "NONE" -> null
-            else -> error("Unknown Reader scene source")
-        }
-        return ReaderScene.create(BookRevisionId(revision), PageId(page), listOfNotNull(source), policy)
+        val revisionId = BookRevisionId(revision)
+        val sources = intent.getStringArrayListExtra(KEY_SOURCES)?.map { decodeSource(it, revisionId) }.orEmpty()
+        return ReaderScene.create(revisionId, PageId(page), sources, policy)
     }
 
-    private fun putLive(intent: Intent, kind: String, target: LiveLayerTarget) {
-        intent.putExtra(KEY_SOURCE_KIND, kind)
-        when (target) {
-            is LiveLayerTarget.StudentAttempt -> intent.putExtra(KEY_TARGET_KIND, "ATTEMPT").putExtra(KEY_TARGET_ID, target.attemptId.value)
-            is LiveLayerTarget.TeacherPreparation -> intent.putExtra(KEY_TARGET_KIND, "PREPARATION")
-                .putExtra(KEY_TARGET_ID, target.teacherId.value)
-            is LiveLayerTarget.TeacherFeedback -> intent.putExtra(KEY_TARGET_KIND, "FEEDBACK").putExtra(KEY_TARGET_ID, target.reviewId.value)
+    private fun encodeSource(source: ReaderLayerSource): String = when (source) {
+        is EditableLiveLayer -> "E:${encodeLive(source.target)}:${source.visibleByDefault}"
+        is ReadOnlyLiveLayer -> "L:${encodeLive(source.target)}:${source.visibleByDefault}"
+        is ReadOnlySnapshot -> when (val target = source.target) {
+            is SnapshotTarget.StudentSubmission -> "S:SUBMISSION:${target.submissionId.value}:${source.visibleByDefault}"
+            is SnapshotTarget.PublishedReview -> "S:REVIEW:${target.reviewId.value}:${source.visibleByDefault}"
         }
     }
 
-    private fun readLive(intent: Intent): LiveLayerTarget = when (intent.getStringExtra(KEY_TARGET_KIND)) {
-        "ATTEMPT" -> LiveLayerTarget.StudentAttempt(AttemptId(requireNotNull(intent.getStringExtra(KEY_TARGET_ID))))
-        "PREPARATION" -> LiveLayerTarget.TeacherPreparation(
-            TeacherId(requireNotNull(intent.getStringExtra(KEY_TARGET_ID))),
-            BookRevisionId(requireNotNull(intent.getStringExtra(KEY_REVISION))),
-        )
-        "FEEDBACK" -> LiveLayerTarget.TeacherFeedback(ReviewId(requireNotNull(intent.getStringExtra(KEY_TARGET_ID))))
+    private fun encodeLive(target: LiveLayerTarget): String = when (target) {
+        is LiveLayerTarget.StudentAttempt -> "ATTEMPT:${target.attemptId.value}"
+        is LiveLayerTarget.TeacherPreparation -> "PREPARATION:${target.teacherId.value}"
+        is LiveLayerTarget.TeacherFeedback -> "FEEDBACK:${target.reviewId.value}"
+    }
+
+    private fun decodeSource(encoded: String, revisionId: BookRevisionId): ReaderLayerSource {
+        val parts = encoded.split(':', limit = 4)
+        require(parts.size == 4)
+        val visible = parts[3].toBooleanStrict()
+        val targetId = parts[2]
+        return when (parts[0]) {
+            "E" -> EditableLiveLayer(decodeLive(parts[1], targetId, revisionId), visible)
+            "L" -> ReadOnlyLiveLayer(decodeLive(parts[1], targetId, revisionId), visible)
+            "S" -> ReadOnlySnapshot(
+                when (parts[1]) {
+                    "SUBMISSION" -> SnapshotTarget.StudentSubmission(SubmissionId(targetId))
+                    "REVIEW" -> SnapshotTarget.PublishedReview(ReviewId(targetId))
+                    else -> error("Unknown snapshot target")
+                }, visible,
+            )
+            else -> error("Unknown Reader layer source")
+        }
+    }
+
+    private fun decodeLive(kind: String, id: String, revisionId: BookRevisionId): LiveLayerTarget = when (kind) {
+        "ATTEMPT" -> LiveLayerTarget.StudentAttempt(AttemptId(id))
+        "PREPARATION" -> LiveLayerTarget.TeacherPreparation(TeacherId(id), revisionId)
+        "FEEDBACK" -> LiveLayerTarget.TeacherFeedback(ReviewId(id))
         else -> error("Unknown live target")
     }
 
     private const val KEY_REVISION = "com.studyink.reader.SCENE_REVISION"
     private const val KEY_PAGE = "com.studyink.reader.SCENE_PAGE"
     private const val KEY_POLICY = "com.studyink.reader.SCENE_POLICY"
-    private const val KEY_SOURCE_KIND = "com.studyink.reader.SCENE_SOURCE_KIND"
-    private const val KEY_TARGET_KIND = "com.studyink.reader.SCENE_TARGET_KIND"
-    private const val KEY_TARGET_ID = "com.studyink.reader.SCENE_TARGET_ID"
+    private const val KEY_SOURCES = "com.studyink.reader.SCENE_SOURCES"
 }
