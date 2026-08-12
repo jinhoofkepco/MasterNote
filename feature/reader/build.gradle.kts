@@ -21,6 +21,7 @@ kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarg
 dependencies {
     api(project(":document:pdf-androidx"))
     implementation(project(":annotation:storage"))
+    implementation(project(":remote:sync"))
 
     val composeBom = platform("androidx.compose:compose-bom:2026.06.00")
     implementation(composeBom)

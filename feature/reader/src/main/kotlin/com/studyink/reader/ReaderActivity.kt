@@ -100,7 +100,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             it.viewport = viewport
             root.addView(it, contentLayoutParams())
         }
-        viewport.onViewportChanged = { dryInkView.postInvalidateOnAnimation() }
+        viewport.onViewportChanged = {
+            dryInkView.postInvalidateOnAnimation()
+            viewport.state()?.let { ReaderRemoteBridge.sink?.onViewportChanged(it) }
+        }
         wetInkView = InProgressStrokesView(this).also {
             it.eagerInit()
             it.addFinishedStrokesListener(
@@ -126,6 +129,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 }
             }
             it.onStroke = { stroke -> viewModel.addStroke(stroke) }
+            it.onStrokePreview = { id, page, points, time ->
+                ReaderRemoteBridge.sink?.onStrokePreview(id, page, points, time)
+            }
+            it.onStrokePreviewFinished = { id -> ReaderRemoteBridge.sink?.onStrokeFinished(id) }
             it.onEraserPreview = { preview -> dryInkView.eraserPreview = preview }
             it.onErase = { page, path, radius, whole ->
                 viewModel.erase(page, path, radius, whole) { dryInkView.eraserPreview = null }
@@ -244,6 +251,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         viewModel.flushAsync()
         val target = pageNumber.coerceIn(0, (loadedPageCount - 1).coerceAtLeast(0))
         currentPage = target
+        ReaderRemoteBridge.sink?.onPageChanged(target)
         dryInkView.activePage = target
         viewport.showPage(target)
         viewModel.onPageSelected(target)

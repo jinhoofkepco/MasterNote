@@ -6,6 +6,14 @@ import com.studyink.core.model.CANONICAL_PAGE_WIDTH
 import com.studyink.core.model.PagePoint
 
 data class CanonicalPdfPoint(val pageNumber: Int, val point: PagePoint)
+data class PdfViewportState(
+    val pageNumber: Int,
+    val normalizedCenterX: Float,
+    val normalizedCenterY: Float,
+    val zoomScale: Float,
+    val viewportWidthRatio: Float,
+    val viewportHeightRatio: Float,
+)
 
 class PdfViewportAdapter {
     private var pdfView: SinglePagePdfView? = null
@@ -64,6 +72,20 @@ class PdfViewportAdapter {
     fun activePage(): Int = pdfView?.activePage ?: 0
 
     fun activePageBounds(): RectF? = pdfView?.pageBounds
+
+    fun state(): PdfViewportState? {
+        val view = pdfView ?: return null
+        val bounds = view.pageBounds ?: return null
+        if (bounds.width() <= 0f || bounds.height() <= 0f) return null
+        return PdfViewportState(
+            view.activePage,
+            ((view.width / 2f - bounds.left) / bounds.width()).coerceIn(0f, 1f),
+            ((view.height / 2f - bounds.top) / bounds.height()).coerceIn(0f, 1f),
+            view.displayScale,
+            (view.width / bounds.width()).coerceAtMost(1f),
+            (view.height / bounds.height()).coerceAtMost(1f),
+        )
+    }
 
     fun showPage(pageNumber: Int) {
         pdfView?.showPage(pageNumber)
