@@ -45,7 +45,7 @@ class AnnotationDatabaseSchemaTest {
         ).build()
         database.openHelper.writableDatabase.query("PRAGMA user_version").use { cursor ->
             cursor.moveToFirst()
-            assertEquals(7, cursor.getInt(0))
+            assertEquals(8, cursor.getInt(0))
         }
         val preserved = runBlocking { database.annotationDao().document("preserved-document") }
         assertEquals(7L, preserved?.currentRevision)
@@ -69,7 +69,7 @@ class AnnotationDatabaseSchemaTest {
         ).build()
         database.openHelper.writableDatabase.query("PRAGMA user_version").use { cursor ->
             cursor.moveToFirst()
-            assertEquals(7, cursor.getInt(0))
+            assertEquals(8, cursor.getInt(0))
         }
         listOf(
             "teacher_profiles", "teacher_prep_pages", "submission_reviews", "review_pages",
@@ -77,6 +77,7 @@ class AnnotationDatabaseSchemaTest {
             "remote_replica_pages", "remote_replica_strokes",
             "managed_assets",
             "answer_documents", "answer_page_links", "answer_bookmarks",
+            "teaching_resources", "teaching_resource_revisions", "book_page_resource_links",
         )
             .forEach { table ->
                 database.openHelper.writableDatabase.query(

@@ -83,6 +83,7 @@ fun TopReaderBar(
     onOpenPdf: (() -> Unit)?,
     onSubmit: (() -> Unit)? = null,
     onAnswer: (() -> Unit)? = null,
+    onResources: (() -> Unit)? = null,
 ) {
     MaterialTheme {
         Surface(tonalElevation = 3.dp, shadowElevation = 3.dp) {
@@ -110,6 +111,9 @@ fun TopReaderBar(
                 }
                 if (onAnswer != null) {
                     TextButton(onClick = onAnswer) { Text("정답") }
+                }
+                if (onResources != null) {
+                    TextButton(onClick = onResources) { Text("자료") }
                 }
             }
         }
