@@ -20,7 +20,7 @@
 | One corrupt payload is isolated | `corruptStrokeBlobIsSkippedWithoutBlockingOtherStrokes` | import diagnostic corrupt fixture |
 | PDF-specific isolation | `ReaderInteractionTest.annotationsAreIsolatedAndRestoredPerPdf` | switch among three named PDFs |
 | UI thread avoids database I/O | debug StrictMode plus reader instrumentation log inspection | 30-minute writing soak |
-| 2,000-stroke page | deferred to PR 3 benchmark | required before performance release |
+| 20 pages / 2,000 student strokes / 500 feedback strokes | `RoomTeacherRepositoryTest.largeReviewSnapshotsReferenceAssetsWithoutBlobDuplication` | repeat review/publish while profiling frame time and memory |
 
 ## Merge gate
 

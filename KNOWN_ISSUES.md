@@ -11,8 +11,16 @@
 - Undo/redo changes are persisted as normal operations, but the navigation stacks themselves
   are not reconstructed after process death. Durable cross-session undo-stack semantics remain
   a follow-up.
-- There is no migration path yet because Room schema v1 is the initial schema. Every future
-  schema version requires an explicit migration and device migration test.
+- Room migrations v1 → v2 → v3 are explicit and covered with exported-schema migration tests.
+  Every future schema version still requires a non-destructive migration and device test.
+
+## Teacher review v0.3
+
+- Physical BiometricPrompt success/cancel/device-credential fallback and S Pen review have not
+  been run because only an Android 16 ARM64 emulator was connected.
+- A physical tablet 30-minute review soak and update-install certificate check remain release gates.
+- The first tablet layout uses a stable fixed-width/bottom supporting pane. Material3 Adaptive is
+  intentionally deferred so this change does not force a navigation migration.
 
 ## Diagnostics
 

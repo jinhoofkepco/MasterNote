@@ -90,7 +90,17 @@ internal interface TeacherDao {
     @Query("UPDATE submission_reviews SET lastVisitedPageId = :pageId, updatedAtEpochMillis = :updatedAt WHERE reviewId = :reviewId AND status = 'DRAFT'")
     suspend fun updateResumePage(reviewId: String, pageId: String, updatedAt: Long): Int
 
-    @Query("UPDATE review_pages SET checkStatus = :status, lastVisitedAtEpochMillis = :updatedAt WHERE reviewId = :reviewId AND pageId = :pageId")
+    @Query("""
+        UPDATE review_pages
+        SET checkStatus = :status, lastVisitedAtEpochMillis = :updatedAt
+        WHERE reviewId = :reviewId
+          AND pageId = :pageId
+          AND EXISTS (
+              SELECT 1 FROM submission_reviews
+              WHERE submission_reviews.reviewId = :reviewId
+                AND submission_reviews.status = 'DRAFT'
+          )
+    """)
     suspend fun updatePageCheck(reviewId: String, pageId: String, status: String, updatedAt: Long): Int
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
