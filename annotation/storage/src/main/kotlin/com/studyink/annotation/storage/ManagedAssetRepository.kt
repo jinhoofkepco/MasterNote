@@ -222,6 +222,7 @@ private object AssetInspector {
     private fun inspectZip(file: File): InspectedAsset {
         var entries = 0
         var expanded = 0L
+        val names = hashSetOf<String>()
         try {
             ZipInputStream(BufferedInputStream(FileInputStream(file))).use { zip ->
                 while (true) {
@@ -230,7 +231,9 @@ private object AssetInspector {
                     require(!entry.isDirectory) { "ZIP에는 이미지 파일만 허용됩니다" }
                     val name = entry.name.replace('\\', '/')
                     require(!name.startsWith('/') && name.split('/').none { it == ".." }) { "안전하지 않은 ZIP 경로입니다" }
-                    require(name.substringAfterLast('.', "").lowercase() in setOf("png", "jpg", "jpeg", "webp")) {
+                    require(names.add(name)) { "ZIP에 중복 파일명이 있습니다" }
+                    val isOrder = name == "page-order.json"
+                    require(isOrder || name.substringAfterLast('.', "").lowercase() in setOf("png", "jpg", "jpeg", "webp")) {
                         "ZIP에는 PNG, JPEG, WebP만 허용됩니다"
                     }
                     val signature = ByteArray(16)
@@ -247,7 +250,7 @@ private object AssetInspector {
                         expanded += read
                         require(expanded <= MAX_ZIP_EXPANDED_BYTES) { "ZIP 압축 해제 크기가 너무 큽니다" }
                     }
-                    require(isAllowedImageHeader(signature)) { "ZIP 안에 손상되었거나 지원하지 않는 이미지가 있습니다" }
+                    if (!isOrder) require(isAllowedImageHeader(signature)) { "ZIP 안에 손상되었거나 지원하지 않는 이미지가 있습니다" }
                     zip.closeEntry()
                 }
             }
@@ -256,7 +259,7 @@ private object AssetInspector {
         }
         require(entries > 0) { "빈 ZIP입니다" }
         require(expanded <= maxOf(file.length() * MAX_ZIP_RATIO, MIN_ZIP_RATIO_ALLOWANCE)) { "ZIP 압축 비율이 비정상적입니다" }
-        return InspectedAsset("application/zip", pageCount = entries)
+        return InspectedAsset("application/zip", pageCount = entries - if ("page-order.json" in names) 1 else 0)
     }
 
     private fun isAllowedImageHeader(bytes: ByteArray) =
@@ -264,7 +267,7 @@ private object AssetInspector {
             (bytes[0] == 0xff.toByte() && bytes[1] == 0xd8.toByte()) ||
             (bytes.startsWithAscii("RIFF") && bytes.copyOfRange(8, 12).toString(Charsets.US_ASCII) == "WEBP")
 
-    private const val MAX_ZIP_ENTRIES = 2_000
+    private const val MAX_ZIP_ENTRIES = 10_000
     private const val MAX_ZIP_EXPANDED_BYTES = 2L * 1024 * 1024 * 1024
     private const val MAX_ZIP_RATIO = 200L
     private const val MIN_ZIP_RATIO_ALLOWANCE = 16L * 1024 * 1024
