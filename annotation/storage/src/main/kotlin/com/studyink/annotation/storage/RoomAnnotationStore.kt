@@ -30,19 +30,21 @@ class RoomAnnotationStore internal constructor(
 ) {
     private val dao = database.annotationDao()
 
-    suspend fun load(documentId: String): AnnotationSnapshot = withContext(Dispatchers.IO) {
+    suspend fun load(documentId: String, attemptId: String? = null): AnnotationSnapshot = withContext(Dispatchers.IO) {
         if (!dao.hasDocument(documentId) && legacyStore?.exists(documentId) == true) {
             importLegacySnapshot(legacyStore.load(documentId))
         }
-        database.withTransaction { loadRoomSnapshot(documentId) }
+        database.withTransaction {
+            if (attemptId == null) loadRoomSnapshot(documentId) else loadAttemptSnapshot(documentId, attemptId)
+        }
     }
 
-    suspend fun applyMutation(mutation: AnnotationMutation) = withContext(Dispatchers.IO) {
+    suspend fun applyMutation(mutation: AnnotationMutation, attemptId: String? = null) = withContext(Dispatchers.IO) {
         val snapshot = mutation.snapshot
         val operation = mutation.operation
         val documentId = snapshot.documentId
         val pageId = pageId(documentId, operation.pageNumber)
-        val layerId = layerId(pageId)
+        val layerId = attemptId?.let { AnnotationIds.attemptLayerId(pageId, it) } ?: layerId(pageId)
         val now = operation.createdAtEpochMillis
 
         database.withTransaction {
@@ -62,17 +64,23 @@ class RoomAnnotationStore internal constructor(
                     createdAtEpochMillis = now,
                 )
             )
-            dao.insertLayer(
-                AnnotationLayerEntity(
-                    layerId = layerId,
-                    pageId = pageId,
-                    attemptId = null,
-                    layerType = AnnotationLayerType.STUDENT_WORKING.name,
-                    ownerType = AnnotationOwnerType.STUDENT.name,
-                    currentRevision = operation.baseRevision,
-                    createdAtEpochMillis = now,
+            if (attemptId == null) {
+                dao.insertLayer(
+                    AnnotationLayerEntity(
+                        layerId = layerId,
+                        pageId = pageId,
+                        attemptId = null,
+                        layerType = AnnotationLayerType.STUDENT_WORKING.name,
+                        ownerType = AnnotationOwnerType.STUDENT.name,
+                        currentRevision = operation.baseRevision,
+                        createdAtEpochMillis = now,
+                    )
                 )
-            )
+            } else {
+                check(dao.layer(layerId)?.attemptId == attemptId) {
+                    "Attempt page must be opened before writing annotations"
+                }
+            }
 
             mutation.addedAssets.forEach { asset -> dao.insertStroke(asset.toEntity(documentId)) }
             operation.removedStrokeIds.forEach { strokeId ->
@@ -113,19 +121,24 @@ class RoomAnnotationStore internal constructor(
                 )
             )
 
-            check(dao.advancePageRevision(pageId, operation.baseRevision, operation.resultRevision) == 1) {
-                "Page revision conflict for $pageId"
-            }
             check(dao.advanceLayerRevision(layerId, operation.baseRevision, operation.resultRevision) == 1) {
                 "Layer revision conflict for $layerId"
             }
-            check(
-                dao.advanceDocumentRevision(
-                    documentId,
-                    snapshot.revision - 1L,
-                    snapshot.revision,
-                ) == 1
-            ) { "Document revision conflict for $documentId" }
+            if (attemptId == null) {
+                check(dao.advancePageRevision(pageId, operation.baseRevision, operation.resultRevision) == 1) {
+                    "Page revision conflict for $pageId"
+                }
+                check(
+                    dao.advanceDocumentRevision(
+                        documentId,
+                        snapshot.revision - 1L,
+                        snapshot.revision,
+                    ) == 1
+                ) { "Document revision conflict for $documentId" }
+            } else {
+                check(dao.incrementPageRevision(pageId) == 1)
+                check(dao.incrementDocumentRevision(documentId) == 1)
+            }
         }
     }
 
@@ -152,6 +165,29 @@ class RoomAnnotationStore internal constructor(
             documentId = documentId,
             revision = document.currentRevision,
             pageRevisions = dao.pages(documentId).associate { it.pageNumber to it.currentRevision },
+            assets = decodedAssets,
+            activeStrokeIds = activeIds,
+        )
+    }
+
+    private suspend fun loadAttemptSnapshot(documentId: String, attemptId: String): AnnotationSnapshot {
+        if (!dao.hasDocument(documentId)) return AnnotationSnapshot.empty(documentId)
+        val decodedAssets = linkedMapOf<StrokeId, StrokeAsset>()
+        dao.attemptStrokeAssets(attemptId).forEach { entity ->
+            runCatching { entity.toDomain() }.onSuccess { decodedAssets[it.id] = it }
+        }
+        val activeIds = dao.attemptLayerStrokes(attemptId)
+            .asSequence()
+            .filter(LayerStrokeEntity::active)
+            .map { StrokeId(it.strokeId) }
+            .filter(decodedAssets::containsKey)
+            .toSet()
+        val pageRevisions = dao.attemptLayerRevisions(attemptId)
+            .associate { it.pageNumber to it.currentRevision }
+        return AnnotationSnapshot(
+            documentId = documentId,
+            revision = pageRevisions.values.sum(),
+            pageRevisions = pageRevisions,
             assets = decodedAssets,
             activeStrokeIds = activeIds,
         )
