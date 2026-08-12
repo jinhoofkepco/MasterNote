@@ -9,6 +9,10 @@
 | Attempt create/reuse/profile/abandon | `RoomLearningRepositoryTest` | open the same activity repeatedly |
 | Attempt working-layer isolation | `RoomLearningRepositoryTest.workingLayersAreIsolatedBetweenAttempts` | submit then start a new attempt |
 | Resume page plus working ink | `ReaderAttemptSessionTest` | close on page 3 and reopen |
+| Duplicate submission is idempotent | `RoomLearningRepositoryTest.duplicateSubmitReturnsOneImmutableSnapshotWithoutCopyingStrokeBlobs` | rapidly tap submit twice |
+| Submission transaction rollback | `RoomLearningRepositoryTest.everyInjectedSubmissionFailureRollsBackTheWholeTransaction` | interrupt submission during a diagnostic fault run |
+| Flush failure blocks submission | `RoomLearningRepositoryTest.flushFailurePreventsSubmissionTransactionFromStarting` | simulate unavailable storage before submit |
+| Immutable read-only submission | repository and `ReaderAttemptSessionTest.submittedAttemptReopensAsAnImmutableReadOnlySnapshot` | submit, reopen snapshot, attempt to write |
 | Partial erase is atomic | success and injected-failure tests in `RoomAnnotationStoreTest` | erase repeatedly, force-stop immediately |
 | Undo restores original asset | `AnnotationDocumentTest.undoAfterPartialEraseRestoresTheImmutableOriginalStroke` | erase, undo, force-stop, reopen |
 | One corrupt payload is isolated | `corruptStrokeBlobIsSkippedWithoutBlockingOtherStrokes` | import diagnostic corrupt fixture |

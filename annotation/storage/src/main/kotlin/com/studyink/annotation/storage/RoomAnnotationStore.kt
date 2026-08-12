@@ -29,6 +29,7 @@ class RoomAnnotationStore internal constructor(
     private val faultInjector: AnnotationTransactionFaultInjector = AnnotationTransactionFaultInjector.NONE,
 ) {
     private val dao = database.annotationDao()
+    private val learningDao = database.learningDao()
 
     suspend fun load(documentId: String, attemptId: String? = null): AnnotationSnapshot = withContext(Dispatchers.IO) {
         if (!dao.hasDocument(documentId) && legacyStore?.exists(documentId) == true) {
@@ -48,6 +49,11 @@ class RoomAnnotationStore internal constructor(
         val now = operation.createdAtEpochMillis
 
         database.withTransaction {
+            if (attemptId != null) {
+                check(learningDao.attempt(attemptId)?.status == com.studyink.core.model.AttemptStatus.IN_PROGRESS.name) {
+                    "Submitted or abandoned attempts are immutable"
+                }
+            }
             dao.insertDocument(
                 AnnotationDocumentEntity(
                     documentId = documentId,
@@ -145,6 +151,23 @@ class RoomAnnotationStore internal constructor(
     suspend fun flush() = withContext(Dispatchers.IO) {
         database.openHelper.writableDatabase.query("SELECT 1").use { cursor -> cursor.moveToFirst() }
     }
+
+    suspend fun loadSubmission(documentId: String, submissionId: String): AnnotationSnapshot =
+        withContext(Dispatchers.IO) {
+            database.withTransaction {
+                val assets = linkedMapOf<StrokeId, StrokeAsset>()
+                dao.submissionStrokeAssets(submissionId).forEach { entity ->
+                    runCatching { entity.toDomain() }.onSuccess { assets[it.id] = it }
+                }
+                val submission = requireNotNull(learningDao.submission(submissionId))
+                AnnotationSnapshot(
+                    documentId = documentId,
+                    revision = submission.annotationRevision,
+                    assets = assets,
+                    activeStrokeIds = assets.keys,
+                )
+            }
+        }
 
     fun close() = database.close()
 

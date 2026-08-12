@@ -188,4 +188,7 @@ internal interface LearningDao {
 
     @Query("SELECT COUNT(*) FROM submission_answers WHERE submissionId = :submissionId")
     suspend fun submissionAnswerCount(submissionId: String): Int
+
+    @Query("SELECT COUNT(*) FROM stroke_assets")
+    suspend fun strokeAssetCount(): Int
 }
