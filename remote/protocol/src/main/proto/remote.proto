@@ -1,0 +1,90 @@
+syntax = "proto3";
+package studyink.remote.v1;
+option java_package = "com.studyink.remote.protocol.wire";
+option java_multiple_files = true;
+
+enum Lane { LANE_UNSPECIFIED = 0; DURABLE = 1; EPHEMERAL = 2; }
+enum DeviceRole { ROLE_UNSPECIFIED = 0; STUDENT = 1; TEACHER = 2; }
+enum OperationType { OP_UNSPECIFIED = 0; ADD_STROKE = 1; REMOVE_STROKES = 2; REPLACE_STROKES = 3; SUBMISSION_CHANGED = 4; SESSION_CONTROL = 5; }
+
+message Envelope {
+  uint32 protocol_version = 1;
+  string session_id = 2;
+  string sender_device_id = 3;
+  string message_id = 4;
+  Lane lane = 5;
+  uint64 durable_sequence = 6;
+  uint64 sent_elapsed_realtime_ms = 7;
+  oneof payload {
+    Hello hello = 20;
+    HelloAccepted hello_accepted = 21;
+    SessionRejected session_rejected = 22;
+    DurableOperationBatch durable_operation_batch = 23;
+    LiveStrokePreview live_stroke_preview = 24;
+    PageState page_state = 25;
+    ViewportState viewport_state = 26;
+    Ack ack = 27;
+    Nack nack = 28;
+    PageDigest page_digest = 29;
+    CheckpointRequest checkpoint_request = 30;
+    CheckpointChunk checkpoint_chunk = 31;
+    Ping ping = 32;
+    Pong pong = 33;
+    ProtocolError protocol_error = 34;
+  }
+}
+
+message Hello {
+  uint32 min_protocol_version = 1;
+  uint32 max_protocol_version = 2;
+  string app_version = 3;
+  DeviceRole device_role = 4;
+  string device_id = 5;
+  string book_revision_id = 6;
+  string document_content_hash = 7;
+  uint32 page_count = 8;
+  string attempt_id = 9;
+  string current_page_id = 10;
+  uint64 last_acked_durable_sequence = 11;
+  repeated PageGeometry pages = 12;
+}
+message PageGeometry { string page_id = 1; float width = 2; float height = 3; }
+message HelloAccepted { uint32 protocol_version = 1; uint64 expected_sequence = 2; }
+message SessionRejected { string reason = 1; }
+
+message DurableOperationBatch { repeated DurableOperation operations = 1; }
+message DurableOperation {
+  string operation_id = 1;
+  OperationType type = 2;
+  string page_id = 3;
+  uint64 page_revision = 4;
+  repeated string removed_stroke_ids = 5;
+  repeated StrokeAsset added_strokes = 6;
+}
+message StrokeAsset {
+  string stroke_id = 1;
+  uint32 page_number = 2;
+  uint32 tool = 3;
+  sint32 color_argb = 4;
+  float width = 5;
+  repeated StrokePoint points = 6;
+}
+message StrokePoint { float x = 1; float y = 2; float pressure = 3; uint64 elapsed_ms = 4; }
+
+message LiveStrokePreview { string preview_id = 1; string page_id = 2; repeated StrokePoint points = 3; }
+message PageState { string page_id = 1; uint32 page_order = 2; uint64 state_revision = 3; }
+message ViewportState {
+  string page_id = 1; float normalized_center_x = 2; float normalized_center_y = 3;
+  float zoom_scale = 4; float viewport_width_ratio = 5; float viewport_height_ratio = 6;
+}
+message Ack { uint64 highest_contiguous_sequence = 1; }
+message Nack { uint64 expected_sequence = 1; }
+message PageDigest { string page_id = 1; uint64 layer_revision = 2; uint32 active_stroke_count = 3; bytes sorted_stroke_id_hash = 4; }
+message CheckpointRequest { string page_id = 1; uint64 expected_revision = 2; }
+message CheckpointChunk {
+  string snapshot_id = 1; string page_id = 2; uint64 layer_revision = 3;
+  uint32 chunk_index = 4; uint32 chunk_count = 5; bytes stroke_assets = 6; bytes payload_hash = 7;
+}
+message Ping { uint64 nonce = 1; }
+message Pong { uint64 nonce = 1; }
+message ProtocolError { string code = 1; string message = 2; }
