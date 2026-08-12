@@ -58,7 +58,19 @@ class ProgressActivity : ComponentActivity() {
                     reader.launch(args.putInto(Intent(this@ProgressActivity, ReaderActivity::class.java)))
                 }
             }
-            ProgressScreen(state, viewModel::openActivity, viewModel::retry)
+            ProgressScreen(
+                state,
+                viewModel::openActivity,
+                viewModel::retry,
+                onTeacherMode = {
+                    startActivity(
+                        Intent().setClassName(
+                            packageName,
+                            "com.studyink.teacher.TeacherModeGateActivity",
+                        )
+                    )
+                },
+            )
         }
     }
 }
@@ -68,6 +80,7 @@ fun ProgressScreen(
     state: ProgressUiState,
     onActivityClick: (com.studyink.core.model.LearningActivityId) -> Unit,
     onRetry: () -> Unit,
+    onTeacherMode: (() -> Unit)? = null,
 ) {
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFFF5F6FA)) {
@@ -87,12 +100,15 @@ fun ProgressScreen(
                     }
                 }
                 is ProgressUiState.Content -> Column(Modifier.fillMaxSize()) {
-                    Text(
-                        text = state.bookTitle,
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 22.dp, vertical = 20.dp),
-                    )
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = state.bookTitle,
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.weight(1f),
+                        )
+                        onTeacherMode?.let { Button(onClick = it) { Text("선생 모드") } }
+                    }
                     HorizontalDivider(color = Color(0xFFE0E3EB))
                     LazyColumn {
                         items(state.activities, key = { it.activityId.value }) { activity ->

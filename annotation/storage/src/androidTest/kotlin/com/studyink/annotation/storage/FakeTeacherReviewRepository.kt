@@ -45,6 +45,8 @@ class FakeTeacherReviewRepository(
         checkedPages[reviewId to pageId] = checked
     }
 
+    override suspend fun updateReviewResumePage(reviewId: ReviewId, pageId: PageId) = Unit
+
     override suspend fun updateSummary(reviewId: ReviewId, text: String) {
         summaries[reviewId] = text
     }

@@ -10,5 +10,6 @@ not teacher-domain source code.
   dependency and this feature does not justify a navigation migration.
 - Room 2.8.4 transactions are used for draft creation and publication. Every publication phase has
   local fault-injection coverage.
-- AndroidX BiometricPrompt will be isolated behind a MasterNote interface. Authentication state is
-  process-memory-only and never persisted to Room.
+- AndroidX BiometricPrompt 1.1.0 is isolated behind a MasterNote interface. Authentication state is
+  process-memory-only, expires after five background minutes, guards Reader teacher scenes, and is
+  never persisted to Room.

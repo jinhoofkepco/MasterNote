@@ -19,5 +19,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name="com.studyink.teacher.TeacherModeGateActivity"
+            android:exported="false" />
+        <activity
+            android:name="com.studyink.teacher.TeacherHomeActivity"
+            android:exported="false"
+            android:screenOrientation="fullSensor" />
     </application>
 </manifest>

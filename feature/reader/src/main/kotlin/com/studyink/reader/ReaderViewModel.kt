@@ -43,6 +43,7 @@ data class ReaderUiState(
     val readOnly: Boolean = false,
     val submissionId: SubmissionId? = null,
     val scene: ReaderScene? = null,
+    val layerVisibility: List<Boolean> = emptyList(),
 )
 
 class ReaderViewModel(application: Application) : AndroidViewModel(application) {
@@ -75,6 +76,8 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     private var teacherStore: RoomTeacherRepository? = null
     private var document = AnnotationDocument(AnnotationSnapshot.empty("sample"))
     private var readOnlySceneSnapshot = AnnotationSnapshot.empty("sample")
+    private var sceneSourceSnapshots: List<Pair<ReaderLayerSource, AnnotationSnapshot>> = emptyList()
+    private var sceneVisibility: MutableList<Boolean> = mutableListOf()
     private var activeAttemptId: AttemptId? = null
     private var activeSession: AttemptSession? = null
     private var activeScene: ReaderScene? = null
@@ -167,6 +170,15 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     fun undo() = enqueueMutation("되돌리는 중…") { undo() }
     fun redo() = enqueueMutation("다시 실행 중…") { redo() }
 
+    fun setLayerVisibility(index: Int, visible: Boolean) {
+        if (index !in sceneVisibility.indices) return
+        sceneVisibility[index] = visible
+        val editable = document.snapshot()
+        val composed = composeSceneSnapshot(editable)
+        readOnlySceneSnapshot = composeReadOnlySnapshot(editable.documentId)
+        _uiState.value = _uiState.value.copy(snapshot = composed, layerVisibility = sceneVisibility.toList())
+    }
+
     fun submit(onSubmitted: (SubmissionId) -> Unit) {
         if (_uiState.value.readOnly || activeAttemptId == null) return
         _uiState.value = _uiState.value.copy(busy = true, status = "제출 준비 중…")
@@ -247,6 +259,10 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         val loaded = sceneLoad.snapshot
         document = AnnotationDocument(sceneLoad.editableSnapshot)
         readOnlySceneSnapshot = sceneLoad.readOnlySnapshot
+        if (command.scene == null) {
+            sceneSourceSnapshots = emptyList()
+            sceneVisibility = mutableListOf()
+        }
         activeScene = command.scene
         activeSession = session
         activeAttemptId = session?.attempt?.attemptId.takeIf { command.scene == null }
@@ -266,6 +282,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     (session != null && session.attempt.status != com.studyink.core.model.AttemptStatus.IN_PROGRESS)),
             submissionId = command.launchArgs?.submissionId,
             scene = command.scene,
+            layerVisibility = sceneVisibility.toList(),
         )
     }
 
@@ -282,6 +299,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         var pages: List<com.studyink.core.model.ActivityPage> = emptyList()
         var editable = AnnotationSnapshot.empty(documentId)
         val readOnlyParts = mutableListOf<AnnotationSnapshot>()
+        val loadedSources = mutableListOf<Pair<ReaderLayerSource, AnnotationSnapshot>>()
         for (source in scene.visibleLayerSources) {
             val loaded = when (source) {
                 is EditableLiveLayer -> loadLiveTarget(documentId, source.target).also {
@@ -310,11 +328,14 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 }
             }
+            loadedSources += source to loaded
             if (source is EditableLiveLayer) editable = loaded
             else if (source.visibleByDefault) readOnlyParts += loaded
         }
         require(pages.isNotEmpty()) { "ReaderScene has no pages" }
         scenePages = pages
+        sceneSourceSnapshots = loadedSources
+        sceneVisibility = scene.visibleLayerSources.map(ReaderLayerSource::visibleByDefault).toMutableList()
         val readOnly = mergeSnapshots(documentId, readOnlyParts)
         return SceneLoad(mergeSnapshots(documentId, listOf(readOnly, editable)), editable, readOnly, session, scene.initialPageId)
     }
@@ -362,7 +383,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         _uiState.value = _uiState.value.copy(
-            snapshot = mergeSnapshots(mutation.snapshot.documentId, listOf(readOnlySceneSnapshot, mutation.snapshot)),
+            snapshot = composeSceneSnapshot(mutation.snapshot),
             busy = false,
             status = "저장 대기 중…",
         )
@@ -389,7 +410,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             .onFailure { error ->
                 document = AnnotationDocument(before)
                 _uiState.value = _uiState.value.copy(
-                    snapshot = mergeSnapshots(before.documentId, listOf(readOnlySceneSnapshot, before)),
+                    snapshot = composeSceneSnapshot(before),
                 )
                 finishMutation(command, "저장 실패 · 변경 취소: ${error.message}")
             }
@@ -454,6 +475,22 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         val attemptId = activeAttemptId ?: return
         val pageId = selectedPageId ?: return
         learningRepository().updateResumePage(attemptId, pageId)
+    }
+
+    private fun composeReadOnlySnapshot(documentId: String): AnnotationSnapshot = mergeSnapshots(
+        documentId,
+        sceneSourceSnapshots.mapIndexedNotNull { index, (source, snapshot) ->
+            snapshot.takeIf { source !is EditableLiveLayer && sceneVisibility.getOrNull(index) == true }
+        },
+    )
+
+    private fun composeSceneSnapshot(editable: AnnotationSnapshot): AnnotationSnapshot {
+        if (activeScene == null) return editable
+        val parts = sceneSourceSnapshots.mapIndexedNotNull { index, (source, snapshot) ->
+            if (sceneVisibility.getOrNull(index) != true) null
+            else if (source is EditableLiveLayer) editable else snapshot
+        }
+        return mergeSnapshots(editable.documentId, parts)
     }
 
     override fun onCleared() {

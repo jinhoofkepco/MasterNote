@@ -34,7 +34,13 @@ import com.studyink.document.pdf.PdfViewportAdapter
 import com.studyink.document.pdf.ReaderPdfFragment
 import com.studyink.document.pdf.SinglePagePdfView
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import java.io.File
+import com.studyink.annotation.storage.RoomTeacherRepository
+import com.studyink.core.model.ReviewDecision
+import com.studyink.core.model.ReviewId
+import com.studyink.core.model.ReviewSession
 
 class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private val viewModel: ReaderViewModel by viewModels()
@@ -47,6 +53,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private lateinit var pdfFragment: ReaderPdfFragment
     private lateinit var topBar: ComposeView
     private lateinit var paletteAnchor: ComposeView
+    private var reviewPane: ComposeView? = null
     private var selectedTool by mutableStateOf(ReaderTool.PEN)
     private var selectedPenColor by mutableStateOf(0xFF17233C.toInt())
     private var selectedPenWidthDp by mutableStateOf(3.2f)
@@ -58,6 +65,13 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var stylusButtonPressed = false
     private var appliedInitialAttemptId: String? = null
     private var appliedSceneKey: String? = null
+    private var reviewSession by mutableStateOf<ReviewSession?>(null)
+    private var reviewSummary by mutableStateOf("")
+    private var reviewPublishing by mutableStateOf(false)
+    private var reviewError by mutableStateOf<String?>(null)
+    private var reviewSaveJob: Job? = null
+    private var reviewRepository: RoomTeacherRepository? = null
+    private var reviewExpanded = false
 
     private val openPdf = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -70,6 +84,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (readerScene?.requiresTeacherAccess() == true && !TeacherRouteAccess.session.isValid()) {
+            finish()
+            return
+        }
         val root = FrameLayout(this).apply { setBackgroundColor(Color.rgb(225, 226, 231)) }
         setContentView(root)
 
@@ -126,6 +144,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 FrameLayout.LayoutParams(dp(1), dp(1), Gravity.TOP or Gravity.START)
             )
         }
+        setupReviewPane(root, fragmentContainer)
         applySystemBarInsets(root, fragmentContainer)
         refreshChrome()
 
@@ -144,6 +163,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                     latestState = state
                     dryInkView.snapshot = state.snapshot
                     inputView.visibility = if (state.readOnly) View.INVISIBLE else View.VISIBLE
+                    refreshReviewPane()
                     val session = state.attemptSession
                     if (session != null && appliedInitialAttemptId != session.attempt.attemptId.value) {
                         appliedInitialAttemptId = session.attempt.attemptId.value
@@ -227,6 +247,14 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         dryInkView.activePage = target
         viewport.showPage(target)
         viewModel.onPageSelected(target)
+        reviewSession?.takeIf { it.review.status == com.studyink.core.model.ReviewStatus.DRAFT }
+            ?.pages?.firstOrNull { it.pageNumber == target }
+            ?.let { page ->
+                lifecycleScope.launch {
+                    runCatching { reviewRepository().updateReviewResumePage(page.reviewId, page.pageId) }
+                }
+            }
+        refreshReviewPane()
     }
 
     private fun refreshChrome() {
@@ -238,7 +266,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 } else {
                     null
                 },
-                onSubmit = if (latestState.attemptSession != null && !latestState.readOnly) {
+                onSubmit = if (latestState.scene == null && latestState.attemptSession != null && !latestState.readOnly) {
                     {
                         viewModel.submit { submissionId ->
                             setResult(
@@ -275,7 +303,115 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 onDismissRequest = { stylusMenuExpanded = false },
             )
         }
+        refreshReviewPane()
     }
+
+    private fun setupReviewPane(root: FrameLayout, fragmentContainer: View) {
+        val reviewId = readerScene?.reviewIdOrNull() ?: return
+        val expanded = resources.configuration.screenWidthDp >= 720
+        reviewExpanded = expanded
+        reviewPane = ComposeView(this).also { pane ->
+            pane.setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            root.addView(
+                pane,
+                FrameLayout.LayoutParams(
+                    if (expanded) dp(320) else MATCH,
+                    if (expanded) MATCH else dp(250),
+                    if (expanded) Gravity.END else Gravity.BOTTOM,
+                ),
+            )
+        }
+        listOf(fragmentContainer, dryInkView, wetInkView, inputView).forEach { content ->
+            content.updateFrameLayoutParams {
+                if (expanded) rightMargin = dp(320) else bottomMargin = dp(250)
+            }
+        }
+        lifecycleScope.launch {
+            runCatching { reviewRepository().getReview(reviewId) }
+                .onSuccess {
+                    reviewSession = it
+                    reviewSummary = it.review.summaryText
+                }
+                .onFailure { reviewError = it.message }
+            refreshReviewPane()
+        }
+    }
+
+    private fun refreshReviewPane() {
+        reviewPane?.setContent {
+            TeacherReviewSupportingPane(
+                session = reviewSession,
+                currentPage = currentPage,
+                summary = reviewSummary,
+                layerSources = latestState.scene?.visibleLayerSources.orEmpty(),
+                layerVisibility = latestState.layerVisibility,
+                publishing = reviewPublishing,
+                error = reviewError,
+                onSummaryChange = ::updateReviewSummary,
+                onToggleLayer = viewModel::setLayerVisibility,
+                onTogglePageChecked = ::toggleCurrentReviewPage,
+                onEvaluate = ::evaluateAnswer,
+                onPublish = ::publishReview,
+            )
+        }
+    }
+
+    private fun updateReviewSummary(text: String) {
+        val session = reviewSession ?: return
+        if (session.review.status != com.studyink.core.model.ReviewStatus.DRAFT) return
+        reviewSummary = text
+        reviewSaveJob?.cancel()
+        reviewSaveJob = lifecycleScope.launch {
+            delay(500)
+            runCatching { reviewRepository().updateSummary(session.review.reviewId, text) }
+                .onFailure { reviewError = it.message }
+        }
+    }
+
+    private fun toggleCurrentReviewPage(checked: Boolean) {
+        val session = reviewSession ?: return
+        val page = session.pages.firstOrNull { it.pageNumber == currentPage } ?: return
+        lifecycleScope.launch {
+            runCatching { reviewRepository().markPageChecked(session.review.reviewId, page.pageId, checked) }
+                .onSuccess { reviewSession = reviewRepository().getReview(session.review.reviewId) }
+                .onFailure { reviewError = it.message }
+            refreshReviewPane()
+        }
+    }
+
+    private fun evaluateAnswer(fieldId: String, verdict: com.studyink.core.model.AnswerVerdict) {
+        val session = reviewSession ?: return
+        lifecycleScope.launch {
+            runCatching { reviewRepository().updateAnswerEvaluation(session.review.reviewId, fieldId, verdict, "") }
+                .onFailure { reviewError = it.message }
+        }
+    }
+
+    private fun publishReview(decision: ReviewDecision) {
+        val session = reviewSession ?: return
+        if (reviewPublishing) return
+        reviewPublishing = true
+        refreshReviewPane()
+        lifecycleScope.launch {
+            runCatching {
+                viewModel.flush()
+                reviewSaveJob?.join()
+                reviewRepository().updateSummary(session.review.reviewId, reviewSummary)
+                reviewRepository().publishReview(session.review.reviewId, decision)
+            }.onSuccess {
+                Toast.makeText(this@ReaderActivity, "검토를 게시했습니다", Toast.LENGTH_SHORT).show()
+                setResult(RESULT_OK)
+                finish()
+            }.onFailure {
+                reviewPublishing = false
+                reviewError = it.message
+                refreshReviewPane()
+            }
+        }
+    }
+
+    private suspend fun reviewRepository(): RoomTeacherRepository = reviewRepository
+        ?: RoomTeacherRepository.open(this).also { reviewRepository = it }
 
     override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
         if (handleStylusButton(event)) return true
@@ -346,6 +482,28 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         super.onStop()
     }
 
+    override fun onPause() {
+        val session = reviewSession
+        if (session?.review?.status == com.studyink.core.model.ReviewStatus.DRAFT) {
+            reviewSaveJob?.cancel()
+            reviewSaveJob = lifecycleScope.launch {
+                runCatching { reviewRepository().updateSummary(session.review.reviewId, reviewSummary) }
+            }
+        }
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        val repository = reviewRepository
+        val saveJob = reviewSaveJob
+        if (repository != null && saveJob?.isActive == true) {
+            saveJob.invokeOnCompletion { repository.close() }
+        } else {
+            repository?.close()
+        }
+        super.onDestroy()
+    }
+
     private fun contentLayoutParams() = FrameLayout.LayoutParams(MATCH, MATCH).apply {
         topMargin = dp(TOP_BAR_HEIGHT)
     }
@@ -360,7 +518,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             listOf(fragmentContainer, dryInkView, wetInkView, inputView).forEach { content ->
                 content.updateFrameLayoutParams {
                     topMargin = bars.top + dp(TOP_BAR_HEIGHT)
-                    bottomMargin = bars.bottom
+                    bottomMargin = bars.bottom + if (reviewPane != null && !reviewExpanded) dp(250) else 0
+                    rightMargin = if (reviewPane != null && reviewExpanded) dp(320) else 0
                 }
             }
             windowInsets
@@ -394,5 +553,13 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         private const val PDF_CONTAINER_ID = 0x5100
         private const val TOP_BAR_HEIGHT = 52
         private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+    }
+}
+
+private fun ReaderScene.reviewIdOrNull(): ReviewId? = visibleLayerSources.firstNotNullOfOrNull { source ->
+    when (source) {
+        is EditableLiveLayer -> (source.target as? LiveLayerTarget.TeacherFeedback)?.reviewId
+        is ReadOnlySnapshot -> (source.target as? SnapshotTarget.PublishedReview)?.reviewId
+        else -> null
     }
 }

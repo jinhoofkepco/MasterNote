@@ -28,6 +28,7 @@ import com.studyink.reader.ReaderViewModel
 import com.studyink.reader.SampleLearningContent
 import com.studyink.reader.OpenSubmissionReviewUseCase
 import com.studyink.core.model.ReviewDecision
+import com.studyink.reader.TeacherRouteAccess
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -43,6 +44,7 @@ class ReaderTeacherSceneTest {
 
     @Before fun resetAndSeed() {
         runBlocking {
+            TeacherRouteAccess.session.authenticated()
             context.deleteDatabase("master-note-annotations.db")
             RoomLearningRepository.open(context).also {
                 it.ensureContent(SampleLearningContent.createSeed(context))
@@ -51,7 +53,7 @@ class ReaderTeacherSceneTest {
         }
     }
 
-    @After fun close() { scenario?.close() }
+    @After fun close() { scenario?.close(); TeacherRouteAccess.session.invalidate() }
 
     @Test fun teacherPreparationStrokeRestoresAfterReaderReopen() = runBlocking {
         val teacherRepository = RoomTeacherRepository.open(context)
