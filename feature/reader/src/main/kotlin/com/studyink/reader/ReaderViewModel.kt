@@ -408,7 +408,13 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 val layerId = teacherRepository().getOrCreateFeedbackLayer(feedback.reviewId, pageId)
                 annotationStore().applyMutationToLayer(mutation, layerId.value)
             } else {
-                annotationStore().applyMutation(mutation, activeAttemptId?.value)
+                val attempt = activeAttemptId
+                val remote = ReaderRemoteBridge.sink?.outboxRequest()
+                if (attempt != null && remote != null) {
+                    annotationStore().applyMutationAndEnqueueRemote(mutation, attempt.value, remote)
+                } else {
+                    annotationStore().applyMutation(mutation, attempt?.value)
+                }
             }
         }
             .onSuccess {

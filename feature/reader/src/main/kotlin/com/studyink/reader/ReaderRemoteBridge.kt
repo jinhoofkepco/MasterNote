@@ -12,6 +12,7 @@ interface ReaderRemoteEventSink {
     fun onStrokeFinished(previewId: String)
     fun onPageChanged(pageNumber: Int)
     fun onViewportChanged(state: com.studyink.document.pdf.PdfViewportState)
+    fun outboxRequest(): com.studyink.annotation.storage.RemoteOutboxRequest? = null
 }
 
 class RemoteLiveReaderSink(
