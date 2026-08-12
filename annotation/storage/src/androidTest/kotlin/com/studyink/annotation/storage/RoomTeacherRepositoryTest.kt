@@ -23,6 +23,9 @@ import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.flow.first
 import com.studyink.core.model.ActivityProgressState
@@ -61,6 +64,22 @@ class RoomTeacherRepositoryTest {
         assertEquals(1, first.review.reviewNumber)
         assertEquals(listOf(0, 1), first.pages.map { it.pageNumber })
         assertTrue(first.pages.all { it.feedbackLayerId == null })
+    }
+
+    @Test fun concurrentDraftRequestsStillCreateOneReview() = runTest {
+        val ids = AtomicLong()
+        val generator = LearningIdGenerator { "concurrent-${ids.incrementAndGet()}" }
+        val clock = LearningClock { now.getAndIncrement() }
+        val learning = RoomLearningRepository(database, Dispatchers.IO, clock, generator)
+        val teacher = RoomTeacherRepository(database, Dispatchers.IO, clock, generator)
+        val submission = submittedAttempt(learning)
+
+        val reviews = coroutineScope {
+            List(8) { async(Dispatchers.Default) { teacher.getOrCreateDraftReview(submission, TEACHER) } }.awaitAll()
+        }
+
+        assertEquals(1, reviews.map { it.review.reviewId }.distinct().size)
+        assertEquals(1, database.teacherDao().maxReviewNumber(submission.value))
     }
 
     @Test fun differentSubmissionsCreateDifferentReviews() = runTest {
@@ -127,6 +146,20 @@ class RoomTeacherRepositoryTest {
         }.exceptionOrNull() is IllegalStateException)
         assertTrue(runCatching {
             store.applyMutationToLayer(document.addStroke(stroke("late")), layer.value)
+        }.exceptionOrNull() is IllegalStateException)
+        assertTrue(runCatching {
+            teacher.markPageChecked(review.review.reviewId, PAGE_ONE, true)
+        }.exceptionOrNull() is IllegalStateException)
+        assertTrue(runCatching {
+            teacher.updateSummary(review.review.reviewId, "late summary")
+        }.exceptionOrNull() is IllegalStateException)
+        assertTrue(runCatching {
+            teacher.updateAnswerEvaluation(
+                review.review.reviewId,
+                "answer-1",
+                com.studyink.core.model.AnswerVerdict.CORRECT,
+                "late evaluation",
+            )
         }.exceptionOrNull() is IllegalStateException)
     }
 
@@ -209,6 +242,47 @@ class RoomTeacherRepositoryTest {
         )
     }
 
+    @Test fun largeReviewSnapshotsReferenceAssetsWithoutBlobDuplication() = runTest {
+        val (learning, teacher) = repositories("large-attempt", "large-submission", "large-review")
+        val seed = largeSeed()
+        learning.ensureContent(seed)
+        database.teacherDao().insertTeacher(TeacherProfileEntity(TEACHER.value, "선생님", 1L))
+        val attempt = learning.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+        val store = RoomAnnotationStore(database)
+
+        seed.activities.single().pages.forEach { page ->
+            learning.prepareAttemptPage(attempt.attempt.attemptId, page.pageId)
+            val pageDocument = AnnotationDocument(AnnotationSnapshot.empty(DOCUMENT))
+            repeat(100) { index ->
+                store.applyMutation(
+                    pageDocument.addStroke(stroke("student-${page.pageNumber}-$index", page.pageNumber)),
+                    attempt.attempt.attemptId.value,
+                )
+            }
+        }
+        val submission = learning.submitAttempt(attempt.attempt.attemptId)
+        val review = teacher.getOrCreateDraftReview(submission, TEACHER)
+        review.pages.forEach { page ->
+            val layer = teacher.getOrCreateFeedbackLayer(review.review.reviewId, page.pageId)
+            val pageDocument = AnnotationDocument(AnnotationSnapshot.empty(DOCUMENT))
+            repeat(25) { index ->
+                store.applyMutationToLayer(
+                    pageDocument.addStroke(stroke("feedback-${page.pageNumber}-$index", page.pageNumber)),
+                    layer.value,
+                )
+            }
+        }
+        val assetCountBeforePublish = database.learningDao().strokeAssetCount()
+
+        val published = teacher.publishReview(review.review.reviewId, ReviewDecision.ACCEPTED)
+
+        assertEquals(2_000, learning.getSubmission(submission).strokes.size)
+        assertEquals(500, published.strokes.size)
+        assertEquals(2_500, assetCountBeforePublish)
+        assertEquals(assetCountBeforePublish, database.learningDao().strokeAssetCount())
+        assertEquals(500, store.loadPublishedReview(DOCUMENT, review.review.reviewId.value).activeStrokeIds.size)
+    }
+
     private fun repositories(vararg ids: String): Pair<RoomLearningRepository, RoomTeacherRepository> {
         val iterator = ids.iterator()
         val generator = LearningIdGenerator(iterator::next)
@@ -233,8 +307,17 @@ class RoomTeacherRepositoryTest {
         )),
     )
 
-    private fun stroke(id: String) = StrokeAsset(
-        id = com.studyink.core.model.StrokeId(id), pageNumber = 0, tool = StrokeTool.PEN,
+    private fun largeSeed() = LearningContentSeed(
+        LearnerProfile(PROFILE, "학생", 1L),
+        BookRevision(REVISION, "book", DOCUMENT, 1, "large-hash", "큰 책", 1L),
+        listOf(LearningActivitySeed(
+            LearningActivity(ACTIVITY, REVISION, "20 page activity", 0, SubmissionMode.INK_ONLY),
+            List(20) { page -> ActivityPage(PageId("$DOCUMENT:page:$page"), page, page) },
+        )),
+    )
+
+    private fun stroke(id: String, pageNumber: Int = 0) = StrokeAsset(
+        id = com.studyink.core.model.StrokeId(id), pageNumber = pageNumber, tool = StrokeTool.PEN,
         colorArgb = 0xffcc2233.toInt(), width = 3f,
         points = listOf(PagePoint(10f, 10f), PagePoint(50f, 50f)),
     )

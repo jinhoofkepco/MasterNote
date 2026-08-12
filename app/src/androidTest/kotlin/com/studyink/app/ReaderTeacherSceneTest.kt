@@ -139,6 +139,9 @@ class ReaderTeacherSceneTest {
         viewModel.addStroke(feedback)
         flush()
         scenario!!.onActivity { assertEquals(setOf(student.id, feedback.id), it.findDryInkView().snapshot.activeStrokeIds) }
+        scenario!!.recreate()
+        waitForReady(readOnly = false, strokes = 2)
+        scenario!!.onActivity { assertEquals(setOf(student.id, feedback.id), it.findDryInkView().snapshot.activeStrokeIds) }
         scenario!!.close()
         scenario = null
 
