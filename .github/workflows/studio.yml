@@ -1,0 +1,19 @@
+name: Studio
+
+on:
+  pull_request:
+    paths: ["studio/**", "package-format/**", ".github/workflows/studio.yml"]
+  workflow_dispatch:
+
+jobs:
+  independent-studio-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: chmod +x gradlew
+      - run: ./gradlew -p studio test :app:assembleDebug

@@ -1,0 +1,26 @@
+name: Content package contract
+
+on:
+  pull_request:
+    paths:
+      - "package-format/**"
+      - "studio/**"
+      - "annotation/storage/**"
+      - ".github/workflows/contract-compatibility.yml"
+  workflow_dispatch:
+
+jobs:
+  studio-to-reader-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: chmod +x gradlew
+      - name: Export snapshot and shared validator tests
+        run: ./gradlew -p studio :exporter:test
+      - name: Reader importer contract compiles
+        run: ./gradlew :annotation:storage:assembleDebugAndroidTest
