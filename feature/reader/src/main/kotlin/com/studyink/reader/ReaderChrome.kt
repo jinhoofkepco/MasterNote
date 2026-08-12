@@ -82,6 +82,7 @@ fun TopReaderBar(
     state: ReaderUiState,
     onOpenPdf: (() -> Unit)?,
     onSubmit: (() -> Unit)? = null,
+    onAnswer: (() -> Unit)? = null,
 ) {
     MaterialTheme {
         Surface(tonalElevation = 3.dp, shadowElevation = 3.dp) {
@@ -106,6 +107,9 @@ fun TopReaderBar(
                 }
                 if (onSubmit != null) {
                     TextButton(onClick = onSubmit, enabled = !state.busy) { Text("답안 제출") }
+                }
+                if (onAnswer != null) {
+                    TextButton(onClick = onAnswer) { Text("정답") }
                 }
             }
         }

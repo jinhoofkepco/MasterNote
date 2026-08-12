@@ -44,6 +44,7 @@ data class ReaderUiState(
     val submissionId: SubmissionId? = null,
     val scene: ReaderScene? = null,
     val layerVisibility: List<Boolean> = emptyList(),
+    val currentPageId: PageId? = null,
 )
 
 class ReaderViewModel(application: Application) : AndroidViewModel(application) {
@@ -136,14 +137,16 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun onPageSelected(pageNumber: Int) {
-        if (_uiState.value.readOnly) return
         if (activeScene != null) {
             selectedPageId = scenePages.firstOrNull { it.pageNumber == pageNumber }?.pageId
+            _uiState.value = _uiState.value.copy(currentPageId = selectedPageId)
             return
         }
         val session = activeSession ?: return
         val page = session.pages.firstOrNull { it.pageNumber == pageNumber } ?: return
         selectedPageId = page.pageId
+        _uiState.value = _uiState.value.copy(currentPageId = page.pageId)
+        if (_uiState.value.readOnly) return
         publishRemotePageSnapshot(page.pageId, pageNumber)
         val attemptId = session.attempt.attemptId
         check(commands.trySend(Command.PreparePage(attemptId, page.pageId)).isSuccess)
@@ -284,6 +287,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             submissionId = command.launchArgs?.submissionId,
             scene = command.scene,
             layerVisibility = sceneVisibility.toList(),
+            currentPageId = initialPageId,
         )
     }
 
