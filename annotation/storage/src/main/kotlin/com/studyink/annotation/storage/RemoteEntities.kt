@@ -45,3 +45,30 @@ internal data class RemoteAppliedOperationEntity(
     val operationId: String,
     val appliedAtEpochMillis: Long,
 )
+
+@Entity(
+    tableName = "remote_replica_pages",
+    primaryKeys = ["sessionId", "pageId"],
+    indices = [Index(value = ["sessionId", "lastUpdatedAtEpochMillis"])],
+)
+internal data class RemoteReplicaPageEntity(
+    val sessionId: String,
+    val pageId: String,
+    val pageNumber: Int,
+    val layerRevision: Long,
+    val lastAppliedSequence: Long,
+    val lastUpdatedAtEpochMillis: Long,
+)
+
+@Entity(
+    tableName = "remote_replica_strokes",
+    primaryKeys = ["sessionId", "pageId", "strokeId"],
+    indices = [Index(value = ["sessionId", "pageId", "zOrder"])],
+)
+internal data class RemoteReplicaStrokeEntity(
+    val sessionId: String,
+    val pageId: String,
+    val strokeId: String,
+    val zOrder: Long,
+    val encodedStroke: ByteArray,
+)

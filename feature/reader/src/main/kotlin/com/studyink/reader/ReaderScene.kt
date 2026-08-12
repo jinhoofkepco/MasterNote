@@ -25,6 +25,7 @@ sealed interface ReaderLayerSource { val visibleByDefault: Boolean }
 data class EditableLiveLayer(val target: LiveLayerTarget, override val visibleByDefault: Boolean = true) : ReaderLayerSource
 data class ReadOnlyLiveLayer(val target: LiveLayerTarget, override val visibleByDefault: Boolean = true) : ReaderLayerSource
 data class ReadOnlySnapshot(val target: SnapshotTarget, override val visibleByDefault: Boolean = true) : ReaderLayerSource
+data class ReadOnlyRemoteLayer(val remoteSessionId: String, override val visibleByDefault: Boolean = true) : ReaderLayerSource
 
 class ReaderScene private constructor(
     val documentRevisionId: BookRevisionId,
@@ -95,6 +96,10 @@ class ReaderScene private constructor(
             ),
             ReaderInteractionPolicy.REVIEW,
         )
+
+        fun remoteObservation(revisionId: BookRevisionId, remoteSessionId: String, pageId: PageId) = create(
+            revisionId, pageId, listOf(ReadOnlyRemoteLayer(remoteSessionId)), ReaderInteractionPolicy.OBSERVE,
+        )
     }
 }
 
@@ -123,6 +128,7 @@ object ReaderSceneIntentCodec {
             is SnapshotTarget.StudentSubmission -> "S:SUBMISSION:${target.submissionId.value}:${source.visibleByDefault}"
             is SnapshotTarget.PublishedReview -> "S:REVIEW:${target.reviewId.value}:${source.visibleByDefault}"
         }
+        is ReadOnlyRemoteLayer -> "R:REMOTE:${source.remoteSessionId}:${source.visibleByDefault}"
     }
 
     private fun encodeLive(target: LiveLayerTarget): String = when (target) {
@@ -146,6 +152,7 @@ object ReaderSceneIntentCodec {
                     else -> error("Unknown snapshot target")
                 }, visible,
             )
+            "R" -> ReadOnlyRemoteLayer(targetId, visible)
             else -> error("Unknown Reader layer source")
         }
     }

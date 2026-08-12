@@ -1,5 +1,7 @@
 package com.studyink.remote.storage
 
+import com.studyink.remote.protocol.RemoteDurableOperation
+import com.studyink.remote.protocol.RemoteStrokeAsset
 import kotlinx.coroutines.flow.Flow
 
 data class RemoteOutboxEntry(
@@ -34,4 +36,28 @@ interface RemoteInboxStore {
         appliedAtEpochMillis: Long,
     ): Boolean
     suspend fun highestContiguousSequence(sessionId: String): Long
+}
+
+data class RemoteReplicaPage(
+    val sessionId: String,
+    val pageId: String,
+    val pageNumber: Int,
+    val layerRevision: Long,
+    val lastAppliedSequence: Long,
+    val lastUpdatedAtEpochMillis: Long,
+    val strokes: List<RemoteStrokeAsset>,
+)
+
+interface RemoteReplicaStore {
+    suspend fun page(sessionId: String, pageId: String): RemoteReplicaPage?
+    suspend fun pages(sessionId: String): List<RemoteReplicaPage>
+    suspend fun replacePageAtomically(page: RemoteReplicaPage)
+    suspend fun applyOperationAtomically(
+        sessionId: String,
+        durableSequence: Long,
+        messageId: String,
+        operation: RemoteDurableOperation,
+        appliedAtEpochMillis: Long,
+    ): Boolean
+    suspend fun deleteSession(sessionId: String)
 }

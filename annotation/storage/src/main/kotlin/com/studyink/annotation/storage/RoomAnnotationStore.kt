@@ -10,6 +10,7 @@ import com.studyink.core.model.PageBounds
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeId
 import com.studyink.core.model.StrokeTool
+import com.studyink.core.model.PagePoint
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -284,6 +285,30 @@ class RoomAnnotationStore internal constructor(
                 }
                 AnnotationSnapshot(documentId, assets.size.toLong(), assets = assets, activeStrokeIds = assets.keys)
             }
+        }
+
+    suspend fun loadRemoteReplica(documentId: String, sessionId: String): AnnotationSnapshot =
+        withContext(Dispatchers.IO) {
+            val pages = RoomRemoteReplicaStore(database).pages(sessionId)
+            val assets = pages.flatMap { it.strokes }.mapNotNull { remote ->
+                runCatching {
+                    StrokeAsset(
+                        id = StrokeId(remote.strokeId),
+                        pageNumber = remote.pageNumber,
+                        tool = StrokeTool.entries.getOrElse(remote.tool) { StrokeTool.PEN },
+                        colorArgb = remote.colorArgb,
+                        width = remote.width,
+                        points = remote.points.map { PagePoint(it.x, it.y, it.pressure, it.elapsedMs) },
+                    )
+                }.getOrNull()
+            }.associateBy(StrokeAsset::id)
+            AnnotationSnapshot(
+                documentId = documentId,
+                revision = pages.sumOf { it.layerRevision },
+                pageRevisions = pages.associate { it.pageNumber to it.layerRevision },
+                assets = assets,
+                activeStrokeIds = assets.keys,
+            )
         }
 
     fun close() = database.close()

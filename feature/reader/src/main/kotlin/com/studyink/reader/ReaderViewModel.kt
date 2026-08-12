@@ -327,6 +327,14 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                         annotationStore().loadPublishedReview(documentId, target.reviewId.value)
                     }
                 }
+                is ReadOnlyRemoteLayer -> {
+                    val replicaStore = com.studyink.annotation.storage.RoomRemoteReplicaStore.open(getApplication())
+                    val replicaPages = try { replicaStore.pages(source.remoteSessionId) } finally { replicaStore.close() }
+                    pages = replicaPages.map {
+                        com.studyink.core.model.ActivityPage(com.studyink.core.model.PageId(it.pageId), it.pageNumber, it.pageNumber)
+                    }
+                    annotationStore().loadRemoteReplica(documentId, source.remoteSessionId)
+                }
             }
             loadedSources += source to loaded
             if (source is EditableLiveLayer) editable = loaded

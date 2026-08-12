@@ -120,4 +120,5 @@ private fun layerName(source: ReaderLayerSource): String = when (source) {
         is SnapshotTarget.StudentSubmission -> "학생 제출 필기"
         is SnapshotTarget.PublishedReview -> "게시된 첨삭"
     }
+    is ReadOnlyRemoteLayer -> "학생 원격 필기"
 }
