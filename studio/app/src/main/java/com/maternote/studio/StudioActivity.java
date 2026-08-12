@@ -1,17 +1,37 @@
 package com.maternote.studio;
 
-import android.app.Activity;
 import android.os.Bundle;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.activity.ComponentActivity;
+import com.maternote.studio.exporter.StudioExporter;
 import com.maternote.studio.project.StudioProject;
 import com.maternote.studio.project.StudioProjectStore;
 import java.io.File;
 
-public final class StudioActivity extends Activity {
+public final class StudioActivity extends ComponentActivity {
     private final StudioProjectStore store = new StudioProjectStore();
     private TextView status;
+    private final ActivityResultLauncher<String> exportDestination = registerForActivityResult(
+        new ActivityResultContracts.CreateDocument("application/vnd.maternote.book+zip"), uri -> {
+            if (uri == null) return;
+            try {
+                File temporary = new File(getCacheDir(), "studio-export.mnote");
+                StudioExporter.exportFixture(store.read(projectFile()), temporary);
+                try (java.io.InputStream input = new java.io.FileInputStream(temporary);
+                     java.io.OutputStream output = getContentResolver().openOutputStream(uri)) {
+                    if (output == null) throw new IllegalStateException("Cannot open destination");
+                    byte[] buffer = new byte[64 * 1024];
+                    for (int count; (count = input.read(buffer)) >= 0;) output.write(buffer, 0, count);
+                }
+                status.setText("검증된 .mnote를 저장했습니다.\n" + uri);
+            } catch (Exception error) {
+                status.setText("내보내기 실패: " + error.getMessage());
+            }
+        });
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -29,6 +49,13 @@ public final class StudioActivity extends Activity {
         create.setText("3페이지 · 진도 2개 테스트 프로젝트 만들기");
         create.setOnClickListener(v -> createFixture());
         root.addView(create);
+        Button export = new Button(this);
+        export.setText("검증 후 .mnote 내보내기");
+        export.setOnClickListener(v -> {
+            if (!projectFile().isFile()) createFixture();
+            exportDestination.launch("maternote-studio-test.mnote");
+        });
+        root.addView(export);
         restore();
         setContentView(root);
     }

@@ -17,7 +17,9 @@ android {
 }
 
 dependencies {
+    implementation("androidx.activity:activity:1.13.0")
     implementation(project(":project"))
     implementation(project(":editor"))
+    implementation(project(":exporter"))
     implementation(project(":preview"))
 }
