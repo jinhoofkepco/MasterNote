@@ -32,4 +32,5 @@ include(
     ":remote:sync",
     ":feature:remote-session",
     ":lab:remote-simulator",
+    ":lab:assistant-webview",
 )
