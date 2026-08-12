@@ -12,3 +12,10 @@ The canonical human-readable notices currently live in `THIRD_PARTY_NOTICES.md`.
 
 Exact upstream revisions and adoption details are recorded in
 `docs/references/REFERENCE_LEDGER.md`.
+
+## Remote synchronization
+
+- Protocol Buffers Gradle plugin 0.10.0 and protobuf-javalite/protoc 4.35.1, BSD-3-Clause
+- Android Connectivity Samples at `ba2371c9e05da06fa398efc1444d254474a2708a`,
+  Apache-2.0, lifecycle pattern reference only with no copied source
+- Google Play services Nearby 19.3.0, used behind the transport adapter

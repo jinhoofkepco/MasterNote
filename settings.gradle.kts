@@ -24,4 +24,6 @@ include(
     ":feature:reader",
     ":feature:progress",
     ":feature:teacher",
+    ":remote:protocol",
+    ":remote:transport-api",
 )

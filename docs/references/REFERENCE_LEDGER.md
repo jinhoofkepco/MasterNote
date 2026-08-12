@@ -153,3 +153,42 @@ must be pinned, licensed, isolated behind a MasterNote-owned API, and validated 
 - Adoption: direct dependency behind `TeacherAccessAuthenticator`; no custom PIN
 - Validation: success/cancel coordinator tests, process-memory expiry tests, API 36 route-guard smoke test
 - Allowed authenticators: `BIOMETRIC_WEAK | DEVICE_CREDENTIAL`
+
+## REF-REMOTE-001
+
+- Capability: Nearby endpoint lifecycle and callback separation
+- Source: `android/connectivity-samples`
+- Commit: `ba2371c9e05da06fa398efc1444d254474a2708a`
+- Paths: `NearbyConnectionsWalkieTalkie/.../ConnectionsActivity.java`, `MainActivity.java`
+- License: Apache-2.0
+- Adoption: lifecycle pattern only; no source copied
+- Validation: pinned implementation and root license inspected locally
+- Excluded: Activity ownership, automatic acceptance, archived permissions, and dependency versions
+
+## REF-REMOTE-002
+
+- Capability: versioned binary wire format with unknown-field tolerance
+- Source: `protocolbuffers/protobuf` Maven releases
+- Versions: Gradle plugin `0.10.0`, `protoc` and `protobuf-javalite` `4.35.1`
+- License: BSD-3-Clause
+- Adoption: generated lite messages isolated inside `remote:protocol`
+- Validation: all payload round trips, unknown future field, corruption, and size limits tested
+
+## REF-REMOTE-003
+
+- Capability: current Nearby Connections API and connection authentication
+- Source: Google Nearby Connections official setup, strategies, manage-connections, and exchange-data guides
+- Dependency: `com.google.android.gms:play-services-nearby:19.3.0`
+- License: Android SDK terms; documentation samples Apache-2.0
+- Adoption: direct dependency only in `remote:transport-nearby`
+- Validation: current official setup table and authentication warning checked 2026-08-12
+- Configuration: `P2P_POINT_TO_POINT`, `ConnectionType.NON_DISRUPTIVE`, BYTES payloads
+
+## REF-REMOTE-004
+
+- Capability: long-running connected-device foreground service
+- Source: Android foreground-service type and launch documentation
+- Target: API 36
+- License: documentation CC BY 4.0; code samples Apache-2.0
+- Adoption: manifest/service lifecycle pattern
+- Validation: required `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_CONNECTED_DEVICE` declarations checked 2026-08-12
