@@ -4,7 +4,8 @@
 | --- | --- | --- |
 | Five pages restore independently | `RoomAnnotationStoreTest.strokesOnFivePagesRestoreWithIndependentPageRevisions` | write on five pages, force-stop, reopen |
 | Stable Ink 1.0 codec | `inkCodecRoundTripsInputsUsingStableStreamApi` | reopen pressure-sensitive pen strokes |
-| Exported Room schema | `AnnotationDatabaseSchemaTest` | Database Inspector schema spot-check |
+| Room v1 → v2 migration | `AnnotationDatabaseSchemaTest` preserves annotation rows and validates new tables | Database Inspector schema spot-check |
+| Learning fixture and empty progress | `LearningDaoTest` | fixed three-page book smoke test |
 | Partial erase is atomic | success and injected-failure tests in `RoomAnnotationStoreTest` | erase repeatedly, force-stop immediately |
 | Undo restores original asset | `AnnotationDocumentTest.undoAfterPartialEraseRestoresTheImmutableOriginalStroke` | erase, undo, force-stop, reopen |
 | One corrupt payload is isolated | `corruptStrokeBlobIsSkippedWithoutBlockingOtherStrokes` | import diagnostic corrupt fixture |

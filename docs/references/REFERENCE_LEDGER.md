@@ -68,3 +68,45 @@ must be pinned, licensed, isolated behind a MasterNote-owned API, and validated 
 - Adoption: build-time plugin only
 - Validation: clean Room compilation and schema export pass
 - Differences: none
+
+## REF-LEARNING-001
+
+- Capability: repository as the single data entry point, Flow exposure, dispatcher injection
+- Source: `android/architecture-samples`
+- Commit: `ee66e1526b84c026615df032c705842b7d2a521f`
+- Paths: `DefaultTaskRepository.kt`, `DefaultTaskRepositoryTest.kt`
+- License: Apache-2.0
+- Adoption: architecture and test pattern only; no source copied
+- MasterNote target: learning repository and use-case tests
+- Validation: upstream implementation and tests inspected at the pinned revision
+- Excluded: network synchronization, Task domain, and fire-and-forget persistence
+
+## REF-LEARNING-002
+
+- Capability: explicit Room versions, schema export, and migration registration
+- Source: `android/nowinandroid`
+- Commit: `7d45eae4f8720a0c77f507712ba2437ff974b6ed`
+- Paths: `core/database/.../NiaDatabase.kt`, `DatabaseMigrations.kt`
+- License: Apache-2.0
+- Adoption: schema/version organization pattern only; no source copied
+- MasterNote target: `AnnotationDatabase` schema v2 and later migrations
+- Validation: upstream database and migration declarations inspected at the pinned revision
+- Differences: MasterNote uses a declared v1-to-v2 auto-migration because this revision only adds tables
+
+## REF-LEARNING-003
+
+- Capability: atomic submission transaction
+- Source: AndroidX Room `@Transaction` / `withTransaction`
+- Version: Room 2.8.4, pinned by REF-ANNOTATION-002
+- License: Apache-2.0
+- Adoption: direct dependency API behind the learning repository
+- Validation: failure injection after submission, stroke-reference, and answer phases
+
+## REF-LEARNING-004
+
+- Capability: exported-schema migration verification
+- Source: AndroidX Room `MigrationTestHelper`
+- Version: Room 2.8.4, pinned by REF-ANNOTATION-002
+- License: Apache-2.0
+- Adoption: instrumentation-test dependency only
+- Validation: v1 database creation, v2 migration, schema validation, and old-row preservation
