@@ -22,6 +22,8 @@ import com.studyink.core.model.ProfileId
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
 import com.studyink.core.model.SubmissionMode
+import com.studyink.remote.protocol.ProtobufRemoteMessageCodec
+import com.studyink.remote.protocol.RemoteDurableOperationBatch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
@@ -229,6 +231,51 @@ class RoomLearningRepositoryTest {
         assertTrue(failure is IOException)
         assertEquals(0, database.learningDao().submissionCountForAttempt(attempt.attempt.attemptId.value))
         assertEquals(AttemptStatus.IN_PROGRESS, repository.getAttemptSession(attempt.attempt.attemptId).attempt.status)
+    }
+
+    @Test
+    fun annotationMutationAndRemoteOutboxAreCommittedAndRolledBackTogether() = runTest {
+        val repository = repository("attempt-remote")
+        repository.ensureContent(seed())
+        val attempt = repository.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+        val annotationStore = RoomAnnotationStore(database)
+        val document = AnnotationDocument(
+            annotationStore.load(DOCUMENT_ID, attempt.attempt.attemptId.value)
+        )
+        val request = RemoteOutboxRequest(
+            sessionId = "remote-session",
+            senderDeviceId = "student-device",
+            messageId = "message-1",
+            sentElapsedRealtimeMs = 10L,
+            createdAtEpochMillis = 2_000L,
+        )
+
+        val sequence = annotationStore.applyMutationAndEnqueueRemote(
+            document.addStroke(stroke()), attempt.attempt.attemptId.value, request,
+        )
+
+        assertEquals(1L, sequence)
+        val stored = database.remoteDao().pending("remote-session", 64).single()
+        val envelope = ProtobufRemoteMessageCodec().decode(stored.encodedEnvelope)
+        val batch = envelope.payload as RemoteDurableOperationBatch
+        assertEquals(1, batch.operations.size)
+        assertEquals(stored.operationId, batch.operations.single().operationId)
+
+        val failingStore = RoomAnnotationStore(
+            database,
+            faultInjector = AnnotationTransactionFaultInjector { throw IOException("injected") },
+        )
+        val failure = runCatching {
+            failingStore.applyMutationAndEnqueueRemote(
+                document.addStroke(stroke()),
+                attempt.attempt.attemptId.value,
+                request.copy(messageId = "message-2"),
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IOException)
+        assertEquals(1, database.remoteDao().pendingCount("remote-session"))
+        assertEquals(1, annotationStore.load(DOCUMENT_ID, attempt.attempt.attemptId.value).activeStrokes.size)
     }
 
     @Test

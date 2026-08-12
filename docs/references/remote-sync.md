@@ -12,3 +12,14 @@ Nearby and generated protobuf types remain inside adapters and never cross into 
 - Runtime requests use `NEARBY_WIFI_DEVICES` from API 33, where the platform constant exists. The
   current Nearby guide's `minSdkVersion=32` manifest example is retained as documentation context,
   but requesting that permission on API 32 would reference a permission unavailable on that release.
+
+## Durable storage invariants
+
+- A local annotation operation and its outbox envelope are inserted by one Room transaction.
+- Network failure never rolls back the student annotation transaction after it has committed.
+- Inbox sequence receipts and applied operation IDs are stored separately: sequence rows advance
+  contiguous ACK state, while operation IDs provide effectively-once application across retries.
+- At most 64 unacknowledged messages are selected for an in-memory send window. Remaining work stays
+  in Room and never blocks Ink input.
+- A duplicate message can advance the contiguous sequence without applying its operation twice.
+- A gap buffer holds at most 32 envelopes; overflow requests a page checkpoint instead of growing.

@@ -14,6 +14,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import com.studyink.remote.protocol.ProtobufRemoteMessageCodec
+import com.studyink.remote.protocol.RemoteDurableOperation
+import com.studyink.remote.protocol.RemoteDurableOperationBatch
+import com.studyink.remote.protocol.RemoteEnvelope
+import com.studyink.remote.protocol.RemoteLane
+import com.studyink.remote.protocol.RemoteOperationType
+import com.studyink.remote.protocol.RemoteStrokeAsset
+import com.studyink.remote.protocol.RemoteStrokePoint
 
 fun interface AnnotationTransactionFaultInjector {
     fun afterLayerLinksChanged(mutation: AnnotationMutation)
@@ -22,6 +30,35 @@ fun interface AnnotationTransactionFaultInjector {
         val NONE = AnnotationTransactionFaultInjector {}
     }
 }
+
+data class RemoteOutboxRequest(
+    val sessionId: String,
+    val senderDeviceId: String,
+    val messageId: String,
+    val sentElapsedRealtimeMs: Long,
+    val createdAtEpochMillis: Long,
+)
+
+private fun com.studyink.core.model.AssetOperation.toRemote(
+    addedAssets: List<StrokeAsset>,
+    pageId: String,
+) = RemoteDurableOperation(
+    operationId = id.value,
+    type = when (operationType) {
+        com.studyink.core.model.AnnotationOperationType.ADD_STROKE -> RemoteOperationType.ADD_STROKE
+        com.studyink.core.model.AnnotationOperationType.REMOVE_STROKES -> RemoteOperationType.REMOVE_STROKES
+        com.studyink.core.model.AnnotationOperationType.REPLACE_STROKES -> RemoteOperationType.REPLACE_STROKES
+    },
+    pageId = pageId,
+    pageRevision = resultRevision,
+    removedStrokeIds = removedStrokeIds.map { it.value },
+    addedStrokes = addedAssets.map { asset ->
+        RemoteStrokeAsset(
+            asset.id.value, asset.pageNumber, asset.tool.ordinal, asset.colorArgb, asset.width,
+            asset.points.map { point -> RemoteStrokePoint(point.x, point.y, point.pressure, point.elapsedTimeMillis) },
+        )
+    },
+)
 
 class RoomAnnotationStore internal constructor(
     private val database: AnnotationDatabase,
@@ -46,11 +83,18 @@ class RoomAnnotationStore internal constructor(
     suspend fun applyMutationToLayer(mutation: AnnotationMutation, layerId: String) =
         applyMutationInternal(mutation, null, layerId)
 
+    suspend fun applyMutationAndEnqueueRemote(
+        mutation: AnnotationMutation,
+        attemptId: String,
+        request: RemoteOutboxRequest,
+    ): Long = requireNotNull(applyMutationInternal(mutation, attemptId, null, request))
+
     private suspend fun applyMutationInternal(
         mutation: AnnotationMutation,
         attemptId: String?,
         explicitLayerId: String?,
-    ) = withContext(Dispatchers.IO) {
+        remoteRequest: RemoteOutboxRequest? = null,
+    ): Long? = withContext(Dispatchers.IO) {
         val snapshot = mutation.snapshot
         val operation = mutation.operation
         val documentId = snapshot.documentId
@@ -159,6 +203,35 @@ class RoomAnnotationStore internal constructor(
             } else {
                 check(dao.incrementPageRevision(pageId) == 1)
                 check(dao.incrementDocumentRevision(documentId) == 1)
+            }
+            remoteRequest?.let { request ->
+                val sequence = database.remoteDao().maxOutboxSequence(request.sessionId) + 1L
+                val fullOperation = operation.toRemote(mutation.addedAssets, pageId)
+                val envelope = RemoteEnvelope(
+                    sessionId = request.sessionId,
+                    senderDeviceId = request.senderDeviceId,
+                    messageId = request.messageId,
+                    lane = RemoteLane.DURABLE,
+                    durableSequence = sequence,
+                    sentElapsedRealtimeMs = request.sentElapsedRealtimeMs,
+                    payload = RemoteDurableOperationBatch(listOf(fullOperation)),
+                )
+                val codec = ProtobufRemoteMessageCodec()
+                val encoded = runCatching { codec.encode(envelope) }.getOrElse {
+                    codec.encode(envelope.copy(payload = RemoteDurableOperationBatch(listOf(
+                        fullOperation.copy(
+                            type = RemoteOperationType.SESSION_CONTROL,
+                            removedStrokeIds = emptyList(),
+                            addedStrokes = emptyList(),
+                        )
+                    ))))
+                }
+                database.remoteDao().insertOutbox(RemoteOutboxEntity(
+                    request.sessionId, sequence, operation.id.value, request.messageId,
+                    fullOperation.type.name, encoded, request.createdAtEpochMillis,
+                    null, 0, null,
+                ))
+                sequence
             }
         }
     }
