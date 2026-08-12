@@ -26,4 +26,6 @@ include(
     ":feature:teacher",
     ":remote:protocol",
     ":remote:transport-api",
+    ":remote:transport-nearby",
+    ":remote:session",
 )
