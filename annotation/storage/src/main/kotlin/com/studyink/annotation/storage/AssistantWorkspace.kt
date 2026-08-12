@@ -67,6 +67,7 @@ class AssistantWorkspace internal constructor(private val database: AnnotationDa
     suspend fun unfinishedJobs(): List<AssistantJob> = dao.unfinishedJobs().map(AssistantJobEntity::toModel)
     suspend fun markExternalOpened(id: String) { check(dao.updateStatus(id, AssistantJobStatus.EXTERNAL_OPENED.name, clock()) == 1) }
     suspend fun markResultImported(id: String) { check(dao.updateStatus(id, AssistantJobStatus.RESULT_IMPORTED.name, clock()) == 1) }
+    suspend fun markSavedAsResource(id: String) { check(dao.updateStatus(id, AssistantJobStatus.SAVED_AS_RESOURCE.name, clock()) == 1) }
     suspend fun cancel(id: String) { check(dao.updateStatus(id, AssistantJobStatus.CANCELLED.name, clock()) == 1) }
     fun close() = database.close()
 
