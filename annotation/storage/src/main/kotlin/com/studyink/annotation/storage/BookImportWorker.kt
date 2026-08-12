@@ -35,10 +35,11 @@ class BookImportRepository internal constructor(private val context: Context, pr
         try {
             if (session.managedAssetId == null) {
                 update(session, ImportState.COPYING); val uri=Uri.parse(session.sourceUri)
-                val imported=assets.importUri(uri); val type=when(imported.mimeType){"application/pdf"->ImportSourceType.RAW_PDF;"application/zip"->ImportSourceType.RAW_IMAGE_ZIP;else->error("IMPORT_UNSUPPORTED_TYPE")}
+                val imported=assets.importUri(uri); val type=when(imported.mimeType){"application/pdf"->ImportSourceType.RAW_PDF;"application/zip"->ImportSourceType.RAW_IMAGE_ZIP;"application/vnd.maternote.book+zip"->ImportSourceType.MATERNOTE_PACKAGE;else->error("IMPORT_UNSUPPORTED_TYPE")}
                 session=requireNotNull(dao.session(id)).copy(managedAssetId=imported.assetId.value,detectedSourceType=type.name,progressCurrent=imported.byteSize,progressTotal=imported.byteSize,title=imported.originalFileName.substringBeforeLast('.'),updatedAtEpochMillis=now()); dao.update(session)
             }
             session=requireNotNull(dao.session(id)); val type=ImportSourceType.valueOf(requireNotNull(session.detectedSourceType))
+            if (type == ImportSourceType.MATERNOTE_PACKAGE) { processPackage(id, session); return@withContext }
             update(session, if(type==ImportSourceType.RAW_IMAGE_ZIP) ImportState.INVENTORY else ImportState.PROBING_DOCUMENT)
             val sourceHandle=assets.open(ManagedAssetId(requireNotNull(session.managedAssetId))); require((sourceHandle.asset.pageCount ?: 0)>0) { "IMPORT_DOCUMENT_PROBE_FAILED" }
             if (!session.confirmed) { update(requireNotNull(dao.session(id)),ImportState.WAITING_USER_CONFIRMATION); return@withContext }
@@ -59,6 +60,28 @@ class BookImportRepository internal constructor(private val context: Context, pr
         } catch (t: Throwable) { val failed=requireNotNull(dao.session(id)); dao.update(failed.copy(state=ImportState.FAILED.name,errorCode=t.message?.takeIf { it.startsWith("IMPORT_") } ?: "IMPORT_FAILED",errorDetail=t.message,updatedAtEpochMillis=now(),completedAtEpochMillis=now())); throw t }
     }
     private suspend fun update(value: ImportSessionEntity,state:ImportState){dao.update(value.copy(state=state.name,updatedAtEpochMillis=now()))}
+    private suspend fun processPackage(id:String, initial:ImportSessionEntity) {
+        update(initial,ImportState.VALIDATING); val source=assets.open(ManagedAssetId(requireNotNull(initial.managedAssetId))); val prepared=MaternotePackageImporter.validate(source.file); val m=prepared.manifest
+        var session=requireNotNull(dao.session(id)).copy(packageId=m.packageId,bookId=m.book.bookId,revisionId=m.book.revisionId,title=m.book.title,updatedAtEpochMillis=now());dao.update(session)
+        val existing=database.learningDao().bookRevision(m.book.revisionId)
+        if(existing!=null){require(existing.contentHash==source.asset.sha256){"IMPORT_REVISION_CONFLICT"};LibraryRepository(database,now).registerBook(m.book.bookId,m.book.title,m.book.revisionId,session.requestedFolderId);dao.update(session.copy(state=ImportState.SUCCEEDED.name,completedAtEpochMillis=now(),updatedAtEpochMillis=now()));return}
+        if(!session.confirmed){update(session,ImportState.WAITING_USER_CONFIRMATION);return}
+        update(session,ImportState.VERIFYING_ASSETS);val imported=MaternotePackageImporter.importAssets(source.file,assets,m);val documentAsset=requireNotNull(imported[m.document.assetId]);require(documentAsset.mimeType=="application/pdf"){"IMPORT_UNSUPPORTED_DOCUMENT"}
+        val documentHandle=assets.open(documentAsset.assetId);val pageCount=requireNotNull(documentAsset.pageCount);m.pages.forEach{p->require(p.source.type=="pdfPage"&&(p.source.pageIndex?:-1) in 0 until pageCount){"PKG_PAGE_INDEX_OUT_OF_RANGE:${p.pageId}"}}
+        val current=database.libraryDao().book(m.book.bookId);if(current!=null&&m.book.previousRevisionId!=null)require(current.currentRevisionId==m.book.previousRevisionId){"IMPORT_REVISION_CHAIN_MISMATCH"}
+        update(requireNotNull(dao.session(id)),ImportState.COMMITTING);val documentId=documentIdentity(documentHandle.file);val t=now()
+        database.withTransaction {
+            database.learningDao().insertBookRevision(BookRevisionEntity(m.book.revisionId,m.book.bookId,documentId,m.book.revisionNumber,source.asset.sha256,m.book.title,t))
+            m.activities.forEach{a->database.learningDao().insertActivity(LearningActivityEntity(a.activityId,m.book.revisionId,a.title,a.position,a.submissionMode));database.learningDao().insertActivityPages(a.pageIds.mapIndexed{i,pageId->val page=requireNotNull(m.pages.find{it.pageId==pageId});ActivityPageRefEntity(a.activityId,pageId,requireNotNull(page.source.pageIndex),i)})}
+            database.teacherDao().insertTeacher(TeacherProfileEntity("package-author","Package Author",t))
+            m.answerDocuments.forEach{a->val asset=requireNotNull(imported[a.assetId]);database.answerDao().insertDocument(AnswerDocumentEntity(a.answerDocumentId,m.book.revisionId,asset.assetId.value,if(asset.mimeType=="application/pdf")"PDF" else "IMAGE_SEQUENCE",a.type,asset.pageCount?:1,a.answerDocumentId,true,t))}
+            m.answerLinks.forEachIndexed{i,a->database.answerDao().insertLink(AnswerPageLinkEntity(a.linkId,m.book.revisionId,a.answerDocumentId,null,a.problemPageId,null,null,null,null,a.answerPageIndex,null,null,null,null,i,t,t))}
+            m.teachingResources.forEach{r->val rid="${m.book.revisionId}:${r.resourceId}";val revision="$rid:1";database.teachingResourceDao().insertResource(TeachingResourceEntity(rid,m.book.revisionId,r.type,"GENERAL",r.title,"TEACHER_ONLY","PUBLISHED","CONTENT_PACKAGE",revision,"package-author",t,t));database.teachingResourceDao().insertRevision(TeachingResourceRevisionEntity(revision,rid,1,r.text,null,r.imageAssetId?.let{requireNotNull(imported[it]).assetId.value},null,"Maternote Package",t))}
+            m.pageResourceLinks.forEachIndexed{i,l->database.teachingResourceDao().insertLink(BookPageResourceLinkEntity(l.linkId,m.book.revisionId,l.pageId,"${m.book.revisionId}:${l.resourceId}",null,null,null,null,"PAGE_RESOURCE_LIST",i,t))}
+            LibraryRepository(database,now).ensureRoot();LibraryRepository(database,now).registerBook(m.book.bookId,m.book.title,m.book.revisionId,session.requestedFolderId)
+        }
+        session=requireNotNull(dao.session(id));dao.update(session.copy(state=ImportState.SUCCEEDED.name,completedAtEpochMillis=now(),updatedAtEpochMillis=now()))
+    }
     private fun documentIdentity(file: java.io.File): String { val d=MessageDigest.getInstance("SHA-256"); d.update(Uri.fromFile(file).normalizeScheme().toString().toByteArray()); d.update(0); FileInputStream(file).use{input->val b=ByteArray(64*1024);while(true){val n=input.read(b);if(n<0)break;d.update(b,0,n)}};return d.digest().joinToString(""){"%02x".format(it)} }
 }
 private fun ImportSessionEntity.model()=ImportSession(importSessionId,sourceUri,requestedFolderId,detectedSourceType?.let(ImportSourceType::valueOf),ImportState.valueOf(state),progressCurrent,progressTotal,title,bookId,revisionId,errorCode,errorDetail)

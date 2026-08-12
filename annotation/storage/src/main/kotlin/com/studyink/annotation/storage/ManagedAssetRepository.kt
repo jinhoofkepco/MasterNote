@@ -223,6 +223,8 @@ private object AssetInspector {
         var entries = 0
         var expanded = 0L
         val names = hashSetOf<String>()
+        var containsPackageManifest = false
+        var containsNonImagePackageEntry = false
         try {
             ZipInputStream(BufferedInputStream(FileInputStream(file))).use { zip ->
                 while (true) {
@@ -233,9 +235,15 @@ private object AssetInspector {
                     require(!name.startsWith('/') && name.split('/').none { it == ".." }) { "안전하지 않은 ZIP 경로입니다" }
                     require(names.add(name)) { "ZIP에 중복 파일명이 있습니다" }
                     val isOrder = name == "page-order.json"
-                    require(isOrder || name.substringAfterLast('.', "").lowercase() in setOf("png", "jpg", "jpeg", "webp")) {
+                    val isImage = name.substringAfterLast('.', "").lowercase() in setOf("png", "jpg", "jpeg", "webp")
+                    val isManifest = name == "manifest.json"
+                    val isPackageAsset = name.matches(Regex("assets/[0-9a-f]{64}\\.(pdf|png|jpg|jpeg|webp)"))
+                    val isPreview = name == "metadata/preview.png"
+                    require(isOrder || isImage || isManifest || isPackageAsset || isPreview) {
                         "ZIP에는 PNG, JPEG, WebP만 허용됩니다"
                     }
+                    if (isManifest) containsPackageManifest = true
+                    if (!isOrder && !isImage) containsNonImagePackageEntry = true
                     val signature = ByteArray(16)
                     var signatureBytes = 0
                     val buffer = ByteArray(64 * 1024)
@@ -250,7 +258,7 @@ private object AssetInspector {
                         expanded += read
                         require(expanded <= MAX_ZIP_EXPANDED_BYTES) { "ZIP 압축 해제 크기가 너무 큽니다" }
                     }
-                    if (!isOrder) require(isAllowedImageHeader(signature)) { "ZIP 안에 손상되었거나 지원하지 않는 이미지가 있습니다" }
+                    if (isImage) require(isAllowedImageHeader(signature)) { "ZIP 안에 손상되었거나 지원하지 않는 이미지가 있습니다" }
                     zip.closeEntry()
                 }
             }
@@ -259,6 +267,8 @@ private object AssetInspector {
         }
         require(entries > 0) { "빈 ZIP입니다" }
         require(expanded <= maxOf(file.length() * MAX_ZIP_RATIO, MIN_ZIP_RATIO_ALLOWANCE)) { "ZIP 압축 비율이 비정상적입니다" }
+        if (containsPackageManifest) return InspectedAsset("application/vnd.maternote.book+zip")
+        require(!containsNonImagePackageEntry) { "manifest가 없는 콘텐츠 패키지입니다" }
         return InspectedAsset("application/zip", pageCount = entries - if ("page-order.json" in names) 1 else 0)
     }
 
@@ -296,6 +306,7 @@ private fun atomicMove(source: File, target: File) {
 private fun String.extension() = when (this) {
     "application/pdf" -> "pdf"
     "application/zip" -> "zip"
+    "application/vnd.maternote.book+zip" -> "mnote"
     "image/png" -> "png"
     "image/jpeg" -> "jpg"
     "image/webp" -> "webp"
