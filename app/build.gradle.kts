@@ -49,6 +49,7 @@ android {
 kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
 
 dependencies {
+    implementation(project(":feature:progress"))
     implementation(project(":feature:reader"))
     androidTestImplementation(project(":annotation:storage"))
     androidTestImplementation("androidx.test:core-ktx:1.7.0")

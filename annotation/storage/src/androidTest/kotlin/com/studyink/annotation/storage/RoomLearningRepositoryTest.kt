@@ -23,6 +23,7 @@ import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
 import com.studyink.core.model.SubmissionMode
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -228,6 +229,40 @@ class RoomLearningRepositoryTest {
         assertTrue(failure is IOException)
         assertEquals(0, database.learningDao().submissionCountForAttempt(attempt.attempt.attemptId.value))
         assertEquals(AttemptStatus.IN_PROGRESS, repository.getAttemptSession(attempt.attempt.attemptId).attempt.status)
+    }
+
+    @Test
+    fun progressIsProjectedFromAttemptsAndSubmissionsWithoutMutableCounters() = runTest {
+        val repository = repository(
+            "attempt-1", "submission-1",
+            "attempt-2", "submission-2",
+            "attempt-3", "submission-3",
+        )
+        repository.ensureContent(seed())
+
+        fun progress() = repository.observeActivitiesWithProgress(PROFILE, REVISION)
+        assertEquals(0, progress().first().single().submissionCount)
+        assertTrue(!progress().first().single().hasDraft)
+
+        val first = repository.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+        assertEquals(0, progress().first().single().submissionCount)
+        assertTrue(progress().first().single().hasDraft)
+        repository.submitAttempt(first.attempt.attemptId)
+        assertEquals(1, progress().first().single().submissionCount)
+        assertTrue(!progress().first().single().hasDraft)
+
+        val second = repository.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+        val submittedAndDraft = progress().first().single()
+        assertEquals(1, submittedAndDraft.submissionCount)
+        assertTrue(submittedAndDraft.hasDraft)
+        repository.submitAttempt(second.attempt.attemptId)
+
+        val third = repository.getOrCreateActiveAttempt(PROFILE, ACTIVITY)
+        repository.submitAttempt(third.attempt.attemptId)
+        val final = progress().first().single()
+        assertEquals(3, final.attemptCount)
+        assertEquals(3, final.submissionCount)
+        assertTrue(!final.hasDraft)
     }
 
     private fun repository(

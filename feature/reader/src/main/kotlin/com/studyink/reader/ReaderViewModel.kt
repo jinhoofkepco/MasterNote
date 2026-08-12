@@ -337,6 +337,12 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         learningRepository().updateResumePage(attemptId, pageId)
     }
 
+    override fun onCleared() {
+        store?.close()
+        learningStore?.close()
+        super.onCleared()
+    }
+
     private companion object {
         const val RESUME_PAGE_DEBOUNCE_MILLIS = 750L
     }

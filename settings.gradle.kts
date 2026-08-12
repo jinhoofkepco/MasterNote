@@ -22,4 +22,5 @@ include(
     ":annotation:storage",
     ":document:pdf-androidx",
     ":feature:reader",
+    ":feature:progress",
 )
