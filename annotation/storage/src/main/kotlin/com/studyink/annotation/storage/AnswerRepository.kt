@@ -35,6 +35,7 @@ data class AnswerLocation(
     val pageIndex: Int,
     val region: CanonicalRect?,
     val source: AnswerLocationSource,
+    val bookmark: AnswerBookmark? = null,
 )
 
 data class AnswerBookmark(
@@ -171,7 +172,8 @@ class AnswerRepository internal constructor(
             }
         }
         dao.bookmark(teacherId, document.answerDocumentId)?.let {
-            return AnswerLocation(document.answerDocumentId, it.pageIndex, null, AnswerLocationSource.BOOKMARK)
+            val bookmark = AnswerBookmark(it.pageIndex, it.normalizedCenterX, it.normalizedCenterY, it.zoomScale)
+            return AnswerLocation(document.answerDocumentId, it.pageIndex, null, AnswerLocationSource.BOOKMARK, bookmark)
         }
         return AnswerLocation(document.answerDocumentId, 0, null, AnswerLocationSource.FIRST_PAGE)
     }
@@ -185,6 +187,8 @@ class AnswerRepository internal constructor(
             AnswerBookmarkEntity(teacherId, answerDocumentId, bookmark.pageIndex, bookmark.normalizedCenterX, bookmark.normalizedCenterY, bookmark.zoomScale, clock())
         )
     }
+
+    fun close() = database.close()
 
     private suspend fun validateLinkTarget(revisionId: String, documentId: String, activityId: String?, pageId: String?, answerPage: Int) {
         val document = dao.document(documentId) ?: error("Unknown answer document")

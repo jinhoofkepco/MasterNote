@@ -95,4 +95,12 @@ class PdfViewportAdapter {
     fun resetZoom() {
         pdfView?.resetZoom()
     }
+
+    fun restore(state: PdfViewportState) {
+        val view = pdfView ?: return
+        view.showPage(state.pageNumber)
+        view.post {
+            view.restoreViewport(state.normalizedCenterX, state.normalizedCenterY, state.zoomScale)
+        }
+    }
 }

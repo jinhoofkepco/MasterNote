@@ -158,6 +158,18 @@ class SinglePagePdfView @JvmOverloads constructor(
         scheduleTileRefresh(0L)
     }
 
+    fun restoreViewport(normalizedCenterX: Float, normalizedCenterY: Float, displayScale: Float) {
+        val size = pageSize() ?: return
+        val fitScale = fitScaleFor(size)
+        zoomFactor = (displayScale / fitScale).coerceIn(MIN_ZOOM, MAX_ZOOM)
+        val scale = this.displayScale
+        translationX = width / 2f - normalizedCenterX.coerceIn(0f, 1f) * size.width * scale - (width - size.width * scale) / 2f
+        translationY = height / 2f - normalizedCenterY.coerceIn(0f, 1f) * size.height * scale - (height - size.height * scale) / 2f
+        clampTranslation()
+        notifyViewportChanged()
+        scheduleTileRefresh(0L)
+    }
+
     fun viewToPdfPoint(x: Float, y: Float): PointF? {
         val size = pageSize() ?: return null
         val bounds = calculatePageBounds(size)
