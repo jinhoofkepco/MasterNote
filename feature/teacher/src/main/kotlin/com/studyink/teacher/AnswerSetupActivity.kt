@@ -4,6 +4,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -51,7 +52,7 @@ class AnswerSetupActivity : ComponentActivity() {
         if (!TeacherSession.controller.isValid()) { finish(); return }
         answers = AnswerRepository.open(this); assets = ManagedAssetRepository.open(this)
         lifecycleScope.launch { answers.observeDocuments(SampleLearningContent.REVISION_ID).collectLatest { documents = it } }
-        setContent { MaterialTheme { Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        setContent { MaterialTheme { Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text("정답지 설정", style = MaterialTheme.typography.headlineSmall)
             Button(onClick = { openDocument.launch(arrayOf("application/pdf", "application/zip")) }) { Text("정답 PDF/이미지 ZIP 가져오기") }
             Text("연결된 정답지: ${documents.joinToString { it.displayName }.ifBlank { "없음" }}")

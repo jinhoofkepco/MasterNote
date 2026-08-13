@@ -5,6 +5,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -50,7 +51,7 @@ class TeachingResourceActivity : ComponentActivity() {
         lifecycleScope.launch { repository.observePageResources(revision, page).collectLatest { resources = it } }
         setContent {
             MaterialTheme {
-                Column(Modifier.fillMaxSize().padding(20.dp)) {
+                Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(20.dp)) {
                     Button(onClick = ::finish) { Text("닫기") }
                     Text("현재 페이지 설명 자료", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(vertical = 12.dp))
                     selected?.let { content ->

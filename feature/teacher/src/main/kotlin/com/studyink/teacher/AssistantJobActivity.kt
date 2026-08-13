@@ -7,6 +7,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -63,7 +64,7 @@ class AssistantJobActivity : ComponentActivity() {
             if (job == null) { finish(); return@launch }
             importSharedResult(intent)
         }
-        setContent { MaterialTheme { Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        setContent { MaterialTheme { Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("GPT 요청 자료", style = MaterialTheme.typography.headlineSmall)
             Text(job?.promptText ?: "요청 자료 준비 중…")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
