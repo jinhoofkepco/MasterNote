@@ -276,8 +276,15 @@ class LibraryActivity : ComponentActivity() {
 
     private fun openBook(book: LibraryBook) {
         lifecycleScope.launch {
-            val id = library.currentDocumentAssetId(book.id)
-            val uri = Uri.fromFile(assets.open(id).file)
+            val uri = if (book.id == SAMPLE_BOOK_ID) {
+                // The baseline sample revision was created from this exact URI. Document identity
+                // intentionally includes the URI, so opening its managed copy would detach the
+                // existing attempt layers even though the PDF bytes are identical.
+                Uri.fromFile(SampleLearningContent.ensurePdf(this@LibraryActivity))
+            } else {
+                val id = library.currentDocumentAssetId(book.id)
+                Uri.fromFile(assets.open(id).file)
+            }
             startActivity(
                 ProgressActivity.intent(
                     this@LibraryActivity,
@@ -298,6 +305,7 @@ class LibraryActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_TEACHER = "teacher"
+        private const val SAMPLE_BOOK_ID = "sample-book"
 
         fun teacherIntent(context: Context) =
             Intent(context, LibraryActivity::class.java).putExtra(EXTRA_TEACHER, true)

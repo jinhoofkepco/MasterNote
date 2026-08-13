@@ -100,9 +100,18 @@ fun TopReaderBar(
                     maxLines = 1,
                 )
                 Text(
-                    text = if (state.busy) "처리 중" else "저장됨",
-                    color = if (state.busy) Color(0xFFE57700) else Color(0xFF16834A),
+                    text = when {
+                        state.status.contains("실패") -> state.status
+                        state.busy -> "처리 중"
+                        else -> "저장됨"
+                    },
+                    color = when {
+                        state.status.contains("실패") -> MaterialTheme.colorScheme.error
+                        state.busy -> Color(0xFFE57700)
+                        else -> Color(0xFF16834A)
+                    },
                     style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
                 )
                 if (onOpenPdf != null) {
                     TextButton(onClick = onOpenPdf) { Text("PDF 열기") }
