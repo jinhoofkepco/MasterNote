@@ -254,7 +254,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun showPage(pageNumber: Int) {
         viewModel.flushAsync()
-        val target = pageNumber.coerceIn(0, (loadedPageCount - 1).coerceAtLeast(0))
+        val pages = navigablePageNumbers()
+        val target = pageNumber.takeIf(pages::contains) ?: pages.first()
         currentPage = target
         ReaderRemoteBridge.sink?.onPageChanged(target)
         dryInkView.activePage = target
@@ -298,6 +299,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             )
         }
         paletteAnchor.setContent {
+            val pages = navigablePageNumbers()
+            val pageIndex = pages.indexOf(currentPage).coerceAtLeast(0)
             StylusToolMenu(
                 expanded = stylusMenuExpanded,
                 state = latestState,
@@ -305,14 +308,14 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 selectedColorArgb = selectedPenColor,
                 selectedWidthDp = selectedPenWidthDp,
                 selectedOpacity = selectedPenOpacity,
-                currentPage = currentPage,
-                pageCount = loadedPageCount,
+                currentPage = pageIndex,
+                pageCount = pages.size,
                 onSelectTool = ::selectTool,
                 onSelectColor = ::selectPenColor,
                 onSelectWidth = ::selectPenWidth,
                 onSelectOpacity = ::selectPenOpacity,
-                onPreviousPage = { showPage(currentPage - 1) },
-                onNextPage = { showPage(currentPage + 1) },
+                onPreviousPage = { pages.getOrNull(pageIndex - 1)?.let(::showPage) },
+                onNextPage = { pages.getOrNull(pageIndex + 1)?.let(::showPage) },
                 onResetZoom = viewport::resetZoom,
                 onUndo = viewModel::undo,
                 onRedo = viewModel::redo,
@@ -321,6 +324,14 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         }
         refreshReviewPane()
     }
+
+    private fun navigablePageNumbers(): List<Int> =
+        latestState.attemptSession?.pages
+            ?.map { it.pageNumber }
+            ?.distinct()
+            ?.sorted()
+            ?.takeIf { it.isNotEmpty() }
+            ?: (0 until loadedPageCount.coerceAtLeast(1)).toList()
 
     private fun openAnswerViewer() {
         val revision = latestState.scene?.documentRevisionId?.value
