@@ -72,7 +72,16 @@ class LibraryActivity : ComponentActivity() {
             ensureSampleBook()
             observeFolder()
         }
-        setContent { MaterialTheme { LibraryScreen() } }
+        setContent {
+            MaterialTheme {
+                androidx.compose.material3.Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background,
+                ) {
+                    LibraryScreen()
+                }
+            }
+        }
     }
 
     private fun observeFolder() {
