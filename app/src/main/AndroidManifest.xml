@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application
         android:allowBackup="true"
-        android:label="학습 필기 커널"
+        android:label="MasterNote"
         android:supportsRtl="true"
         android:theme="@style/Theme.StudyInk">
         <activity
-            android:name="com.studyink.reader.ReaderActivity"
+            android:name="com.studyink.library.ui.LibraryActivity"
             android:configChanges="keyboardHidden|orientation|screenSize"
             android:exported="true"
             android:screenOrientation="fullSensor">

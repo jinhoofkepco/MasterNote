@@ -3,9 +3,71 @@ package com.studyink.core.model
 import java.util.UUID
 
 const val CANONICAL_PAGE_WIDTH = 1000f
+const val ANNOTATION_FORMAT_VERSION = 2
 
 @JvmInline value class StrokeId(val value: String)
 @JvmInline value class OperationId(val value: String)
+
+data class Student(
+    val id: String = UUID.randomUUID().toString(),
+    val displayName: String,
+    val createdAtEpochMillis: Long = System.currentTimeMillis(),
+    val hiddenAtEpochMillis: Long? = null,
+)
+
+data class Book(
+    val id: String = UUID.randomUUID().toString(),
+    val studentId: String,
+    val title: String,
+    val pageCount: Int,
+    /** App-private path, relative to the MasterNote book directory. */
+    val pdfRelativePath: String,
+    /** Matching aid for LAN pairing; UUID remains the document identity. */
+    val contentSha256: String = "",
+    val answerSourceRelativePath: String? = null,
+    val createdAtEpochMillis: Long = System.currentTimeMillis(),
+    val hiddenAtEpochMillis: Long? = null,
+)
+
+data class AnswerSource(
+    val sourceId: String,
+    val items: List<AnswerItem>,
+)
+
+data class AnswerItem(
+    val id: String,
+    val pageNumber: Int,
+    val bounds: PageBounds,
+    val answer: String? = null,
+)
+
+data class Attempt(
+    val bookId: String,
+    val pageNumber: Int,
+    val attemptNo: Int,
+    val locked: Boolean = false,
+    val startedAtEpochMillis: Long = System.currentTimeMillis(),
+    val lockedAtEpochMillis: Long? = null,
+)
+
+enum class MarkColor { BLUE, RED, GRAY }
+
+data class Mark(
+    val attemptNo: Int,
+    val color: MarkColor,
+    val gradedAtEpochMillis: Long = System.currentTimeMillis(),
+    val hiddenAtEpochMillis: Long? = null,
+)
+
+data class MarkGroup(
+    val id: String = UUID.randomUUID().toString(),
+    val bookId: String,
+    val pageNumber: Int,
+    val anchor: PagePoint,
+    val marks: List<Mark> = emptyList(),
+    val createdAtEpochMillis: Long = System.currentTimeMillis(),
+    val hiddenAtEpochMillis: Long? = null,
+)
 
 data class PagePoint(
     val x: Float,
@@ -45,36 +107,56 @@ data class StrokeAsset(
     val colorArgb: Int,
     val width: Float,
     val points: List<PagePoint>,
+    val authorId: String = "student",
+    val attemptNo: Int = 1,
+    val logicalClock: Long = 0L,
+    val deviceId: String = "local",
+    val itemId: String? = null,
+    val publishedAtEpochMillis: Long? = null,
     val bounds: PageBounds = PageBounds.from(points),
     val createdAtEpochMillis: Long = System.currentTimeMillis(),
     val parentStrokeId: StrokeId? = null,
-    val formatVersion: Int = 1,
+    val formatVersion: Int = ANNOTATION_FORMAT_VERSION,
 )
 
 sealed interface AnnotationOperation {
     val id: OperationId
     val removedStrokeIds: Set<StrokeId>
     val addedStrokeIds: Set<StrokeId>
+    val logicalClock: Long
+    val deviceId: String
 }
 
 data class AssetOperation(
     override val id: OperationId = OperationId(UUID.randomUUID().toString()),
     override val removedStrokeIds: Set<StrokeId>,
     override val addedStrokeIds: Set<StrokeId>,
+    override val logicalClock: Long = 0L,
+    override val deviceId: String = "local",
 ) : AnnotationOperation
 
-data class AnnotationSnapshot(
-    val documentId: String,
+/**
+ * Immutable, single-page materialized state. Ordered lists are built once here rather than in
+ * View.onDraw. Undo/redo are intentionally absent: they belong to the live editor process only.
+ */
+class AnnotationSnapshot(
+    val bookId: String,
+    val pageNumber: Int,
     val revision: Long,
     val assets: Map<StrokeId, StrokeAsset>,
     val activeStrokeIds: Set<StrokeId>,
-    val undoStack: List<AssetOperation> = emptyList(),
-    val redoStack: List<AssetOperation> = emptyList(),
+    val appliedOperationIds: Set<OperationId> = emptySet(),
 ) {
-    val activeStrokes: List<StrokeAsset>
-        get() = activeStrokeIds.mapNotNull(assets::get).sortedBy { it.createdAtEpochMillis }
+    val activeStrokes: List<StrokeAsset> = activeStrokeIds.asSequence()
+        .mapNotNull(assets::get)
+        .sortedWith(compareBy<StrokeAsset>({ it.logicalClock }, { it.createdAtEpochMillis }, { it.id.value }))
+        .toList()
+
+    fun visibleStrokes(attemptNo: Int): List<StrokeAsset> =
+        activeStrokes.filter { it.attemptNo == attemptNo }
 
     companion object {
-        fun empty(documentId: String) = AnnotationSnapshot(documentId, 0L, emptyMap(), emptySet())
+        fun empty(bookId: String, pageNumber: Int = 0) =
+            AnnotationSnapshot(bookId, pageNumber, 0L, emptyMap(), emptySet(), emptySet())
     }
 }

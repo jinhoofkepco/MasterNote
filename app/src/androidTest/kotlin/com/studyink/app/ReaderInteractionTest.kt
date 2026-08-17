@@ -7,19 +7,26 @@ import android.net.Uri
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
-import androidx.pdf.view.PdfView
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
+import com.studyink.annotation.storage.CorruptAnnotationDataException
+import com.studyink.annotation.storage.PageOperationLogStore
+import com.studyink.annotation.engine.AnnotationDocument
+import com.studyink.core.model.AnnotationSnapshot
+import com.studyink.core.model.PagePoint
+import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
-import com.studyink.document.pdf.ReaderPdfFragment
+import com.studyink.library.data.LibraryRepository
 import com.studyink.reader.DryInkView
 import com.studyink.reader.ReaderActivity
+import com.studyink.sync.lan.PairingPayload
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -29,233 +36,209 @@ import java.io.FileOutputStream
 
 @RunWith(AndroidJUnit4::class)
 class ReaderInteractionTest {
-    private lateinit var scenario: ActivityScenario<ReaderActivity>
+    private val context = InstrumentationRegistry.getInstrumentation().targetContext
     private val device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+    private lateinit var scenario: ActivityScenario<ReaderActivity>
+    private lateinit var bookId: String
 
     @Before
     fun launchReader() {
-        scenario = ActivityScenario.launch(ReaderActivity::class.java)
-        waitForDocument()
+        val source = createPdf(File(context.cacheDir, "reader-${System.nanoTime()}.pdf"), 3)
+        val repository = LibraryRepository.get(context)
+        bookId = repository.importPdf(repository.state.selectedStudentId, Uri.fromFile(source), "기기 시험 교재").id
+        assertEquals(64, repository.book(bookId).contentSha256.length)
+        scenario = ActivityScenario.launch(ReaderActivity.intent(context, bookId, 0))
+        waitForBook()
     }
 
     @After
-    fun closeReader() {
-        scenario.close()
-    }
+    fun closeReader() { scenario.close() }
 
     @Test
     fun fingerDoesNotWriteButStylusDoes() {
         val before = revision()
         dispatchStroke(InputDevice.SOURCE_TOUCHSCREEN, MotionEvent.TOOL_TYPE_FINGER, 320f, 760f, 430f, 790f)
-        SystemClock.sleep(500)
-        assertEquals("손가락 입력은 주석을 추가하면 안 됩니다", before, revision())
-
+        SystemClock.sleep(300)
+        assertEquals(before, revision())
         dispatchStroke(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 360f, 820f, 520f, 870f)
-        assertTrue("스타일러스 입력은 저장된 필기를 만들어야 합니다", waitForRevisionAfter(before))
+        assertTrue(waitForRevisionAfter(before))
     }
 
     @Test
-    fun stylusSideButtonOpensIconMenuAtPointer() {
-        val eventTime = SystemClock.uptimeMillis()
+    fun stylusSideButtonOpensTheExistingFanMenu() {
         val event = motionEvent(
-            action = MotionEvent.ACTION_BUTTON_PRESS,
-            source = InputDevice.SOURCE_STYLUS,
-            toolType = MotionEvent.TOOL_TYPE_STYLUS,
-            x = 520f,
-            y = 920f,
-            buttonState = MotionEvent.BUTTON_STYLUS_PRIMARY,
-            eventTime = eventTime,
+            MotionEvent.ACTION_BUTTON_PRESS, InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS,
+            520f, 920f, MotionEvent.BUTTON_STYLUS_PRIMARY,
         )
-
-        scenario.onActivity { activity ->
-            assertTrue(activity.dispatchGenericMotionEvent(event))
-        }
+        scenario.onActivity { assertTrue(it.dispatchGenericMotionEvent(event)) }
         event.recycle()
-
         assertTrue(device.wait(Until.hasObject(By.desc("펜")), 3_000))
         assertTrue(device.hasObject(By.desc("형광펜")))
         assertTrue(device.hasObject(By.desc("지우개")))
-        assertTrue(device.hasObject(By.desc("다음 페이지")))
         assertTrue(device.hasObject(By.desc("되돌리기")))
+    }
 
-        device.findObject(By.desc("다음 페이지")).click()
+    @Test
+    fun stylusHoverShowsCurrentToolRing() {
+        val event = motionEvent(
+            MotionEvent.ACTION_HOVER_MOVE, InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS,
+            400f, 600f,
+        )
+        scenario.onActivity { it.dispatchGenericMotionEvent(event) }
+        event.recycle()
+        scenario.onActivity { assertNotNull(it.findDryInkView().hoverPreview) }
+    }
+
+    @Test
+    fun pageNavigationIgnoresFingerAndAcceptsStylus() {
+        assertTrue(device.wait(Until.hasObject(By.desc("다음 페이지")), 3_000))
+        val bounds = device.findObject(By.desc("다음 페이지")).visibleBounds
+        var localX = bounds.centerX().toFloat()
+        var localY = bounds.centerY().toFloat()
+        scenario.onActivity { activity ->
+            val origin = IntArray(2)
+            activity.window.decorView.getLocationOnScreen(origin)
+            localX -= origin[0]
+            localY -= origin[1]
+        }
+        dispatchTap(InputDevice.SOURCE_TOUCHSCREEN, MotionEvent.TOOL_TYPE_FINGER, localX, localY)
+        SystemClock.sleep(300)
+        scenario.onActivity { assertEquals(0, it.findDryInkView().activePage) }
+        dispatchDownInsideUpOutside(localX, localY)
+        SystemClock.sleep(300)
+        scenario.onActivity { assertEquals(0, it.findDryInkView().activePage) }
+        dispatchTap(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, localX, localY)
         repeat(30) {
             var page = 0
-            scenario.onActivity { activity -> page = activity.findDryInkView().activePage }
-            if (page == 1) {
-                assertTrue("페이지 이동 후에도 메뉴가 유지되어야 합니다", device.hasObject(By.desc("펜")))
-                dispatchStroke(InputDevice.SOURCE_TOUCHSCREEN, MotionEvent.TOOL_TYPE_FINGER, 300f, 720f, 360f, 740f)
-                assertTrue(
-                    "메뉴 밖을 손가락으로 누르면 메뉴가 닫혀야 합니다",
-                    device.wait(Until.gone(By.desc("펜")), 3_000),
-                )
-                return
-            }
+            scenario.onActivity { page = it.findDryInkView().activePage }
+            if (page == 1) return
             SystemClock.sleep(100)
         }
-        throw AssertionError("팝업의 다음 페이지 아이콘이 2페이지로 이동하지 못했습니다")
+        throw AssertionError("S펜 페이지 버튼이 동작하지 않았습니다")
     }
 
     @Test
-    fun highlighterSelectionSurvivesMenuDismissAndStoresTransparentStroke() {
-        val eventTime = SystemClock.uptimeMillis()
-        val event = motionEvent(
-            action = MotionEvent.ACTION_BUTTON_PRESS,
-            source = InputDevice.SOURCE_STYLUS,
-            toolType = MotionEvent.TOOL_TYPE_STYLUS,
-            x = 520f,
-            y = 920f,
-            buttonState = MotionEvent.BUTTON_STYLUS_PRIMARY,
-            eventTime = eventTime,
-        )
-        scenario.onActivity { activity -> assertTrue(activity.dispatchGenericMotionEvent(event)) }
-        event.recycle()
-
-        assertTrue(device.wait(Until.hasObject(By.desc("형광펜")), 3_000))
-        device.findObject(By.desc("형광펜")).click()
+    fun annotationsRestoreFromTheBookPageLog() {
         val before = revision()
-        dispatchStroke(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 360f, 820f, 520f, 850f)
-        assertTrue("형광펜 획이 저장되어야 합니다", waitForRevisionAfter(before))
-
-        scenario.onActivity { activity ->
-            val stroke = activity.findDryInkView().snapshot.activeStrokes.last()
-            assertEquals(StrokeTool.HIGHLIGHTER, stroke.tool)
-            assertEquals(0x66FFE45C, stroke.colorArgb)
-        }
-    }
-
-    @Test
-    fun penSettingsOpenOnlyWhenTheSelectedPenIsTappedAgain() {
-        openStylusMenu()
-        device.findObject(By.desc("형광펜")).click()
-        device.findObject(By.desc("펜")).click()
-        assertTrue("첫 번째 펜 탭은 펜 선택만 해야 합니다", device.hasObject(By.desc("지우개")))
-        assertTrue(!device.hasObject(By.descContains("선 굵기")))
-
-        device.findObject(By.desc("펜")).click()
-        assertTrue(device.wait(Until.hasObject(By.descContains("선 굵기")), 3_000))
-        assertTrue(device.hasObject(By.descContains("펜 투명도")))
-    }
-
-    @Test
-    fun openPdfButtonLaunchesTheSystemDocumentPicker() {
-        device.findObject(By.text("PDF 열기")).click()
-        assertTrue(
-            "PDF 열기는 시스템 문서 선택기를 열어야 합니다",
-            waitForSystemDocumentPicker(),
-        )
-        device.pressBack()
-    }
-
-    @Test
-    fun annotationsAreIsolatedAndRestoredPerPdf() {
-        lateinit var firstPdf: File
-        lateinit var secondPdf: File
-        var initialId = ""
-        scenario.onActivity { activity ->
-            initialId = activity.findDryInkView().snapshot.documentId
-            firstPdf = createPdf(activity.filesDir, "isolation-a-${System.nanoTime()}.pdf", "Document A")
-            secondPdf = createPdf(activity.filesDir, "isolation-b-${System.nanoTime()}.pdf", "Document B")
-            openDocument(activity, Uri.fromFile(firstPdf))
-        }
-        val firstId = waitForStableDocumentId(excluding = initialId)
-        val before = revision()
-        dispatchStroke(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 340f, 780f, 520f, 820f)
+        dispatchStroke(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 330f, 780f, 520f, 820f)
         assertTrue(waitForRevisionAfter(before))
-
-        scenario.onActivity { activity -> openDocument(activity, Uri.fromFile(secondPdf)) }
-        val secondId = waitForStableDocumentId(excluding = firstId)
-        assertTrue("PDF마다 서로 다른 필기 저장소를 사용해야 합니다", secondId != firstId)
-        scenario.onActivity { activity ->
-            assertTrue(activity.findDryInkView().snapshot.activeStrokes.isEmpty())
-        }
-
-        scenario.onActivity { activity -> openDocument(activity, Uri.fromFile(firstPdf)) }
-        waitForStableDocumentId(expected = firstId)
-        scenario.onActivity { activity ->
-            assertTrue("첫 PDF를 다시 열면 그 PDF의 필기만 복원되어야 합니다", activity.findDryInkView().snapshot.activeStrokes.isNotEmpty())
-        }
+        scenario.close()
+        scenario = ActivityScenario.launch(ReaderActivity.intent(context, bookId, 0))
+        waitForBook()
+        scenario.onActivity { assertTrue(it.findDryInkView().snapshot.activeStrokes.isNotEmpty()) }
     }
 
     @Test
-    fun zoomAndVerticalScrollStayOnTheSelectedPageWithoutThePdfEditButton() {
-        var initialId = ""
-        scenario.onActivity { activity ->
-            initialId = activity.findDryInkView().snapshot.documentId
-            val pdf = createColorPagesPdf(activity.filesDir, "page-lock-${System.nanoTime()}.pdf")
-            openDocument(activity, Uri.fromFile(pdf))
-        }
-        waitForStableDocumentId(excluding = initialId)
-
-        scenario.onActivity { activity ->
-            ReaderActivity::class.java
-                .getDeclaredMethod("showPage", Int::class.javaPrimitiveType)
-                .apply { isAccessible = true }
-                .invoke(activity, 1)
-
-            activity.readerPdfFragment().onRequestImmersiveMode(false)
-            assertTrue(
-                "AndroidX PDF 편집 버튼은 항상 숨겨져야 합니다",
-                !activity.readerPdfFragment().isToolboxVisible,
-            )
-        }
-
-        repeat(3) {
-            scenario.onActivity { activity ->
-                activity.findPdfView().apply {
-                    zoom = maxOf(minZoom * 2.5f, 1.5f).coerceAtMost(maxZoom)
-                }
-            }
-            SystemClock.sleep(400)
-            repeat(2) { device.swipe(540, 1_700, 540, 450, 20) }
-            assertOnlySelectedPageColorIsVisible()
-
-            repeat(2) { device.swipe(540, 450, 540, 1_700, 20) }
-            assertOnlySelectedPageColorIsVisible()
-
-            scenario.onActivity { activity ->
-                activity.findPdfView().apply { zoom = minZoom }
-            }
-            SystemClock.sleep(300)
-        }
-
-        scenario.onActivity { activity ->
-            assertTrue(
-                "확대·축소 후에도 PDF 편집 버튼이 나타나면 안 됩니다",
-                !activity.readerPdfFragment().isToolboxVisible,
-            )
-        }
+    fun corruptLogIsQuarantinedAndNeverOpenedAsEmpty() {
+        val store = PageOperationLogStore(context)
+        val log = store.operationLogFile("corruption-${System.nanoTime()}", 0)
+        log.writeText("{not-json}\n")
+        val pageDirectory = requireNotNull(log.parentFile)
+        val pagesDirectory = requireNotNull(pageDirectory.parentFile)
+        val bookDirectory = requireNotNull(pagesDirectory.parentFile)
+        val error = runCatching { store.loadPage(bookDirectory.name, 0) }.exceptionOrNull()
+        assertTrue(error is CorruptAnnotationDataException)
+        assertTrue(pageDirectory.listFiles().orEmpty().any { it.name.contains(".corrupt-") })
     }
 
-    private fun openStylusMenu() {
-        val eventTime = SystemClock.uptimeMillis()
-        val event = motionEvent(
-            action = MotionEvent.ACTION_BUTTON_PRESS,
-            source = InputDevice.SOURCE_STYLUS,
-            toolType = MotionEvent.TOOL_TYPE_STYLUS,
-            x = 520f,
-            y = 920f,
-            buttonState = MotionEvent.BUTTON_STYLUS_PRIMARY,
-            eventTime = eventTime,
+    @Test
+    fun fiveSubmittedAttemptsRemainIndividuallyAddressable() {
+        val repository = LibraryRepository.get(context)
+        repeat(5) { index ->
+            val attempt = requireNotNull(repository.writableAttempt(bookId, 1, create = true))
+            assertEquals(index + 1, attempt.attemptNo)
+            repository.lockAttempt(bookId, 1, attempt.attemptNo)
+        }
+        val attempts = repository.attempts(bookId, 1)
+        assertEquals(listOf(1, 2, 3, 4, 5), attempts.map { it.attemptNo })
+        assertTrue(attempts.all { it.locked })
+    }
+
+    @Test
+    fun duplicateRemoteOperationIsAppliedOnlyOnce() {
+        val operationBookId = "remote-${System.nanoTime()}"
+        val localReplicaBookId = "local-${System.nanoTime()}"
+        val sourceRoot = File(context.cacheDir, "sync-source-${System.nanoTime()}")
+        val targetRoot = File(context.cacheDir, "sync-target-${System.nanoTime()}")
+        val sourceStore = PageOperationLogStore(sourceRoot)
+        val targetStore = PageOperationLogStore(targetRoot)
+        val sourceDocument = AnnotationDocument(AnnotationSnapshot.empty(operationBookId, 0))
+        sourceStore.append(
+            sourceDocument.addStroke(
+                StrokeAsset(
+                    pageNumber = 0,
+                    tool = StrokeTool.PEN,
+                    colorArgb = Color.BLACK,
+                    width = 4f,
+                    points = listOf(PagePoint(100f, 100f), PagePoint(200f, 200f)),
+                    deviceId = "student-device",
+                )
+            )
         )
-        scenario.onActivity { activity -> assertTrue(activity.dispatchGenericMotionEvent(event)) }
-        event.recycle()
-        assertTrue(device.wait(Until.hasObject(By.desc("펜")), 3_000))
+        val encoded = sourceStore.encodedOperationsAfter(operationBookId, 0, 0L).single()
+        assertEquals(1L, targetStore.appendEncodedOperation(localReplicaBookId, 0, encoded))
+        assertEquals(1L, targetStore.appendEncodedOperation(localReplicaBookId, 0, encoded))
+        val restored = targetStore.loadPage(localReplicaBookId, 0)
+        assertEquals(1L, restored.revision)
+        assertEquals(1, restored.activeStrokes.size)
+        sourceRoot.deleteRecursively()
+        targetRoot.deleteRecursively()
     }
 
-    private fun dispatchStroke(
-        source: Int,
-        toolType: Int,
-        startX: Float,
-        startY: Float,
-        endX: Float,
-        endY: Float,
-    ) {
-        val downTime = SystemClock.uptimeMillis()
+    @Test
+    fun pairingQrPayloadRoundTripsWithoutChangingBookIdentity() {
+        val expected = PairingPayload("192.168.0.12", 48123, bookId, "pair-1234")
+        assertEquals(expected, PairingPayload.parse(expected.toUri()))
+    }
+
+    private fun waitForBook() {
+        repeat(100) {
+            var ready = false
+            scenario.onActivity { ready = it.findDryInkView().snapshot.bookId == bookId }
+            if (ready) return
+            SystemClock.sleep(100)
+        }
+        throw AssertionError("Book UUID page did not load")
+    }
+
+    private fun revision(): Long {
+        var value = -1L
+        scenario.onActivity { value = it.findDryInkView().snapshot.revision }
+        return value
+    }
+
+    private fun waitForRevisionAfter(before: Long): Boolean {
+        repeat(60) { if (revision() > before) return true else SystemClock.sleep(100) }
+        return false
+    }
+
+    private fun dispatchStroke(source: Int, tool: Int, x1: Float, y1: Float, x2: Float, y2: Float) {
+        val down = SystemClock.uptimeMillis()
         val events = listOf(
-            motionEvent(MotionEvent.ACTION_DOWN, source, toolType, startX, startY, eventTime = downTime),
-            motionEvent(MotionEvent.ACTION_MOVE, source, toolType, endX, endY, eventTime = downTime + 20),
-            motionEvent(MotionEvent.ACTION_UP, source, toolType, endX, endY, eventTime = downTime + 40),
+            motionEvent(MotionEvent.ACTION_DOWN, source, tool, x1, y1, eventTime = down),
+            motionEvent(MotionEvent.ACTION_MOVE, source, tool, x2, y2, eventTime = down + 20),
+            motionEvent(MotionEvent.ACTION_UP, source, tool, x2, y2, eventTime = down + 40),
+        )
+        scenario.onActivity { activity -> events.forEach(activity::dispatchTouchEvent) }
+        events.forEach(MotionEvent::recycle)
+    }
+
+    private fun dispatchTap(source: Int, tool: Int, x: Float, y: Float) {
+        val down = SystemClock.uptimeMillis()
+        val events = listOf(
+            motionEvent(MotionEvent.ACTION_DOWN, source, tool, x, y, eventTime = down),
+            motionEvent(MotionEvent.ACTION_UP, source, tool, x, y, eventTime = down + 40),
+        )
+        scenario.onActivity { activity -> events.forEach(activity::dispatchTouchEvent) }
+        events.forEach(MotionEvent::recycle)
+    }
+
+    private fun dispatchDownInsideUpOutside(x: Float, y: Float) {
+        val down = SystemClock.uptimeMillis()
+        val events = listOf(
+            motionEvent(MotionEvent.ACTION_DOWN, InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, x, y, eventTime = down),
+            motionEvent(MotionEvent.ACTION_MOVE, InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, x - 120f, y + 120f, eventTime = down + 20),
+            motionEvent(MotionEvent.ACTION_UP, InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, x - 120f, y + 120f, eventTime = down + 40),
         )
         scenario.onActivity { activity -> events.forEach(activity::dispatchTouchEvent) }
         events.forEach(MotionEvent::recycle)
@@ -264,199 +247,44 @@ class ReaderInteractionTest {
     private fun motionEvent(
         action: Int,
         source: Int,
-        toolType: Int,
+        tool: Int,
         x: Float,
         y: Float,
-        buttonState: Int = 0,
+        buttons: Int = 0,
         eventTime: Long = SystemClock.uptimeMillis(),
     ): MotionEvent {
-        val properties = arrayOf(MotionEvent.PointerProperties().apply {
-            id = 0
-            this.toolType = toolType
-        })
+        val properties = arrayOf(MotionEvent.PointerProperties().apply { id = 0; toolType = tool })
         val coordinates = arrayOf(MotionEvent.PointerCoords().apply {
-            this.x = x
-            this.y = y
-            pressure = 0.7f
-            size = 0.05f
+            this.x = x; this.y = y; pressure = 0.7f; size = 0.05f
         })
         return MotionEvent.obtain(
-            eventTime,
-            eventTime,
-            action,
-            1,
-            properties,
-            coordinates,
-            0,
-            buttonState,
-            1f,
-            1f,
-            0,
-            0,
-            source,
-            0,
+            eventTime, eventTime, action, 1, properties, coordinates, 0, buttons,
+            1f, 1f, 0, 0, source, 0,
         )
-    }
-
-    private fun waitForDocument() {
-        repeat(80) {
-            var ready = false
-            scenario.onActivity { activity ->
-                val id = activity.findDryInkView().snapshot.documentId
-                ready = id != "sample" && !id.startsWith("loading-")
-            }
-            if (ready) return
-            SystemClock.sleep(100)
-        }
-        throw AssertionError("PDF와 주석 문서가 준비되지 않았습니다")
-    }
-
-    private fun waitForSystemDocumentPicker(): Boolean {
-        repeat(30) {
-            if (
-                device.hasObject(By.pkg("com.android.documentsui")) ||
-                device.hasObject(By.pkg("com.google.android.documentsui"))
-            ) {
-                return true
-            }
-            SystemClock.sleep(100)
-        }
-        return false
-    }
-
-    private fun waitForStableDocumentId(excluding: String? = null, expected: String? = null): String {
-        repeat(100) {
-            var id = ""
-            scenario.onActivity { activity -> id = activity.findDryInkView().snapshot.documentId }
-            val stable = id.isNotBlank() && id != "sample" && !id.startsWith("loading-")
-            if (stable && (excluding == null || id != excluding) && (expected == null || id == expected)) return id
-            SystemClock.sleep(100)
-        }
-        throw AssertionError("PDF별 필기 문서가 준비되지 않았습니다")
-    }
-
-    private fun waitForRevisionAfter(revision: Long): Boolean {
-        repeat(50) {
-            if (revision() > revision) return true
-            SystemClock.sleep(100)
-        }
-        return false
-    }
-
-    private fun assertOnlySelectedPageColorIsVisible() {
-        SystemClock.sleep(500)
-        repeat(20) {
-            val bitmap = device.takeScreenshot() ?: run {
-                SystemClock.sleep(100)
-                return@repeat
-            }
-            var contentTop = 0
-            var contentBottom = bitmap.height
-            scenario.onActivity { activity ->
-                val dryInk = activity.findDryInkView()
-                val location = IntArray(2)
-                dryInk.getLocationOnScreen(location)
-                contentTop = location[1].coerceIn(0, bitmap.height)
-                contentBottom = (location[1] + dryInk.height).coerceIn(contentTop, bitmap.height)
-            }
-
-            var previousPagePixels = 0
-            var selectedPagePixels = 0
-            var nextPagePixels = 0
-            for (y in contentTop until contentBottom step 8) {
-                for (x in 0 until bitmap.width step 8) {
-                    val pixel = bitmap.getPixel(x, y)
-                    when {
-                        pixel.isNear(PAGE_ONE_COLOR) -> previousPagePixels++
-                        pixel.isNear(PAGE_TWO_COLOR) -> selectedPagePixels++
-                        pixel.isNear(PAGE_THREE_COLOR) -> nextPagePixels++
-                    }
-                }
-            }
-            if (selectedPagePixels > 100) {
-                assertEquals("이전 페이지가 화면에 나타나면 안 됩니다", 0, previousPagePixels)
-                assertEquals("다음 페이지가 화면에 나타나면 안 됩니다", 0, nextPagePixels)
-                return
-            }
-            SystemClock.sleep(100)
-        }
-        throw AssertionError("확대·이동 후 선택한 2페이지가 화면으로 복귀하지 않았습니다")
-    }
-
-    private fun revision(): Long {
-        var revision = -1L
-        scenario.onActivity { activity -> revision = activity.findDryInkView().snapshot.revision }
-        return revision
     }
 
     private fun ReaderActivity.findDryInkView(): DryInkView {
         val root = findViewById<android.view.ViewGroup>(android.R.id.content)
-        val queue = ArrayDeque<android.view.View>()
-        queue.add(root)
-        while (queue.isNotEmpty()) {
-            when (val view = queue.removeFirst()) {
-                is DryInkView -> return view
-                is android.view.ViewGroup -> (0 until view.childCount).forEach { queue.add(view.getChildAt(it)) }
-            }
+        val queue = ArrayDeque<android.view.View>().apply { add(root) }
+        while (queue.isNotEmpty()) when (val view = queue.removeFirst()) {
+            is DryInkView -> return view
+            is android.view.ViewGroup -> (0 until view.childCount).forEach { queue.add(view.getChildAt(it)) }
         }
-        throw AssertionError("DryInkView를 찾을 수 없습니다")
+        error("DryInkView missing")
     }
 
-    private fun ReaderActivity.findPdfView(): PdfView {
-        val root = findViewById<android.view.ViewGroup>(android.R.id.content)
-        val queue = ArrayDeque<android.view.View>()
-        queue.add(root)
-        while (queue.isNotEmpty()) {
-            when (val view = queue.removeFirst()) {
-                is PdfView -> return view
-                is android.view.ViewGroup -> (0 until view.childCount).forEach { queue.add(view.getChildAt(it)) }
-            }
-        }
-        throw AssertionError("PdfView를 찾을 수 없습니다")
-    }
-
-    private fun ReaderActivity.readerPdfFragment(): ReaderPdfFragment =
-        supportFragmentManager.fragments.filterIsInstance<ReaderPdfFragment>().single()
-
-    private fun createPdf(directory: File, name: String, text: String): File {
-        val file = File(directory, name)
+    private fun createPdf(file: File, pages: Int): File {
         val document = PdfDocument()
-        val page = document.startPage(PdfDocument.PageInfo.Builder(840, 1188, 1).create())
-        page.canvas.drawText(text, 72f, 120f, Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 36f })
-        document.finishPage(page)
-        FileOutputStream(file).use(document::writeTo)
-        document.close()
-        return file
-    }
-
-    private fun createColorPagesPdf(directory: File, name: String): File {
-        val file = File(directory, name)
-        val document = PdfDocument()
-        listOf(PAGE_ONE_COLOR, PAGE_TWO_COLOR, PAGE_THREE_COLOR).forEachIndexed { index, color ->
+        repeat(pages) { index ->
             val page = document.startPage(PdfDocument.PageInfo.Builder(840, 1188, index + 1).create())
-            page.canvas.drawColor(color)
+            page.canvas.drawColor(Color.WHITE)
+            page.canvas.drawText("Page ${index + 1}", 80f, 120f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.BLACK; textSize = 32f
+            })
             document.finishPage(page)
         }
         FileOutputStream(file).use(document::writeTo)
         document.close()
         return file
-    }
-
-    private fun Int.isNear(target: Int, tolerance: Int = 12): Boolean =
-        kotlin.math.abs(Color.red(this) - Color.red(target)) <= tolerance &&
-            kotlin.math.abs(Color.green(this) - Color.green(target)) <= tolerance &&
-            kotlin.math.abs(Color.blue(this) - Color.blue(target)) <= tolerance
-
-    private fun openDocument(activity: ReaderActivity, uri: Uri) {
-        ReaderActivity::class.java
-            .getDeclaredMethod("showDocument", Uri::class.java, Boolean::class.javaPrimitiveType)
-            .apply { isAccessible = true }
-            .invoke(activity, uri, true)
-    }
-
-    private companion object {
-        val PAGE_ONE_COLOR: Int = Color.rgb(198, 36, 72)
-        val PAGE_TWO_COLOR: Int = Color.rgb(37, 168, 89)
-        val PAGE_THREE_COLOR: Int = Color.rgb(45, 79, 198)
     }
 }

@@ -49,10 +49,13 @@ android {
 kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
 
 dependencies {
-    implementation(project(":feature:reader"))
+    implementation(project(":feature:library"))
     androidTestImplementation("androidx.test:core-ktx:1.7.0")
     androidTestImplementation("androidx.test.ext:junit-ktx:1.3.0")
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("androidx.test.uiautomator:uiautomator:2.4.0")
     androidTestImplementation("androidx.fragment:fragment-ktx:1.8.9")
+    androidTestImplementation(project(":annotation:storage"))
+    androidTestImplementation(project(":library:data"))
+    androidTestImplementation(project(":sync:lan"))
 }

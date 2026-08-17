@@ -161,10 +161,12 @@ class PdfViewportAdapter {
                 .firstOrNull { it.name.startsWith("setEnableDefaultFastScrollerRendering") }
                 ?.invoke(view, false)
         }
-        view.fastScrollVisibility = PdfView.FastScrollVisibility.ALWAYS_HIDE
-        view.fastScroller?.hide()
-        view.fastScroller = null
-        view.updateFastScrollVisibility()
-        view.invalidate()
+        // These restricted members may change while androidx.pdf is alpha. A change must never
+        // crash the reader; our own page controls remain usable even when hiding one control fails.
+        runCatching { view.fastScrollVisibility = PdfView.FastScrollVisibility.ALWAYS_HIDE }
+        runCatching { view.fastScroller?.hide() }
+        runCatching { view.fastScroller = null }
+        runCatching { view.updateFastScrollVisibility() }
+        runCatching { view.invalidate() }
     }
 }

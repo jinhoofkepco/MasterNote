@@ -1,37 +1,27 @@
 package com.studyink.reader
 
+import android.view.MotionEvent
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Backspace
 import androidx.compose.material.icons.automirrored.rounded.Redo
 import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.rounded.Brush
-import androidx.compose.material.icons.rounded.ChevronLeft
-import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.FitScreen
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -40,7 +30,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -50,11 +39,10 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
@@ -78,35 +66,6 @@ private const val FanOriginY = 190
 private enum class RadialMenuPage { MAIN, COLORS, PEN }
 
 @Composable
-fun TopReaderBar(
-    state: ReaderUiState,
-    onOpenPdf: () -> Unit,
-) {
-    MaterialTheme {
-        Surface(tonalElevation = 3.dp, shadowElevation = 3.dp) {
-            Row(
-                modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Text(
-                    text = state.documentLabel,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f),
-                    maxLines = 1,
-                )
-                Text(
-                    text = if (state.busy) "처리 중" else "저장됨",
-                    color = if (state.busy) Color(0xFFE57700) else Color(0xFF16834A),
-                    style = MaterialTheme.typography.labelSmall,
-                )
-                TextButton(onClick = onOpenPdf) { Text("PDF 열기") }
-            }
-        }
-    }
-}
-
-@Composable
 fun StylusToolMenu(
     expanded: Boolean,
     state: ReaderUiState,
@@ -114,14 +73,10 @@ fun StylusToolMenu(
     selectedColorArgb: Int,
     selectedWidthDp: Float,
     selectedOpacity: Float,
-    currentPage: Int,
-    pageCount: Int,
     onSelectTool: (ReaderTool) -> Unit,
     onSelectColor: (Int) -> Unit,
     onSelectWidth: (Float) -> Unit,
     onSelectOpacity: (Float) -> Unit,
-    onPreviousPage: () -> Unit,
-    onNextPage: () -> Unit,
     onResetZoom: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
@@ -141,7 +96,7 @@ fun StylusToolMenu(
             properties = PopupProperties(
                 focusable = false,
                 dismissOnBackPress = false,
-                dismissOnClickOutside = true,
+                dismissOnClickOutside = false,
                 clippingEnabled = true,
             ),
         ) {
@@ -151,8 +106,6 @@ fun StylusToolMenu(
                         state = state,
                         selectedTool = selectedTool,
                         selectedColorArgb = selectedColorArgb,
-                        currentPage = currentPage,
-                        pageCount = pageCount,
                         onPenClick = {
                             if (selectedTool == ReaderTool.PEN) {
                                 menuPage = RadialMenuPage.PEN
@@ -162,8 +115,6 @@ fun StylusToolMenu(
                         },
                         onOpenColors = { menuPage = RadialMenuPage.COLORS },
                         onSelectTool = onSelectTool,
-                        onPreviousPage = onPreviousPage,
-                        onNextPage = onNextPage,
                         onResetZoom = onResetZoom,
                         onUndo = onUndo,
                         onRedo = onRedo,
@@ -193,13 +144,9 @@ private fun MainRadialMenu(
     state: ReaderUiState,
     selectedTool: ReaderTool,
     selectedColorArgb: Int,
-    currentPage: Int,
-    pageCount: Int,
     onPenClick: () -> Unit,
     onOpenColors: () -> Unit,
     onSelectTool: (ReaderTool) -> Unit,
-    onPreviousPage: () -> Unit,
-    onNextPage: () -> Unit,
     onResetZoom: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
@@ -217,7 +164,7 @@ private fun MainRadialMenu(
             0 -> RadialActionButton(
                 icon = Icons.AutoMirrored.Rounded.Undo,
                 label = "되돌리기",
-                enabled = state.snapshot.undoStack.isNotEmpty() && !state.busy,
+                enabled = state.canUndo,
                 size = 44,
             ) { onUndo() }
             1 -> RadialActionButton(
@@ -250,18 +197,11 @@ private fun MainRadialMenu(
             else -> RadialActionButton(
                 icon = Icons.AutoMirrored.Rounded.Redo,
                 label = "다시 실행",
-                enabled = state.snapshot.redoStack.isNotEmpty() && !state.busy,
+                enabled = state.canRedo,
                 size = 44,
             ) { onRedo() }
         }
     }
-    PageControl(
-        currentPage = currentPage,
-        pageCount = pageCount,
-        onPreviousPage = onPreviousPage,
-        onNextPage = onNextPage,
-        modifier = Modifier.offset(x = 67.dp, y = 202.dp),
-    )
 }
 
 @Composable
@@ -403,21 +343,14 @@ private fun RadialActionButton(
     size: Int = 48,
     onClick: () -> Unit,
 ) {
-    Surface(
-        modifier = Modifier.size(size.dp).alpha(if (enabled) 1f else 0.36f),
-        shape = CircleShape,
-        color = if (selected) MaterialTheme.colorScheme.inverseSurface
-        else MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
-        contentColor = if (selected) MaterialTheme.colorScheme.inverseOnSurface
-        else MaterialTheme.colorScheme.onSurface,
-        shadowElevation = if (selected) 8.dp else 5.dp,
-        tonalElevation = 2.dp,
+    PenTapButton(
+        description = label,
+        onAction = onClick,
+        enabled = enabled,
+        selected = selected,
+        modifier = Modifier.size(size.dp),
     ) {
-        IconButton(
-            onClick = onClick,
-            enabled = enabled,
-            modifier = Modifier.semantics { contentDescription = label },
-        ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Icon(icon, contentDescription = null, modifier = Modifier.size((size * 0.48f).dp))
         }
     }
@@ -428,16 +361,12 @@ private fun PaletteButton(
     selectedColorArgb: Int,
     onClick: () -> Unit,
 ) {
-    Surface(
+    PenTapButton(
+        description = "색상 팔레트",
+        onAction = onClick,
         modifier = Modifier.size(46.dp),
-        shape = CircleShape,
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
-        shadowElevation = 7.dp,
     ) {
-        IconButton(
-            onClick = onClick,
-            modifier = Modifier.semantics { contentDescription = "색상 팔레트" },
-        ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Box(
                 modifier = Modifier
                     .size(32.dp)
@@ -464,10 +393,13 @@ private fun ColorChoice(
     onSelect: (Int) -> Unit,
 ) {
     val selected = color.toArgb() == selectedColorArgb
-    IconButton(
-        onClick = { onSelect(color.toArgb()) },
-        modifier = Modifier.size(48.dp).semantics { contentDescription = label },
+    PenTapButton(
+        description = label,
+        onAction = { onSelect(color.toArgb()) },
+        selected = selected,
+        modifier = Modifier.size(48.dp),
     ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Box(
             modifier = Modifier
                 .size(if (selected) 36.dp else 32.dp)
@@ -481,6 +413,7 @@ private fun ColorChoice(
                 )
                 .background(color, CircleShape),
         )
+        }
     }
 }
 
@@ -492,17 +425,13 @@ private fun StrokeWidthChoice(
 ) {
     val selected = kotlin.math.abs(widthDp - selectedWidthDp) < 0.15f
     val strokeColor = if (selected) MaterialTheme.colorScheme.inverseOnSurface else MaterialTheme.colorScheme.onSurface
-    Surface(
+    PenTapButton(
+        description = "선 굵기 $widthDp",
+        onAction = { onSelect(widthDp) },
+        selected = selected,
         modifier = Modifier.size(48.dp),
-        shape = CircleShape,
-        color = if (selected) MaterialTheme.colorScheme.inverseSurface else Color.Transparent,
-        contentColor = if (selected) MaterialTheme.colorScheme.inverseOnSurface else MaterialTheme.colorScheme.onSurface,
-        shadowElevation = if (selected) 7.dp else 0.dp,
     ) {
-        IconButton(
-            onClick = { onSelect(widthDp) },
-            modifier = Modifier.semantics { contentDescription = "선 굵기 $widthDp" },
-        ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Canvas(modifier = Modifier.size(29.dp)) {
                 val path = Path().apply {
                     moveTo(size.width * 0.14f, size.height * 0.62f)
@@ -554,21 +483,17 @@ private fun CurvedOpacitySlider(
     }
     val inputModifier = modifier
         .semantics { contentDescription = "펜 투명도 ${(opacity * 100).roundToInt()}%" }
-        .pointerInput(onOpacityChange) {
-            detectTapGestures { position ->
-                updateOpacity(position)
+        .pointerInteropFilter { event ->
+            val index = event.actionIndex.coerceIn(0, (event.pointerCount - 1).coerceAtLeast(0))
+            val stylus = event.pointerCount > 0 && when (event.getToolType(index)) {
+                MotionEvent.TOOL_TYPE_STYLUS, MotionEvent.TOOL_TYPE_ERASER -> true
+                else -> false
             }
-        }
-        .pointerInput(onOpacityChange) {
-            detectDragGestures(
-                onDragStart = { position ->
-                    updateOpacity(position)
-                },
-                onDrag = { change, _ ->
-                    change.consume()
-                    updateOpacity(change.position)
-                },
-            )
+            if (!stylus) return@pointerInteropFilter false
+            if (event.actionMasked == MotionEvent.ACTION_DOWN || event.actionMasked == MotionEvent.ACTION_MOVE) {
+                updateOpacity(Offset(event.x, event.y))
+            }
+            true
         }
     val previewSurface = MaterialTheme.colorScheme.surface
     Canvas(modifier = inputModifier) {
@@ -610,47 +535,5 @@ private fun CurvedOpacitySlider(
             radius = 10.dp.toPx(),
             center = thumbCenter,
         )
-    }
-}
-
-@Composable
-private fun PageControl(
-    currentPage: Int,
-    pageCount: Int,
-    onPreviousPage: () -> Unit,
-    onNextPage: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Surface(
-        modifier = modifier.size(width = 136.dp, height = 36.dp),
-        shape = RoundedCornerShape(999.dp),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
-        shadowElevation = 4.dp,
-        tonalElevation = 2.dp,
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            IconButton(
-                onClick = onPreviousPage,
-                enabled = currentPage > 0,
-                modifier = Modifier.size(36.dp).semantics { contentDescription = "이전 페이지" },
-            ) {
-                Icon(Icons.Rounded.ChevronLeft, contentDescription = null, modifier = Modifier.size(22.dp))
-            }
-            Text(
-                text = "${currentPage + 1}/${pageCount.coerceAtLeast(1)}",
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.Medium,
-            )
-            IconButton(
-                onClick = onNextPage,
-                enabled = currentPage + 1 < pageCount,
-                modifier = Modifier.size(36.dp).semantics { contentDescription = "다음 페이지" },
-            ) {
-                Icon(Icons.Rounded.ChevronRight, contentDescription = null, modifier = Modifier.size(22.dp))
-            }
-        }
     }
 }

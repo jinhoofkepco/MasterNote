@@ -14,6 +14,9 @@ class EraseEngineTest {
         colorArgb = 0xff000000.toInt(),
         width = 4f,
         points = listOf(PagePoint(0f, 50f), PagePoint(100f, 50f)),
+        authorId = "teacher",
+        attemptNo = 4,
+        deviceId = "teacher-phone",
     )
 
     @Test fun partialEraseSplitsAStrokeAndPreservesParent() {
@@ -26,6 +29,9 @@ class EraseEngineTest {
         assertEquals(setOf(stroke.id), result.removedStrokeIds)
         assertEquals(2, result.fragments.size)
         assertTrue(result.fragments.all { it.parentStrokeId == stroke.id })
+        assertTrue(result.fragments.all { it.authorId == "teacher" })
+        assertTrue(result.fragments.all { it.attemptNo == 4 })
+        assertTrue(result.fragments.all { it.deviceId == "teacher-phone" })
     }
 
     @Test fun wholeEraseRemovesWithoutFragments() {

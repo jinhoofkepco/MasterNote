@@ -20,6 +20,9 @@ include(
     ":core:model",
     ":annotation:engine",
     ":annotation:storage",
+    ":library:data",
+    ":sync:lan",
     ":document:pdf-androidx",
     ":feature:reader",
+    ":feature:library",
 )
