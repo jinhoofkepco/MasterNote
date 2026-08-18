@@ -45,9 +45,30 @@ jobs:
           chmod 600 "$KEYSTORE_PATH"
           echo "MASTERNOTE_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
 
-      - name: Build and test
+      - name: Allocate a monotonic app version
+        run: |
+          COMMIT_UNIX="$(git show -s --format=%ct "$GITHUB_SHA")"
+          VERSION_CODE="$((COMMIT_UNIX / 60))"
+          VERSION_NAME="$(date -u -d "@$COMMIT_UNIX" +%Y.%m.%d).${GITHUB_RUN_NUMBER}"
+          test "$VERSION_CODE" -gt 10009
+          echo "MASTERNOTE_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "MASTERNOTE_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "Release version: $VERSION_NAME ($VERSION_CODE)"
+
+      - name: Require a version newer than the published APK
         env:
-          MASTERNOTE_BUILD_NUMBER: ${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREVIOUS_APK="$RUNNER_TEMP/previous-MasterNote.apk"
+          if gh release download dev-latest --pattern MasterNote.apk --output "$PREVIOUS_APK" --repo "$GITHUB_REPOSITORY"; then
+            PREVIOUS_VERSION_CODE="$("$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$PREVIOUS_APK" | awk -F\"'\" '/^package:/ {print $4; exit}')"
+            echo "Published version code: $PREVIOUS_VERSION_CODE"
+            test "$MASTERNOTE_VERSION_CODE" -gt "$PREVIOUS_VERSION_CODE"
+          else
+            echo "No previous APK release; accepting the first fixed-signature build."
+          fi
+
+      - name: Build and test
         run: |
           chmod +x gradlew
           ./gradlew :app:assembleRelease testDebugUnitTest
@@ -58,8 +79,12 @@ jobs:
         run: |
           APK_PATH="app/build/outputs/apk/release/app-release.apk"
           ACTUAL_CERT_SHA256="$("$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$APK_PATH" | awk -F': ' '/SHA-256 digest/ {print $2; exit}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]:')"
+          ACTUAL_PACKAGE="$("$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK_PATH" | awk -F\"'\" '/^package:/ {print $2; exit}')"
+          ACTUAL_VERSION_CODE="$("$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK_PATH" | awk -F\"'\" '/^package:/ {print $4; exit}')"
           echo "Signing certificate SHA-256: $ACTUAL_CERT_SHA256"
           test "$ACTUAL_CERT_SHA256" = "$EXPECTED_CERT_SHA256"
+          test "$ACTUAL_PACKAGE" = "com.studyink.app"
+          test "$ACTUAL_VERSION_CODE" = "$MASTERNOTE_VERSION_CODE"
           cp "$APK_PATH" "$RUNNER_TEMP/MasterNote.apk"
 
       - name: Publish the stable APK download
@@ -68,7 +93,7 @@ jobs:
         run: |
           git tag -f dev-latest "$GITHUB_SHA"
           git push --force origin refs/tags/dev-latest
-          RELEASE_NOTES="Automatically built from main commit ${GITHUB_SHA}. Signing certificate SHA-256: d511edca8bcc955e687df75a51e4c741f7636a612238e508d209b0fc1f162983"
+          RELEASE_NOTES="Automatically built from main commit ${GITHUB_SHA}. Version ${MASTERNOTE_VERSION_NAME} (${MASTERNOTE_VERSION_CODE}). Signing certificate SHA-256: d511edca8bcc955e687df75a51e4c741f7636a612238e508d209b0fc1f162983"
           if gh release view dev-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload dev-latest "$RUNNER_TEMP/MasterNote.apk" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit dev-latest --title "MasterNote latest test APK" --notes "$RELEASE_NOTES" --latest --repo "$GITHUB_REPOSITORY"

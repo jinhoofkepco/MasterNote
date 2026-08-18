@@ -4,7 +4,21 @@ plugins {
 }
 
 val masterNoteKeystorePath = providers.environmentVariable("MASTERNOTE_KEYSTORE_PATH").orNull
-val masterNoteBuildNumber = providers.environmentVariable("MASTERNOTE_BUILD_NUMBER").orNull?.toIntOrNull()
+val masterNoteVersionCode = providers.environmentVariable("MASTERNOTE_VERSION_CODE").orNull?.toIntOrNull()
+val masterNoteVersionName = providers.environmentVariable("MASTERNOTE_VERSION_NAME").orNull
+val releaseTaskRequested = gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }
+
+if (releaseTaskRequested) {
+    require(!masterNoteKeystorePath.isNullOrBlank()) {
+        "Release builds require MASTERNOTE_KEYSTORE_PATH so the update signing identity cannot change."
+    }
+    require(masterNoteVersionCode != null && masterNoteVersionCode > 10_009) {
+        "Release builds require MASTERNOTE_VERSION_CODE greater than the last published version (10009)."
+    }
+    require(!masterNoteVersionName.isNullOrBlank()) {
+        "Release builds require MASTERNOTE_VERSION_NAME."
+    }
+}
 
 android {
     namespace = "com.studyink.app"
@@ -15,8 +29,8 @@ android {
         applicationId = "com.studyink.app"
         minSdk = 31
         targetSdk = 36
-        versionCode = masterNoteBuildNumber?.let { 10_000 + it } ?: 2
-        versionName = "0.2.${masterNoteBuildNumber ?: 0}-test"
+        versionCode = masterNoteVersionCode ?: 1
+        versionName = masterNoteVersionName ?: "0.0.0-dev"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -32,6 +46,12 @@ android {
     }
 
     buildTypes {
+        debug {
+            // A development build is a separate app, so it can never replace or downgrade the
+            // fixed-signature APK downloaded from GitHub Releases.
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             signingConfig = signingConfigs.getByName("debug")
             isMinifyEnabled = true

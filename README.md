@@ -23,6 +23,10 @@
 
 [MasterNote.apk 다운로드](https://github.com/jinhoofkepco/MasterNote/releases/download/dev-latest/MasterNote.apk)
 
+GitHub Release의 `MasterNote.apk`는 항상 같은 인증서로 서명되고 이전 배포본보다 높은
+`versionCode`로 생성되므로 기존 앱을 지우지 않고 업데이트됩니다. Android Studio의
+debug 앱은 `com.studyink.app.debug`로 분리되어 배포 앱을 덮어쓰지 않습니다.
+
 `main`에 변경 사항이 올라오면 GitHub Actions가 빌드와 단위 테스트를 실행한 뒤 위 파일을 교체합니다. APK는 고정된 테스트 인증서로 서명되며, 인증서 지문이 달라지면 배포 단계가 실패하도록 검사합니다.
 
 ## 빌드
