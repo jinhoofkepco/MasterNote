@@ -13,7 +13,7 @@ import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
 import com.studyink.document.pdf.PdfViewportAdapter
 
-enum class ReaderTool { PAN, PEN, HIGHLIGHTER, PARTIAL_ERASER, WHOLE_ERASER }
+enum class ReaderTool { PAN, PEN, HIGHLIGHTER, PARTIAL_ERASER, WHOLE_ERASER, GRADE }
 
 class InkInputView(context: Context) : View(context) {
     lateinit var viewport: PdfViewportAdapter
@@ -22,13 +22,14 @@ class InkInputView(context: Context) : View(context) {
     var penColorArgb: Int = 0xFF17233C.toInt()
     var penWidthDp: Float = 3.2f
     var penOpacity: Float = 1f
-    var teacherTapEnabled: Boolean = false
     var onStroke: (StrokeAsset) -> Unit = {}
     var onStylusContact: () -> Unit = {}
     var onEraserPreview: (EraserPreview?) -> Unit = {}
     var onErase: (Int, List<PagePoint>, Float, Boolean) -> Unit = { _, _, _, _ -> }
-    var onTeacherTap: (Int, PagePoint, Int) -> Unit = { _, _, _ -> }
-    var onTeacherLongPress: (Int, PagePoint) -> Unit = { _, _ -> }
+    var onGradeTap: (Int, PagePoint, Int, Float, Float) -> Unit = { _, _, _, _, _ -> }
+    var onGradeLongPress: (Int, PagePoint, Float, Float) -> Unit = { _, _, _, _ -> }
+    var findMarkAttempt: (Float, Float) -> Int? = { _, _ -> null }
+    var onOpenMarkedAttempt: (Int) -> Unit = {}
     var onHoverPreview: (StylusHoverPreview?) -> Unit = {}
     var findScrollableMarkGroup: (Float, Float) -> String? = { _, _ -> null }
     var onDragMarkHistory: (String, Float) -> Unit = { _, _ -> }
@@ -40,13 +41,21 @@ class InkInputView(context: Context) : View(context) {
     private var activeTool = ReaderTool.PEN
     private var strokeWidthCanonical = 4f
     private var eraserRadiusCanonical = 18f
-    private var downAtMillis = 0L
     private var pendingSingleTap: Runnable? = null
     private var lastTapAtMillis = 0L
+    private var lastTapViewX = 0f
+    private var lastTapViewY = 0f
     private var lastTapPoint: PagePoint? = null
+    private var longPressRunnable: Runnable? = null
+    private var longPressTriggered = false
+    private var downViewX = 0f
+    private var downViewY = 0f
+    private var maxTravelPixels = 0f
+    private var markedAttemptTarget: Int? = null
+    private var markedAttemptInteraction = false
     private var markHistoryGroupId: String? = null
     private var markHistoryLastX = 0f
-    private var markHistoryTravel = 0f
+    private var draggingMarkHistory = false
 
     init {
         setBackgroundColor(Color.TRANSPARENT)
@@ -112,13 +121,31 @@ class InkInputView(context: Context) : View(context) {
             tool == ReaderTool.PAN -> ReaderTool.PEN
             else -> tool
         }
-        downAtMillis = event.eventTime
+        downViewX = event.x
+        downViewY = event.y
+        maxTravelPixels = 0f
+        longPressTriggered = false
+        draggingMarkHistory = false
+        markedAttemptTarget = null
+        markedAttemptInteraction = false
         currentPoints.clear()
         currentPoints += mapped.point.copy(pressure = event.pressure.coerceIn(0f, 1f))
-        markHistoryGroupId = findScrollableMarkGroup(event.x, event.y)
-        if (markHistoryGroupId != null) {
+        if (activeTool == ReaderTool.GRADE) {
+            markHistoryGroupId = findScrollableMarkGroup(event.x, event.y)
             markHistoryLastX = event.x
-            markHistoryTravel = 0f
+            longPressRunnable = Runnable {
+                if (currentPointer >= 0 && activeTool == ReaderTool.GRADE && maxTravelPixels <= tapTravelThreshold()) {
+                    longPressTriggered = true
+                    onGradeLongPress(currentPage, currentPoints.first(), downViewX, downViewY)
+                }
+            }.also { postDelayed(it, LONG_PRESS_MILLIS) }
+            return true
+        }
+        markedAttemptTarget = findMarkAttempt(event.x, event.y)
+        if (markedAttemptTarget != null) {
+            markedAttemptInteraction = true
+            markHistoryGroupId = findScrollableMarkGroup(event.x, event.y)
+            markHistoryLastX = event.x
             return true
         }
         strokeWidthCanonical = viewport.viewWidthToCanonical(
@@ -141,14 +168,38 @@ class InkInputView(context: Context) : View(context) {
 
     private fun move(event: MotionEvent): Boolean {
         if (currentPointer < 0) return false
-        markHistoryGroupId?.let { groupId ->
+        if (activeTool == ReaderTool.GRADE) {
             val pointerIndex = event.findPointerIndex(currentPointer)
             if (pointerIndex >= 0) {
                 val x = event.getX(pointerIndex)
+                val y = event.getY(pointerIndex)
+                updateTravel(x, y)
+                if (maxTravelPixels > tapTravelThreshold()) cancelGradeLongPress()
                 val delta = x - markHistoryLastX
-                markHistoryTravel += kotlin.math.abs(delta)
                 markHistoryLastX = x
-                onDragMarkHistory(groupId, delta)
+                markHistoryGroupId?.let { groupId ->
+                    if (maxTravelPixels > tapTravelThreshold()) {
+                        draggingMarkHistory = true
+                        onDragMarkHistory(groupId, delta)
+                    }
+                }
+            }
+            return true
+        }
+        if (markedAttemptInteraction) {
+            val pointerIndex = event.findPointerIndex(currentPointer)
+            if (pointerIndex >= 0) {
+                val x = event.getX(pointerIndex)
+                val y = event.getY(pointerIndex)
+                updateTravel(x, y)
+                val delta = x - markHistoryLastX
+                markHistoryLastX = x
+                markHistoryGroupId?.let { groupId ->
+                    if (maxTravelPixels > tapTravelThreshold()) {
+                        draggingMarkHistory = true
+                        onDragMarkHistory(groupId, delta)
+                    }
+                }
             }
             return true
         }
@@ -163,27 +214,30 @@ class InkInputView(context: Context) : View(context) {
 
     private fun finish(event: MotionEvent): Boolean {
         if (currentPointer < 0) return false
-        markHistoryGroupId?.let { groupId ->
+        if (activeTool == ReaderTool.GRADE) {
+            cancelGradeLongPress()
+            updateTravel(event.x, event.y)
             val mapped = viewport.viewToCanonical(event.x, event.y)
-            val held = event.eventTime - downAtMillis
-            if (teacherTapEnabled && mapped?.pageNumber == currentPage && markHistoryTravel < dp(6f)) {
-                if (held >= 550L) onTeacherLongPress(currentPage, mapped.point)
-                else queueTeacherTap(currentPage, mapped.point, event.eventTime)
+            if (draggingMarkHistory) {
+                markHistoryGroupId?.let(onEndMarkHistoryDrag)
+            } else if (!longPressTriggered && maxTravelPixels <= tapTravelThreshold() && mapped?.pageNumber == currentPage) {
+                queueGradeTap(currentPage, mapped.point, event.eventTime, event.x, event.y)
             }
-            onEndMarkHistoryDrag(groupId)
+            reset()
+            return true
+        }
+        if (markedAttemptInteraction) {
+            updateTravel(event.x, event.y)
+            if (draggingMarkHistory) {
+                markHistoryGroupId?.let(onEndMarkHistoryDrag)
+            } else if (maxTravelPixels <= tapTravelThreshold()) {
+                markedAttemptTarget?.let(onOpenMarkedAttempt)
+            }
             reset()
             return true
         }
         collectPoint(event.x, event.y, event.pressure)
-        val isTap = teacherTapEnabled && currentPoints.size <= 3 && pathDistance() <= 4f
-        val isLongPress = isTap && event.eventTime - downAtMillis >= 550L
-        if ((activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) && (isTap || isLongPress)) {
-            runCatching { wetInkView.cancelStroke(event, currentPointer) }
-            val point = currentPoints.lastOrNull()
-            if (point != null) {
-                if (isLongPress) onTeacherLongPress(currentPage, point) else queueTeacherTap(currentPage, point, event.eventTime)
-            }
-        } else if (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) {
+        if (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) {
             wetInkView.finishStroke(event, currentPointer)
             if (currentPoints.isNotEmpty()) {
                 onStroke(
@@ -203,39 +257,30 @@ class InkInputView(context: Context) : View(context) {
         return true
     }
 
-    private fun queueTeacherTap(page: Int, point: PagePoint, eventTime: Long) {
+    private fun queueGradeTap(page: Int, point: PagePoint, eventTime: Long, viewX: Float, viewY: Float) {
         val previous = lastTapPoint
         val doubleTap = previous != null && eventTime - lastTapAtMillis <= 320L &&
-            kotlin.math.hypot(previous.x - point.x, previous.y - point.y) <= 22f
+            kotlin.math.hypot(lastTapViewX - viewX, lastTapViewY - viewY) <= tapTravelThreshold()
         if (doubleTap) {
             pendingSingleTap?.let(::removeCallbacks)
             pendingSingleTap = null
             lastTapPoint = null
-            onTeacherTap(page, point, 2)
+            onGradeTap(page, point, 2, viewX, viewY)
         } else {
             lastTapAtMillis = eventTime
+            lastTapViewX = viewX
+            lastTapViewY = viewY
             lastTapPoint = point
             pendingSingleTap = Runnable {
-                onTeacherTap(page, point, 1)
+                onGradeTap(page, point, 1, viewX, viewY)
                 pendingSingleTap = null
                 lastTapPoint = null
             }.also { postDelayed(it, 330L) }
         }
     }
 
-    private fun pathDistance(): Float {
-        if (currentPoints.size < 2) return 0f
-        var distance = 0f
-        for (index in 1 until currentPoints.size) {
-            distance += kotlin.math.hypot(
-                currentPoints[index].x - currentPoints[index - 1].x,
-                currentPoints[index].y - currentPoints[index - 1].y,
-            )
-        }
-        return distance
-    }
-
     private fun cancel(event: MotionEvent) {
+        cancelGradeLongPress()
         markHistoryGroupId?.let(onEndMarkHistoryDrag)
         if (currentPointer >= 0 && (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER)) {
             runCatching { wetInkView.cancelStroke(event, currentPointer) }
@@ -268,8 +313,13 @@ class InkInputView(context: Context) : View(context) {
     }
 
     private fun reset() {
+        cancelGradeLongPress()
         markHistoryGroupId = null
-        markHistoryTravel = 0f
+        draggingMarkHistory = false
+        markedAttemptTarget = null
+        markedAttemptInteraction = false
+        maxTravelPixels = 0f
+        longPressTriggered = false
         currentPointer = -1
         currentPage = -1
         currentPoints.clear()
@@ -288,4 +338,19 @@ class InkInputView(context: Context) : View(context) {
     }
 
     private fun dp(value: Float): Float = value * resources.displayMetrics.density
+
+    private fun tapTravelThreshold(): Float = dp(8f)
+
+    private fun updateTravel(x: Float, y: Float) {
+        maxTravelPixels = maxOf(maxTravelPixels, kotlin.math.hypot(x - downViewX, y - downViewY))
+    }
+
+    private fun cancelGradeLongPress() {
+        longPressRunnable?.let(::removeCallbacks)
+        longPressRunnable = null
+    }
+
+    private companion object {
+        const val LONG_PRESS_MILLIS = 550L
+    }
 }

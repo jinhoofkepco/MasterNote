@@ -18,6 +18,7 @@ import androidx.compose.material.icons.automirrored.rounded.Backspace
 import androidx.compose.material.icons.automirrored.rounded.Redo
 import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.rounded.Brush
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.FitScreen
 import androidx.compose.material3.Icon
@@ -151,8 +152,9 @@ private fun MainRadialMenu(
     onUndo: () -> Unit,
     onRedo: () -> Unit,
 ) {
+    val canGrade = state.capabilities.canGrade
     RadialFan(
-        itemCount = 7,
+        itemCount = if (canGrade) 8 else 7,
         originX = FanOriginX,
         originY = FanOriginY,
         radius = CompactFanRadius,
@@ -160,36 +162,42 @@ private fun MainRadialMenu(
         sweepAngleDegrees = 180f,
         animationKey = "main-tools",
     ) { index ->
-        when (index) {
-            0 -> RadialActionButton(
+        when {
+            index == 0 -> RadialActionButton(
                 icon = Icons.AutoMirrored.Rounded.Undo,
                 label = "되돌리기",
                 enabled = state.canUndo,
                 size = 44,
             ) { onUndo() }
-            1 -> RadialActionButton(
+            index == 1 -> RadialActionButton(
                 icon = Icons.AutoMirrored.Rounded.Backspace,
                 label = "지우개",
                 selected = selectedTool == ReaderTool.PARTIAL_ERASER,
                 size = 44,
             ) { onSelectTool(ReaderTool.PARTIAL_ERASER) }
-            2 -> RadialActionButton(
+            index == 2 -> RadialActionButton(
                 icon = Icons.Rounded.Edit,
                 label = "펜",
                 selected = selectedTool == ReaderTool.PEN,
                 size = 44,
             ) { onPenClick() }
-            3 -> RadialActionButton(
+            index == 3 -> RadialActionButton(
                 icon = Icons.Rounded.Brush,
                 label = "형광펜",
                 selected = selectedTool == ReaderTool.HIGHLIGHTER,
                 size = 44,
             ) { onSelectTool(ReaderTool.HIGHLIGHTER) }
-            4 -> PaletteButton(
+            index == 4 -> PaletteButton(
                 selectedColorArgb = selectedColorArgb,
                 onClick = onOpenColors,
             )
-            5 -> RadialActionButton(
+            canGrade && index == 5 -> RadialActionButton(
+                icon = Icons.Rounded.CheckCircle,
+                label = "채점",
+                selected = selectedTool == ReaderTool.GRADE,
+                size = 44,
+            ) { onSelectTool(ReaderTool.GRADE) }
+            index == if (canGrade) 6 else 5 -> RadialActionButton(
                 icon = Icons.Rounded.FitScreen,
                 label = "확대 초기화",
                 size = 44,

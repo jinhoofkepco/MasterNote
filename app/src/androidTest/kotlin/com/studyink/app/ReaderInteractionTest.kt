@@ -17,12 +17,15 @@ import com.studyink.annotation.storage.CorruptAnnotationDataException
 import com.studyink.annotation.storage.PageOperationLogStore
 import com.studyink.annotation.engine.AnnotationDocument
 import com.studyink.core.model.AnnotationSnapshot
+import com.studyink.core.model.MarkColor
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
 import com.studyink.library.data.LibraryRepository
 import com.studyink.reader.DryInkView
+import com.studyink.reader.InkInputView
 import com.studyink.reader.ReaderActivity
+import com.studyink.reader.ReaderTool
 import com.studyink.sync.lan.PairingPayload
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -33,6 +36,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 @RunWith(AndroidJUnit4::class)
 class ReaderInteractionTest {
@@ -87,6 +92,98 @@ class ReaderInteractionTest {
         scenario.onActivity { it.dispatchGenericMotionEvent(event) }
         event.recycle()
         scenario.onActivity { assertNotNull(it.findDryInkView().hoverPreview) }
+    }
+
+    @Test
+    fun gradeToolRecognizesTenOfTenTapsAndLongPressBeforePenUp() {
+        val taps = AtomicInteger(0)
+        val longPressed = AtomicBoolean(false)
+        val before = revision()
+        scenario.onActivity { activity ->
+            activity.findInkInputView().apply {
+                tool = ReaderTool.GRADE
+                onGradeTap = { _, _, _, _, _ -> taps.incrementAndGet() }
+                onGradeLongPress = { _, _, _, _ -> longPressed.set(true) }
+            }
+        }
+        repeat(10) {
+            dispatchTap(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 440f, 720f)
+            SystemClock.sleep(380)
+        }
+        assertEquals(10, taps.get())
+        assertEquals(before, revision())
+
+        val downAt = SystemClock.uptimeMillis()
+        val down = motionEvent(
+            MotionEvent.ACTION_DOWN,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            480f,
+            760f,
+            eventTime = downAt,
+        )
+        scenario.onActivity { it.dispatchTouchEvent(down) }
+        down.recycle()
+        SystemClock.sleep(650)
+        assertTrue("롱프레스는 펜을 떼기 전에 발생해야 합니다", longPressed.get())
+        val up = motionEvent(
+            MotionEvent.ACTION_UP,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            480f,
+            760f,
+            eventTime = downAt + 700,
+        )
+        scenario.onActivity { it.dispatchTouchEvent(up) }
+        up.recycle()
+        assertEquals(10, taps.get())
+    }
+
+    @Test
+    fun rightmostMarkCellUsesWholeGroupHitboxAndOpensItsAttempt() {
+        val repository = LibraryRepository.get(context)
+        val first = repository.addMark(bookId, 0, 1, PagePoint(220f, 300f), MarkColor.BLUE)
+        repository.addMark(bookId, 0, 2, first.anchor, MarkColor.RED, first.id)
+        repository.addMark(bookId, 0, 3, first.anchor, MarkColor.BLUE, first.id)
+        scenario.onActivity { activity ->
+            activity.findDryInkView().apply {
+                visibleAttemptNo = 3
+                markGroups = repository.markGroups(bookId, 0)
+                invalidate()
+            }
+        }
+        SystemClock.sleep(250)
+
+        var hitX = -1f
+        var hitY = -1f
+        scenario.onActivity { activity ->
+            val dry = activity.findDryInkView()
+            search@ for (y in 80 until dry.height step 3) {
+                for (x in 0 until dry.width step 3) {
+                    if (dry.markedAttemptAt(x.toFloat(), y.toFloat()) == 3) {
+                        hitX = x.toFloat()
+                        hitY = y.toFloat()
+                        break@search
+                    }
+                }
+            }
+            assertEquals(first.id, dry.markGroupAt(hitX, hitY))
+        }
+        assertTrue(hitX >= 0f && hitY >= 0f)
+
+        val openedAttempt = AtomicInteger(0)
+        val before = revision()
+        scenario.onActivity { activity ->
+            activity.findInkInputView().apply {
+                tool = ReaderTool.PEN
+                findMarkAttempt = activity.findDryInkView()::markedAttemptAt
+                onOpenMarkedAttempt = openedAttempt::set
+            }
+        }
+        dispatchTap(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, hitX, hitY)
+        SystemClock.sleep(100)
+        assertEquals(3, openedAttempt.get())
+        assertEquals(before, revision())
     }
 
     @Test
@@ -186,6 +283,46 @@ class ReaderInteractionTest {
     }
 
     @Test
+    fun teacherDraftIsNotTransmittedUntilPublishAndGcKeepsMergeHistory() {
+        val syncBookId = "teacher-sync-${System.nanoTime()}"
+        val teacherDevice = "teacher-device"
+        val sourceRoot = File(context.cacheDir, "teacher-sync-source-${System.nanoTime()}")
+        val targetRoot = File(context.cacheDir, "teacher-sync-target-${System.nanoTime()}")
+        val sourceStore = PageOperationLogStore(sourceRoot)
+        val targetStore = PageOperationLogStore(targetRoot)
+        val document = AnnotationDocument(AnnotationSnapshot.empty(syncBookId, 0))
+        val draft = document.addStroke(
+            StrokeAsset(
+                pageNumber = 0,
+                tool = StrokeTool.PEN,
+                colorArgb = Color.RED,
+                width = 4f,
+                points = listOf(PagePoint(100f, 100f), PagePoint(180f, 180f)),
+                authorId = "teacher",
+                attemptNo = 1,
+                deviceId = teacherDevice,
+            )
+        )
+        sourceStore.append(draft)
+
+        assertTrue(sourceStore.encodedOperationsAfter(syncBookId, 0, teacherDevice, 0L, false).isEmpty())
+
+        val published = requireNotNull(document.publishTeacherDrafts(1, teacherDevice))
+        sourceStore.append(published)
+        val outgoing = sourceStore.encodedOperationsAfter(syncBookId, 0, teacherDevice, 0L, false)
+        assertEquals(1, outgoing.size)
+        targetStore.appendEncodedOperation("teacher-sync-target", 0, outgoing.single())
+        val received = targetStore.loadPage("teacher-sync-target", 0).activeStrokes.single()
+        assertEquals("teacher", received.authorId)
+        assertNotNull(received.publishedAtEpochMillis)
+
+        sourceStore.garbageCollectOrphans(document.snapshot(), emptySet())
+        assertEquals(2, sourceStore.encodedOperationsAfter(syncBookId, 0, 0L).size)
+        sourceRoot.deleteRecursively()
+        targetRoot.deleteRecursively()
+    }
+
+    @Test
     fun pairingQrPayloadRoundTripsWithoutChangingBookIdentity() {
         val expected = PairingPayload("192.168.0.12", 48123, bookId, "pair-1234")
         assertEquals(expected, PairingPayload.parse(expected.toUri()))
@@ -271,6 +408,16 @@ class ReaderInteractionTest {
             is android.view.ViewGroup -> (0 until view.childCount).forEach { queue.add(view.getChildAt(it)) }
         }
         error("DryInkView missing")
+    }
+
+    private fun ReaderActivity.findInkInputView(): InkInputView {
+        val root = findViewById<android.view.ViewGroup>(android.R.id.content)
+        val queue = ArrayDeque<android.view.View>().apply { add(root) }
+        while (queue.isNotEmpty()) when (val view = queue.removeFirst()) {
+            is InkInputView -> return view
+            is android.view.ViewGroup -> (0 until view.childCount).forEach { queue.add(view.getChildAt(it)) }
+        }
+        error("InkInputView missing")
     }
 
     private fun createPdf(file: File, pages: Int): File {

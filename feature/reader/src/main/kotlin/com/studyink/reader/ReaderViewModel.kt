@@ -46,7 +46,8 @@ data class ReaderUiState(
     val snapshot: AnnotationSnapshot = AnnotationSnapshot.empty("unopened"),
     val bookId: String = "",
     val bookTitle: String = "",
-    val pageCount: Int = 1,
+    val pageCount: Int = 0,
+    val documentReady: Boolean = false,
     val pageNumber: Int = 0,
     val attemptNo: Int = 1,
     val role: ReaderRole = ReaderRole.STUDENT,
@@ -97,10 +98,32 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         super.onCleared()
     }
 
-    fun openBook(bookId: String, pageNumber: Int, role: ReaderRole, selectedAttemptNo: Int? = null) {
+    fun openBook(
+        bookId: String,
+        pageNumber: Int,
+        role: ReaderRole,
+        selectedAttemptNo: Int? = null,
+        confirmedPageCount: Int? = null,
+    ) {
         val book = library.book(bookId)
         val target = pageNumber.coerceIn(0, book.pageCount - 1)
+        val beforeLoad = _uiState.value
+        val readyPageCount = confirmedPageCount
+            ?: beforeLoad.pageCount.takeIf { beforeLoad.bookId == bookId && beforeLoad.documentReady }
         val generation = ++loadGeneration
+        _uiState.value = beforeLoad.copy(
+            snapshot = AnnotationSnapshot.empty(book.id, target),
+            bookId = book.id,
+            bookTitle = book.title,
+            pageCount = readyPageCount ?: 0,
+            documentReady = readyPageCount != null,
+            pageNumber = target,
+            role = role,
+            capabilities = ReaderCapabilities.forRole(role),
+            marks = emptyList(),
+            canUndo = false,
+            canRedo = false,
+        )
         viewModelScope.launch(Dispatchers.IO) {
             val result = runCatching { store.loadPage(book.id, target) }
             mutationMutex.withLock {
@@ -108,14 +131,21 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 result.onSuccess { loaded ->
                     document = AnnotationDocument(loaded)
                     val attempts = library.attempts(book.id, target)
-                    val attemptNo = selectedAttemptNo?.takeIf { role != ReaderRole.STUDENT }
-                        ?: attempts.lastOrNull { !it.locked }?.attemptNo
-                        ?: (attempts.maxOfOrNull { it.attemptNo } ?: 0) + 1
+                    val selected = selectedAttemptNo?.takeIf { requested ->
+                        role != ReaderRole.STUDENT && attempts.any { it.attemptNo == requested }
+                    }
+                    val attemptNo = if (role == ReaderRole.STUDENT) {
+                        attempts.lastOrNull { !it.locked }?.attemptNo
+                            ?: (attempts.maxOfOrNull { it.attemptNo } ?: 0) + 1
+                    } else {
+                        selected ?: attempts.maxOfOrNull { it.attemptNo } ?: 1
+                    }
                     _uiState.value = ReaderUiState(
                         snapshot = loaded,
                         bookId = book.id,
                         bookTitle = book.title,
-                        pageCount = book.pageCount,
+                        pageCount = readyPageCount ?: 0,
+                        documentReady = readyPageCount != null,
                         pageNumber = target,
                         attemptNo = attemptNo,
                         role = role,
@@ -132,7 +162,8 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     _uiState.value = _uiState.value.copy(
                         bookId = book.id,
                         bookTitle = book.title,
-                        pageCount = book.pageCount,
+                        pageCount = readyPageCount ?: 0,
+                        documentReady = readyPageCount != null,
                         pageNumber = target,
                         role = role,
                         capabilities = ReaderCapabilities.forRole(role),
@@ -218,7 +249,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         val state = _uiState.value
         if (!state.capabilities.canBrowseAttempts) return
         if (library.attempts(state.bookId, state.pageNumber).none { it.attemptNo == attemptNo }) return
-        _uiState.value = state.copy(attemptNo = attemptNo)
+        openBook(state.bookId, state.pageNumber, state.role, attemptNo)
     }
 
     fun addGrade(anchor: PagePoint, color: MarkColor, groupId: String? = null) {
@@ -266,7 +297,6 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     withContext(Dispatchers.IO) { store.append(change) }
                     _uiState.value = before.copy(
                         snapshot = change.snapshot,
-                        attemptNo = change.addedAssets.firstOrNull()?.attemptNo ?: before.attemptNo,
                         canUndo = document.canUndo,
                         canRedo = document.canRedo,
                     )

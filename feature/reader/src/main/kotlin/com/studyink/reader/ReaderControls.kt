@@ -30,6 +30,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.contentDescription
@@ -47,10 +51,12 @@ fun PenTapButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     selected: Boolean = false,
+    shape: Shape = RoundedCornerShape(22.dp),
     content: @Composable () -> Unit,
 ) {
     var hovered by remember { mutableStateOf(false) }
     var armed by remember { mutableStateOf(false) }
+    var gestureStartedInside by remember { mutableStateOf(false) }
     var componentSize by remember { mutableStateOf(IntSize.Zero) }
     fun isInside(event: MotionEvent): Boolean =
         event.x >= 0f && event.y >= 0f && event.x < componentSize.width && event.y < componentSize.height
@@ -66,6 +72,16 @@ fun PenTapButton(
                 }
             }
             .onSizeChanged { componentSize = it }
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        if (event.changes.any { it.type == PointerType.Stylus }) {
+                            hovered = event.type != PointerEventType.Exit
+                        }
+                    }
+                }
+            }
             .pointerInteropFilter { event ->
                 val index = event.actionIndex.coerceIn(0, (event.pointerCount - 1).coerceAtLeast(0))
                 val stylus = event.pointerCount > 0 && when (event.getToolType(index)) {
@@ -75,18 +91,22 @@ fun PenTapButton(
                 if (!stylus) return@pointerInteropFilter false
                 when (event.actionMasked) {
                     MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> hovered = true
-                    MotionEvent.ACTION_HOVER_EXIT -> { hovered = false; armed = false }
-                    MotionEvent.ACTION_DOWN -> if (enabled && isInside(event)) armed = true
-                    MotionEvent.ACTION_MOVE -> if (!isInside(event)) armed = false
+                    MotionEvent.ACTION_HOVER_EXIT -> { hovered = false; armed = false; gestureStartedInside = false }
+                    MotionEvent.ACTION_DOWN -> {
+                        gestureStartedInside = enabled && isInside(event)
+                        armed = gestureStartedInside
+                    }
+                    MotionEvent.ACTION_MOVE -> armed = gestureStartedInside && isInside(event)
                     MotionEvent.ACTION_UP -> {
                         if (enabled && armed && isInside(event)) onAction()
                         armed = false
+                        gestureStartedInside = false
                     }
-                    MotionEvent.ACTION_CANCEL -> armed = false
+                    MotionEvent.ACTION_CANCEL -> { armed = false; gestureStartedInside = false }
                 }
                 true
             },
-        shape = if (modifier == Modifier) CircleShape else RoundedCornerShape(22.dp),
+        shape = shape,
         color = if (selected) MaterialTheme.colorScheme.inverseSurface else MaterialTheme.colorScheme.surface,
         contentColor = if (selected) MaterialTheme.colorScheme.inverseOnSurface else MaterialTheme.colorScheme.onSurface,
         shadowElevation = if (hovered) 8.dp else 3.dp,
@@ -114,16 +134,18 @@ fun ReaderTopChrome(
             PenTapButton(
                 description = "이전 페이지",
                 onAction = onPrevious,
-                enabled = state.pageNumber > 0,
+                enabled = state.documentReady && state.pageNumber > 0,
                 modifier = Modifier.align(Alignment.TopStart).size(48.dp),
+                shape = CircleShape,
             ) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Icon(Icons.Rounded.ChevronLeft, null)
             } }
             PenTapButton(
                 description = "다음 페이지",
                 onAction = onNext,
-                enabled = state.pageNumber + 1 < state.pageCount,
+                enabled = state.documentReady && state.pageNumber + 1 < state.pageCount,
                 modifier = Modifier.align(Alignment.TopEnd).size(48.dp),
+                shape = CircleShape,
             ) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Icon(Icons.Rounded.ChevronRight, null)
             } }
@@ -132,7 +154,8 @@ fun ReaderTopChrome(
                 PenTapButton(
                     description = "상단 메뉴 열기",
                     onAction = onToggleExpanded,
-                    modifier = Modifier.align(Alignment.TopCenter).size(44.dp),
+                    modifier = Modifier.align(Alignment.TopCenter).size(36.dp),
+                    shape = CircleShape,
                 ) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Icon(Icons.Rounded.MoreHoriz, null)
                 } }

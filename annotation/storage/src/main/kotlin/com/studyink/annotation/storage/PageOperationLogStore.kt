@@ -27,14 +27,14 @@ data class OperationCursor(val deviceId: String, val logicalClock: Long)
 
 /**
  * Append-only annotation persistence partitioned by (book, page). A checkpoint is only a loading
- * accelerator; durable operations remain the source of truth until an explicit orphan GC rotates
- * the old log into a retained archive.
+ * accelerator; durable operations remain the source of truth and are retained for offline peers.
  */
 class PageOperationLogStore(
     private val rootDirectory: File,
     checkpointInterval: Int = DEFAULT_CHECKPOINT_INTERVAL,
 ) {
     private val checkpointInterval = checkpointInterval.coerceAtLeast(1)
+    private val pageIndexes = mutableMapOf<PageKey, PageIndex>()
 
     constructor(context: Context, checkpointInterval: Int = DEFAULT_CHECKPOINT_INTERVAL) : this(
         File(context.filesDir, "masternote/annotation-pages"),
@@ -46,7 +46,10 @@ class PageOperationLogStore(
     }
 
     @Synchronized
-    fun loadPage(bookId: String, pageNumber: Int): AnnotationSnapshot {
+    fun loadPage(bookId: String, pageNumber: Int): AnnotationSnapshot =
+        pageIndex(bookId, pageNumber).snapshot
+
+    private fun readPageIndex(bookId: String, pageNumber: Int): PageIndex {
         val directory = pageDirectory(bookId, pageNumber)
         val checkpointFile = File(directory, CHECKPOINT_FILE)
         var snapshot = if (checkpointFile.exists()) {
@@ -56,8 +59,11 @@ class PageOperationLogStore(
         }
         validatePartition(snapshot, bookId, pageNumber)
 
+        val records = mutableListOf<IndexedOperation>()
+        val byDevice = mutableMapOf<String, MutableList<IndexedOperation>>()
+        val maximumClocks = mutableMapOf<String, Long>()
         val logFile = File(directory, LOG_FILE)
-        if (!logFile.exists()) return snapshot
+        if (!logFile.exists()) return PageIndex(snapshot, records, byDevice, maximumClocks)
         try {
             logFile.bufferedReader(Charsets.UTF_8).useLines { lines ->
                 lines.forEachIndexed { index, line ->
@@ -67,10 +73,18 @@ class PageOperationLogStore(
                     } catch (error: Throwable) {
                         throw IOException("Invalid operation at line ${index + 1}", error)
                     }
+                    require(record.bookId == bookId && record.pageNumber == pageNumber) {
+                        "Operation partition identity mismatch"
+                    }
+                    val encoded = line.toByteArray(Charsets.UTF_8)
+                    val indexed = IndexedOperation(record, encoded)
+                    records += indexed
+                    byDevice.getOrPut(record.operation.deviceId, ::mutableListOf) += indexed
+                    maximumClocks[record.operation.deviceId] = maxOf(
+                        maximumClocks[record.operation.deviceId] ?: 0L,
+                        record.operation.logicalClock,
+                    )
                     if (record.revision > snapshot.revision) {
-                        require(record.bookId == bookId && record.pageNumber == pageNumber) {
-                            "Operation partition identity mismatch"
-                        }
                         snapshot = apply(snapshot, record)
                     }
                 }
@@ -78,17 +92,21 @@ class PageOperationLogStore(
         } catch (error: Throwable) {
             quarantineAndThrow(logFile, error)
         }
+        byDevice.values.forEach { operations -> operations.sortBy { it.record.operation.logicalClock } }
         validatePartition(snapshot, bookId, pageNumber)
-        return snapshot
+        return PageIndex(snapshot, records, byDevice, maximumClocks)
     }
 
     @Synchronized
     fun append(change: AnnotationChange) {
         val snapshot = change.snapshot
+        val index = pageIndex(snapshot.bookId, snapshot.pageNumber)
+        if (change.operation.id in index.snapshot.appliedOperationIds) return
         val directory = pageDirectory(snapshot.bookId, snapshot.pageNumber)
-        val line = encodeRecord(
-            StoredOperationRecord(snapshot.bookId, snapshot.pageNumber, snapshot.revision, change.operation, change.addedAssets)
-        ).toString()
+        val record = StoredOperationRecord(
+            snapshot.bookId, snapshot.pageNumber, snapshot.revision, change.operation, change.addedAssets
+        )
+        val line = encodeRecord(record).toString()
         val logFile = File(directory, LOG_FILE)
         FileOutputStream(logFile, true).use { output ->
             output.write(line.toByteArray(Charsets.UTF_8))
@@ -96,6 +114,7 @@ class PageOperationLogStore(
             output.flush()
             output.fd.sync()
         }
+        index.add(record, line.toByteArray(Charsets.UTF_8), snapshot)
         if (snapshot.revision % checkpointInterval == 0L) writeCheckpoint(snapshot)
     }
 
@@ -106,34 +125,18 @@ class PageOperationLogStore(
     }
 
     /**
-     * Removes only malformed/unowned assets. The previous append log is archived, never silently
-     * deleted, so a diagnostic recovery remains possible.
+     * GC must not rotate the only operation history while a paired device may still request it.
+     * Until peer acknowledgement watermarks are persisted, retaining the append log is the only
+     * safe policy for offline merge. Orphan compaction can be re-enabled once every paired peer is
+     * known to have crossed a checkpoint.
      */
     @Synchronized
     fun garbageCollectOrphans(
         snapshot: AnnotationSnapshot,
         validAttemptNumbers: Set<Int>,
     ): AnnotationSnapshot {
-        val retainedAssets = snapshot.assets.filterValues { it.attemptNo in validAttemptNumbers }
-        val retainedIds = snapshot.activeStrokeIds.intersect(retainedAssets.keys)
-        if (retainedAssets.size == snapshot.assets.size && retainedIds.size == snapshot.activeStrokeIds.size) {
-            return snapshot
-        }
-        val compacted = AnnotationSnapshot(
-            bookId = snapshot.bookId,
-            pageNumber = snapshot.pageNumber,
-            revision = snapshot.revision,
-            assets = retainedAssets,
-            activeStrokeIds = retainedIds,
-            appliedOperationIds = snapshot.appliedOperationIds,
-        )
-        writeCheckpoint(compacted)
-        val log = File(pageDirectory(snapshot.bookId, snapshot.pageNumber), LOG_FILE)
-        if (log.exists() && log.length() > 0L) {
-            val archive = File(log.parentFile, "operations.gc-${System.currentTimeMillis()}.log")
-            check(log.renameTo(archive)) { "Could not archive operation log" }
-        }
-        return compacted
+        @Suppress("UNUSED_VARIABLE") val attemptsKeptForFuturePeerWatermarks = validAttemptNumbers
+        return snapshot
     }
 
     fun operationLogFile(bookId: String, pageNumber: Int): File =
@@ -141,22 +144,9 @@ class PageOperationLogStore(
 
     @Synchronized
     fun encodedOperationsAfter(bookId: String, pageNumber: Int, revision: Long): List<ByteArray> {
-        val file = File(pageDirectory(bookId, pageNumber), LOG_FILE)
-        if (!file.exists()) return emptyList()
-        return try {
-            buildList {
-                file.bufferedReader(Charsets.UTF_8).useLines { lines ->
-                    lines.filter(String::isNotBlank).forEach { line ->
-                        val root = JSONObject(line)
-                        val record = decodeRecord(root)
-                        require(record.bookId == bookId && record.pageNumber == pageNumber)
-                        if (record.revision > revision) add(line.toByteArray(Charsets.UTF_8))
-                    }
-                }
-            }
-        } catch (error: Throwable) {
-            quarantineAndThrow(file, error)
-        }
+        val records = pageIndex(bookId, pageNumber).records
+        val start = records.firstIndexAfterRevision(revision)
+        return records.subList(start, records.size).map { it.encoded.copyOf() }
     }
 
     @Synchronized
@@ -165,45 +155,21 @@ class PageOperationLogStore(
         pageNumber: Int,
         originDeviceId: String,
         logicalClock: Long,
+        includeTeacherDrafts: Boolean = true,
     ): List<ByteArray> {
-        val file = File(pageDirectory(bookId, pageNumber), LOG_FILE)
-        if (!file.exists()) return emptyList()
-        return try {
-            buildList {
-                file.bufferedReader(Charsets.UTF_8).useLines { lines ->
-                    lines.filter(String::isNotBlank).forEach { line ->
-                        val record = decodeRecord(JSONObject(line))
-                        require(record.bookId == bookId && record.pageNumber == pageNumber)
-                        if (record.operation.deviceId == originDeviceId && record.operation.logicalClock > logicalClock) {
-                            add(line.toByteArray(Charsets.UTF_8))
-                        }
-                    }
-                }
-            }
-        } catch (error: Throwable) {
-            quarantineAndThrow(file, error)
-        }
+        val index = pageIndex(bookId, pageNumber)
+        val records = index.byDevice[originDeviceId].orEmpty()
+        val start = records.firstIndexAfterClock(logicalClock)
+        return records.subList(start, records.size)
+            .asSequence()
+            .filter { includeTeacherDrafts || it.record.isPublishable(index.snapshot) }
+            .map { it.encoded.copyOf() }
+            .toList()
     }
 
     @Synchronized
     fun maxOperationClock(bookId: String, pageNumber: Int, originDeviceId: String): Long {
-        val file = File(pageDirectory(bookId, pageNumber), LOG_FILE)
-        if (!file.exists()) return 0L
-        return try {
-            var maximum = 0L
-            file.bufferedReader(Charsets.UTF_8).useLines { lines ->
-                lines.filter(String::isNotBlank).forEach { line ->
-                    val record = decodeRecord(JSONObject(line))
-                    require(record.pageNumber == pageNumber)
-                    if (record.operation.deviceId == originDeviceId) {
-                        maximum = maxOf(maximum, record.operation.logicalClock)
-                    }
-                }
-            }
-            maximum
-        } catch (error: Throwable) {
-            quarantineAndThrow(file, error)
-        }
+        return pageIndex(bookId, pageNumber).maximumClockByDevice[originDeviceId] ?: 0L
     }
 
     fun operationCursor(bytes: ByteArray): OperationCursor {
@@ -220,7 +186,8 @@ class PageOperationLogStore(
         val record = decodeRecord(JSONObject(text))
         require(record.pageNumber == pageNumber) { "Operation page partition mismatch" }
         require(record.addedAssets.all { it.pageNumber == pageNumber }) { "Operation contains another page" }
-        val current = loadPage(bookId, pageNumber)
+        val index = pageIndex(bookId, pageNumber)
+        val current = index.snapshot
         if (record.operation.id in current.appliedOperationIds) return current.revision
         val localRecord = record.copy(bookId = bookId, revision = current.revision + 1L)
         val localBytes = encodeRecord(localRecord).toString().toByteArray(Charsets.UTF_8)
@@ -232,9 +199,13 @@ class PageOperationLogStore(
             output.fd.sync()
         }
         val updated = apply(current, localRecord)
+        index.add(localRecord, localBytes, updated)
         if (updated.revision % checkpointInterval == 0L) writeCheckpoint(updated)
         return updated.revision
     }
+
+    private fun pageIndex(bookId: String, pageNumber: Int): PageIndex =
+        pageIndexes.getOrPut(PageKey(bookId, pageNumber)) { readPageIndex(bookId, pageNumber) }
 
     private fun pageDirectory(bookId: String, pageNumber: Int): File {
         require(pageNumber >= 0) { "Page number cannot be negative" }
@@ -257,6 +228,10 @@ class PageOperationLogStore(
     }
 
     private fun quarantineAndThrow(file: File, error: Throwable): Nothing {
+        pageIndexes.entries.removeAll { (key, _) ->
+            val directory = File(rootDirectory, "${key.bookId.safeFileName()}/pages/${key.pageNumber}")
+            file.absolutePath.startsWith(directory.absolutePath)
+        }
         val quarantined = File(file.parentFile, "${file.name}.corrupt-${System.currentTimeMillis()}")
         if (!file.renameTo(quarantined)) {
             throw CorruptAnnotationDataException("손상된 필기 데이터를 격리하지 못했습니다.", file, error)
@@ -282,6 +257,64 @@ class PageOperationLogStore(
         val operation: AssetOperation,
         val addedAssets: List<StrokeAsset>,
     )
+
+    private data class PageKey(val bookId: String, val pageNumber: Int)
+
+    private data class IndexedOperation(
+        val record: StoredOperationRecord,
+        val encoded: ByteArray,
+    )
+
+    private data class PageIndex(
+        var snapshot: AnnotationSnapshot,
+        val records: MutableList<IndexedOperation>,
+        val byDevice: MutableMap<String, MutableList<IndexedOperation>>,
+        val maximumClockByDevice: MutableMap<String, Long>,
+    ) {
+        fun add(record: StoredOperationRecord, encoded: ByteArray, updated: AnnotationSnapshot) {
+            val indexed = IndexedOperation(record, encoded)
+            records += indexed
+            byDevice.getOrPut(record.operation.deviceId, ::mutableListOf).apply {
+                val insertion = binarySearchBy(record.operation.logicalClock) { it.record.operation.logicalClock }
+                add(if (insertion < 0) -insertion - 1 else insertion, indexed)
+            }
+            maximumClockByDevice[record.operation.deviceId] = maxOf(
+                maximumClockByDevice[record.operation.deviceId] ?: 0L,
+                record.operation.logicalClock,
+            )
+            snapshot = updated
+        }
+    }
+
+    private fun StoredOperationRecord.isPublishable(snapshot: AnnotationSnapshot): Boolean {
+        if (addedAssets.isNotEmpty()) {
+            return addedAssets.none { it.authorId == "teacher" && it.publishedAtEpochMillis == null }
+        }
+        val removedAssets = operation.removedStrokeIds.mapNotNull(snapshot.assets::get)
+        return removedAssets.isEmpty() || removedAssets.none {
+            it.authorId == "teacher" && it.publishedAtEpochMillis == null
+        }
+    }
+
+    private fun List<IndexedOperation>.firstIndexAfterRevision(revision: Long): Int {
+        var low = 0
+        var high = size
+        while (low < high) {
+            val middle = (low + high) ushr 1
+            if (this[middle].record.revision <= revision) low = middle + 1 else high = middle
+        }
+        return low
+    }
+
+    private fun List<IndexedOperation>.firstIndexAfterClock(clock: Long): Int {
+        var low = 0
+        var high = size
+        while (low < high) {
+            val middle = (low + high) ushr 1
+            if (this[middle].record.operation.logicalClock <= clock) low = middle + 1 else high = middle
+        }
+        return low
+    }
 
     private fun apply(snapshot: AnnotationSnapshot, record: StoredOperationRecord): AnnotationSnapshot {
         val assets = snapshot.assets.toMutableMap()

@@ -53,8 +53,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var selectedPenWidthDp by mutableStateOf(3.2f)
     private var selectedPenOpacity by mutableStateOf(1f)
     private var latestState by mutableStateOf(ReaderUiState())
-    private var currentPage by mutableStateOf(0)
-    private var loadedPageCount by mutableStateOf(1)
+    private var initialPage = 0
     private var role by mutableStateOf(ReaderRole.STUDENT)
     private var stylusMenuExpanded by mutableStateOf(false)
     private var topMenuExpanded by mutableStateOf(false)
@@ -67,7 +66,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         bookId = intent.getStringExtra(EXTRA_BOOK_ID) ?: run { finish(); return }
-        currentPage = intent.getIntExtra(EXTRA_PAGE_NUMBER, 0)
+        initialPage = intent.getIntExtra(EXTRA_PAGE_NUMBER, 0)
         teacherAccess = TeacherAccessController(this)
         val requestedRole = intent.getStringExtra(EXTRA_ROLE)
             ?.let { runCatching { ReaderRole.valueOf(it) }.getOrNull() }
@@ -118,8 +117,12 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             input.onErase = { page, path, radius, whole ->
                 viewModel.erase(page, path, radius, whole) { dryInkView.eraserPreview = null }
             }
-            input.onTeacherTap =(::handleTeacherTap)
-            input.onTeacherLongPress =(::handleTeacherLongPress)
+            input.onGradeTap =(::handleGradeTap)
+            input.onGradeLongPress =(::handleGradeLongPress)
+            input.findMarkAttempt = { x, y ->
+                if (latestState.capabilities.canBrowseAttempts) dryInkView.markedAttemptAt(x, y) else null
+            }
+            input.onOpenMarkedAttempt = viewModel::selectAttempt
             input.findScrollableMarkGroup = dryInkView::scrollableMarkGroupAt
             input.onDragMarkHistory = dryInkView::dragMarkHistory
             input.onEndMarkHistoryDrag = dryInkView::endMarkHistoryDrag
@@ -147,14 +150,12 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 viewModel.uiState.collect { state ->
                     latestState = state
-                    currentPage = state.pageNumber
-                    loadedPageCount = state.pageCount
                     dryInkView.snapshot = state.snapshot
                     dryInkView.activePage = state.pageNumber
                     dryInkView.visibleAttemptNo = state.attemptNo
                     dryInkView.showTeacherDrafts = state.role != ReaderRole.STUDENT
                     dryInkView.markGroups = state.marks
-                    inputView.teacherTapEnabled = state.capabilities.canGrade
+                    if (!state.capabilities.canGrade && selectedTool == ReaderTool.GRADE) selectTool(ReaderTool.PEN)
                     inputView.isEnabled = state.capabilities.canWrite && state.storageAvailable
                 }
             }
@@ -173,8 +174,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     override fun onDocumentReady(uri: Uri, pageWidths: Map<Int, Float>, pageCount: Int) {
         viewport.setPageWidths(pageWidths)
-        loadedPageCount = pageCount
-        showPage(currentPage)
+        val target = initialPage.coerceIn(0, (pageCount - 1).coerceAtLeast(0))
+        viewport.showPage(target)
+        viewModel.openBook(bookId, target, role, confirmedPageCount = pageCount)
     }
 
     override fun onDocumentError(error: Throwable) {
@@ -182,8 +184,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private fun showPage(pageNumber: Int, attemptNo: Int? = null) {
-        val target = pageNumber.coerceIn(0, (loadedPageCount - 1).coerceAtLeast(0))
-        currentPage = target
+        val state = latestState
+        if (!state.documentReady || state.pageCount <= 0) return
+        val target = pageNumber.coerceIn(0, state.pageCount - 1)
         dryInkView.activePage = target
         viewport.showPage(target)
         viewModel.openBook(bookId, target, role, attemptNo)
@@ -200,12 +203,12 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         if (role != ReaderRole.STUDENT) {
             role = ReaderRole.STUDENT
             TeacherAccessController.invalidateSession()
-            showPage(currentPage)
+            showPage(latestState.pageNumber)
             return
         }
         if (teacherAccess.isSessionAuthenticated()) {
             role = ReaderRole.TEACHER_TABLET
-            showPage(currentPage, latestAttemptForPage())
+            showPage(latestState.pageNumber, latestAttemptForPage())
         } else {
             requestedTeacherRole = ReaderRole.TEACHER_TABLET
             pinDialogVisible = true
@@ -213,35 +216,38 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private fun latestAttemptForPage(): Int? = LibraryRepository.get(this)
-        .attempts(bookId, currentPage).maxOfOrNull { it.attemptNo }
+        .attempts(bookId, latestState.pageNumber).maxOfOrNull { it.attemptNo }
 
     private fun changeAttempt(delta: Int) {
-        val attempts = LibraryRepository.get(this).attempts(bookId, currentPage).map { it.attemptNo }
+        val attempts = LibraryRepository.get(this).attempts(bookId, latestState.pageNumber).map { it.attemptNo }
+        if (attempts.isEmpty()) return
         val index = attempts.indexOf(latestState.attemptNo)
+        if (index < 0) {
+            viewModel.selectAttempt(attempts.last())
+            return
+        }
         val next = (index + delta).coerceIn(0, attempts.lastIndex)
         if (next in attempts.indices) viewModel.selectAttempt(attempts[next])
     }
 
-    private fun handleTeacherTap(page: Int, point: PagePoint, tapCount: Int) {
-        if (!latestState.capabilities.canGrade || page != currentPage) return
+    private fun handleGradeTap(page: Int, point: PagePoint, tapCount: Int, viewX: Float, viewY: Float) {
+        if (!latestState.capabilities.canGrade || selectedTool != ReaderTool.GRADE || page != latestState.pageNumber) return
         movingMarkGroupId?.let { groupId ->
             viewModel.moveMarkGroup(groupId, point)
             movingMarkGroupId = null
             return
         }
-        val threshold = viewport.viewWidthToCanonical(page, dp(28f))
-        val group = latestState.marks.minByOrNull { mark ->
-            kotlin.math.hypot(mark.anchor.x - point.x, mark.anchor.y - point.y)
-        }?.takeIf { mark -> kotlin.math.hypot(mark.anchor.x - point.x, mark.anchor.y - point.y) <= threshold }
-        viewModel.addGrade(point, if (tapCount >= 2) MarkColor.RED else MarkColor.BLUE, group?.id)
+        viewModel.addGrade(
+            point,
+            if (tapCount >= 2) MarkColor.RED else MarkColor.BLUE,
+            dryInkView.markGroupAt(viewX, viewY),
+        )
     }
 
-    private fun handleTeacherLongPress(page: Int, point: PagePoint) {
-        if (!latestState.capabilities.canGrade || page != currentPage) return
-        val threshold = viewport.viewWidthToCanonical(page, dp(32f))
-        selectedMarkGroupId = latestState.marks.minByOrNull { mark ->
-            kotlin.math.hypot(mark.anchor.x - point.x, mark.anchor.y - point.y)
-        }?.takeIf { mark -> kotlin.math.hypot(mark.anchor.x - point.x, mark.anchor.y - point.y) <= threshold }?.id
+    private fun handleGradeLongPress(page: Int, point: PagePoint, viewX: Float, viewY: Float) {
+        if (!latestState.capabilities.canGrade || selectedTool != ReaderTool.GRADE || page != latestState.pageNumber) return
+        selectedMarkGroupId = dryInkView.markGroupAt(viewX, viewY)
+        dryInkView.pressedMarkGroupId = selectedMarkGroupId
     }
 
     private fun selectTool(tool: ReaderTool) {
@@ -277,8 +283,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 state = latestState,
                 expanded = topMenuExpanded,
                 onToggleExpanded = { topMenuExpanded = !topMenuExpanded },
-                onPrevious = { showPage(currentPage - 1) },
-                onNext = { showPage(currentPage + 1) },
+                onPrevious = { showPage(latestState.pageNumber - 1) },
+                onNext = { showPage(latestState.pageNumber + 1) },
                 onExitToLibrary = { finish() },
                 onSubmit =(::submitCurrentPage),
                 onTeacherMode =(::toggleTeacherMode),
@@ -299,7 +305,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                             pinDialogVisible = false
                             role = requestedTeacherRole ?: ReaderRole.TEACHER_TABLET
                             requestedTeacherRole = null
-                            showPage(currentPage, latestAttemptForPage())
+                            showPage(latestState.pageNumber, latestAttemptForPage())
                         }
                         valid
                     },
@@ -307,11 +313,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             }
             selectedMarkGroupId?.let { groupId ->
                 MarkEditDialog(
-                    onBlue = { viewModel.changeGrade(groupId, MarkColor.BLUE); selectedMarkGroupId = null },
-                    onRed = { viewModel.changeGrade(groupId, MarkColor.RED); selectedMarkGroupId = null },
-                    onMove = { movingMarkGroupId = groupId; selectedMarkGroupId = null },
-                    onHide = { viewModel.hideMarkGroup(groupId); selectedMarkGroupId = null },
-                    onCancel = { selectedMarkGroupId = null },
+                    onBlue = { viewModel.changeGrade(groupId, MarkColor.BLUE); clearMarkSelection() },
+                    onRed = { viewModel.changeGrade(groupId, MarkColor.RED); clearMarkSelection() },
+                    onMove = { movingMarkGroupId = groupId; clearMarkSelection() },
+                    onHide = { viewModel.hideMarkGroup(groupId); clearMarkSelection() },
+                    onCancel =(::clearMarkSelection),
                 )
             }
         }
@@ -397,6 +403,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
     private fun dp(value: Float): Float = value * resources.displayMetrics.density
+
+    private fun clearMarkSelection() {
+        selectedMarkGroupId = null
+        dryInkView.pressedMarkGroupId = null
+    }
 
     companion object {
         private const val PDF_FRAGMENT_TAG = "reader-pdf"

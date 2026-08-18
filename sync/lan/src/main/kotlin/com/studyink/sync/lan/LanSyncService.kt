@@ -320,7 +320,13 @@ class LanSyncService : Service(), LanSyncBus.Listener {
         if (page != subscribedPage || writer == null) return
         runCatching {
             val acknowledgedClock = peerReceivedClocks[library.deviceId] ?: 0L
-            store.encodedOperationsAfter(bookId, page, library.deviceId, acknowledgedClock).forEach { record ->
+            store.encodedOperationsAfter(
+                bookId = bookId,
+                pageNumber = page,
+                originDeviceId = library.deviceId,
+                logicalClock = acknowledgedClock,
+                includeTeacherDrafts = role != LanPeerRole.TEACHER_CLIENT,
+            ).forEach { record ->
                 send(LanWire.message("OPERATION") {
                     put("page", page)
                     put("payload", Base64.encodeToString(record, Base64.NO_WRAP))

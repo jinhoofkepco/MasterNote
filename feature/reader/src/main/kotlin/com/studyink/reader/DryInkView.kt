@@ -15,6 +15,7 @@ import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
 import com.studyink.document.pdf.PdfViewportAdapter
+import kotlin.math.hypot
 import kotlin.math.max
 
 data class EraserPreview(
@@ -48,6 +49,8 @@ class DryInkView(context: Context) : View(context) {
         set(value) { field = value; rebuildPageCache(); invalidate() }
     var markGroups: List<MarkGroup> = emptyList()
         set(value) { field = value; invalidate() }
+    var pressedMarkGroupId: String? = null
+        set(value) { field = value; invalidate() }
 
     private var cachedPageStrokes: Map<Int, List<StrokeAsset>> = emptyMap()
     private val pageMaskPaint = Paint().apply { color = Color.rgb(225, 226, 231) }
@@ -56,8 +59,19 @@ class DryInkView(context: Context) : View(context) {
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
     }
-    private val markPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val markPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        alpha = MARK_ALPHA
+    }
+    private val markFocusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(2f)
+        color = Color.rgb(31, 42, 68)
+    }
     private val markHistoryBounds = mutableMapOf<String, RectF>()
+    private val markHistoryAnchors = mutableMapOf<String, android.graphics.PointF>()
+    private val markHistoryCounts = mutableMapOf<String, Int>()
+    private val markCellHits = mutableListOf<MarkCellHit>()
     private val markHistoryOffsets = mutableMapOf<String, Int>()
     private val markHistoryDragRemainders = mutableMapOf<String, Float>()
 
@@ -158,9 +172,12 @@ class DryInkView(context: Context) : View(context) {
     private fun drawMarks(canvas: Canvas, adapter: PdfViewportAdapter) {
         val groups = markGroups.filter { it.pageNumber == activePage && it.hiddenAtEpochMillis == null }
             .sortedBy { it.anchor.y }
-        val cell = dp(11f)
-        val gap = dp(3f)
+        val cell = dp(22f)
+        val gap = dp(4f)
         markHistoryBounds.clear()
+        markHistoryAnchors.clear()
+        markHistoryCounts.clear()
+        markCellHits.clear()
         groups.forEachIndexed { groupIndex, group ->
             val anchor = adapter.canonicalToView(activePage, group.anchor) ?: return@forEachIndexed
             val history = group.marks.filter { it.hiddenAtEpochMillis == null }.toMutableList()
@@ -175,25 +192,46 @@ class DryInkView(context: Context) : View(context) {
             val visibleHistory = history.subList(start, end)
             visibleHistory.forEachIndexed { markIndex, mark ->
                 markPaint.color = mark.color.toArgb()
+                markPaint.alpha = MARK_ALPHA
                 val left = anchor.x + markIndex * (cell + gap)
-                canvas.drawRoundRect(left, anchor.y, left + cell, anchor.y + cell, dp(2f), dp(2f), markPaint)
+                val cellBounds = RectF(left, anchor.y, left + cell, anchor.y + cell)
+                canvas.drawRoundRect(cellBounds, dp(4f), dp(4f), markPaint)
+                markCellHits += MarkCellHit(group.id, mark.attemptNo, cellBounds, anchor.x, anchor.y)
             }
-            if (history.size > 3) {
-                val historyWidth = visibleHistory.size * cell + (visibleHistory.size - 1).coerceAtLeast(0) * gap
-                markHistoryBounds[group.id] = RectF(
-                    anchor.x - dp(8f), anchor.y - dp(8f),
-                    anchor.x + historyWidth + dp(8f), anchor.y + cell + dp(8f),
-                )
+            val historyWidth = visibleHistory.size * cell + (visibleHistory.size - 1).coerceAtLeast(0) * gap
+            val groupBounds = RectF(
+                anchor.x - dp(4f), anchor.y - dp(4f),
+                anchor.x + historyWidth + dp(4f), anchor.y + cell + dp(4f),
+            )
+            markHistoryBounds[group.id] = groupBounds
+            markHistoryAnchors[group.id] = android.graphics.PointF(anchor.x, anchor.y)
+            markHistoryCounts[group.id] = history.size
+            if (pressedMarkGroupId == group.id) {
+                canvas.drawRoundRect(groupBounds, dp(6f), dp(6f), markFocusPaint)
             }
             val current = history.lastOrNull { it.attemptNo == visibleAttemptNo }?.color ?: MarkColor.GRAY
             markPaint.color = current.toArgb()
+            markPaint.alpha = MARK_ALPHA
             val barTop = dp(84f) + groupIndex * (cell + gap)
-            canvas.drawRoundRect(width - dp(14f), barTop, width - dp(5f), barTop + cell, dp(2f), dp(2f), markPaint)
+            canvas.drawRoundRect(width - dp(17f), barTop, width - dp(5f), barTop + cell, dp(3f), dp(3f), markPaint)
         }
     }
 
-    fun scrollableMarkGroupAt(viewX: Float, viewY: Float): String? =
-        markHistoryBounds.entries.firstOrNull { (_, bounds) -> bounds.contains(viewX, viewY) }?.key
+    fun markGroupAt(viewX: Float, viewY: Float): String? = markHistoryBounds.entries
+        .asSequence()
+        .filter { (_, bounds) -> bounds.contains(viewX, viewY) }
+        .minByOrNull { (groupId, _) ->
+            markHistoryAnchors[groupId]?.let { hypot(it.x - viewX, it.y - viewY) } ?: Float.MAX_VALUE
+        }
+        ?.key
+
+    fun markedAttemptAt(viewX: Float, viewY: Float): Int? = markCellHits.asSequence()
+        .filter { it.bounds.contains(viewX, viewY) }
+        .minByOrNull { hypot(it.anchorX - viewX, it.anchorY - viewY) }
+        ?.attemptNo
+
+    fun scrollableMarkGroupAt(viewX: Float, viewY: Float): String? = markGroupAt(viewX, viewY)
+        ?.takeIf { (markHistoryCounts[it] ?: 0) > 3 }
 
     fun dragMarkHistory(groupId: String, deltaX: Float) {
         val group = markGroups.firstOrNull { it.id == groupId } ?: return
@@ -238,4 +276,16 @@ class DryInkView(context: Context) : View(context) {
     }
 
     private fun dp(value: Float): Float = value * resources.displayMetrics.density
+
+    private data class MarkCellHit(
+        val groupId: String,
+        val attemptNo: Int,
+        val bounds: RectF,
+        val anchorX: Float,
+        val anchorY: Float,
+    )
+
+    private companion object {
+        const val MARK_ALPHA = 176
+    }
 }

@@ -51,9 +51,7 @@ class PdfViewportAdapter {
         pdfView?.removeOnViewportChangedListener(viewportChangedListener)
         pdfView?.removeOnGestureStateChangedListener(gestureStateChangedListener)
         pdfView = view
-        pageWidths = emptyMap()
         pageLocations.clear()
-        activePageNumber = 0
         settlePosted = false
         view.pagesPerRow = PdfView.SINGLE_PAGE
         view.verticalAlignment = PdfView.VERTICAL_ALIGNMENT_CENTER
@@ -61,6 +59,9 @@ class PdfViewportAdapter {
         hideBuiltInPageControls(view)
         view.addOnViewportChangedListener(viewportChangedListener)
         view.addOnGestureStateChangedListener(gestureStateChangedListener)
+        if (pageWidths.containsKey(activePageNumber)) {
+            view.post { showPage(activePageNumber) }
+        }
     }
 
     fun setPageWidths(widths: Map<Int, Float>) {
