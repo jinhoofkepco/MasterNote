@@ -51,6 +51,8 @@ android {
             // fixed-signature APK downloaded from GitHub Releases.
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
         release {
             signingConfig = signingConfigs.getByName("debug")

@@ -33,6 +33,7 @@ data class StylusHoverPreview(
 )
 
 class DryInkView(context: Context) : View(context) {
+    private val readerTokens = readerCanvasTokens()
     var viewport: PdfViewportAdapter? = null
         set(value) { field = value; invalidate() }
     var snapshot: AnnotationSnapshot = AnnotationSnapshot.empty("unopened")
@@ -61,12 +62,12 @@ class DryInkView(context: Context) : View(context) {
     }
     private val markPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        alpha = MARK_ALPHA
+        alpha = readerTokens.markAlpha
     }
     private val markFocusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = dp(2f)
-        color = Color.rgb(31, 42, 68)
+        color = readerTokens.markFocusArgb
     }
     private val markHistoryBounds = mutableMapOf<String, RectF>()
     private val markHistoryAnchors = mutableMapOf<String, android.graphics.PointF>()
@@ -172,8 +173,8 @@ class DryInkView(context: Context) : View(context) {
     private fun drawMarks(canvas: Canvas, adapter: PdfViewportAdapter) {
         val groups = markGroups.filter { it.pageNumber == activePage && it.hiddenAtEpochMillis == null }
             .sortedBy { it.anchor.y }
-        val cell = dp(22f)
-        val gap = dp(4f)
+        val cell = dp(readerTokens.markCellDp)
+        val gap = dp(readerTokens.markGapDp)
         markHistoryBounds.clear()
         markHistoryAnchors.clear()
         markHistoryCounts.clear()
@@ -192,16 +193,23 @@ class DryInkView(context: Context) : View(context) {
             val visibleHistory = history.subList(start, end)
             visibleHistory.forEachIndexed { markIndex, mark ->
                 markPaint.color = mark.color.toArgb()
-                markPaint.alpha = MARK_ALPHA
+                markPaint.alpha = readerTokens.markAlpha
                 val left = anchor.x + markIndex * (cell + gap)
                 val cellBounds = RectF(left, anchor.y, left + cell, anchor.y + cell)
-                canvas.drawRoundRect(cellBounds, dp(4f), dp(4f), markPaint)
+                canvas.drawRoundRect(
+                    cellBounds,
+                    dp(readerTokens.markCornerDp),
+                    dp(readerTokens.markCornerDp),
+                    markPaint,
+                )
                 markCellHits += MarkCellHit(group.id, mark.attemptNo, cellBounds, anchor.x, anchor.y)
             }
             val historyWidth = visibleHistory.size * cell + (visibleHistory.size - 1).coerceAtLeast(0) * gap
             val groupBounds = RectF(
-                anchor.x - dp(4f), anchor.y - dp(4f),
-                anchor.x + historyWidth + dp(4f), anchor.y + cell + dp(4f),
+                anchor.x - dp(readerTokens.markHitPaddingDp),
+                anchor.y - dp(readerTokens.markHitPaddingDp),
+                anchor.x + historyWidth + dp(readerTokens.markHitPaddingDp),
+                anchor.y + cell + dp(readerTokens.markHitPaddingDp),
             )
             markHistoryBounds[group.id] = groupBounds
             markHistoryAnchors[group.id] = android.graphics.PointF(anchor.x, anchor.y)
@@ -211,9 +219,18 @@ class DryInkView(context: Context) : View(context) {
             }
             val current = history.lastOrNull { it.attemptNo == visibleAttemptNo }?.color ?: MarkColor.GRAY
             markPaint.color = current.toArgb()
-            markPaint.alpha = MARK_ALPHA
-            val barTop = dp(84f) + groupIndex * (cell + gap)
-            canvas.drawRoundRect(width - dp(17f), barTop, width - dp(5f), barTop + cell, dp(3f), dp(3f), markPaint)
+            markPaint.alpha = readerTokens.markAlpha
+            val barTop = dp(readerTokens.markBarTopDp) + groupIndex * (cell + gap)
+            val barRight = width - dp(readerTokens.markBarRightInsetDp)
+            canvas.drawRoundRect(
+                barRight - dp(readerTokens.markBarWidthDp),
+                barTop,
+                barRight,
+                barTop + cell,
+                dp(readerTokens.markCornerDp),
+                dp(readerTokens.markCornerDp),
+                markPaint,
+            )
         }
     }
 
@@ -270,9 +287,9 @@ class DryInkView(context: Context) : View(context) {
     }
 
     private fun MarkColor.toArgb(): Int = when (this) {
-        MarkColor.BLUE -> Color.rgb(44, 108, 232)
-        MarkColor.RED -> Color.rgb(226, 59, 59)
-        MarkColor.GRAY -> Color.rgb(170, 174, 184)
+        MarkColor.BLUE -> readerTokens.markBlueArgb
+        MarkColor.RED -> readerTokens.markRedArgb
+        MarkColor.GRAY -> readerTokens.markGrayArgb
     }
 
     private fun dp(value: Float): Float = value * resources.displayMetrics.density
@@ -284,8 +301,4 @@ class DryInkView(context: Context) : View(context) {
         val anchorX: Float,
         val anchorY: Float,
     )
-
-    private companion object {
-        const val MARK_ALPHA = 176
-    }
 }

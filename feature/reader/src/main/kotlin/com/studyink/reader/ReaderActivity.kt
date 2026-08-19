@@ -157,6 +157,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                     dryInkView.markGroups = state.marks
                     if (!state.capabilities.canGrade && selectedTool == ReaderTool.GRADE) selectTool(ReaderTool.PEN)
                     inputView.isEnabled = state.capabilities.canWrite && state.storageAvailable
+                    ReaderDebugSessionStore.save(this@ReaderActivity, state)
                 }
             }
         }
@@ -287,7 +288,6 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 onNext = { showPage(latestState.pageNumber + 1) },
                 onExitToLibrary = { finish() },
                 onSubmit =(::submitCurrentPage),
-                onTeacherMode =(::toggleTeacherMode),
                 onPreviousAttempt = { changeAttempt(-1) },
                 onNextAttempt = { changeAttempt(1) },
                 onPublish = { viewModel.publishTeacherInk() },
@@ -336,6 +336,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 onResetZoom = viewport::resetZoom,
                 onUndo = viewModel::undo,
                 onRedo = viewModel::redo,
+                onToggleRole = {
+                    stylusMenuExpanded = false
+                    toggleTeacherMode()
+                },
                 onDismissRequest = { stylusMenuExpanded = false },
             )
         }
@@ -412,7 +416,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     companion object {
         private const val PDF_FRAGMENT_TAG = "reader-pdf"
         private const val PDF_CONTAINER_ID = 0x5100
-        private const val TOP_CHROME_HEIGHT = 64
+        private const val TOP_CHROME_HEIGHT = 76
         private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         private const val EXTRA_BOOK_ID = "bookId"
         private const val EXTRA_PAGE_NUMBER = "pageNumber"

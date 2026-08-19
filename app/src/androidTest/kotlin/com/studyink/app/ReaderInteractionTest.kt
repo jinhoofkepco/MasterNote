@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -25,6 +26,8 @@ import com.studyink.library.data.LibraryRepository
 import com.studyink.reader.DryInkView
 import com.studyink.reader.InkInputView
 import com.studyink.reader.ReaderActivity
+import com.studyink.reader.ReaderDebugSessionStore
+import com.studyink.reader.ReaderRole
 import com.studyink.reader.ReaderTool
 import com.studyink.sync.lan.PairingPayload
 import org.junit.After
@@ -81,6 +84,51 @@ class ReaderInteractionTest {
         assertTrue(device.hasObject(By.desc("형광펜")))
         assertTrue(device.hasObject(By.desc("지우개")))
         assertTrue(device.hasObject(By.desc("되돌리기")))
+        assertTrue(device.hasObject(By.desc("선생 모드")))
+    }
+
+    @Test
+    fun debugBuildBypassesTeacherPinForFastReaderEntry() {
+        assertTrue(ReaderDebugSessionStore.isEnabled(context))
+        scenario.close()
+        scenario = ActivityScenario.launch(ReaderActivity.intent(context, bookId, 1, ReaderRole.TEACHER_TABLET))
+        waitForBook()
+        val event = motionEvent(
+            MotionEvent.ACTION_BUTTON_PRESS, InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS,
+            520f, 920f, MotionEvent.BUTTON_STYLUS_PRIMARY,
+        )
+        scenario.onActivity { assertTrue(it.dispatchGenericMotionEvent(event)) }
+        event.recycle()
+        assertTrue(device.wait(Until.hasObject(By.desc("채점")), 3_000))
+        assertTrue(device.hasObject(By.desc("학생 모드")))
+    }
+
+    @Test
+    fun compactExpandedChromeKeepsLongTitleInsideNavigationBounds() {
+        LibraryRepository.get(context).renameBook(
+            bookId,
+            "아주 긴 영어 문제집 단원명 — 문장 구조와 어휘 연습",
+        )
+        scenario.close()
+        scenario = ActivityScenario.launch(ReaderActivity.intent(context, bookId, 0))
+        waitForBook()
+        val root = InstrumentationRegistry.getInstrumentation().uiAutomation.rootInActiveWindow
+        val menu = requireNotNull(root.findByDescription("상단 메뉴 열기"))
+        assertTrue(menu.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+        assertTrue(device.wait(Until.hasObject(By.desc("책장으로 나가기")), 3_000))
+
+        val previous = device.findObject(By.desc("이전 페이지")).visibleBounds
+        val contextButton = device.findObject(By.desc("책장으로 나가기")).visibleBounds
+        val status = device.findObject(By.desc("현재 풀이 상태")).visibleBounds
+        val submit = device.findObject(By.desc("현재 페이지 제출")).visibleBounds
+        val close = device.findObject(By.desc("상단 메뉴 닫기")).visibleBounds
+        val next = device.findObject(By.desc("다음 페이지")).visibleBounds
+        val layout = "previous=$previous context=$contextButton status=$status submit=$submit close=$close next=$next"
+        assertTrue(layout, previous.right <= contextButton.left)
+        assertTrue(layout, contextButton.right <= status.left)
+        assertTrue(layout, status.right <= submit.left)
+        assertTrue(layout, submit.right <= close.left)
+        assertTrue(layout, close.right <= next.left)
     }
 
     @Test
@@ -398,6 +446,14 @@ class ReaderInteractionTest {
             eventTime, eventTime, action, 1, properties, coordinates, 0, buttons,
             1f, 1f, 0, 0, source, 0,
         )
+    }
+
+    private fun AccessibilityNodeInfo.findByDescription(description: String): AccessibilityNodeInfo? {
+        if (contentDescription?.toString() == description) return this
+        repeat(childCount) { index ->
+            getChild(index)?.findByDescription(description)?.let { return it }
+        }
+        return null
     }
 
     private fun ReaderActivity.findDryInkView(): DryInkView {

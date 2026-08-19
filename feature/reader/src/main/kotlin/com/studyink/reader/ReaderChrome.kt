@@ -21,6 +21,7 @@ import androidx.compose.material.icons.rounded.Brush
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.FitScreen
+import androidx.compose.material.icons.rounded.ManageAccounts
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
@@ -81,6 +82,7 @@ fun StylusToolMenu(
     onResetZoom: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
+    onToggleRole: () -> Unit,
     onDismissRequest: () -> Unit,
 ) {
     var menuPage by remember { mutableStateOf(RadialMenuPage.MAIN) }
@@ -119,15 +121,18 @@ fun StylusToolMenu(
                         onResetZoom = onResetZoom,
                         onUndo = onUndo,
                         onRedo = onRedo,
+                        onToggleRole = onToggleRole,
                     )
 
                     RadialMenuPage.COLORS -> ColorRadialMenu(
+                        role = state.role,
                         selectedColorArgb = selectedColorArgb,
                         onSelectColor = onSelectColor,
                         onBack = { menuPage = RadialMenuPage.MAIN },
                     )
 
                     RadialMenuPage.PEN -> PenRadialMenu(
+                        role = state.role,
                         selectedColorArgb = selectedColorArgb,
                         selectedWidthDp = selectedWidthDp,
                         selectedOpacity = selectedOpacity,
@@ -151,10 +156,13 @@ private fun MainRadialMenu(
     onResetZoom: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
+    onToggleRole: () -> Unit,
 ) {
     val canGrade = state.capabilities.canGrade
+    val resetIndex = if (canGrade) 6 else 5
+    val modeIndex = resetIndex + 1
     RadialFan(
-        itemCount = if (canGrade) 8 else 7,
+        itemCount = if (canGrade) 9 else 8,
         originX = FanOriginX,
         originY = FanOriginY,
         radius = CompactFanRadius,
@@ -168,27 +176,32 @@ private fun MainRadialMenu(
                 label = "되돌리기",
                 enabled = state.canUndo,
                 size = 44,
+                role = state.role,
             ) { onUndo() }
             index == 1 -> RadialActionButton(
                 icon = Icons.AutoMirrored.Rounded.Backspace,
                 label = "지우개",
                 selected = selectedTool == ReaderTool.PARTIAL_ERASER,
                 size = 44,
+                role = state.role,
             ) { onSelectTool(ReaderTool.PARTIAL_ERASER) }
             index == 2 -> RadialActionButton(
                 icon = Icons.Rounded.Edit,
                 label = "펜",
                 selected = selectedTool == ReaderTool.PEN,
                 size = 44,
+                role = state.role,
             ) { onPenClick() }
             index == 3 -> RadialActionButton(
                 icon = Icons.Rounded.Brush,
                 label = "형광펜",
                 selected = selectedTool == ReaderTool.HIGHLIGHTER,
                 size = 44,
+                role = state.role,
             ) { onSelectTool(ReaderTool.HIGHLIGHTER) }
             index == 4 -> PaletteButton(
                 selectedColorArgb = selectedColorArgb,
+                role = state.role,
                 onClick = onOpenColors,
             )
             canGrade && index == 5 -> RadialActionButton(
@@ -196,17 +209,26 @@ private fun MainRadialMenu(
                 label = "채점",
                 selected = selectedTool == ReaderTool.GRADE,
                 size = 44,
+                role = state.role,
             ) { onSelectTool(ReaderTool.GRADE) }
-            index == if (canGrade) 6 else 5 -> RadialActionButton(
+            index == resetIndex -> RadialActionButton(
                 icon = Icons.Rounded.FitScreen,
                 label = "확대 초기화",
                 size = 44,
+                role = state.role,
             ) { onResetZoom() }
+            index == modeIndex -> RadialActionButton(
+                icon = Icons.Rounded.ManageAccounts,
+                label = if (state.role == ReaderRole.STUDENT) "선생 모드" else "학생 모드",
+                size = 44,
+                role = state.role,
+            ) { onToggleRole() }
             else -> RadialActionButton(
                 icon = Icons.AutoMirrored.Rounded.Redo,
                 label = "다시 실행",
                 enabled = state.canRedo,
                 size = 44,
+                role = state.role,
             ) { onRedo() }
         }
     }
@@ -214,6 +236,7 @@ private fun MainRadialMenu(
 
 @Composable
 private fun ColorRadialMenu(
+    role: ReaderRole,
     selectedColorArgb: Int,
     onSelectColor: (Int) -> Unit,
     onBack: () -> Unit,
@@ -236,15 +259,16 @@ private fun ColorRadialMenu(
     ) { index ->
         if (index < colors.size) {
             val (color, label) = colors[index]
-            ColorChoice(color, selectedColorArgb, label, onSelect = onSelectColor)
+            ColorChoice(color, selectedColorArgb, label, role, onSelect = onSelectColor)
         } else {
-            PaletteButton(selectedColorArgb = selectedColorArgb, onClick = onBack)
+            PaletteButton(selectedColorArgb = selectedColorArgb, role = role, onClick = onBack)
         }
     }
 }
 
 @Composable
 private fun PenRadialMenu(
+    role: ReaderRole,
     selectedColorArgb: Int,
     selectedWidthDp: Float,
     selectedOpacity: Float,
@@ -277,6 +301,7 @@ private fun PenRadialMenu(
         StrokeWidthChoice(
             widthDp = widths[index],
             selectedWidthDp = selectedWidthDp,
+            role = role,
             onSelect = onSelectWidth,
         )
     }
@@ -349,6 +374,7 @@ private fun RadialActionButton(
     selected: Boolean = false,
     enabled: Boolean = true,
     size: Int = 48,
+    role: ReaderRole = ReaderRole.STUDENT,
     onClick: () -> Unit,
 ) {
     PenTapButton(
@@ -357,6 +383,7 @@ private fun RadialActionButton(
         enabled = enabled,
         selected = selected,
         modifier = Modifier.size(size.dp),
+        role = role,
     ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Icon(icon, contentDescription = null, modifier = Modifier.size((size * 0.48f).dp))
@@ -367,12 +394,14 @@ private fun RadialActionButton(
 @Composable
 private fun PaletteButton(
     selectedColorArgb: Int,
+    role: ReaderRole = ReaderRole.STUDENT,
     onClick: () -> Unit,
 ) {
     PenTapButton(
         description = "색상 팔레트",
         onAction = onClick,
         modifier = Modifier.size(46.dp),
+        role = role,
     ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Box(
@@ -398,6 +427,7 @@ private fun ColorChoice(
     color: Color,
     selectedColorArgb: Int,
     label: String,
+    role: ReaderRole,
     onSelect: (Int) -> Unit,
 ) {
     val selected = color.toArgb() == selectedColorArgb
@@ -406,6 +436,7 @@ private fun ColorChoice(
         onAction = { onSelect(color.toArgb()) },
         selected = selected,
         modifier = Modifier.size(48.dp),
+        role = role,
     ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Box(
@@ -429,6 +460,7 @@ private fun ColorChoice(
 private fun StrokeWidthChoice(
     widthDp: Float,
     selectedWidthDp: Float,
+    role: ReaderRole,
     onSelect: (Float) -> Unit,
 ) {
     val selected = kotlin.math.abs(widthDp - selectedWidthDp) < 0.15f
@@ -438,6 +470,7 @@ private fun StrokeWidthChoice(
         onAction = { onSelect(widthDp) },
         selected = selected,
         modifier = Modifier.size(48.dp),
+        role = role,
     ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Canvas(modifier = Modifier.size(29.dp)) {

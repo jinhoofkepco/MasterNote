@@ -43,6 +43,7 @@ import com.studyink.core.model.Book
 import com.studyink.library.data.LibraryRepository
 import com.studyink.library.data.LibraryState
 import com.studyink.reader.ReaderActivity
+import com.studyink.reader.ReaderDebugSessionStore
 import com.studyink.reader.ReaderRole
 import com.studyink.sync.lan.LanSyncService
 import com.studyink.sync.lan.LanSyncBus
@@ -186,6 +187,13 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                         )
                     }
                 }
+            }
+        }
+        if (savedInstanceState == null) {
+            ReaderDebugSessionStore.load(this)?.takeIf { session ->
+                repository.state.books.any { it.id == session.bookId }
+            }?.let { session ->
+                startActivity(ReaderActivity.intent(this, session.bookId, session.pageNumber, session.role))
             }
         }
     }
