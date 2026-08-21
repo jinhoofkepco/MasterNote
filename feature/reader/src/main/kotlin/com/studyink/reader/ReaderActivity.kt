@@ -19,6 +19,7 @@ import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.fragment.app.FragmentContainerView
@@ -79,8 +80,13 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             role = requestedRole
         }
 
-        val root = FrameLayout(this).apply { setBackgroundColor(Color.rgb(225, 226, 231)) }
+        val readerBackgroundColor = Color.rgb(225, 226, 231)
+        val root = FrameLayout(this).apply { setBackgroundColor(readerBackgroundColor) }
         setContentView(root)
+        @Suppress("DEPRECATION")
+        window.navigationBarColor = readerBackgroundColor
+        window.isNavigationBarContrastEnforced = false
+        WindowCompat.getInsetsController(window, root).isAppearanceLightNavigationBars = true
         val fragmentContainer = FragmentContainerView(this).apply { id = PDF_CONTAINER_ID }
         root.addView(fragmentContainer, FrameLayout.LayoutParams(MATCH, MATCH))
 
@@ -137,7 +143,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             composeView.setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
             root.addView(composeView, FrameLayout.LayoutParams(dp(1), dp(1), Gravity.TOP or Gravity.START))
         }
-        applySystemBarInsets(root)
+        applySystemBarInsets(root, fragmentContainer)
         renderChrome()
 
         pdfFragment = supportFragmentManager.findFragmentByTag(PDF_FRAGMENT_TAG) as? ReaderPdfFragment
@@ -195,7 +201,6 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun submitCurrentPage() {
         viewModel.submit { nextPage ->
-            topMenuExpanded = false
             showPage(nextPage)
         }
     }
@@ -325,7 +330,6 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             StylusToolMenu(
                 expanded = stylusMenuExpanded,
                 state = latestState,
-                selectedTool = selectedTool,
                 selectedColorArgb = selectedPenColor,
                 selectedWidthDp = selectedPenWidthDp,
                 selectedOpacity = selectedPenOpacity,
@@ -389,11 +393,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         paletteAnchor.post { stylusMenuExpanded = true }
     }
 
-    private fun applySystemBarInsets(root: FrameLayout) {
+    private fun applySystemBarInsets(root: FrameLayout, fragmentContainer: FragmentContainerView) {
         ViewCompat.setOnApplyWindowInsetsListener(root) { _, windowInsets ->
             val bars: Insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
             topChrome.updateFrameLayoutParams { topMargin = bars.top }
-            listOf(dryInkView, wetInkView, inputView).forEach { view ->
+            listOf(fragmentContainer, dryInkView, wetInkView, inputView).forEach { view ->
                 view.updateFrameLayoutParams { bottomMargin = bars.bottom }
             }
             windowInsets

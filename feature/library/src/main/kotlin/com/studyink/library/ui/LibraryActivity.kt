@@ -8,21 +8,27 @@ import android.os.Bundle
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -36,6 +42,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
@@ -122,7 +132,7 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
         state = repository.state
         setContent {
             MaterialTheme {
-                Surface(Modifier.fillMaxSize()) {
+                Surface(Modifier.fillMaxSize(), color = LibraryBackground) {
                     LibraryScreen(
                         state = state ?: return@Surface,
                         selectedBook = selectedBook,
@@ -233,6 +243,15 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
     }
 }
 
+private val LibraryBackground = Color(0xFFF2EEE5)
+private val PaperIvory = Color(0xFFFFFCF5)
+private val PaperInk = Color(0xFF403D36)
+private val PaperMutedInk = Color(0xFF777066)
+private val PaperHighlight = Color(0xFFFFFFFF)
+private val PaperStroke = Color(0xFFD9D1C3)
+private val PaperYellow = Color(0xFFF2C94C)
+private val PaperYellowSoft = Color(0xFFFFF2B8)
+
 @Composable
 private fun LibraryScreen(
     state: LibraryState,
@@ -250,65 +269,295 @@ private fun LibraryScreen(
     onScanTeacherQr: (Book) -> Unit,
     onStopSync: () -> Unit,
 ) {
-    Column(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Text("내 책장", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(state.students, key = { it.id }) { student ->
-                if (student.id == state.selectedStudentId) {
-                    Button(onClick = { onSelectStudent(student.id) }) { Text(student.displayName) }
+    PaperBackdrop {
+        Column(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .widthIn(max = 720.dp)
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = "내 책장",
+                    color = PaperInk,
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = "읽을 교재를 골라 바로 이어서 공부해요.",
+                    color = PaperMutedInk,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(vertical = 2.dp),
+            ) {
+                items(state.students, key = { it.id }) { student ->
+                    StudentPaperChip(
+                        name = student.displayName,
+                        selected = student.id == state.selectedStudentId,
+                        onClick = { onSelectStudent(student.id) },
+                    )
+                }
+            }
+            if (selectedBook == null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = "교재",
+                        color = PaperInk,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Button(
+                        onClick = onImport,
+                        enabled = !importing,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = PaperYellow,
+                            contentColor = PaperInk,
+                        ),
+                    ) {
+                        Text(if (importing) "가져오는 중" else "+ PDF 가져오기")
+                    }
+                }
+                val books = state.books.filter { it.studentId == state.selectedStudentId }
+                if (books.isEmpty()) {
+                    EmptyLibraryNotice(Modifier.weight(1f))
                 } else {
-                    OutlinedButton(onClick = { onSelectStudent(student.id) }) { Text(student.displayName) }
-                }
-            }
-        }
-        if (selectedBook == null) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(onClick = onImport, enabled = !importing) { Text(if (importing) "가져오는 중" else "PDF 교재 가져오기") }
-            }
-            val books = state.books.filter { it.studentId == state.selectedStudentId }
-            if (books.isEmpty()) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("PDF 교재를 가져오면 이곳에 표시됩니다.")
-                }
-            } else {
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    items(books, key = { it.id }) { book ->
-                        Card(Modifier.fillMaxWidth().clickable { onSelectBook(book) }) {
-                            Row(
-                                Modifier.fillMaxWidth().padding(18.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                            ) {
-                                Column {
-                                    Text(book.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                                    Text("${book.pageCount}쪽", style = MaterialTheme.typography.bodySmall)
-                                }
-                                TextButton(onClick = { onRename(book) }) { Text("이름 바꾸기") }
-                            }
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        contentPadding = PaddingValues(vertical = 3.dp),
+                    ) {
+                        items(books, key = { it.id }) { book ->
+                            CompactBookItem(
+                                book = book,
+                                onOpen = { onSelectBook(book) },
+                                onRename = { onRename(book) },
+                            )
                         }
                     }
                 }
-            }
-        } else {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedButton(onClick = onBackToBooks) { Text("교재 목록") }
-                Text(selectedBook.title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                OutlinedButton(onClick = { onImportAnswers(selectedBook) }) { Text("정답 JSON") }
-                OutlinedButton(onClick = { onStartStudentSync(selectedBook) }) { Text("학생 기기") }
-                OutlinedButton(onClick = { onStartTeacherSync(selectedBook) }) { Text("선생 폰") }
-                OutlinedButton(onClick = { onScanTeacherQr(selectedBook) }) { Text("QR 연결") }
-                TextButton(onClick = onStopSync) { Text("연결 종료") }
-            }
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(selectedBook.pageCount) { page ->
-                    Card(Modifier.fillMaxWidth().clickable { onOpenPage(selectedBook, page) }) {
-                        Text("${page + 1}쪽", Modifier.padding(18.dp), style = MaterialTheme.typography.titleMedium)
+            } else {
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    contentPadding = PaddingValues(vertical = 2.dp),
+                ) {
+                    item { OutlinedButton(onClick = onBackToBooks) { Text("교재 목록") } }
+                    item { OutlinedButton(onClick = { onImportAnswers(selectedBook) }) { Text("정답 JSON") } }
+                    item { OutlinedButton(onClick = { onStartStudentSync(selectedBook) }) { Text("학생 기기") } }
+                    item { OutlinedButton(onClick = { onStartTeacherSync(selectedBook) }) { Text("선생 폰") } }
+                    item { OutlinedButton(onClick = { onScanTeacherQr(selectedBook) }) { Text("QR 연결") } }
+                    item { TextButton(onClick = onStopSync) { Text("연결 종료") } }
+                }
+                Text(
+                    text = selectedBook.title,
+                    color = PaperInk,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(7.dp),
+                    contentPadding = PaddingValues(vertical = 3.dp),
+                ) {
+                    items(selectedBook.pageCount) { page ->
+                        CompactPageItem(
+                            page = page,
+                            onOpen = { onOpenPage(selectedBook, page) },
+                        )
                     }
                 }
             }
         }
     }
 }
+
+@Composable
+private fun PaperBackdrop(content: @Composable androidx.compose.foundation.layout.BoxScope.() -> Unit) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Canvas(Modifier.fillMaxSize()) {
+            drawRect(LibraryBackground)
+            val fiberStep = 30.dp.toPx()
+            var y = fiberStep * 0.6f
+            var row = 0
+            while (y < size.height) {
+                val inset = ((row * 37) % 71).toFloat().dp.toPx()
+                drawLine(
+                    color = PaperHighlight.copy(alpha = 0.16f),
+                    start = androidx.compose.ui.geometry.Offset(inset, y),
+                    end = androidx.compose.ui.geometry.Offset(size.width, y + 0.7f),
+                    strokeWidth = 0.7.dp.toPx(),
+                )
+                drawLine(
+                    color = PaperStroke.copy(alpha = 0.10f),
+                    start = androidx.compose.ui.geometry.Offset(0f, y + 1.5.dp.toPx()),
+                    end = androidx.compose.ui.geometry.Offset((size.width - inset).coerceAtLeast(0f), y + 1.5.dp.toPx()),
+                    strokeWidth = 0.45.dp.toPx(),
+                )
+                y += fiberStep
+                row++
+            }
+        }
+        content()
+    }
+}
+
+@Composable
+private fun StudentPaperChip(name: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+        color = if (selected) PaperYellowSoft else PaperIvory,
+        contentColor = PaperInk,
+        border = paperEdge(),
+        shadowElevation = if (selected) 3.dp else 1.dp,
+    ) {
+        Text(
+            text = name,
+            modifier = Modifier.padding(horizontal = 13.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+        )
+    }
+}
+
+@Composable
+private fun CompactBookItem(book: Book, onOpen: () -> Unit, onRename: () -> Unit) {
+    val shape = androidx.compose.foundation.shape.RoundedCornerShape(13.dp)
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        onClick = onOpen,
+        shape = shape,
+        color = PaperIvory,
+        contentColor = PaperInk,
+        border = paperEdge(),
+        tonalElevation = 0.dp,
+        shadowElevation = 3.dp,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 58.dp)
+                .padding(start = 12.dp, end = 6.dp, top = 7.dp, bottom = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(11.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(width = 5.dp, height = 30.dp),
+            ) {
+                Canvas(Modifier.fillMaxSize()) {
+                    drawRoundRect(
+                        color = PaperYellow,
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(size.width / 2f),
+                    )
+                }
+            }
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(1.dp),
+            ) {
+                Text(
+                    text = book.title,
+                    color = PaperInk,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = "${book.pageCount}쪽",
+                    color = PaperMutedInk,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+            TextButton(onClick = onRename) {
+                Text("이름 변경", color = PaperMutedInk, style = MaterialTheme.typography.labelMedium)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompactPageItem(page: Int, onOpen: () -> Unit) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        onClick = onOpen,
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
+        color = PaperIvory.copy(alpha = 0.96f),
+        contentColor = PaperInk,
+        border = paperEdge(),
+        tonalElevation = 0.dp,
+        shadowElevation = 2.dp,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 50.dp)
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text("${page + 1}쪽", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text("열기", color = PaperMutedInk, style = MaterialTheme.typography.labelMedium)
+        }
+    }
+}
+
+@Composable
+private fun EmptyLibraryNotice(modifier: Modifier = Modifier) {
+    Box(modifier = modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+        Surface(
+            modifier = Modifier.widthIn(max = 420.dp),
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
+            color = PaperIvory.copy(alpha = 0.78f),
+            border = paperEdge(),
+            tonalElevation = 0.dp,
+            shadowElevation = 2.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                Canvas(Modifier.size(26.dp)) {
+                    drawCircle(PaperYellowSoft)
+                    drawCircle(PaperYellow, style = Stroke(width = 1.dp.toPx()))
+                }
+                Text("아직 교재가 없어요", color = PaperInk, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "PDF 교재를 가져오면 제목별로 이곳에 표시됩니다.",
+                    color = PaperMutedInk,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
+}
+
+private fun paperEdge() = BorderStroke(
+    width = 1.dp,
+    brush = Brush.verticalGradient(
+        colors = listOf(PaperHighlight.copy(alpha = 0.92f), PaperStroke.copy(alpha = 0.86f)),
+    ),
+)
 
 @Composable
 private fun RenameBookDialog(book: Book, onDismiss: () -> Unit, onSave: (String) -> Unit) {

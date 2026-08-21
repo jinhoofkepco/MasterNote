@@ -4,6 +4,13 @@ Reader 상단 UI의 반복 조정 값은 `feature/reader/.../ReaderTheme.kt`의
 `readerChromeTokens()` 함수 본문에 모여 있다. 색, 크기, 여백, 투명도, 그림자와
 호버·눌림 애니메이션 값은 이 함수에서 조정한다.
 
+반원 메뉴의 반지름은 토큰이 아니라 `radialFanGeometry()`가 계산한다. 역할에 따라
+항목 수가 8개 또는 9개로 달라지므로, 반지름을 고정하면 항목 수가 늘었을 때 버튼이
+겹친다. `toolButtonSize`를 키우면 반지름과 팝업 크기가 함께 커지고 이웃 버튼 사이
+간격은 `radialItemGap`으로 유지된다. 도구 그림(`ic_tool_*_item.png`)은 원 안에서
+`toolSelectedOffsetY`만큼 떠오르므로, 그림 높이는 최대 리프트 상태에서도 원을 벗어나지
+않도록 512x768 캔버스 안에서 맞춰 두었다.
+
 ## 확인된 빌드 조건
 
 - Android Gradle Plugin: 8.13.2
