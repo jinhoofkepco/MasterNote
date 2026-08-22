@@ -49,44 +49,172 @@ internal object LanWire {
     }
 }
 
+/** Page-scoped peer cursors. Annotation clocks are allocated independently by each page editor. */
+internal class PageOperationWatermarks {
+    private data class Key(val pageNumber: Int, val deviceId: String)
+
+    private val clocks = mutableMapOf<Key, Long>()
+
+    @Synchronized
+    fun replace(pageNumber: Int, deviceId: String, logicalClock: Long) {
+        require(pageNumber >= 0) { "Watermark page cannot be negative" }
+        require(deviceId.isNotBlank()) { "Watermark device cannot be blank" }
+        require(logicalClock >= 0L) { "Watermark clock cannot be negative" }
+        clocks[Key(pageNumber, deviceId)] = logicalClock
+    }
+
+    @Synchronized
+    fun acknowledge(pageNumber: Int, deviceId: String, logicalClock: Long) {
+        require(pageNumber >= 0) { "Watermark page cannot be negative" }
+        require(deviceId.isNotBlank()) { "Watermark device cannot be blank" }
+        require(logicalClock >= 0L) { "Watermark clock cannot be negative" }
+        val key = Key(pageNumber, deviceId)
+        clocks[key] = maxOf(clocks[key] ?: 0L, logicalClock)
+    }
+
+    @Synchronized
+    fun clock(pageNumber: Int, deviceId: String): Long =
+        clocks[Key(pageNumber, deviceId)] ?: 0L
+
+    @Synchronized
+    fun clear() = clocks.clear()
+}
+
+/** The reader page currently open on this process, retained per book for late service startup. */
+data class PagePresence(
+    val bookId: String,
+    val pageNumber: Int,
+    val attemptNo: Int? = null,
+    val revision: Long,
+    val followRemoteStudent: Boolean = false,
+) {
+    init {
+        require(bookId.isNotBlank()) { "Presence book id cannot be blank" }
+        require(pageNumber >= 0) { "Presence page cannot be negative" }
+        require(attemptNo == null || attemptNo >= 0) { "Presence attempt cannot be negative" }
+        require(revision >= 0L) { "Presence revision cannot be negative" }
+    }
+}
+
+/** The latest student location received from a paired device, retained per local book. */
+data class StudentLocation(
+    val bookId: String,
+    val pageNumber: Int,
+    val attemptNo: Int? = null,
+    val revision: Long = 0L,
+) {
+    init {
+        require(bookId.isNotBlank()) { "Student location book id cannot be blank" }
+        require(pageNumber >= 0) { "Student location page cannot be negative" }
+        require(attemptNo == null || attemptNo >= 0) { "Student location attempt cannot be negative" }
+        require(revision >= 0L) { "Student location revision cannot be negative" }
+    }
+}
+
 object LanSyncBus {
     interface Listener {
         fun onLocalOperation(bookId: String, pageNumber: Int) {}
         fun onPageChanged(bookId: String, pageNumber: Int, revision: Long) {}
+        fun onPagePresenceChanged(presence: PagePresence) {
+            onPageChanged(presence.bookId, presence.pageNumber, presence.revision)
+        }
         fun onRemoteOperation(bookId: String, pageNumber: Int) {}
         fun onRemoteMarkGroup(bookId: String, pageNumber: Int) {}
         fun onRemoteAttempt(bookId: String, pageNumber: Int) {}
         fun onRemotePageChanged(bookId: String, pageNumber: Int) {}
+        fun onRemoteStudentLocationChanged(location: StudentLocation) {
+            onRemotePageChanged(location.bookId, location.pageNumber)
+        }
         fun onPairingReady(bookId: String, pairingUri: String) {}
         fun onSessionIssue(message: String) {}
     }
 
     private val listeners = linkedSetOf<Listener>()
+    private val localPagePresences = mutableMapOf<String, PagePresence>()
+    private val remoteStudentLocations = mutableMapOf<String, StudentLocation>()
 
-    @Synchronized fun addListener(listener: Listener) { listeners += listener }
-    @Synchronized fun removeListener(listener: Listener) { listeners -= listener }
-    @Synchronized fun operationWritten(bookId: String, pageNumber: Int) = listeners.toList().forEach {
+    fun addListener(listener: Listener) {
+        synchronized(this) { listeners += listener }
+    }
+
+    fun removeListener(listener: Listener) {
+        synchronized(this) { listeners -= listener }
+    }
+
+    fun localPagePresence(bookId: String): PagePresence? = synchronized(this) {
+        localPagePresences[bookId]
+    }
+
+    fun remoteStudentLocation(bookId: String): StudentLocation? = synchronized(this) {
+        remoteStudentLocations[bookId]
+    }
+
+    internal fun clearRemoteStudentLocation(bookId: String) {
+        synchronized(this) { remoteStudentLocations.remove(bookId) }
+    }
+
+    fun operationWritten(bookId: String, pageNumber: Int) = listenerSnapshot().forEach {
         it.onLocalOperation(bookId, pageNumber)
     }
-    @Synchronized fun pageChanged(bookId: String, pageNumber: Int, revision: Long) = listeners.toList().forEach {
-        it.onPageChanged(bookId, pageNumber, revision)
+
+    fun pageChanged(
+        bookId: String,
+        pageNumber: Int,
+        revision: Long,
+        attemptNo: Int? = null,
+        followRemoteStudent: Boolean = false,
+    ) = pageChanged(
+        PagePresence(
+            bookId = bookId,
+            pageNumber = pageNumber,
+            attemptNo = attemptNo,
+            revision = revision,
+            followRemoteStudent = followRemoteStudent,
+        )
+    )
+
+    fun pageChanged(presence: PagePresence) {
+        val snapshot = synchronized(this) {
+            localPagePresences[presence.bookId] = presence
+            listeners.toList()
+        }
+        snapshot.forEach { it.onPagePresenceChanged(presence) }
     }
-    @Synchronized internal fun remoteOperation(bookId: String, pageNumber: Int) = listeners.toList().forEach {
+
+    internal fun remoteOperation(bookId: String, pageNumber: Int) = listenerSnapshot().forEach {
         it.onRemoteOperation(bookId, pageNumber)
     }
-    @Synchronized internal fun remoteMarkGroup(bookId: String, pageNumber: Int) = listeners.toList().forEach {
+
+    internal fun remoteMarkGroup(bookId: String, pageNumber: Int) = listenerSnapshot().forEach {
         it.onRemoteMarkGroup(bookId, pageNumber)
     }
-    @Synchronized internal fun remoteAttempt(bookId: String, pageNumber: Int) = listeners.toList().forEach {
+
+    internal fun remoteAttempt(bookId: String, pageNumber: Int) = listenerSnapshot().forEach {
         it.onRemoteAttempt(bookId, pageNumber)
     }
-    @Synchronized internal fun remotePageChanged(bookId: String, pageNumber: Int) = listeners.toList().forEach {
-        it.onRemotePageChanged(bookId, pageNumber)
+
+    internal fun remotePageChanged(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int? = null,
+        revision: Long = 0L,
+    ) = remotePageChanged(StudentLocation(bookId, pageNumber, attemptNo, revision))
+
+    internal fun remotePageChanged(location: StudentLocation) {
+        val snapshot = synchronized(this) {
+            remoteStudentLocations[location.bookId] = location
+            listeners.toList()
+        }
+        snapshot.forEach { it.onRemoteStudentLocationChanged(location) }
     }
-    @Synchronized internal fun pairingReady(bookId: String, pairingUri: String) = listeners.toList().forEach {
+
+    internal fun pairingReady(bookId: String, pairingUri: String) = listenerSnapshot().forEach {
         it.onPairingReady(bookId, pairingUri)
     }
-    @Synchronized internal fun sessionIssue(message: String) = listeners.toList().forEach {
+
+    internal fun sessionIssue(message: String) = listenerSnapshot().forEach {
         it.onSessionIssue(message)
     }
+
+    private fun listenerSnapshot(): List<Listener> = synchronized(this) { listeners.toList() }
 }

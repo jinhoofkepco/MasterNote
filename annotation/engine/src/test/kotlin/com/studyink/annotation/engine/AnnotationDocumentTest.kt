@@ -6,6 +6,7 @@ import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -54,6 +55,47 @@ class AnnotationDocumentTest {
         ))
         assertFalse(change.snapshot.activeStrokeIds.contains(student.id))
         assertTrue(change.snapshot.activeStrokeIds.contains(teacher.id))
+    }
+
+    @Test
+    fun inactiveStrokeClockRemainsAHighWaterMarkAfterRestart() {
+        val erased = stroke("student").copy(logicalClock = 20L)
+        val initial = AnnotationSnapshot(
+            bookId = "book",
+            pageNumber = 0,
+            revision = 2,
+            assets = mapOf(erased.id to erased),
+            activeStrokeIds = emptySet(),
+        )
+
+        val change = AnnotationDocument(initial).addStroke(stroke("student"))
+
+        assertEquals(21L, change.operation.logicalClock)
+    }
+
+    @Test
+    fun operationOnlyClockRemainsAHighWaterMarkAfterRestart() {
+        val document = AnnotationDocument(AnnotationSnapshot.empty("book"))
+        val added = document.addStroke(stroke("student"))
+        val erased = document.erase(
+            page = 0,
+            path = added.addedAssets.single().points,
+            radius = 20f,
+            wholeStroke = true,
+            authorId = "student",
+            attemptNo = 1,
+            deviceId = "device",
+        )!!
+        assertTrue(erased.addedAssets.isEmpty())
+        assertEquals(2L, erased.operation.logicalClock)
+
+        val restarted = AnnotationDocument(
+            initial = erased.snapshot,
+            operationClockHighWater = erased.operation.logicalClock,
+        )
+        val next = restarted.addStroke(stroke("student"))
+
+        assertEquals(3L, next.operation.logicalClock)
     }
 
     private fun stroke(author: String) = StrokeAsset(

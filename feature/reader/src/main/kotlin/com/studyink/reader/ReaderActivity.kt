@@ -69,6 +69,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var requestedTeacherWorkflow: ReaderWorkflow? = null
     private var exitOnPinCancel = false
     private var stylusButtonPressed = false
+    private var displayedPdfPage = -1
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -181,6 +182,14 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 viewModel.uiState.collect { state ->
                     latestState = state
+                    if (
+                        state.documentReady &&
+                        state.pageCount > 0 &&
+                        displayedPdfPage != state.pageNumber
+                    ) {
+                        viewport.showPage(state.pageNumber)
+                        displayedPdfPage = state.pageNumber
+                    }
                     if (selectedMarkGroupId != null && selectedMarkTarget?.matches(state) != true) {
                         clearMarkSelection()
                     }
@@ -218,6 +227,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         viewport.setPageWidths(pageWidths)
         val target = initialPage.coerceIn(0, (pageCount - 1).coerceAtLeast(0))
         viewport.showPage(target)
+        displayedPdfPage = target
         val targetAttempt = if (workflow == ReaderWorkflow.REVIEW && role != ReaderRole.STUDENT) {
             reviewableAttemptForPage(target, initialAttemptNo)
         } else {
@@ -243,6 +253,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         val target = pageNumber.coerceIn(0, state.pageCount - 1)
         dryInkView.activePage = target
         viewport.showPage(target)
+        displayedPdfPage = target
         val targetAttempt = attemptNo ?: if (workflow == ReaderWorkflow.REVIEW && role != ReaderRole.STUDENT) {
             reviewableAttemptForPage(target)
         } else {

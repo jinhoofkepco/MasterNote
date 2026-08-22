@@ -26,6 +26,15 @@ class CorruptAnnotationDataException(
 data class OperationCursor(val deviceId: String, val logicalClock: Long)
 
 /**
+ * Snapshot plus the durable operation clock that cannot be reconstructed from assets alone.
+ * Keeping this runtime-only avoids changing the existing checkpoint/snapshot file format.
+ */
+data class StoredAnnotationPage(
+    val snapshot: AnnotationSnapshot,
+    val operationClockHighWater: Long,
+)
+
+/**
  * Append-only annotation persistence partitioned by (book, page). A checkpoint is only a loading
  * accelerator; durable operations remain the source of truth and are retained for offline peers.
  */
@@ -48,6 +57,15 @@ class PageOperationLogStore(
     @Synchronized
     fun loadPage(bookId: String, pageNumber: Int): AnnotationSnapshot =
         pageIndex(bookId, pageNumber).snapshot
+
+    @Synchronized
+    fun loadPageState(bookId: String, pageNumber: Int): StoredAnnotationPage {
+        val index = pageIndex(bookId, pageNumber)
+        return StoredAnnotationPage(
+            snapshot = index.snapshot,
+            operationClockHighWater = index.maximumClockByDevice.values.maxOrNull() ?: 0L,
+        )
+    }
 
     private fun readPageIndex(bookId: String, pageNumber: Int): PageIndex {
         val directory = pageDirectory(bookId, pageNumber)
@@ -98,13 +116,22 @@ class PageOperationLogStore(
     }
 
     @Synchronized
-    fun append(change: AnnotationChange) {
-        val snapshot = change.snapshot
-        val index = pageIndex(snapshot.bookId, snapshot.pageNumber)
-        if (change.operation.id in index.snapshot.appliedOperationIds) return
-        val directory = pageDirectory(snapshot.bookId, snapshot.pageNumber)
+    fun append(change: AnnotationChange): AnnotationSnapshot {
+        val proposed = change.snapshot
+        val index = pageIndex(proposed.bookId, proposed.pageNumber)
+        val current = index.snapshot
+        if (change.operation.id in current.appliedOperationIds) return current
+        val directory = pageDirectory(proposed.bookId, proposed.pageNumber)
+        // A Reader edit can be produced just before the LAN service appends a remote operation.
+        // Persisting change.snapshot verbatim would then replace the newer in-memory index and give
+        // two log records the same revision. Store operations are the source of truth, so always
+        // merge the local operation into the latest durable snapshot while holding this store lock.
         val record = StoredOperationRecord(
-            snapshot.bookId, snapshot.pageNumber, snapshot.revision, change.operation, change.addedAssets
+            proposed.bookId,
+            proposed.pageNumber,
+            current.revision + 1L,
+            change.operation,
+            change.addedAssets,
         )
         val line = encodeRecord(record).toString()
         val logFile = File(directory, LOG_FILE)
@@ -114,8 +141,10 @@ class PageOperationLogStore(
             output.flush()
             output.fd.sync()
         }
-        index.add(record, line.toByteArray(Charsets.UTF_8), snapshot)
-        if (snapshot.revision % checkpointInterval == 0L) writeCheckpoint(snapshot)
+        val merged = apply(current, record)
+        index.add(record, line.toByteArray(Charsets.UTF_8), merged)
+        if (merged.revision % checkpointInterval == 0L) writeCheckpoint(merged)
+        return merged
     }
 
     @Synchronized
@@ -290,6 +319,16 @@ class PageOperationLogStore(
         if (addedAssets.isNotEmpty()) {
             return addedAssets.none { it.authorId == "teacher" && it.publishedAtEpochMillis == null }
         }
+        // Redo reactivates an existing asset and therefore carries no addedAssets payload. Looking
+        // only at addedAssets would classify redo of a private teacher draft as publishable even
+        // though the peer never received the referenced draft asset. Besides leaking a draft, that
+        // operation makes the peer reject the log row as a missing-asset dependency.
+        val reactivatedAssets = operation.addedStrokeIds.mapNotNull(snapshot.assets::get)
+        if (reactivatedAssets.size != operation.addedStrokeIds.size) return false
+        if (reactivatedAssets.any {
+                it.authorId == "teacher" && it.publishedAtEpochMillis == null
+            }
+        ) return false
         val removedAssets = operation.removedStrokeIds.mapNotNull(snapshot.assets::get)
         return removedAssets.isEmpty() || removedAssets.none {
             it.authorId == "teacher" && it.publishedAtEpochMillis == null
@@ -473,6 +512,23 @@ class PageOperationLogStore(
     }
 
     companion object {
+        @Volatile
+        private var applicationInstance: PageOperationLogStore? = null
+
+        /**
+         * Returns the annotation store shared by this app process.
+         *
+         * Reader and LAN sync both keep an in-memory page index, so they must use the same store
+         * instance when they operate on the application's durable annotation directory. The
+         * public constructors remain available for tests and deliberately isolated stores.
+         */
+        fun get(context: Context): PageOperationLogStore =
+            applicationInstance ?: synchronized(this) {
+                applicationInstance ?: PageOperationLogStore(context.applicationContext).also {
+                    applicationInstance = it
+                }
+            }
+
         private const val DEFAULT_CHECKPOINT_INTERVAL = 64
         private const val CHECKPOINT_FILE = "checkpoint.json"
         private const val LOG_FILE = "operations.log"

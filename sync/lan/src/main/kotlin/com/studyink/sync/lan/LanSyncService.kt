@@ -15,6 +15,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.Build
 import android.util.Base64
+import android.util.Log
 import com.studyink.annotation.storage.PageOperationLogStore
 import com.studyink.core.model.Attempt
 import com.studyink.core.model.MarkGroup
@@ -46,7 +47,7 @@ class LanSyncService : Service(),
     private val io = Executors.newCachedThreadPool()
     private val metadataIo = Executors.newSingleThreadExecutor()
     private val handler = Handler(Looper.getMainLooper())
-    private val store by lazy { PageOperationLogStore(this) }
+    private val store by lazy { PageOperationLogStore.get(this) }
     private val library by lazy { LibraryRepository.get(this) }
     private val pairingPreferences by lazy { getSharedPreferences("masternote-lan-pairs", MODE_PRIVATE) }
     private val nsd by lazy { getSystemService(NsdManager::class.java) }
@@ -66,11 +67,19 @@ class LanSyncService : Service(),
     private var peerPort: Int = 0
     private var pairingToken: String = ""
     private var subscribedPage = -1
-    private val peerReceivedClocks = mutableMapOf<String, Long>()
+    private val peerReceivedClocks = PageOperationWatermarks()
     private var pendingPage = -1
     private var pendingSince = 0L
     private var lastFlushAt = 0L
     private var currentStudentPage = -1
+    private var currentStudentAttemptNo: Int? = null
+    private var currentStudentRevision = 0L
+    private var currentTeacherAttemptNo: Int? = null
+    private var followRemoteStudent = false
+    private var connectionGeneration = 0L
+    private var lastSubscriptionGeneration = -1L
+    private var lastSubscriptionPage = -1
+    private var lastTeacherRepairGeneration = -1L
     private val stopping = AtomicBoolean(false)
 
     private val flushRunnable = Runnable { flushPendingAtStrokeBoundary() }
@@ -90,9 +99,10 @@ class LanSyncService : Service(),
             ACTION_TEACHER_DISCOVER -> startTeacher(requireNotNull(intent.getStringExtra(EXTRA_BOOK_ID)))
             ACTION_TEACHER_PAIR_URI -> {
                 val payload = PairingPayload.parse(UriCompat.parse(requireNotNull(intent.getStringExtra(EXTRA_PAIR_URI))))
-                bookId = requireNotNull(intent.getStringExtra(EXTRA_BOOK_ID))
-                documentHash = library.book(bookId).contentSha256
-                startTeacherSocket(payload.host, payload.port, payload.bookId, payload.token)
+                startTeacherPairing(
+                    targetBookId = requireNotNull(intent.getStringExtra(EXTRA_BOOK_ID)),
+                    payload = payload,
+                )
             }
         }
         return START_NOT_STICKY
@@ -107,6 +117,8 @@ class LanSyncService : Service(),
         bookId = targetBookId
         documentHash = library.book(targetBookId).contentSha256
         pairingToken = UUID.randomUUID().toString().substring(0, 8)
+        bootstrapLocalPresence()
+        logSessionStart()
         startForeground(NOTIFICATION_ID, notification("선생 기기 연결 대기 중"))
         io.execute {
             val server = ServerSocket(0).also { serverSocket = it }
@@ -125,10 +137,13 @@ class LanSyncService : Service(),
 
     private fun startTeacher(targetBookId: String) {
         closeSession()
+        LanSyncBus.clearRemoteStudentLocation(targetBookId)
         stopping.set(false)
         role = LanPeerRole.TEACHER_CLIENT
         bookId = targetBookId
         documentHash = library.book(targetBookId).contentSha256
+        bootstrapLocalPresence()
+        logSessionStart()
         startForeground(NOTIFICATION_ID, notification("학생 기기 찾는 중"))
         acquireMulticast()
         val listener = object : NsdManager.DiscoveryListener {
@@ -144,6 +159,19 @@ class LanSyncService : Service(),
         }
         discovery = listener
         nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
+    }
+
+    private fun startTeacherPairing(targetBookId: String, payload: PairingPayload) {
+        closeSession()
+        LanSyncBus.clearRemoteStudentLocation(targetBookId)
+        stopping.set(false)
+        role = LanPeerRole.TEACHER_CLIENT
+        bookId = targetBookId
+        documentHash = library.book(targetBookId).contentSha256
+        bootstrapLocalPresence()
+        logSessionStart()
+        startForeground(NOTIFICATION_ID, notification("학생 기기에 연결 중"))
+        startTeacherSocket(payload.host, payload.port, payload.bookId, payload.token)
     }
 
     private fun resolveService(serviceInfo: NsdServiceInfo) {
@@ -199,6 +227,10 @@ class LanSyncService : Service(),
         socket?.close()
         socket = connected.apply { tcpNoDelay = true; keepAlive = true }
         writer = BufferedWriter(OutputStreamWriter(connected.getOutputStream(), Charsets.UTF_8))
+        connectionGeneration += 1L
+        lastSubscriptionGeneration = -1L
+        lastSubscriptionPage = -1
+        lastTeacherRepairGeneration = -1L
         send(LanWire.message("HELLO") {
             put("deviceId", library.deviceId)
             put("role", role?.name)
@@ -224,6 +256,9 @@ class LanSyncService : Service(),
             if (socket === connected) {
                 socket = null
                 writer = null
+                lastSubscriptionGeneration = -1L
+                lastSubscriptionPage = -1
+                lastTeacherRepairGeneration = -1L
                 updateNotification("연결 끊김")
                 scheduleReconnect()
             }
@@ -257,19 +292,32 @@ class LanSyncService : Service(),
                 if (pairedDeviceId == null) pairingPreferences.edit().putString(pairingKey, peerDeviceId).apply()
                 send(LanWire.message("HELLO_OK"))
                 sendMetadataSnapshot()
-                if (role == LanPeerRole.STUDENT_SERVER && currentStudentPage >= 0) {
-                    send(LanWire.message("PAGE_STATE") { put("page", currentStudentPage); put("revision", 0L) })
-                }
-                if (role == LanPeerRole.TEACHER_CLIENT && subscribedPage >= 0) sendSubscription()
+                if (role == LanPeerRole.STUDENT_SERVER) sendStudentPageState("hello")
+                repairTeacherConnection()
             }
-            "HELLO_OK" -> if (role == LanPeerRole.TEACHER_CLIENT && subscribedPage >= 0) sendSubscription()
+            "HELLO_OK" -> repairTeacherConnection()
             "SUBSCRIBE" -> {
-                subscribedPage = message.getInt("page")
-                peerReceivedClocks[library.deviceId] = message.getLong("receivedClock")
-                flushPage(subscribedPage)
+                require(
+                    role == LanPeerRole.STUDENT_SERVER && peerRole == LanPeerRole.TEACHER_CLIENT
+                ) { "Only a teacher peer may subscribe to student ink" }
+                val requestedPage = message.getInt("page")
+                require(isPageInBook(requestedPage)) { "Subscription page is outside the book" }
+                updateDesiredSubscription(requestedPage, "peer-request")
+                peerReceivedClocks.replace(
+                    pageNumber = requestedPage,
+                    deviceId = library.deviceId,
+                    logicalClock = message.getLong("receivedClock"),
+                )
+                // A teacher may enter Live Monitor after the original page event. Repeating the
+                // state is safe because the teacher's subscription sender is connection-idempotent.
+                sendStudentPageState("subscription")
+                if (flushPage(subscribedPage) && pendingPage == subscribedPage) {
+                    pendingPage = -1
+                }
             }
             "OPERATION" -> {
                 val page = message.getInt("page")
+                require(isPageInBook(page)) { "Operation page is outside the book" }
                 val bytes = Base64.decode(message.getString("payload"), Base64.NO_WRAP)
                 val cursor = store.operationCursor(bytes)
                 store.appendEncodedOperation(bookId, page, bytes)
@@ -280,13 +328,34 @@ class LanSyncService : Service(),
             }
             "ACK" -> if (message.getInt("page") == subscribedPage) {
                 if (message.getString("deviceId") == library.deviceId) {
-                    peerReceivedClocks[library.deviceId] = maxOf(
-                        peerReceivedClocks[library.deviceId] ?: 0L,
-                        message.getLong("logicalClock"),
+                    peerReceivedClocks.acknowledge(
+                        pageNumber = message.getInt("page"),
+                        deviceId = library.deviceId,
+                        logicalClock = message.getLong("logicalClock"),
                     )
                 }
             }
-            "PAGE_STATE" -> LanSyncBus.remotePageChanged(bookId, message.getInt("page"))
+            "PAGE_STATE" -> {
+                require(
+                    role == LanPeerRole.TEACHER_CLIENT && peerRole == LanPeerRole.STUDENT_SERVER
+                ) { "Only a student peer may publish page state" }
+                val page = message.getInt("page")
+                require(isPageInBook(page)) { "Student page is outside the book" }
+                val attemptNo = message.optionalNonNegativeInt("attemptNo")
+                val revision = message.optLong("revision", 0L).also {
+                    require(it >= 0L) { "Student page revision cannot be negative" }
+                }
+                val location = StudentLocation(bookId, page, attemptNo, revision)
+                Log.i(
+                    TAG,
+                    "PAGE_STATE receive book=$bookId page=$page attempt=${attemptNo ?: "-"} revision=$revision follow=$followRemoteStudent",
+                )
+                if (followRemoteStudent) {
+                    updateDesiredSubscription(page, "live-follow")
+                    ensureSubscription()
+                }
+                LanSyncBus.remotePageChanged(location)
+            }
             "ATTEMPT_UPSERT" -> {
                 require(
                     role == LanPeerRole.TEACHER_CLIENT && peerRole == LanPeerRole.STUDENT_SERVER
@@ -338,25 +407,132 @@ class LanSyncService : Service(),
         handler.postDelayed(flushRunnable, delay)
     }
 
-    override fun onPageChanged(bookId: String, pageNumber: Int, revision: Long) {
-        if (this.bookId != bookId) return
+    override fun onPagePresenceChanged(presence: PagePresence) {
+        if (bookId != presence.bookId || !isPageInBook(presence.pageNumber)) return
         if (role == LanPeerRole.STUDENT_SERVER) {
-            currentStudentPage = pageNumber
             flushPendingAtStrokeBoundary()
-            send(LanWire.message("PAGE_STATE") { put("page", pageNumber); put("revision", revision) })
+            currentStudentPage = presence.pageNumber
+            currentStudentAttemptNo = presence.attemptNo
+            currentStudentRevision = presence.revision
+            sendStudentPageState("local-presence")
         } else if (role == LanPeerRole.TEACHER_CLIENT) {
-            subscribedPage = pageNumber
-            sendSubscription()
+            currentTeacherAttemptNo = presence.attemptNo
+            followRemoteStudent = presence.followRemoteStudent
+            val desiredPage = if (followRemoteStudent) {
+                LanSyncBus.remoteStudentLocation(bookId)
+                    ?.takeIf { isPageInBook(it.pageNumber) }
+                    ?.pageNumber
+                    ?: presence.pageNumber
+            } else {
+                presence.pageNumber
+            }
+            updateDesiredSubscription(desiredPage, "local-presence")
+            if (ensureSubscription()) {
+                if (flushPage(desiredPage) && pendingPage == desiredPage) pendingPage = -1
+            }
         }
     }
 
-    private fun sendSubscription() {
-        if (writer == null || subscribedPage < 0) return
+    @Synchronized
+    private fun ensureSubscription(force: Boolean = false): Boolean {
+        val page = subscribedPage
+        if (writer == null || !isPageInBook(page)) return false
+        if (
+            !force &&
+            lastSubscriptionGeneration == connectionGeneration &&
+            lastSubscriptionPage == page
+        ) return true
         val receivedClock = if (peerDeviceId.isBlank()) 0L else runCatching {
-            store.maxOperationClock(bookId, subscribedPage, peerDeviceId)
+            store.maxOperationClock(bookId, page, peerDeviceId)
         }.getOrDefault(0L)
-        send(LanWire.message("SUBSCRIBE") { put("page", subscribedPage); put("receivedClock", receivedClock) })
+        val sent = send(LanWire.message("SUBSCRIBE") {
+            put("page", page)
+            put("receivedClock", receivedClock)
+        })
+        if (sent) {
+            lastSubscriptionGeneration = connectionGeneration
+            lastSubscriptionPage = page
+            Log.i(TAG, "SUBSCRIBE send book=$bookId page=$page generation=$connectionGeneration")
+        }
+        return sent
     }
+
+    private fun repairTeacherConnection() {
+        if (role != LanPeerRole.TEACHER_CLIENT || writer == null || !isPageInBook(subscribedPage)) return
+        if (lastTeacherRepairGeneration == connectionGeneration) return
+        if (!ensureSubscription()) return
+        lastTeacherRepairGeneration = connectionGeneration
+        // A reconnect must repair published teacher operations as well as request student ink.
+        if (flushPage(subscribedPage) && pendingPage == subscribedPage) pendingPage = -1
+    }
+
+    private fun updateDesiredSubscription(pageNumber: Int, reason: String) {
+        if (!isPageInBook(pageNumber)) return
+        if (subscribedPage == pageNumber) return
+        subscribedPage = pageNumber
+        Log.i(TAG, "subscription target book=$bookId page=$pageNumber reason=$reason")
+    }
+
+    private fun sendStudentPageState(reason: String): Boolean {
+        if (role != LanPeerRole.STUDENT_SERVER || writer == null || !isPageInBook(currentStudentPage)) return false
+        val page = currentStudentPage
+        val attemptNo = currentStudentAttemptNo
+        val revision = currentStudentRevision
+        val sent = send(LanWire.message("PAGE_STATE") {
+            put("page", page)
+            put("revision", revision)
+            attemptNo?.let { put("attemptNo", it) }
+        })
+        if (sent) {
+            Log.i(
+                TAG,
+                "PAGE_STATE send book=$bookId page=$page attempt=${attemptNo ?: "-"} revision=$revision reason=$reason",
+            )
+        }
+        return sent
+    }
+
+    private fun bootstrapLocalPresence() {
+        val presence = LanSyncBus.localPagePresence(bookId)
+            ?.takeIf { isPageInBook(it.pageNumber) }
+            ?: return
+        when (role) {
+            LanPeerRole.STUDENT_SERVER -> {
+                currentStudentPage = presence.pageNumber
+                currentStudentAttemptNo = presence.attemptNo
+                currentStudentRevision = presence.revision
+            }
+
+            LanPeerRole.TEACHER_CLIENT -> {
+                currentTeacherAttemptNo = presence.attemptNo
+                followRemoteStudent = presence.followRemoteStudent
+                subscribedPage = presence.pageNumber
+            }
+
+            null -> Unit
+        }
+    }
+
+    private fun logSessionStart() {
+        val localPage = when (role) {
+            LanPeerRole.STUDENT_SERVER -> currentStudentPage
+            LanPeerRole.TEACHER_CLIENT -> subscribedPage
+            null -> -1
+        }
+        val localAttempt = when (role) {
+            LanPeerRole.STUDENT_SERVER -> currentStudentAttemptNo
+            LanPeerRole.TEACHER_CLIENT -> currentTeacherAttemptNo
+            null -> null
+        }
+        Log.i(
+            TAG,
+            "session start role=$role book=$bookId page=$localPage attempt=${localAttempt ?: "-"} follow=$followRemoteStudent",
+        )
+    }
+
+    private fun isPageInBook(pageNumber: Int): Boolean = pageNumber >= 0 && runCatching {
+        pageNumber < library.book(bookId).pageCount
+    }.getOrDefault(false)
 
     /**
      * Repairs events that occurred before connection or during a disconnect. Attempts come from
@@ -410,36 +586,56 @@ class LanSyncService : Service(),
     private fun flushPendingAtStrokeBoundary() {
         handler.removeCallbacks(flushRunnable)
         val page = pendingPage
-        pendingPage = -1
-        if (page >= 0) flushPage(page)
+        if (page < 0) return
+        if (writer == null) {
+            // Keep the trigger. The reconnect repair path will retry durable operations.
+            return
+        }
+        if (page != subscribedPage) {
+            pendingPage = -1
+            return
+        }
+        if (flushPage(page)) pendingPage = -1
     }
 
-    private fun flushPage(page: Int) {
-        if (page != subscribedPage || writer == null) return
-        runCatching {
-            val acknowledgedClock = peerReceivedClocks[library.deviceId] ?: 0L
-            store.encodedOperationsAfter(
+    private fun flushPage(page: Int): Boolean {
+        if (page != subscribedPage || writer == null || !isPageInBook(page)) return false
+        return runCatching {
+            val acknowledgedClock = peerReceivedClocks.clock(page, library.deviceId)
+            val records = store.encodedOperationsAfter(
                 bookId = bookId,
                 pageNumber = page,
                 originDeviceId = library.deviceId,
                 logicalClock = acknowledgedClock,
                 includeTeacherDrafts = role != LanPeerRole.TEACHER_CLIENT,
-            ).forEach { record ->
+            )
+            val allSent = records.all { record ->
                 send(LanWire.message("OPERATION") {
                     put("page", page)
                     put("payload", Base64.encodeToString(record, Base64.NO_WRAP))
                 })
             }
+            if (!allSent) return@runCatching false
             lastFlushAt = System.currentTimeMillis()
+            Log.i(TAG, "operation flush role=$role book=$bookId page=$page count=${records.size}")
+            true
         }.onFailure {
             updateNotification("필기 로그 확인 필요")
-        }
+        }.getOrDefault(false)
     }
 
     @Synchronized
-    private fun send(line: String) {
-        if (line.length > LanWire.MAX_LINE_CHARS) return
-        runCatching { writer?.apply { write(line); newLine(); flush() } }
+    private fun send(line: String): Boolean {
+        if (line.length > LanWire.MAX_LINE_CHARS) return false
+        val target = writer ?: return false
+        return runCatching {
+            target.write(line)
+            target.newLine()
+            target.flush()
+            true
+        }.onFailure {
+            Log.w(TAG, "LAN write failed role=$role book=$bookId")
+        }.getOrDefault(false)
     }
 
     private fun registerService(port: Int) {
@@ -483,11 +679,28 @@ class LanSyncService : Service(),
         runCatching { socket?.close() }
         runCatching { serverSocket?.close() }
         socket = null; serverSocket = null; writer = null
+        role = null
+        bookId = ""
+        documentHash = ""
+        pairingToken = ""
         peerBookId = ""
         peerRole = null
         peerDeviceId = ""
         peerHost = ""
         peerPort = 0
+        subscribedPage = -1
+        currentStudentPage = -1
+        currentStudentAttemptNo = null
+        currentStudentRevision = 0L
+        currentTeacherAttemptNo = null
+        followRemoteStudent = false
+        pendingPage = -1
+        pendingSince = 0L
+        lastFlushAt = 0L
+        connectionGeneration = 0L
+        lastSubscriptionGeneration = -1L
+        lastSubscriptionPage = -1
+        lastTeacherRepairGeneration = -1L
         peerReceivedClocks.clear()
     }
 
@@ -549,25 +762,42 @@ class LanSyncService : Service(),
         private const val ATTRIBUTE_HASH = "hash"
         private const val CHANNEL_ID = "remote-class"
         private const val NOTIFICATION_ID = 4201
-        private const val DEBOUNCE_MILLIS = 2_000L
-        private const val MAX_DELAY_MILLIS = 5_000L
+        private const val DEBOUNCE_MILLIS = 180L
+        private const val MAX_DELAY_MILLIS = 600L
         private const val RECONNECT_DELAY_MILLIS = 2_000L
+        private const val TAG = "MasterNoteLan"
 
         fun startStudent(context: Context, bookId: String) = context.startForegroundService(
             Intent(context, LanSyncService::class.java).setAction(ACTION_STUDENT_SERVER).putExtra(EXTRA_BOOK_ID, bookId)
         )
-        fun startTeacher(context: Context, bookId: String) = context.startForegroundService(
-            Intent(context, LanSyncService::class.java).setAction(ACTION_TEACHER_DISCOVER).putExtra(EXTRA_BOOK_ID, bookId)
-        )
-        fun startTeacherPairing(context: Context, bookId: String, pairingUri: String) = context.startForegroundService(
-            Intent(context, LanSyncService::class.java)
-                .setAction(ACTION_TEACHER_PAIR_URI)
-                .putExtra(EXTRA_BOOK_ID, bookId)
-                .putExtra(EXTRA_PAIR_URI, pairingUri)
-        )
+        fun startTeacher(context: Context, bookId: String) {
+            // Clear synchronously before the caller launches ReaderActivity. Service start is
+            // asynchronous, so clearing only in onStartCommand can expose a previous session.
+            LanSyncBus.clearRemoteStudentLocation(bookId)
+            context.startForegroundService(
+                Intent(context, LanSyncService::class.java)
+                    .setAction(ACTION_TEACHER_DISCOVER)
+                    .putExtra(EXTRA_BOOK_ID, bookId)
+            )
+        }
+
+        fun startTeacherPairing(context: Context, bookId: String, pairingUri: String) {
+            LanSyncBus.clearRemoteStudentLocation(bookId)
+            context.startForegroundService(
+                Intent(context, LanSyncService::class.java)
+                    .setAction(ACTION_TEACHER_PAIR_URI)
+                    .putExtra(EXTRA_BOOK_ID, bookId)
+                    .putExtra(EXTRA_PAIR_URI, pairingUri)
+            )
+        }
         fun stop(context: Context) = context.startService(Intent(context, LanSyncService::class.java).setAction(ACTION_STOP))
     }
 }
 
 /** Keeps android.net.Uri parsing isolated for local JVM protocol tests. */
 private object UriCompat { fun parse(value: String) = android.net.Uri.parse(value) }
+
+private fun JSONObject.optionalNonNegativeInt(name: String): Int? {
+    if (!has(name) || isNull(name)) return null
+    return getInt(name).also { require(it >= 0) { "$name cannot be negative" } }
+}

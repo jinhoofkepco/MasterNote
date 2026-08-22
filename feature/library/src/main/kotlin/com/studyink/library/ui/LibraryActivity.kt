@@ -217,6 +217,21 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                                     ReaderRole.TEACHER_PHONE
                                 }
                             }
+                            val readerWorkflow = when (selectedPerspective) {
+                                LibraryPerspective.STUDENT -> ReaderWorkflow.STUDY
+                                LibraryPerspective.TEACHER -> {
+                                    val opensCurrentStudentWork = role == ReaderRole.TEACHER_PHONE &&
+                                        attemptNo != null &&
+                                        repository.attempts(book.id, page).any { attempt ->
+                                            attempt.attemptNo == attemptNo && !attempt.locked
+                                        }
+                                    if (opensCurrentStudentWork) {
+                                        ReaderWorkflow.LIVE_MONITOR
+                                    } else {
+                                        ReaderWorkflow.REVIEW
+                                    }
+                                }
+                            }
                             startActivity(
                                 ReaderActivity.intent(
                                     context = this,
@@ -224,11 +239,7 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                                     pageNumber = page,
                                     role = role,
                                     attemptNo = attemptNo,
-                                    workflow = if (selectedPerspective == LibraryPerspective.TEACHER) {
-                                        ReaderWorkflow.REVIEW
-                                    } else {
-                                        ReaderWorkflow.STUDY
-                                    },
+                                    workflow = readerWorkflow,
                                 )
                             )
                         },
@@ -858,7 +869,7 @@ private fun BookPageContent(
                 item { OutlinedButton(onClick = { onStartStudentSync(book) }) { Text("학생 기기") } }
             } else {
                 item { OutlinedButton(onClick = { onImportAnswers(book) }) { Text("정답 JSON") } }
-                item { OutlinedButton(onClick = { onStartTeacherSync(book) }) { Text("선생 폰") } }
+                item { OutlinedButton(onClick = { onStartTeacherSync(book) }) { Text("실시간 보기") } }
                 item { OutlinedButton(onClick = { onScanTeacherQr(book) }) { Text("QR 연결") } }
             }
             item { TextButton(onClick = onStopSync) { Text("연결 종료") } }
@@ -913,6 +924,7 @@ private fun BookPageContent(
                                         TEACHER_PAGE_REVIEW_ATTEMPT_NO
                                     } else {
                                         summary.latestSubmittedAttemptNo
+                                            ?: summary.latestAttemptNo
                                             ?: TEACHER_PAGE_REVIEW_ATTEMPT_NO
                                     }
                                 } else {

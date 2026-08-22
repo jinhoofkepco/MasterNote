@@ -16,6 +16,7 @@ import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.library.data.LibraryRepository
 import com.studyink.sync.lan.LanSyncBus
+import com.studyink.sync.lan.StudentLocation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -52,9 +53,22 @@ internal fun resolveReaderAttemptNo(
     selectedAttemptNo: Int?,
     attempts: List<Attempt>,
     observedStudentAttemptNos: Set<Int> = emptySet(),
+    liveStudentAttemptNo: Int? = null,
 ): Int = when (workflow) {
-    ReaderWorkflow.STUDY -> attempts.lastOrNull { !it.locked }?.attemptNo
-        ?: (attempts.maxOfOrNull { it.attemptNo } ?: 0) + 1
+    // Submitting locks the attempt without opening the next one. Targeting the unwritten next
+    // number would hide the work that was just submitted, and a student has no attempt picker to
+    // get back to it. An open attempt is selected only after its stroke evidence is durable; this
+    // also keeps a failed first append from leaving an empty N+1 over the submitted page. The next
+    // successful stroke moves the view onto N+1.
+    ReaderWorkflow.STUDY -> attempts.lastOrNull { attempt ->
+        !attempt.locked && (
+            attempt.attemptNo in observedStudentAttemptNos ||
+                attempts.none(Attempt::locked)
+        )
+    }?.attemptNo
+        ?: attempts.lastOrNull(Attempt::locked)?.attemptNo
+        ?: attempts.maxOfOrNull { it.attemptNo }
+        ?: 1
 
     ReaderWorkflow.REVIEW -> selectedAttemptNo?.takeIf { requested ->
         requested == TEACHER_PAGE_REVIEW_ATTEMPT_NO ||
@@ -62,12 +76,23 @@ internal fun resolveReaderAttemptNo(
     } ?: attempts.lastOrNull { it.locked }?.attemptNo
         ?: TEACHER_PAGE_REVIEW_ATTEMPT_NO
 
-    ReaderWorkflow.LIVE_MONITOR -> selectedAttemptNo?.takeIf { requested ->
-        requested > TEACHER_PAGE_REVIEW_ATTEMPT_NO &&
-            (attempts.any { it.attemptNo == requested } || requested in observedStudentAttemptNos)
-    } ?: attempts.maxOfOrNull { it.attemptNo }
-        ?: observedStudentAttemptNos.maxOrNull()
-        ?: TEACHER_PAGE_REVIEW_ATTEMPT_NO
+    ReaderWorkflow.LIVE_MONITOR -> {
+        val liveEvidence = sequenceOf(
+            liveStudentAttemptNo?.takeIf { it > TEACHER_PAGE_REVIEW_ATTEMPT_NO },
+            observedStudentAttemptNos.maxOrNull(),
+        ).filterNotNull().maxOrNull()
+        liveEvidence
+            ?: selectedAttemptNo?.takeIf { requested ->
+                requested > TEACHER_PAGE_REVIEW_ATTEMPT_NO &&
+                    (attempts.any { it.attemptNo == requested } || requested in observedStudentAttemptNos)
+            }
+            // Attempt metadata is a fallback only. writableAttempt() is persisted and broadcast
+            // before the first annotation append, so a failed append can leave an empty open N+1
+            // in the catalog while PAGE_STATE and durable stroke evidence still point at N.
+            ?: attempts.lastOrNull(Attempt::locked)?.attemptNo
+            ?: attempts.lastOrNull { !it.locked }?.attemptNo
+            ?: TEACHER_PAGE_REVIEW_ATTEMPT_NO
+    }
 }
 
 data class ReaderCapabilities(
@@ -117,6 +142,8 @@ data class ReaderUiState(
     val dataError: String? = null,
     val storageAvailable: Boolean = true,
     val studentPageNumber: Int? = null,
+    val studentAttemptNo: Int? = null,
+    val currentAttemptWritable: Boolean = false,
 ) {
     val isTeacherPageTarget: Boolean
         get() = role != ReaderRole.STUDENT &&
@@ -126,7 +153,7 @@ data class ReaderUiState(
         get() = if (isTeacherPageTarget) "페이지 표시" else "${attemptNo}회"
 
     val canSubmitNow: Boolean
-        get() = documentReady && storageAvailable && capabilities.canSubmit
+        get() = documentReady && storageAvailable && capabilities.canSubmit && currentAttemptWritable
 
     val canPublishTeacherInkNow: Boolean
         get() = documentReady && storageAvailable && capabilities.canPublishTeacherInk
@@ -156,15 +183,34 @@ internal data class PendingMarkMove(
 
 internal fun ReaderUiState.annotationTarget() = ReaderAnnotationTarget(bookId, pageNumber, attemptNo)
 
+internal fun ReaderUiState.canMutateStudentAttempt(writableAttemptNo: Int?): Boolean =
+    role != ReaderRole.STUDENT ||
+        currentAttemptWritable && writableAttemptNo != null && writableAttemptNo == attemptNo
+
 internal fun ReaderUiState.matchesRemotePage(bookId: String, pageNumber: Int): Boolean =
     this.bookId == bookId && this.pageNumber == pageNumber
 
+internal fun ReaderUiState.shouldFollowRemoteStudentPage(
+    bookId: String,
+    pageNumber: Int,
+    attemptNo: Int?,
+): Boolean =
+    this.bookId == bookId &&
+        capabilities.showsStudentLocation &&
+        (this.pageNumber != pageNumber || attemptNo != null && this.attemptNo != attemptNo)
+
+/** Attempts the student is inking on this page, recovered from the strokes we already hold. */
+internal fun AnnotationSnapshot.studentAttemptNos(): Set<Int> = assets.values.asSequence()
+    .filter { it.authorId == "student" && it.attemptNo > TEACHER_PAGE_REVIEW_ATTEMPT_NO }
+    .map { it.attemptNo }
+    .toSet()
+
 class ReaderViewModel(application: Application) : AndroidViewModel(application) {
-    private val store = PageOperationLogStore(application)
+    private val store = PageOperationLogStore.get(application)
     private val library = LibraryRepository.get(application)
     private val mutationMutex = Mutex()
     private var document = AnnotationDocument(AnnotationSnapshot.empty("unopened"))
-    private var loadGeneration = 0L
+    @Volatile private var loadGeneration = 0L
     private val _uiState = MutableStateFlow(ReaderUiState())
     val uiState: StateFlow<ReaderUiState> = _uiState.asStateFlow()
     private val syncListener = object : LanSyncBus.Listener {
@@ -172,15 +218,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             viewModelScope.launch(Dispatchers.Main.immediate) {
                 val state = _uiState.value
                 if (!state.matchesRemotePage(bookId, pageNumber)) return@launch
-                openBook(
-                    bookId = bookId,
-                    pageNumber = pageNumber,
-                    role = state.role,
-                    selectedAttemptNo = state.attemptNo.takeUnless {
-                        state.workflow == ReaderWorkflow.LIVE_MONITOR
-                    },
-                    workflow = state.workflow,
-                )
+                refreshCurrentPage(bookId, pageNumber, state.studentAttemptNo)
             }
         }
 
@@ -191,13 +229,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     !state.matchesRemotePage(bookId, pageNumber) ||
                     state.workflow != ReaderWorkflow.LIVE_MONITOR
                 ) return@launch
-                openBook(
-                    bookId = bookId,
-                    pageNumber = pageNumber,
-                    role = state.role,
-                    selectedAttemptNo = null,
-                    workflow = state.workflow,
-                )
+                refreshCurrentPage(bookId, pageNumber, state.studentAttemptNo)
             }
         }
 
@@ -212,11 +244,39 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
 
-        override fun onRemotePageChanged(bookId: String, pageNumber: Int) {
+        override fun onRemoteStudentLocationChanged(location: StudentLocation) {
             viewModelScope.launch(Dispatchers.Main.immediate) {
                 val latest = _uiState.value
-                if (latest.bookId == bookId && latest.capabilities.showsStudentLocation) {
-                    _uiState.value = latest.copy(studentPageNumber = pageNumber)
+                if (
+                    latest.bookId != location.bookId ||
+                    !latest.capabilities.showsStudentLocation
+                ) return@launch
+                val shouldFollow = latest.shouldFollowRemoteStudentPage(
+                    location.bookId,
+                    location.pageNumber,
+                    location.attemptNo,
+                )
+                _uiState.value = latest.copy(
+                    studentPageNumber = location.pageNumber,
+                    studentAttemptNo = location.attemptNo,
+                )
+                if (!shouldFollow) return@launch
+                if (latest.pageNumber != location.pageNumber) {
+                    openBook(
+                        bookId = location.bookId,
+                        pageNumber = location.pageNumber,
+                        role = latest.role,
+                        selectedAttemptNo = null,
+                        confirmedPageCount = latest.pageCount.takeIf { it > 0 },
+                        workflow = ReaderWorkflow.LIVE_MONITOR,
+                        liveStudentAttemptNo = location.attemptNo,
+                    )
+                } else {
+                    refreshCurrentPage(
+                        location.bookId,
+                        location.pageNumber,
+                        location.attemptNo,
+                    )
                 }
             }
         }
@@ -244,10 +304,20 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         selectedAttemptNo: Int? = null,
         confirmedPageCount: Int? = null,
         workflow: ReaderWorkflow = ReaderWorkflow.defaultFor(role),
+        liveStudentAttemptNo: Int? = null,
     ) {
         val book = library.book(bookId)
-        val target = pageNumber.coerceIn(0, book.pageCount - 1)
         val resolvedWorkflow = if (role == ReaderRole.STUDENT) ReaderWorkflow.STUDY else workflow
+        val stickyStudentLocation = if (
+            role != ReaderRole.STUDENT && resolvedWorkflow == ReaderWorkflow.LIVE_MONITOR
+        ) {
+            LanSyncBus.remoteStudentLocation(bookId)
+        } else {
+            null
+        }
+        val resolvedLiveAttemptNo = liveStudentAttemptNo ?: stickyStudentLocation?.attemptNo
+        val target = (stickyStudentLocation?.pageNumber ?: pageNumber)
+            .coerceIn(0, book.pageCount - 1)
         val beforeLoad = _uiState.value
         val readyPageCount = confirmedPageCount
             ?: beforeLoad.pageCount.takeIf { beforeLoad.bookId == bookId && it > 0 }
@@ -273,24 +343,27 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             canRedo = false,
         )
         viewModelScope.launch(Dispatchers.IO) {
-            val result = runCatching { store.loadPage(book.id, target) }
             mutationMutex.withLock {
                 if (generation != loadGeneration) return@withLock
+                // Read inside the lock. A LAN operation appended between an earlier read and this
+                // block would otherwise be discarded by the older snapshot landing on top of it.
+                val result = runCatching { store.loadPageState(book.id, target) }
                 result.onSuccess { loaded ->
-                    document = AnnotationDocument(loaded)
+                    val snapshot = loaded.snapshot
+                    document = AnnotationDocument(
+                        initial = snapshot,
+                        operationClockHighWater = loaded.operationClockHighWater,
+                    )
                     val attempts = library.attempts(book.id, target)
-                    val observedStudentAttemptNos = loaded.activeStrokes.asSequence()
-                        .filter { it.authorId == "student" && it.attemptNo > TEACHER_PAGE_REVIEW_ATTEMPT_NO }
-                        .map { it.attemptNo }
-                        .toSet()
                     val attemptNo = resolveReaderAttemptNo(
                         workflow = resolvedWorkflow,
                         selectedAttemptNo = selectedAttemptNo,
                         attempts = attempts,
-                        observedStudentAttemptNos = observedStudentAttemptNos,
+                        observedStudentAttemptNos = snapshot.studentAttemptNos(),
+                        liveStudentAttemptNo = resolvedLiveAttemptNo,
                     )
                     _uiState.value = ReaderUiState(
-                        snapshot = loaded,
+                        snapshot = snapshot,
                         bookId = book.id,
                         bookTitle = book.title,
                         pageCount = readyPageCount ?: 0,
@@ -301,8 +374,27 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                         workflow = resolvedWorkflow,
                         capabilities = ReaderCapabilities.forSession(role, resolvedWorkflow, attemptNo),
                         marks = library.markGroups(book.id, target),
+                        studentPageNumber = if (resolvedWorkflow == ReaderWorkflow.LIVE_MONITOR) {
+                            stickyStudentLocation?.pageNumber ?: _uiState.value.studentPageNumber
+                        } else {
+                            null
+                        },
+                        studentAttemptNo = if (resolvedWorkflow == ReaderWorkflow.LIVE_MONITOR) {
+                            resolvedLiveAttemptNo ?: _uiState.value.studentAttemptNo
+                        } else {
+                            null
+                        },
+                        currentAttemptWritable = role == ReaderRole.STUDENT &&
+                            attempts.any { it.attemptNo == attemptNo && !it.locked },
                     )
-                    LanSyncBus.pageChanged(book.id, target, loaded.revision)
+                    LanSyncBus.pageChanged(
+                        bookId = book.id,
+                        pageNumber = target,
+                        revision = snapshot.revision,
+                        attemptNo = attemptNo,
+                        followRemoteStudent = role != ReaderRole.STUDENT &&
+                            resolvedWorkflow == ReaderWorkflow.LIVE_MONITOR,
+                    )
                 }.onFailure { error ->
                     val message = if (error is CorruptAnnotationDataException) {
                         "이 페이지의 필기 파일이 손상되어 안전하게 격리했습니다. 원본은 덮어쓰지 않았습니다."
@@ -330,6 +422,79 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    /**
+     * Re-materializes the page the reader is already on, in place.
+     *
+     * A stroke arriving over LAN is not a page change. Routing it through [openBook] cleared the
+     * snapshot and dropped `documentReady` synchronously for every operation in a flush burst,
+     * while the generation guard let only the last reload of the burst repaint - so live monitoring
+     * blanked far more often than it drew. Nothing here touches `documentReady`, `pageCount` or the
+     * PDF, and no page event is published, which also stops the SUBSCRIBE round trip that the peer
+     * used to make per received stroke.
+     */
+    private fun refreshCurrentPage(
+        bookId: String,
+        pageNumber: Int,
+        liveStudentAttemptNo: Int? = null,
+    ) {
+        val generation = loadGeneration
+        viewModelScope.launch(Dispatchers.IO) {
+            mutationMutex.withLock {
+                // A page load started after this refresh was queued supersedes it.
+                if (generation != loadGeneration) return@withLock
+                val stateAtLoad = _uiState.value
+                if (!stateAtLoad.matchesRemotePage(bookId, pageNumber)) return@withLock
+                val loadedPage = runCatching { store.loadPageState(bookId, pageNumber) }.getOrNull()
+                    ?: return@withLock
+                val loaded = loadedPage.snapshot
+                val snapshotChanged = loaded.revision != stateAtLoad.snapshot.revision ||
+                    loaded.appliedOperationIds != stateAtLoad.snapshot.appliedOperationIds
+                if (snapshotChanged) {
+                    // A full reload is the missed-event fallback. Incremental remote application can
+                    // preserve undo in the future; until then only reset it when annotation changed.
+                    document = AnnotationDocument(
+                        initial = loaded,
+                        operationClockHighWater = loadedPage.operationClockHighWater,
+                    )
+                }
+                val latest = _uiState.value
+                if (
+                    generation != loadGeneration ||
+                    !latest.matchesRemotePage(bookId, pageNumber)
+                ) return@withLock
+                val attempts = library.attempts(bookId, pageNumber)
+                val attemptNo = resolveReaderAttemptNo(
+                    workflow = latest.workflow,
+                    selectedAttemptNo = latest.attemptNo.takeUnless {
+                        latest.workflow == ReaderWorkflow.LIVE_MONITOR
+                    },
+                    attempts = attempts,
+                    observedStudentAttemptNos = loaded.studentAttemptNos(),
+                    liveStudentAttemptNo = if (latest.workflow == ReaderWorkflow.LIVE_MONITOR) {
+                        liveStudentAttemptNo ?: latest.studentAttemptNo
+                    } else {
+                        null
+                    },
+                )
+                _uiState.value = latest.copy(
+                    snapshot = if (snapshotChanged) loaded else latest.snapshot,
+                    attemptNo = attemptNo,
+                    capabilities = ReaderCapabilities.forSession(latest.role, latest.workflow, attemptNo),
+                    marks = library.markGroups(bookId, pageNumber),
+                    studentAttemptNo = if (latest.workflow == ReaderWorkflow.LIVE_MONITOR) {
+                        liveStudentAttemptNo ?: latest.studentAttemptNo
+                    } else {
+                        null
+                    },
+                    currentAttemptWritable = latest.role == ReaderRole.STUDENT &&
+                        attempts.any { it.attemptNo == attemptNo && !it.locked },
+                    canUndo = if (snapshotChanged) false else latest.canUndo,
+                    canRedo = if (snapshotChanged) false else latest.canRedo,
+                )
+            }
+        }
+    }
+
     fun dismissDataError() {
         _uiState.value = _uiState.value.copy(dataError = null)
     }
@@ -342,7 +507,10 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun addStroke(stroke: StrokeAsset, onComplete: (() -> Unit)? = null) {
-        mutate(onComplete) { state ->
+        // writableAttempt opens a new attempt once the previous one is submitted, so the number a
+        // stroke is written into is not always the one on screen. Report it back to mutate.
+        var writtenAttemptNo: Int? = null
+        mutate(onComplete, attemptNoAfterChange = { writtenAttemptNo }) { state ->
             val authorId = if (state.role == ReaderRole.STUDENT) "student" else "teacher"
             val attemptNo = when {
                 state.role == ReaderRole.STUDENT -> library
@@ -361,6 +529,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     ?.attemptNo
                     ?: error("학생 풀이 회차가 없습니다.")
             }
+            writtenAttemptNo = attemptNo
             document.addStroke(
                 stroke.copy(
                     authorId = authorId,
@@ -380,20 +549,46 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     ) {
         val forceTeacherSync = _uiState.value.role != ReaderRole.STUDENT
         mutate(onComplete, forceSync = forceTeacherSync) { state ->
+            // A student may be looking at a submitted attempt. Erasing must not reach back into
+            // it; only an attempt that is still open can be edited.
+            val attemptNo = if (state.role == ReaderRole.STUDENT) {
+                library.writableAttempt(state.bookId, state.pageNumber, create = false)?.attemptNo
+                    ?.takeIf { state.canMutateStudentAttempt(it) }
+                    ?: return@mutate null
+            } else {
+                state.attemptNo
+            }
             document.erase(
                 page = page,
                 path = path,
                 radius = radius,
                 wholeStroke = wholeStroke,
                 authorId = if (state.role == ReaderRole.STUDENT) "student" else "teacher",
-                attemptNo = state.attemptNo,
+                attemptNo = attemptNo,
                 deviceId = library.deviceId,
             )
         }
     }
 
-    fun undo() = mutate(syncTeacherAttempt = true) { document.undo(library.deviceId) }
-    fun redo() = mutate(syncTeacherAttempt = true) { document.redo(library.deviceId) }
+    fun undo() = mutate(syncTeacherAttempt = true) { state ->
+        val writable = if (state.role == ReaderRole.STUDENT) {
+            library.writableAttempt(state.bookId, state.pageNumber, create = false)?.attemptNo
+        } else {
+            null
+        }
+        if (!state.canMutateStudentAttempt(writable)) return@mutate null
+        document.undo(library.deviceId)
+    }
+
+    fun redo() = mutate(syncTeacherAttempt = true) { state ->
+        val writable = if (state.role == ReaderRole.STUDENT) {
+            library.writableAttempt(state.bookId, state.pageNumber, create = false)?.attemptNo
+        } else {
+            null
+        }
+        if (!state.canMutateStudentAttempt(writable)) return@mutate null
+        document.redo(library.deviceId)
+    }
 
     fun submit(onSubmitted: (nextPage: Int) -> Unit) {
         val state = _uiState.value
@@ -409,6 +604,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 ) return@withLock
                 val attempt = library.writableAttempt(state.bookId, state.pageNumber, create = false)
                     ?: return@withLock
+                if (!current.canMutateStudentAttempt(attempt.attemptNo)) return@withLock
                 val snapshot = document.snapshot()
                 if (snapshot.bookId != state.bookId || snapshot.pageNumber != state.pageNumber) return@withLock
                 store.writeCheckpoint(snapshot)
@@ -502,6 +698,8 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         onComplete: (() -> Unit)? = null,
         forceSync: Boolean = false,
         syncTeacherAttempt: Boolean = false,
+        /** Read after [block] has run, when the change decided its own attempt number. */
+        attemptNoAfterChange: (() -> Int?)? = null,
         block: (ReaderUiState) -> AnnotationChange?,
     ) {
         viewModelScope.launch(Dispatchers.Default) {
@@ -509,14 +707,47 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 val before = _uiState.value
                 if (!before.documentReady || !before.storageAvailable) return@withLock
                 val beforeSnapshot = document.snapshot()
+                val beforeClockHighWater = document.operationClockHighWater
                 try {
                     val change = block(before) ?: return@withLock
-                    withContext(Dispatchers.IO) { store.append(change) }
-                    _uiState.value = before.copy(
-                        snapshot = change.snapshot,
-                        canUndo = document.canUndo,
-                        canRedo = document.canRedo,
-                    )
+                    val persisted = withContext(Dispatchers.IO) { store.append(change) }
+                    val attemptNo = attemptNoAfterChange?.invoke() ?: before.attemptNo
+                    val mergedConcurrentOperation = persisted.appliedOperationIds !=
+                        change.snapshot.appliedOperationIds
+                    val mergedPage = if (mergedConcurrentOperation) {
+                        withContext(Dispatchers.IO) {
+                            store.loadPageState(before.bookId, before.pageNumber)
+                        }
+                    } else {
+                        null
+                    }
+                    val persistedSnapshot = mergedPage?.snapshot ?: persisted
+                    if (mergedPage != null) {
+                        document = AnnotationDocument(
+                            initial = persistedSnapshot,
+                            operationClockHighWater = mergedPage.operationClockHighWater,
+                        )
+                    }
+                    val latest = _uiState.value
+                    if (latest.bookId == before.bookId && latest.pageNumber == before.pageNumber) {
+                        _uiState.value = latest.copy(
+                            snapshot = persistedSnapshot,
+                            attemptNo = attemptNo,
+                            capabilities = if (attemptNo == latest.attemptNo) {
+                                latest.capabilities
+                            } else {
+                                ReaderCapabilities.forSession(latest.role, latest.workflow, attemptNo)
+                            },
+                            currentAttemptWritable = if (latest.role == ReaderRole.STUDENT) {
+                                library.attempts(latest.bookId, latest.pageNumber)
+                                    .any { it.attemptNo == attemptNo && !it.locked }
+                            } else {
+                                false
+                            },
+                            canUndo = if (mergedConcurrentOperation) false else document.canUndo,
+                            canRedo = if (mergedConcurrentOperation) false else document.canRedo,
+                        )
+                    }
                     if (
                         before.role == ReaderRole.STUDENT ||
                         forceSync ||
@@ -524,9 +755,28 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     ) {
                         LanSyncBus.operationWritten(before.bookId, before.pageNumber)
                     }
+                    if (before.role == ReaderRole.STUDENT && attemptNo != before.attemptNo) {
+                        // The first stroke after submission opens N+1 without a page navigation.
+                        // Publish that cursor explicitly so a live teacher follows the new attempt
+                        // even when ATTEMPT_UPSERT and OPERATION arrive in either order.
+                        LanSyncBus.pageChanged(
+                            bookId = before.bookId,
+                            pageNumber = before.pageNumber,
+                            revision = persistedSnapshot.revision,
+                            attemptNo = attemptNo,
+                        )
+                    }
                 } catch (error: Throwable) {
-                    document = AnnotationDocument(beforeSnapshot)
-                    _uiState.value = before.copy(dataError = "필기를 저장하지 못했습니다. 기존 저장 내용은 유지됩니다.")
+                    document = AnnotationDocument(
+                        initial = beforeSnapshot,
+                        operationClockHighWater = beforeClockHighWater,
+                    )
+                    val latest = _uiState.value
+                    if (latest.bookId == before.bookId && latest.pageNumber == before.pageNumber) {
+                        _uiState.value = latest.copy(
+                            dataError = "필기를 저장하지 못했습니다. 기존 저장 내용은 유지됩니다.",
+                        )
+                    }
                 }
             }
             withContext(Dispatchers.Main.immediate) { onComplete?.invoke() }

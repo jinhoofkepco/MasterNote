@@ -20,4 +20,5 @@ dependencies {
     api(project(":core:model"))
     implementation(project(":annotation:storage"))
     implementation(project(":library:data"))
+    testImplementation("junit:junit:4.13.2")
 }

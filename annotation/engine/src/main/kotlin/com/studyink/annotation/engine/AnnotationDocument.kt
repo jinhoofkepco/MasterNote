@@ -15,11 +15,26 @@ data class AnnotationChange(
 )
 
 /** A single-page editor. Its undo/redo history never crosses the process boundary. */
-class AnnotationDocument(initial: AnnotationSnapshot) {
+class AnnotationDocument(
+    initial: AnnotationSnapshot,
+    /**
+     * Highest durable operation clock already observed for this page.
+     *
+     * This is deliberately supplied separately from [AnnotationSnapshot]: snapshots describe
+     * visible assets and keep their on-disk schema stable, while erase/undo operations can advance
+     * the clock without creating an asset that could carry that value.
+     */
+    operationClockHighWater: Long = 0L,
+) {
     private val bookId = initial.bookId
     private val pageNumber = initial.pageNumber
     private var revision = initial.revision
-    private var logicalClock = initial.activeStrokes.maxOfOrNull(StrokeAsset::logicalClock) ?: 0L
+    // Inactive assets remain useful evidence, but they cannot represent operation-only events such
+    // as whole-stroke erase and undo. The storage high-water closes that remaining restart gap.
+    private var logicalClock = maxOf(
+        operationClockHighWater.coerceAtLeast(0L),
+        initial.assets.values.maxOfOrNull(StrokeAsset::logicalClock) ?: 0L,
+    )
     private val assets = initial.assets.toMutableMap()
     private val active = initial.activeStrokeIds.toMutableSet()
     private val appliedOperationIds = initial.appliedOperationIds.toMutableSet()
@@ -28,6 +43,8 @@ class AnnotationDocument(initial: AnnotationSnapshot) {
 
     val canUndo: Boolean @Synchronized get() = undo.isNotEmpty()
     val canRedo: Boolean @Synchronized get() = redo.isNotEmpty()
+
+    val operationClockHighWater: Long @Synchronized get() = logicalClock
 
     @Synchronized
     fun snapshot(): AnnotationSnapshot = AnnotationSnapshot(
