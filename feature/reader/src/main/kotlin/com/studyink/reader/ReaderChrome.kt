@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
@@ -68,6 +69,7 @@ private fun mainMenuItemCount(state: ReaderUiState) = if (state.capabilities.can
 fun StylusToolMenu(
     expanded: Boolean,
     state: ReaderUiState,
+    selectedTool: ReaderTool,
     selectedColorArgb: Int,
     selectedWidthDp: Float,
     selectedOpacity: Float,
@@ -83,13 +85,9 @@ fun StylusToolMenu(
 ) {
     val tokens = readerChromeTokens(state.role)
     var menuPage by remember { mutableStateOf(RadialMenuPage.MAIN) }
-    var raisedTool by remember { mutableStateOf<ReaderTool?>(null) }
     LaunchedEffect(expanded) {
         if (expanded) {
             menuPage = RadialMenuPage.MAIN
-            // A persisted drawing tool must not look pre-selected when a fresh menu opens. Only a
-            // tool explicitly pressed during this menu session remains extracted.
-            raisedTool = null
         }
     }
     if (!expanded) return
@@ -151,6 +149,58 @@ fun StylusToolMenu(
                 val angleFromStart = (angle - FanStartDegrees + 360f) % 360f
                 return angleFromStart <= FanSweepDegrees
             }
+            val selectedToolIndex = if (menuPage == RadialMenuPage.MAIN) {
+                when (selectedTool) {
+                    ReaderTool.PARTIAL_ERASER -> 1
+                    ReaderTool.PEN -> 2
+                    ReaderTool.HIGHLIGHTER -> 3
+                    ReaderTool.GRADE -> if (state.capabilities.canGrade) 5 else null
+                    ReaderTool.PAN,
+                    ReaderTool.WHOLE_ERASER,
+                    -> null
+                }
+            } else {
+                null
+            }
+            val selectedToolAngleRadians = selectedToolIndex?.let { index ->
+                val itemCount = mainMenuItemCount(state)
+                val angleDegrees = FanStartDegrees +
+                    (index / (itemCount - 1f)) * FanSweepDegrees
+                Math.toRadians(angleDegrees.toDouble())
+            }
+            val selectedToolOuterRadiusStartPx = with(density) {
+                (geometry.radius + tokens.toolButtonSize / 2).toPx()
+            }
+            val selectedToolOuterRadiusEndPx = with(density) {
+                (geometry.radius + tokens.toolButtonSize / 2 + tokens.toolProtrusionDistance).toPx()
+            }
+            val selectedToolHalfWidthPx = with(density) {
+                (tokens.toolButtonSize / 2).toPx()
+            }
+            fun isInsideSelectedToolExtension(position: Offset): Boolean {
+                val angle = selectedToolAngleRadians ?: return false
+                val dx = position.x - dismissOriginXPx
+                val dy = position.y - dismissOriginYPx
+                val directionX = cos(angle).toFloat()
+                val directionY = sin(angle).toFloat()
+                val radial = dx * directionX + dy * directionY
+                val tangential = abs(-dx * directionY + dy * directionX)
+                return radial >= selectedToolOuterRadiusStartPx &&
+                    radial <= selectedToolOuterRadiusEndPx &&
+                    tangential <= selectedToolHalfWidthPx
+            }
+            fun activateSelectedTool() {
+                when (selectedTool) {
+                    ReaderTool.PEN -> menuPage = RadialMenuPage.PEN
+                    ReaderTool.PARTIAL_ERASER,
+                    ReaderTool.HIGHLIGHTER,
+                    ReaderTool.GRADE,
+                    -> onSelectTool(selectedTool)
+                    ReaderTool.PAN,
+                    ReaderTool.WHOLE_ERASER,
+                    -> Unit
+                }
+            }
             CompositionLocalProvider(LocalPenRestingAlpha provides tokens.menuRestingAlpha) {
                 Box(
                     modifier = Modifier
@@ -162,10 +212,14 @@ fun StylusToolMenu(
                             dismissOriginXPx,
                             dismissOriginYPx,
                             dismissRadiusPx,
+                            selectedToolIndex,
+                            selectedToolOuterRadiusStartPx,
+                            selectedToolOuterRadiusEndPx,
                             onDismissRequest,
                         ) {
                             var activePointerId: PointerId? = null
                             var armed = false
+                            var selectedToolExtension = false
                             awaitPointerEventScope {
                                 while (true) {
                                     val event = awaitPointerEvent(PointerEventPass.Final)
@@ -175,9 +229,19 @@ fun StylusToolMenu(
                                                 !change.previousPressed && change.pressed &&
                                                 !change.isConsumed
                                         }
-                                        if (down != null && isInsideDismissSector(down.position)) {
-                                            activePointerId = down.id
-                                            armed = true
+                                        if (down != null) {
+                                            when {
+                                                isInsideSelectedToolExtension(down.position) -> {
+                                                    activePointerId = down.id
+                                                    selectedToolExtension = true
+                                                    armed = true
+                                                }
+                                                isInsideDismissSector(down.position) -> {
+                                                    activePointerId = down.id
+                                                    selectedToolExtension = false
+                                                    armed = true
+                                                }
+                                            }
                                         }
                                     } else {
                                         val change = event.changes.firstOrNull {
@@ -186,15 +250,27 @@ fun StylusToolMenu(
                                         if (change == null) {
                                             activePointerId = null
                                             armed = false
+                                            selectedToolExtension = false
                                         } else if (!change.pressed) {
-                                            val shouldDismiss = armed &&
-                                                !change.isConsumed &&
-                                                isInsideDismissSector(change.position)
+                                            val shouldAct = armed && !change.isConsumed &&
+                                                if (selectedToolExtension) {
+                                                    isInsideSelectedToolExtension(change.position)
+                                                } else {
+                                                    isInsideDismissSector(change.position)
+                                                }
+                                            val activateTool = selectedToolExtension
                                             activePointerId = null
                                             armed = false
-                                            if (shouldDismiss) onDismissRequest()
+                                            selectedToolExtension = false
+                                            if (shouldAct) {
+                                                if (activateTool) activateSelectedTool() else onDismissRequest()
+                                            }
                                         } else {
-                                            armed = isInsideDismissSector(change.position)
+                                            armed = if (selectedToolExtension) {
+                                                isInsideSelectedToolExtension(change.position)
+                                            } else {
+                                                isInsideDismissSector(change.position)
+                                            }
                                         }
                                     }
                                 }
@@ -205,21 +281,17 @@ fun StylusToolMenu(
                         RadialMenuPage.MAIN -> MainRadialMenu(
                             state = state,
                             geometry = geometry,
-                            selectedTool = raisedTool,
+                            selectedTool = selectedTool,
                             selectedColorArgb = selectedColorArgb,
                             onPenClick = {
-                                if (raisedTool == ReaderTool.PEN) {
+                                if (selectedTool == ReaderTool.PEN) {
                                     menuPage = RadialMenuPage.PEN
                                 } else {
-                                    raisedTool = ReaderTool.PEN
                                     onSelectTool(ReaderTool.PEN)
                                 }
                             },
                             onOpenColors = { menuPage = RadialMenuPage.COLORS },
-                            onSelectTool = { tool ->
-                                raisedTool = tool
-                                onSelectTool(tool)
-                            },
+                            onSelectTool = onSelectTool,
                             onResetZoom = onResetZoom,
                             onUndo = onUndo,
                             onRedo = onRedo,
@@ -297,6 +369,7 @@ private fun MainRadialMenu(
                 selected = selectedTool == ReaderTool.PARTIAL_ERASER,
                 forceHoveredForPreview = forceHoveredToolForPreview == ReaderTool.PARTIAL_ERASER,
                 radialAngleDegrees = angleDegrees,
+                radialRadius = geometry.radius,
             )
             index == 2 -> ToolPenButton(
                 description = "펜",
@@ -306,6 +379,7 @@ private fun MainRadialMenu(
                 selected = selectedTool == ReaderTool.PEN,
                 forceHoveredForPreview = forceHoveredToolForPreview == ReaderTool.PEN,
                 radialAngleDegrees = angleDegrees,
+                radialRadius = geometry.radius,
             )
             index == 3 -> ToolPenButton(
                 description = "형광펜",
@@ -315,6 +389,7 @@ private fun MainRadialMenu(
                 selected = selectedTool == ReaderTool.HIGHLIGHTER,
                 forceHoveredForPreview = forceHoveredToolForPreview == ReaderTool.HIGHLIGHTER,
                 radialAngleDegrees = angleDegrees,
+                radialRadius = geometry.radius,
             )
             index == 4 -> PaletteButton(
                 selectedColorArgb = selectedColorArgb,
@@ -329,6 +404,7 @@ private fun MainRadialMenu(
                 selected = selectedTool == ReaderTool.GRADE,
                 forceHoveredForPreview = forceHoveredToolForPreview == ReaderTool.GRADE,
                 radialAngleDegrees = angleDegrees,
+                radialRadius = geometry.radius,
             )
             index == resetIndex -> RadialActionButton(
                 iconRes = R.drawable.ic_zoom_reset,

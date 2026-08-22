@@ -42,7 +42,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
@@ -71,6 +73,9 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import java.security.MessageDigest
+import kotlin.math.floor
+import kotlin.math.roundToInt
+import kotlin.math.sin
 
 enum class PenButtonSurfaceStyle { DEFAULT, FILLED, GHOST }
 
@@ -80,6 +85,99 @@ enum class PenButtonSurfaceStyle { DEFAULT, FILLED, GHOST }
  * [ReaderChromeTokens.menuRestingAlpha] here instead. `null` means "use the chrome default".
  */
 val LocalPenRestingAlpha = compositionLocalOf<Float?> { null }
+
+private data class ReaderPaperSpeck(
+    val center: Offset,
+    val radius: Float,
+    val color: Color,
+)
+
+private data class ReaderPaperFiber(
+    val start: Offset,
+    val end: Offset,
+    val strokeWidth: Float,
+    val color: Color,
+)
+
+/** Stable pseudo-random value so the paper grain never shimmers while Compose redraws it. */
+private fun readerPaperNoise(index: Int, channel: Int): Float {
+    val raw = sin((index + 1) * 12.9898 + (channel + 1) * 78.233) * 43_758.5453
+    return (raw - floor(raw)).toFloat()
+}
+
+private fun Modifier.readerPaperTexture(
+    tokens: ReaderChromeTokens,
+    seed: Int,
+): Modifier = drawWithCache {
+    val texture = tokens.paperTexture
+    val oneDp = 1.dp.toPx()
+    val areaDp = (size.width / oneDp) * (size.height / oneDp)
+    val speckCount = (areaDp / texture.areaPerSpeck)
+        .roundToInt()
+        .coerceIn(texture.minSpecks, texture.maxSpecks)
+    val fiberCount = (areaDp / texture.areaPerFiber)
+        .roundToInt()
+        .coerceIn(texture.minFibers, texture.maxFibers)
+    val channel = (seed and 0x3ff) * 181
+    val wash = Brush.linearGradient(
+        colors = listOf(
+            tokens.paperHighlight.copy(alpha = texture.washLightAlpha),
+            Color.Transparent,
+            tokens.paperStroke.copy(alpha = texture.washShadeAlpha),
+        ),
+        start = Offset.Zero,
+        end = Offset(size.width, size.height),
+    )
+    val minSpeck = texture.speckMinRadius.toPx()
+    val speckRange = texture.speckMaxRadius.toPx() - minSpeck
+    val specks = List(speckCount) { index ->
+        val light = readerPaperNoise(index, 113 + channel) > 0.68f
+        ReaderPaperSpeck(
+            center = Offset(
+                x = readerPaperNoise(index, 127 + channel) * size.width,
+                y = readerPaperNoise(index, 131 + channel) * size.height,
+            ),
+            radius = minSpeck + readerPaperNoise(index, 137 + channel) * speckRange,
+            color = if (light) {
+                tokens.paperHighlight.copy(alpha = texture.lightGrainAlpha)
+            } else {
+                tokens.paperStroke.copy(alpha = texture.darkGrainAlpha)
+            },
+        )
+    }
+    val minFiberLength = texture.fiberMinLength.toPx()
+    val fiberLengthRange = texture.fiberMaxLength.toPx() - minFiberLength
+    val minFiberWidth = texture.fiberMinWidth.toPx()
+    val fiberWidthRange = texture.fiberMaxWidth.toPx() - minFiberWidth
+    val fibers = List(fiberCount) { index ->
+        val start = Offset(
+            x = readerPaperNoise(index, 151 + channel) * size.width,
+            y = readerPaperNoise(index, 157 + channel) * size.height,
+        )
+        val length = minFiberLength + readerPaperNoise(index, 163 + channel) * fiberLengthRange
+        val slope = (readerPaperNoise(index, 167 + channel) - 0.5f) * texture.fiberSlope
+        ReaderPaperFiber(
+            start = start,
+            end = Offset(
+                x = (start.x + length).coerceAtMost(size.width),
+                y = (start.y + length * slope).coerceIn(0f, size.height),
+            ),
+            strokeWidth = minFiberWidth +
+                readerPaperNoise(index, 173 + channel) * fiberWidthRange,
+            color = tokens.paperShade.copy(alpha = texture.fiberAlpha),
+        )
+    }
+
+    onDrawBehind {
+        drawRect(brush = wash)
+        fibers.forEach { fiber ->
+            drawLine(fiber.color, fiber.start, fiber.end, fiber.strokeWidth)
+        }
+        specks.forEach { speck ->
+            drawCircle(speck.color, speck.radius, speck.center)
+        }
+    }
+}
 
 @Composable
 private fun PenInteractionTarget(
@@ -167,6 +265,7 @@ private fun AnimatedPenSurface(
     modifier: Modifier = Modifier,
     minVisualWidth: Dp = 0.dp,
     backgroundOverride: Color? = null,
+    textureSeed: Int = 0,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val tokens = readerChromeTokens(role)
@@ -274,6 +373,13 @@ private fun AnimatedPenSurface(
                     } else {
                         Modifier
                     }
+                )
+                .then(
+                    if (paperSurface) {
+                        Modifier.readerPaperTexture(tokens = tokens, seed = textureSeed)
+                    } else {
+                        Modifier
+                    }
                 ),
             contentAlignment = Alignment.Center,
             content = content,
@@ -317,6 +423,7 @@ fun IconPenButton(
             shape = CircleShape,
             style = style,
             backgroundOverride = backgroundOverride,
+            textureSeed = description.hashCode(),
         ) {
             if (content != null) {
                 content()
@@ -364,6 +471,7 @@ fun PrimaryPenButton(
             shape = RoundedCornerShape(tokens.cornerRadius),
             style = PenButtonSurfaceStyle.FILLED,
             minVisualWidth = tokens.primaryMinWidth,
+            textureSeed = description.hashCode(),
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = tokens.primaryHorizontalPadding),
@@ -436,22 +544,24 @@ fun ToolPenButton(
     selected: Boolean = false,
     forceHoveredForPreview: Boolean = false,
     radialAngleDegrees: Float = 270f,
+    radialRadius: Dp? = null,
 ) {
     val tokens = readerChromeTokens(role)
     val isEraser = description == "지우개"
-    val imageScale = if (isEraser) tokens.eraserImageScale else 1f
-    val toolImageWidth = tokens.toolImageWidth * imageScale
-    val toolImageHeight = tokens.toolImageHeight * imageScale
-    val artworkContentFraction = if (isEraser) {
-        tokens.eraserArtworkContentFraction
-    } else {
-        tokens.toolArtworkContentFraction
-    }
+    val toolImageWidth = tokens.toolImageWidth *
+        if (isEraser) tokens.eraserImageWidthScale else 1f
+    val toolImageHeight = tokens.toolImageHeight *
+        if (isEraser) tokens.eraserImageHeightScale else 1f
     val artworkBottomPaddingFraction = if (isEraser) {
         tokens.eraserArtworkBottomPaddingFraction
     } else {
         tokens.toolArtworkBottomPaddingFraction
     }
+    val revealGeometry = radialToolRevealGeometry(
+        fanRadius = radialRadius ?: tokens.radialMinRadius,
+        toolButtonSize = tokens.toolButtonSize,
+        protrusionDistance = tokens.toolProtrusionDistance,
+    )
     PenInteractionTarget(
         description = description,
         onAction = onAction,
@@ -459,11 +569,6 @@ fun ToolPenButton(
         modifier = modifier.size(tokens.toolButtonSize.coerceAtLeast(tokens.minimumTouchSize)),
         forceHoveredForPreview = forceHoveredForPreview,
     ) { hovered, pressed ->
-        val artworkLength = toolImageHeight * artworkContentFraction
-        fun revealDepth(fraction: Float) = minOf(
-            tokens.toolRevealTrackLength * fraction,
-            artworkLength,
-        )
         val targetAlpha = when {
             !enabled -> tokens.disabledAlpha
             hovered || selected -> tokens.hoveredAlpha
@@ -485,29 +590,24 @@ fun ToolPenButton(
             label = "tool-pressed-scale",
         )
         val revealDepth by animateDpAsState(
-            targetValue = when {
-                hovered -> revealDepth(tokens.toolHoveredRevealFraction)
-                selected -> revealDepth(tokens.toolSelectedRevealFraction)
-                else -> revealDepth(tokens.toolRestingRevealFraction)
+            targetValue = if (hovered || selected) {
+                revealGeometry.extractedTipDepth
+            } else {
+                revealGeometry.restingTipDepth
             },
             animationSpec = spring(tokens.springDampingRatio, tokens.springStiffness),
             label = "tool-reveal",
         )
-        val maxRevealFraction = maxOf(
-            tokens.toolHoveredRevealFraction,
-            tokens.toolSelectedRevealFraction,
-        ) + tokens.toolRevealOvershootFraction
-        val maxRevealDepth = revealDepth(maxRevealFraction)
         val toolTipFromImageTop = toolImageHeight * (1f - artworkBottomPaddingFraction)
         val translationYPx = with(LocalDensity.current) { revealDepth.toPx() }
-        val revealWindowOffset = (maxRevealDepth - tokens.toolButtonSize) / 2
 
-        // The old circle's inner edge is the fixed seam. In this local coordinate system down
-        // points away from the fan centre. Rest spans the old diameter, and hover crosses its
-        // outer edge without moving the seam back toward that edge.
+        // In this local coordinate system +Y points away from the fan centre. The viewport's top
+        // is radius a (the old slot's inner edge), rest puts the tip at b, and hover/selection puts
+        // it at c. The viewport itself ends at c, so spring overshoot cannot revive the old
+        // percentage-based over-extraction.
         // Rotate the local coordinate system around the slot centre first. The reveal-window
-        // offset must then follow local +Y; applying that offset outside this rotated parent would
-        // move every tool vertically on screen and put diagonal tools outside their former circles.
+        // direction must then follow local +Y; doing this outside the rotated parent would move
+        // diagonal tools vertically instead of radially.
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -515,11 +615,11 @@ fun ToolPenButton(
         ) {
             Layout(
                 modifier = Modifier
-                    .align(Alignment.Center)
-                    .offset(y = revealWindowOffset)
-                    .requiredSize(width = toolImageWidth, height = maxRevealDepth)
+                    .align(Alignment.TopCenter)
+                    .requiredSize(width = toolImageWidth, height = revealGeometry.viewportLength)
                     .graphicsLayer {
-                        transformOrigin = TransformOrigin(0.5f, 0f)
+                        // Anchor scaling at c so hover enlargement does not change the tip radius.
+                        transformOrigin = TransformOrigin(0.5f, 1f)
                         scaleX = hoverScale
                         scaleY = hoverScale * pressedScaleY
                         alpha = artworkAlpha

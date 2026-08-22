@@ -330,6 +330,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             StylusToolMenu(
                 expanded = stylusMenuExpanded,
                 state = latestState,
+                selectedTool = selectedTool,
                 selectedColorArgb = selectedPenColor,
                 selectedWidthDp = selectedPenWidthDp,
                 selectedOpacity = selectedPenOpacity,

@@ -10,6 +10,28 @@ import androidx.compose.ui.unit.dp
 import kotlin.math.cos
 import kotlin.math.sin
 
+@Immutable
+data class ReaderPaperTextureTokens(
+    val washLightAlpha: Float,
+    val washShadeAlpha: Float,
+    val lightGrainAlpha: Float,
+    val darkGrainAlpha: Float,
+    val fiberAlpha: Float,
+    val areaPerSpeck: Float,
+    val areaPerFiber: Float,
+    val minSpecks: Int,
+    val maxSpecks: Int,
+    val minFibers: Int,
+    val maxFibers: Int,
+    val speckMinRadius: Dp,
+    val speckMaxRadius: Dp,
+    val fiberMinLength: Dp,
+    val fiberMaxLength: Dp,
+    val fiberMinWidth: Dp,
+    val fiberMaxWidth: Dp,
+    val fiberSlope: Float,
+)
+
 /**
  * All reader chrome tuning values live in this composable path so Android Studio Live Edit can
  * replace them while the Reader is running. The width split is intentionally based on the active
@@ -42,6 +64,7 @@ data class ReaderChromeTokens(
     val paperHoverRim: Color,
     val paperSelectedRim: Color,
     val paperStrokeWidth: Dp,
+    val paperTexture: ReaderPaperTextureTokens,
     val toolButtonSize: Dp,
     val navigationButtonSize: Dp,
     val generalButtonSize: Dp,
@@ -78,15 +101,11 @@ data class ReaderChromeTokens(
     val fadeDurationMillis: Int,
     val toolImageWidth: Dp,
     val toolImageHeight: Dp,
-    val toolRevealTrackLength: Dp,
-    val toolRestingRevealFraction: Float,
-    val toolHoveredRevealFraction: Float,
-    val toolSelectedRevealFraction: Float,
-    val toolRevealOvershootFraction: Float,
-    val toolArtworkContentFraction: Float,
+    /** Radial distance from the old button's outer edge (b) to the extracted tip (c). */
+    val toolProtrusionDistance: Dp,
     val toolArtworkBottomPaddingFraction: Float,
-    val eraserImageScale: Float,
-    val eraserArtworkContentFraction: Float,
+    val eraserImageWidthScale: Float,
+    val eraserImageHeightScale: Float,
     val eraserArtworkBottomPaddingFraction: Float,
     val radialItemGap: Dp,
     val radialEdgeMargin: Dp,
@@ -148,6 +167,26 @@ fun readerChromeTokens(role: ReaderRole): ReaderChromeTokens {
         paperHoverRim = Color(0xFFF2C94C),
         paperSelectedRim = Color(0xFFF2C94C),
         paperStrokeWidth = 1.dp,
+        paperTexture = ReaderPaperTextureTokens(
+            washLightAlpha = 0.065f,
+            washShadeAlpha = 0.034f,
+            lightGrainAlpha = 0.075f,
+            darkGrainAlpha = 0.036f,
+            fiberAlpha = 0.040f,
+            areaPerSpeck = 1_050f,
+            areaPerFiber = 4_000f,
+            minSpecks = 6,
+            maxSpecks = 32,
+            minFibers = 2,
+            maxFibers = 9,
+            speckMinRadius = 0.18.dp,
+            speckMaxRadius = 0.62.dp,
+            fiberMinLength = 3.dp,
+            fiberMaxLength = 11.dp,
+            fiberMinWidth = 0.24.dp,
+            fiberMaxWidth = 0.54.dp,
+            fiberSlope = 0.62f,
+        ),
         toolButtonSize = if (compact) 48.dp else 60.dp,
         navigationButtonSize = if (compact) 44.dp else 52.dp,
         generalButtonSize = if (compact) 38.dp else 44.dp,
@@ -187,20 +226,13 @@ fun readerChromeTokens(role: ReaderRole): ReaderChromeTokens {
         // artwork to read as a tool tip instead of a few indistinct pixels.
         toolImageWidth = if (compact) 100.dp else 120.dp,
         toolImageHeight = if (compact) 150.dp else 180.dp,
-        // The reveal seam is the former circle's inner edge. 25% of this track is exactly one old
-        // circle diameter, so the resting tip lands on its outer edge; hover travels beyond it.
-        toolRevealTrackLength = if (compact) 192.dp else 240.dp,
-        toolRestingRevealFraction = 0.25f,
-        toolHoveredRevealFraction = 0.35f,
-        // A tool pressed during the current menu session stays extracted as its selection mark.
-        toolSelectedRevealFraction = 0.35f,
-        toolRevealOvershootFraction = 0.03f,
-        // The supplied PNGs share a 2:3 canvas with transparent padding around the artwork.
-        // These values describe that canvas so the visible percentage applies to the tool itself.
-        toolArtworkContentFraction = 0.5963542f,
+        // c = b + this value. Rest ends exactly at b; hover and persistent selection end at c.
+        toolProtrusionDistance = if (compact) 20.dp else 24.dp,
+        // The supplied PNGs share a 2:3 canvas with transparent padding below the artwork tip.
         toolArtworkBottomPaddingFraction = 0.2018229f,
-        eraserImageScale = 0.82f,
-        eraserArtworkContentFraction = 0.4908854f,
+        // Keep the eraser visually narrower without shortening its body below the a..c viewport.
+        eraserImageWidthScale = 0.82f,
+        eraserImageHeightScale = 1f,
         eraserArtworkBottomPaddingFraction = 0.2552083f,
         radialItemGap = if (compact) 2.dp else 4.dp,
         radialEdgeMargin = if (compact) 12.dp else 16.dp,
@@ -236,6 +268,39 @@ data class RadialFanGeometry(
     val menuWidth: Dp,
     val menuHeight: Dp,
 )
+
+/**
+ * The three radii used to align a radial tool with the slot it replaces.
+ *
+ * [a] is the slot's inner edge, [b] its outer edge, and [c] the extracted tool-tip endpoint.
+ * The reveal viewport begins at [a]. An unselected tool ends at [b], while a hovered or selected
+ * tool ends at [c]. Keeping these as radii prevents image padding or percentage-based reveal
+ * values from gradually moving the artwork away from the existing 120-degree fan.
+ */
+@Immutable
+data class RadialToolRevealGeometry(
+    val a: Dp,
+    val b: Dp,
+    val c: Dp,
+) {
+    val restingTipDepth: Dp get() = b - a
+    val extractedTipDepth: Dp get() = c - a
+    val viewportLength: Dp get() = c - a
+}
+
+fun radialToolRevealGeometry(
+    fanRadius: Dp,
+    toolButtonSize: Dp,
+    protrusionDistance: Dp,
+): RadialToolRevealGeometry {
+    val a = fanRadius - toolButtonSize / 2
+    val b = fanRadius + toolButtonSize / 2
+    return RadialToolRevealGeometry(
+        a = a,
+        b = b,
+        c = b + protrusionDistance,
+    )
+}
 
 fun radialFanGeometry(
     tokens: ReaderChromeTokens,
