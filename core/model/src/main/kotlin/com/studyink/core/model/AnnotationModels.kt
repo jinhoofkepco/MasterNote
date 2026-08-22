@@ -50,6 +50,12 @@ data class Attempt(
     val lockedAtEpochMillis: Long? = null,
 )
 
+/**
+ * Reserved review slot for teacher marks made before a student attempt exists.
+ * Student attempts are numbered from 1, so this slot must never be persisted as an [Attempt].
+ */
+const val TEACHER_PAGE_REVIEW_ATTEMPT_NO = 0
+
 enum class MarkColor { BLUE, RED, GRAY }
 
 data class Mark(
@@ -67,6 +73,10 @@ data class MarkGroup(
     val marks: List<Mark> = emptyList(),
     val createdAtEpochMillis: Long = System.currentTimeMillis(),
     val hiddenAtEpochMillis: Long? = null,
+    /** Monotonic per-group version used to converge full-state LAN upserts. */
+    val syncRevision: Long = 0L,
+    /** Deterministic tie-break when two paired devices edit the same revision while offline. */
+    val lastModifiedByDeviceId: String = "",
 )
 
 data class PagePoint(

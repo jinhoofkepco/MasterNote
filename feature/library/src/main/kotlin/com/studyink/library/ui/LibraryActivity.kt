@@ -1,6 +1,7 @@
 package com.studyink.library.ui
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -10,22 +11,32 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -44,20 +55,37 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import com.studyink.core.model.Book
+import com.studyink.core.model.MarkColor
+import com.studyink.core.model.Student
+import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
+import com.studyink.core.model.resultBundleGrid
+import com.studyink.library.data.AttemptProgressStatus
+import com.studyink.library.data.AttemptProgressSummary
+import com.studyink.library.data.AttemptGradeSummary
+import com.studyink.library.data.LibraryContext
+import com.studyink.library.data.LibraryPerspective
 import com.studyink.library.data.LibraryRepository
 import com.studyink.library.data.LibraryState
+import com.studyink.library.data.PageGradeSnapshot
+import com.studyink.library.data.PageProgressStatus
+import com.studyink.library.data.PageProgressSummary
+import com.studyink.library.data.ProblemGradeSummary
 import com.studyink.reader.ReaderActivity
 import com.studyink.reader.ReaderDebugSessionStore
 import com.studyink.reader.ReaderRole
+import com.studyink.reader.ReaderWorkflow
 import com.studyink.sync.lan.LanSyncService
 import com.studyink.sync.lan.LanSyncBus
 import com.studyink.sync.lan.PairingPayload
@@ -71,10 +99,15 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
+private const val STATE_SELECTED_BOOK_ID = "library.selectedBookId"
+private const val STATE_PERSPECTIVE = "library.perspective"
+
 class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
     private val repository by lazy { LibraryRepository.get(this) }
     private var state by mutableStateOf<LibraryState?>(null)
     private var selectedBook by mutableStateOf<Book?>(null)
+    private var perspective by mutableStateOf(LibraryPerspective.STUDENT)
+    private var progressRevision by mutableStateOf(0)
     private var importing by mutableStateOf(false)
     private var errorMessage by mutableStateOf<String?>(null)
     private var renameTarget by mutableStateOf<Book?>(null)
@@ -95,7 +128,15 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
             .onSuccess {
                 startSyncSession {
                     LanSyncService.startTeacherPairing(this, targetBookId, value)
-                    startActivity(ReaderActivity.intent(this, targetBookId, 0, ReaderRole.TEACHER_PHONE))
+                    startActivity(
+                        ReaderActivity.intent(
+                            context = this,
+                            bookId = targetBookId,
+                            pageNumber = 0,
+                            role = ReaderRole.TEACHER_PHONE,
+                            workflow = ReaderWorkflow.LIVE_MONITOR,
+                        )
+                    )
                 }
             }
             .onFailure { errorMessage = "MasterNote 연결 QR이 아닙니다." }
@@ -137,13 +178,27 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         state = repository.state
+        perspective = savedInstanceState?.getString(STATE_PERSPECTIVE)
+            ?.let { saved -> runCatching { LibraryPerspective.valueOf(saved) }.getOrNull() }
+            ?: LibraryPerspective.STUDENT
+        selectedBook = savedInstanceState?.getString(STATE_SELECTED_BOOK_ID)
+            ?.let { savedId -> repository.state.books.firstOrNull { it.id == savedId } }
+        val returnedFromReader = applyReaderReturnTarget(intent)
         setContent {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize(), color = LibraryBackground) {
                     LibraryScreen(
                         state = state ?: return@Surface,
                         selectedBook = selectedBook,
+                        perspective = perspective,
+                        progressRevision = progressRevision,
                         importing = importing,
+                        progressForBook = { bookId ->
+                            repository.pageProgressSummaries(
+                                LibraryContext(repository.state.selectedStudentId, perspective),
+                                bookId,
+                            )
+                        },
                         onSelectStudent = { id ->
                             repository.selectStudent(id)
                             state = repository.state
@@ -151,8 +206,32 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                         },
                         onImport = { importPdf.launch(arrayOf("application/pdf")) },
                         onSelectBook = { selectedBook = it },
+                        onSelectPerspective = { perspective = it },
                         onBackToBooks = { selectedBook = null },
-                        onOpenPage = { book, page -> startActivity(ReaderActivity.intent(this, book.id, page)) },
+                        onOpenPage = { book, page, selectedPerspective, expanded, attemptNo ->
+                            val role = when (selectedPerspective) {
+                                LibraryPerspective.STUDENT -> ReaderRole.STUDENT
+                                LibraryPerspective.TEACHER -> if (expanded) {
+                                    ReaderRole.TEACHER_TABLET
+                                } else {
+                                    ReaderRole.TEACHER_PHONE
+                                }
+                            }
+                            startActivity(
+                                ReaderActivity.intent(
+                                    context = this,
+                                    bookId = book.id,
+                                    pageNumber = page,
+                                    role = role,
+                                    attemptNo = attemptNo,
+                                    workflow = if (selectedPerspective == LibraryPerspective.TEACHER) {
+                                        ReaderWorkflow.REVIEW
+                                    } else {
+                                        ReaderWorkflow.STUDY
+                                    },
+                                )
+                            )
+                        },
                         onRename = { renameTarget = it },
                         onImportAnswers = { book ->
                             answerTargetBookId = book.id
@@ -165,7 +244,15 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                         onStartTeacherSync = { book ->
                             startSyncSession {
                                 LanSyncService.startTeacher(this, book.id)
-                                startActivity(ReaderActivity.intent(this, book.id, 0, ReaderRole.TEACHER_PHONE))
+                                startActivity(
+                                    ReaderActivity.intent(
+                                        context = this,
+                                        bookId = book.id,
+                                        pageNumber = 0,
+                                        role = ReaderRole.TEACHER_PHONE,
+                                        workflow = ReaderWorkflow.LIVE_MONITOR,
+                                    )
+                                )
                             }
                         },
                         onScanTeacherQr = { book ->
@@ -206,18 +293,57 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                 }
             }
         }
-        if (savedInstanceState == null) {
+        if (savedInstanceState == null && !returnedFromReader) {
             ReaderDebugSessionStore.load(this)?.takeIf { session ->
                 repository.state.books.any { it.id == session.bookId }
             }?.let { session ->
-                startActivity(ReaderActivity.intent(this, session.bookId, session.pageNumber, session.role))
+                startActivity(
+                    ReaderActivity.intent(
+                        context = this,
+                        bookId = session.bookId,
+                        pageNumber = session.pageNumber,
+                        role = session.role,
+                        attemptNo = session.attemptNo,
+                        workflow = session.workflow,
+                    )
+                )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        applyReaderReturnTarget(intent)
+    }
+
+    private fun applyReaderReturnTarget(source: Intent): Boolean {
+        val targetBookId = source.getStringExtra(ReaderActivity.EXTRA_RETURN_LIBRARY_BOOK_ID)
+            ?: return false
+        val teacherView = source.getBooleanExtra(
+            ReaderActivity.EXTRA_RETURN_LIBRARY_TEACHER_VIEW,
+            false,
+        )
+        source.removeExtra(ReaderActivity.EXTRA_RETURN_LIBRARY_BOOK_ID)
+        source.removeExtra(ReaderActivity.EXTRA_RETURN_LIBRARY_TEACHER_VIEW)
+        val book = repository.state.books.firstOrNull { it.id == targetBookId } ?: return true
+        repository.selectStudent(book.studentId)
+        state = repository.state
+        selectedBook = book
+        perspective = if (teacherView) LibraryPerspective.TEACHER else LibraryPerspective.STUDENT
+        return true
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString(STATE_SELECTED_BOOK_ID, selectedBook?.id)
+        outState.putString(STATE_PERSPECTIVE, perspective.name)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onResume() {
         super.onResume()
         state = repository.state
+        progressRevision += 1
     }
 
     override fun onStart() {
@@ -236,8 +362,25 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
         }
     }
 
+    override fun onRemoteAttempt(bookId: String, pageNumber: Int) {
+        refreshSyncedProgress(bookId)
+    }
+
+    override fun onRemoteMarkGroup(bookId: String, pageNumber: Int) {
+        refreshSyncedProgress(bookId)
+    }
+
     override fun onSessionIssue(message: String) {
         runOnUiThread { errorMessage = message }
+    }
+
+    private fun refreshSyncedProgress(bookId: String) {
+        runOnUiThread {
+            if (repository.state.books.any { it.id == bookId }) {
+                state = repository.state
+                progressRevision += 1
+            }
+        }
     }
 
     private fun startSyncSession(action: () -> Unit) {
@@ -260,6 +403,16 @@ private val PaperFiber = Color(0xFF9C907E)
 private val PaperWarmFiber = Color(0xFFC6B79F)
 private val PaperYellow = Color(0xFFF2C94C)
 private val PaperYellowSoft = Color(0xFFFFF2B8)
+private val ReviewTealSoft = Color(0xFFDDF3ED)
+private val ProgressNeutral = Color(0xFFD8D0C5)
+private val ProgressWorking = Color(0xFFF2C94C)
+private val ProgressSubmitted = Color(0xFFEF8D3D)
+private val ProgressReview = Color(0xFF4F83CC)
+private val ProgressTeal = Color(0xFF25A58F)
+private val GradeCorrect = Color(0xFF5B8FE6)
+private val GradeWrong = Color(0xFFEA7378)
+private val GradeUnanswered = Color(0xFFBFC2C7)
+private val GradePageLevel = Color(0xFF27A38E)
 
 private data class PaperSpeck(
     val center: Offset,
@@ -290,12 +443,16 @@ private fun paperNoise(index: Int, channel: Int): Float {
 private fun LibraryScreen(
     state: LibraryState,
     selectedBook: Book?,
+    perspective: LibraryPerspective,
+    progressRevision: Int,
     importing: Boolean,
+    progressForBook: (String) -> List<PageProgressSummary>,
     onSelectStudent: (String) -> Unit,
+    onSelectPerspective: (LibraryPerspective) -> Unit,
     onImport: () -> Unit,
     onSelectBook: (Book) -> Unit,
     onBackToBooks: () -> Unit,
-    onOpenPage: (Book, Int) -> Unit,
+    onOpenPage: (Book, Int, LibraryPerspective, Boolean, Int?) -> Unit,
     onRename: (Book) -> Unit,
     onImportAnswers: (Book) -> Unit,
     onStartStudentSync: (Book) -> Unit,
@@ -304,125 +461,580 @@ private fun LibraryScreen(
     onStopSync: () -> Unit,
 ) {
     PaperBackdrop {
-        Column(
+        BoxWithConstraints(
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .widthIn(max = 720.dp)
+                .widthIn(max = 1120.dp)
                 .fillMaxSize()
                 .statusBarsPadding()
-                .navigationBarsPadding()
-                .padding(horizontal = 20.dp, vertical = 18.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+                .navigationBarsPadding(),
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(
-                    text = "내 책장",
-                    color = PaperInk,
-                    style = MaterialTheme.typography.headlineMedium,
-                    fontWeight = FontWeight.Bold,
-                )
-                Text(
-                    text = "읽을 교재를 골라 바로 이어서 공부해요.",
-                    color = PaperMutedInk,
-                    style = MaterialTheme.typography.bodySmall,
-                )
+            val expanded = maxWidth >= 600.dp
+            val outerHorizontal = if (expanded) 24.dp else 12.dp
+            val outerVertical = if (expanded) 20.dp else 10.dp
+            val visibleBooks = remember(state.books, state.selectedStudentId) {
+                state.books.filter { it.studentId == state.selectedStudentId }
             }
-            LazyRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(vertical = 2.dp),
+            val visibleSelectedBook = selectedBook?.takeIf { it.studentId == state.selectedStudentId }
+            val summariesByBook = remember(visibleBooks, progressRevision) {
+                visibleBooks.associate { it.id to progressForBook(it.id) }
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = outerHorizontal, vertical = outerVertical),
+                verticalArrangement = Arrangement.spacedBy(if (expanded) 16.dp else 10.dp),
             ) {
-                items(state.students, key = { it.id }) { student ->
-                    StudentPaperChip(
-                        name = student.displayName,
-                        selected = student.id == state.selectedStudentId,
-                        onClick = { onSelectStudent(student.id) },
-                    )
-                }
-            }
-            if (selectedBook == null) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Text(
-                        text = "교재",
-                        color = PaperInk,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    val importButtonShape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp)
-                    Button(
-                        modifier = Modifier
-                            .clip(importButtonShape)
-                            .paperSurfaceTexture(intensity = 0.42f, seed = 607, overlay = true),
-                        onClick = onImport,
-                        enabled = !importing,
-                        shape = importButtonShape,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = PaperYellow,
-                            contentColor = PaperInk,
-                        ),
-                    ) {
-                        Text(if (importing) "가져오는 중" else "+ PDF 가져오기")
-                    }
-                }
-                val books = state.books.filter { it.studentId == state.selectedStudentId }
-                if (books.isEmpty()) {
-                    EmptyLibraryNotice(Modifier.weight(1f))
-                } else {
-                    LazyColumn(
+                LibraryAppHeader(
+                    selectedBook = visibleSelectedBook,
+                    studentName = state.students.firstOrNull { it.id == state.selectedStudentId }?.displayName
+                        ?: "학생",
+                    perspective = perspective,
+                )
+
+                if (expanded) {
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        contentPadding = PaddingValues(vertical = 3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(20.dp),
                     ) {
-                        items(books, key = { it.id }) { book ->
-                            CompactBookItem(
-                                book = book,
-                                onOpen = { onSelectBook(book) },
-                                onRename = { onRename(book) },
-                            )
-                        }
+                        LibraryContextPanel(
+                            modifier = Modifier.width(224.dp),
+                            state = state,
+                            perspective = perspective,
+                            onSelectStudent = onSelectStudent,
+                            onSelectPerspective = onSelectPerspective,
+                        )
+                        LibraryMainContent(
+                            modifier = Modifier.weight(1f),
+                            books = visibleBooks,
+                            selectedBook = visibleSelectedBook,
+                            perspective = perspective,
+                            expanded = true,
+                            importing = importing,
+                            summariesByBook = summariesByBook,
+                            onImport = onImport,
+                            onSelectBook = onSelectBook,
+                            onBackToBooks = onBackToBooks,
+                            onOpenPage = onOpenPage,
+                            onRename = onRename,
+                            onImportAnswers = onImportAnswers,
+                            onStartStudentSync = onStartStudentSync,
+                            onStartTeacherSync = onStartTeacherSync,
+                            onScanTeacherQr = onScanTeacherQr,
+                            onStopSync = onStopSync,
+                        )
                     }
+                } else {
+                    LibraryContextPanel(
+                        modifier = Modifier.fillMaxWidth(),
+                        state = state,
+                        perspective = perspective,
+                        onSelectStudent = onSelectStudent,
+                        onSelectPerspective = onSelectPerspective,
+                    )
+                    LibraryMainContent(
+                        modifier = Modifier.weight(1f),
+                        books = visibleBooks,
+                        selectedBook = visibleSelectedBook,
+                        perspective = perspective,
+                        expanded = false,
+                        importing = importing,
+                        summariesByBook = summariesByBook,
+                        onImport = onImport,
+                        onSelectBook = onSelectBook,
+                        onBackToBooks = onBackToBooks,
+                        onOpenPage = onOpenPage,
+                        onRename = onRename,
+                        onImportAnswers = onImportAnswers,
+                        onStartStudentSync = onStartStudentSync,
+                        onStartTeacherSync = onStartTeacherSync,
+                        onScanTeacherQr = onScanTeacherQr,
+                        onStopSync = onStopSync,
+                    )
                 }
-            } else {
+            }
+        }
+    }
+}
+
+@Composable
+private fun LibraryAppHeader(
+    selectedBook: Book?,
+    studentName: String,
+    perspective: LibraryPerspective,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+            Text(
+                text = if (selectedBook == null) "MASTERNOTE" else "$studentName · ${perspective.label}",
+                color = PaperMutedInk,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = selectedBook?.title ?: "내 책장",
+                color = PaperInk,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (selectedBook != null) {
+            Surface(
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+                color = if (perspective == LibraryPerspective.STUDENT) PaperYellowSoft else ReviewTealSoft,
+                border = paperEdge(),
+            ) {
+                Text(
+                    text = if (perspective == LibraryPerspective.STUDENT) "학습" else "검토",
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    color = PaperInk,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LibraryContextPanel(
+    modifier: Modifier,
+    state: LibraryState,
+    perspective: LibraryPerspective,
+    onSelectStudent: (String) -> Unit,
+    onSelectPerspective: (LibraryPerspective) -> Unit,
+) {
+    val shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+    Surface(
+        modifier = modifier,
+        shape = shape,
+        color = PaperIvory.copy(alpha = 0.88f),
+        border = paperEdge(),
+        shadowElevation = 3.dp,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .paperSurfaceTexture(intensity = 0.72f, seed = 401)
+                .padding(5.dp),
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            BoxWithConstraints(
+                modifier = Modifier.weight(1f),
+            ) {
+                val visibleSlots = state.students.size.coerceIn(1, 2)
+                val studentChipWidth = (maxWidth - 2.dp * (visibleSlots - 1)) / visibleSlots
                 LazyRow(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    contentPadding = PaddingValues(vertical = 2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
-                    item { OutlinedButton(onClick = onBackToBooks) { Text("교재 목록") } }
-                    item { OutlinedButton(onClick = { onImportAnswers(selectedBook) }) { Text("정답 JSON") } }
-                    item { OutlinedButton(onClick = { onStartStudentSync(selectedBook) }) { Text("학생 기기") } }
-                    item { OutlinedButton(onClick = { onStartTeacherSync(selectedBook) }) { Text("선생 폰") } }
-                    item { OutlinedButton(onClick = { onScanTeacherQr(selectedBook) }) { Text("QR 연결") } }
-                    item { TextButton(onClick = onStopSync) { Text("연결 종료") } }
-                }
-                Text(
-                    text = selectedBook.title,
-                    color = PaperInk,
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(7.dp),
-                    contentPadding = PaddingValues(vertical = 3.dp),
-                ) {
-                    items(selectedBook.pageCount) { page ->
-                        CompactPageItem(
-                            page = page,
-                            onOpen = { onOpenPage(selectedBook, page) },
+                    items(state.students, key = Student::id) { student ->
+                        StudentPaperChip(
+                            modifier = Modifier.width(studentChipWidth),
+                            name = student.displayName,
+                            selected = student.id == state.selectedStudentId,
+                            onClick = { onSelectStudent(student.id) },
                         )
                     }
                 }
+            }
+            Spacer(
+                Modifier
+                    .width(1.dp)
+                    .height(24.dp)
+                    .background(PaperStroke.copy(alpha = 0.7f)),
+            )
+            Row(
+                modifier = Modifier.weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                PerspectivePaperChip(
+                    modifier = Modifier.weight(1f),
+                    label = "학생",
+                    selected = perspective == LibraryPerspective.STUDENT,
+                    onClick = { onSelectPerspective(LibraryPerspective.STUDENT) },
+                )
+                PerspectivePaperChip(
+                    modifier = Modifier.weight(1f),
+                    label = "선생님",
+                    selected = perspective == LibraryPerspective.TEACHER,
+                    onClick = { onSelectPerspective(LibraryPerspective.TEACHER) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LibraryMainContent(
+    modifier: Modifier,
+    books: List<Book>,
+    selectedBook: Book?,
+    perspective: LibraryPerspective,
+    expanded: Boolean,
+    importing: Boolean,
+    summariesByBook: Map<String, List<PageProgressSummary>>,
+    onImport: () -> Unit,
+    onSelectBook: (Book) -> Unit,
+    onBackToBooks: () -> Unit,
+    onOpenPage: (Book, Int, LibraryPerspective, Boolean, Int?) -> Unit,
+    onRename: (Book) -> Unit,
+    onImportAnswers: (Book) -> Unit,
+    onStartStudentSync: (Book) -> Unit,
+    onStartTeacherSync: (Book) -> Unit,
+    onScanTeacherQr: (Book) -> Unit,
+    onStopSync: () -> Unit,
+) {
+    if (selectedBook == null) {
+        BookShelfContent(
+            modifier = modifier,
+            books = books,
+            expanded = expanded,
+            importing = importing,
+            summariesByBook = summariesByBook,
+            onImport = onImport,
+            onSelectBook = onSelectBook,
+            onRename = onRename,
+        )
+    } else {
+        BookPageContent(
+            modifier = modifier,
+            book = selectedBook,
+            summaries = summariesByBook[selectedBook.id].orEmpty(),
+            perspective = perspective,
+            expanded = expanded,
+            onBackToBooks = onBackToBooks,
+            onOpenPage = onOpenPage,
+            onImportAnswers = onImportAnswers,
+            onStartStudentSync = onStartStudentSync,
+            onStartTeacherSync = onStartTeacherSync,
+            onScanTeacherQr = onScanTeacherQr,
+            onStopSync = onStopSync,
+        )
+    }
+}
+
+@Composable
+private fun BookShelfContent(
+    modifier: Modifier,
+    books: List<Book>,
+    expanded: Boolean,
+    importing: Boolean,
+    summariesByBook: Map<String, List<PageProgressSummary>>,
+    onImport: () -> Unit,
+    onSelectBook: (Book) -> Unit,
+    onRename: (Book) -> Unit,
+) {
+    Column(modifier = modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column {
+                Text("문제집", color = PaperInk, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text("${books.size}권", color = PaperMutedInk, style = MaterialTheme.typography.labelMedium)
+            }
+            val importButtonShape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp)
+            Button(
+                modifier = Modifier
+                    .clip(importButtonShape)
+                    .paperSurfaceTexture(intensity = 0.42f, seed = 607, overlay = true),
+                onClick = onImport,
+                enabled = !importing,
+                shape = importButtonShape,
+                colors = ButtonDefaults.buttonColors(containerColor = PaperYellow, contentColor = PaperInk),
+            ) {
+                Text(if (importing) "가져오는 중" else "+ PDF 가져오기")
+            }
+        }
+        if (books.isEmpty()) {
+            EmptyLibraryNotice(Modifier.weight(1f))
+        } else {
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(if (expanded) 2 else 1),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                verticalArrangement = Arrangement.spacedBy(if (expanded) 12.dp else 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                contentPadding = PaddingValues(vertical = 3.dp, horizontal = 1.dp),
+            ) {
+                gridItems(books, key = { it.id }) { book ->
+                    CompactBookItem(
+                        book = book,
+                        summaries = summariesByBook[book.id].orEmpty(),
+                        expanded = expanded,
+                        onOpen = { onSelectBook(book) },
+                        onRename = { onRename(book) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+private enum class PageFilter {
+    ALL,
+    IN_PROGRESS,
+    SUBMITTED,
+    REVIEW,
+    TEACHER_MARKED,
+    NOT_SUBMITTED,
+    ;
+
+    fun labelFor(perspective: LibraryPerspective): String = when (this) {
+        ALL -> "전체"
+        IN_PROGRESS -> "풀이 중"
+        SUBMITTED -> if (perspective == LibraryPerspective.TEACHER) "채점 필요" else "제출됨"
+        REVIEW -> "채점 중"
+        TEACHER_MARKED -> "표시 있음"
+        NOT_SUBMITTED -> "미제출"
+    }
+}
+
+@Composable
+private fun BookPageContent(
+    modifier: Modifier,
+    book: Book,
+    summaries: List<PageProgressSummary>,
+    perspective: LibraryPerspective,
+    expanded: Boolean,
+    onBackToBooks: () -> Unit,
+    onOpenPage: (Book, Int, LibraryPerspective, Boolean, Int?) -> Unit,
+    onImportAnswers: (Book) -> Unit,
+    onStartStudentSync: (Book) -> Unit,
+    onStartTeacherSync: (Book) -> Unit,
+    onScanTeacherQr: (Book) -> Unit,
+    onStopSync: () -> Unit,
+) {
+    var filter by remember(book.id, perspective) { mutableStateOf(PageFilter.ALL) }
+    val progress = remember(book.id, summaries) {
+        if (summaries.size == book.pageCount) summaries else {
+            val byPage = summaries.associateBy(PageProgressSummary::pageNumber)
+            List(book.pageCount) { page -> byPage.getValue(page) }
+        }
+    }
+    val filters = if (perspective == LibraryPerspective.STUDENT) {
+        listOf(PageFilter.ALL, PageFilter.IN_PROGRESS, PageFilter.SUBMITTED, PageFilter.REVIEW)
+    } else {
+        listOf(PageFilter.ALL, PageFilter.SUBMITTED, PageFilter.TEACHER_MARKED, PageFilter.NOT_SUBMITTED)
+    }
+    val filtered = remember(progress, filter, perspective) {
+        progress.filter { summary ->
+            val displayStatus = summary.statusFor(perspective)
+            when (filter) {
+                PageFilter.ALL -> true
+                PageFilter.IN_PROGRESS -> displayStatus == PageProgressStatus.IN_PROGRESS
+                PageFilter.SUBMITTED -> displayStatus == PageProgressStatus.SUBMITTED
+                PageFilter.REVIEW -> displayStatus == PageProgressStatus.REVIEW_IN_PROGRESS
+                PageFilter.TEACHER_MARKED -> summary.pageLevelTeacherMarkCount > 0 ||
+                    displayStatus == PageProgressStatus.TEACHER_MARKED ||
+                    displayStatus == PageProgressStatus.REVIEW_IN_PROGRESS
+                PageFilter.NOT_SUBMITTED -> displayStatus == PageProgressStatus.NOT_STARTED ||
+                    displayStatus == PageProgressStatus.IN_PROGRESS
+            }
+        }
+    }
+
+    Column(modifier = modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+        LazyRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            contentPadding = PaddingValues(vertical = 1.dp),
+        ) {
+            item { OutlinedButton(onClick = onBackToBooks) { Text("‹ 교재 목록") } }
+            if (perspective == LibraryPerspective.STUDENT) {
+                item { OutlinedButton(onClick = { onStartStudentSync(book) }) { Text("학생 기기") } }
+            } else {
+                item { OutlinedButton(onClick = { onImportAnswers(book) }) { Text("정답 JSON") } }
+                item { OutlinedButton(onClick = { onStartTeacherSync(book) }) { Text("선생 폰") } }
+                item { OutlinedButton(onClick = { onScanTeacherQr(book) }) { Text("QR 연결") } }
+            }
+            item { TextButton(onClick = onStopSync) { Text("연결 종료") } }
+        }
+
+        PageProgressOverview(progress = progress, perspective = perspective, expanded = expanded)
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            filters.forEach { item ->
+                FilterPaperChip(
+                    modifier = Modifier.weight(1f),
+                    label = item.labelFor(perspective),
+                    selected = filter == item,
+                    onClick = { filter = item },
+                )
+            }
+        }
+
+        if (filtered.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("해당하는 페이지가 없어요.", color = PaperMutedInk)
+            }
+        } else {
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(4),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                verticalArrangement = Arrangement.spacedBy(if (expanded) 12.dp else 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(if (expanded) 12.dp else 8.dp),
+                contentPadding = PaddingValues(vertical = 2.dp, horizontal = 1.dp),
+            ) {
+                gridItems(filtered, key = PageProgressSummary::pageNumber) { summary ->
+                    ProgressPageItem(
+                        summary = summary,
+                        perspective = perspective,
+                        expanded = expanded,
+                        onOpen = {
+                            onOpenPage(
+                                book,
+                                summary.pageNumber,
+                                perspective,
+                                expanded,
+                                if (perspective == LibraryPerspective.TEACHER) {
+                                    if (
+                                        filter == PageFilter.TEACHER_MARKED &&
+                                        summary.pageLevelTeacherMarkCount > 0
+                                    ) {
+                                        TEACHER_PAGE_REVIEW_ATTEMPT_NO
+                                    } else {
+                                        summary.latestSubmittedAttemptNo
+                                            ?: TEACHER_PAGE_REVIEW_ATTEMPT_NO
+                                    }
+                                } else {
+                                    null
+                                },
+                            )
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PageProgressOverview(
+    progress: List<PageProgressSummary>,
+    perspective: LibraryPerspective,
+    expanded: Boolean,
+) {
+    val statuses = progress.map { it.statusFor(perspective) }
+    val started = statuses.count { it != PageProgressStatus.NOT_STARTED }
+    val submitted = statuses.count { it == PageProgressStatus.SUBMITTED }
+    val reviewing = statuses.count { it == PageProgressStatus.REVIEW_IN_PROGRESS }
+    val teacherMarked = statuses.count { it == PageProgressStatus.TEACHER_MARKED }
+    val metrics = if (perspective == LibraryPerspective.STUDENT) {
+        listOf(
+            Triple("진행", started, ProgressWorking),
+            Triple("제출", submitted + reviewing, ProgressSubmitted),
+            Triple("채점 중", reviewing, ProgressTeal),
+        )
+    } else {
+        listOf(
+            Triple("채점 필요", submitted, ProgressSubmitted),
+            Triple("표시 있음", reviewing + teacherMarked, ProgressReview),
+            Triple(
+                "미제출",
+                statuses.count { it == PageProgressStatus.NOT_STARTED || it == PageProgressStatus.IN_PROGRESS },
+                ProgressNeutral,
+            ),
+        )
+    }
+    val shape = androidx.compose.foundation.shape.RoundedCornerShape(15.dp)
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = shape,
+        color = PaperIvory.copy(alpha = 0.84f),
+        border = paperEdge(),
+        shadowElevation = 2.dp,
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .height(if (expanded) 72.dp else 64.dp)
+                .paperSurfaceTexture(
+                    intensity = 0.65f,
+                    seed = if (perspective == LibraryPerspective.STUDENT) 419 else 421,
+                )
+                .padding(horizontal = 9.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            metrics.forEach { (label, count, accent) ->
+                ReviewMetric(label, count, accent, Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReviewMetric(label: String, count: Int, accent: Color, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .fillMaxHeight()
+            .clip(androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
+            .background(accent.copy(alpha = 0.13f))
+            .padding(horizontal = 6.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            label,
+            color = PaperMutedInk,
+            style = MaterialTheme.typography.labelSmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text("$count", color = PaperInk, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun FilterPaperChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .height(48.dp)
+            .selectable(selected = selected, role = Role.RadioButton, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(34.dp),
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+            color = if (selected) PaperYellowSoft else PaperIvory.copy(alpha = 0.82f),
+            border = paperEdge(),
+            shadowElevation = if (selected) 2.dp else 0.dp,
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    label,
+                    modifier = Modifier.padding(horizontal = 6.dp),
+                    color = PaperInk,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }
@@ -625,32 +1237,100 @@ private fun Modifier.paperSurfaceTexture(
 }
 
 @Composable
-private fun StudentPaperChip(name: String, selected: Boolean, onClick: () -> Unit) {
-    Surface(
+private fun StudentPaperChip(
+    name: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    ThinSelectorChip(
+        modifier = modifier,
+        label = name,
+        selected = selected,
         onClick = onClick,
-        shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
-        color = if (selected) PaperYellowSoft else PaperIvory,
-        contentColor = PaperInk,
-        border = paperEdge(),
-        shadowElevation = if (selected) 3.dp else 1.dp,
+    )
+}
+
+@Composable
+private fun PerspectivePaperChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    ThinSelectorChip(
+        modifier = modifier,
+        label = label,
+        selected = selected,
+        onClick = onClick,
+    )
+}
+
+@Composable
+private fun ThinSelectorChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .height(48.dp)
+            .selectable(selected = selected, role = Role.RadioButton, onClick = onClick),
+        contentAlignment = Alignment.Center,
     ) {
-        Text(
-            text = name,
+        val shape = androidx.compose.foundation.shape.RoundedCornerShape(10.dp)
+        Surface(
             modifier = Modifier
-                .paperSurfaceTexture(
-                    intensity = if (selected) 0.72f else 0.88f,
-                    seed = name.hashCode(),
+                .fillMaxWidth()
+                .height(34.dp),
+            shape = shape,
+            color = if (selected) PaperYellowSoft else PaperIvory,
+            contentColor = PaperInk,
+            border = paperEdge(),
+            shadowElevation = if (selected) 2.dp else 1.dp,
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .paperSurfaceTexture(
+                        intensity = if (selected) 0.72f else 0.86f,
+                        seed = label.hashCode(),
+                    )
+                    .padding(horizontal = 5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+            ) {
+                Text(
+                    label,
+                    color = PaperInk,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
-                .padding(horizontal = 13.dp, vertical = 8.dp),
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-        )
+            }
+        }
     }
 }
 
 @Composable
-private fun CompactBookItem(book: Book, onOpen: () -> Unit, onRename: () -> Unit) {
+private fun CompactBookItem(
+    book: Book,
+    summaries: List<PageProgressSummary>,
+    expanded: Boolean,
+    onOpen: () -> Unit,
+    onRename: () -> Unit,
+) {
     val shape = androidx.compose.foundation.shape.RoundedCornerShape(13.dp)
+    val progressed = summaries.count { it.status != PageProgressStatus.NOT_STARTED }
+    val fraction = if (book.pageCount == 0) 0f else progressed.toFloat() / book.pageCount
+    val spineColor = when (book.id.hashCode().and(3)) {
+        0 -> PaperYellow
+        1 -> ProgressTeal
+        2 -> ProgressSubmitted
+        else -> ProgressReview
+    }
     Surface(
         modifier = Modifier.fillMaxWidth(),
         onClick = onOpen,
@@ -664,26 +1344,22 @@ private fun CompactBookItem(book: Book, onOpen: () -> Unit, onRename: () -> Unit
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = 58.dp)
+                .heightIn(min = if (expanded) 104.dp else 72.dp)
                 .paperSurfaceTexture(seed = book.id.hashCode())
-                .padding(start = 12.dp, end = 6.dp, top = 7.dp, bottom = 7.dp),
+                .padding(start = 0.dp, end = 5.dp, top = 8.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(11.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Box(
                 modifier = Modifier
-                    .size(width = 5.dp, height = 30.dp),
-            ) {
-                Canvas(Modifier.fillMaxSize()) {
-                    drawRoundRect(
-                        color = PaperYellow,
-                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(size.width / 2f),
-                    )
-                }
-            }
+                    .width(7.dp)
+                    .fillMaxHeight()
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(topEnd = 7.dp, bottomEnd = 7.dp))
+                    .background(spineColor),
+            )
             Column(
                 modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(1.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp),
             ) {
                 Text(
                     text = book.title,
@@ -694,43 +1370,248 @@ private fun CompactBookItem(book: Book, onOpen: () -> Unit, onRename: () -> Unit
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = "${book.pageCount}쪽",
+                    text = if (progressed == 0) {
+                        "${book.pageCount}쪽 · 아직 시작 전"
+                    } else {
+                        "${book.pageCount}쪽 · ${progressed}쪽 진행"
+                    },
                     color = PaperMutedInk,
                     style = MaterialTheme.typography.labelSmall,
                 )
+                PaperProgressBar(fraction)
             }
             TextButton(onClick = onRename) {
-                Text("이름 변경", color = PaperMutedInk, style = MaterialTheme.typography.labelMedium)
+                Text("이름", color = PaperMutedInk, style = MaterialTheme.typography.labelMedium)
             }
         }
     }
 }
 
 @Composable
-private fun CompactPageItem(page: Int, onOpen: () -> Unit) {
+private fun PaperProgressBar(fraction: Float) {
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(5.dp)
+            .clip(androidx.compose.foundation.shape.RoundedCornerShape(4.dp))
+            .background(PaperStroke.copy(alpha = 0.55f)),
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth(fraction.coerceIn(0f, 1f))
+                .fillMaxHeight()
+                .background(PaperYellow),
+        )
+    }
+}
+
+@Composable
+private fun ProgressPageItem(
+    summary: PageProgressSummary,
+    perspective: LibraryPerspective,
+    expanded: Boolean,
+    onOpen: () -> Unit,
+) {
+    val displayStatus = summary.statusFor(perspective)
+    val gradeSnapshot = summary.gradeSnapshotFor(perspective)
+    val accent = when {
+        gradeSnapshot == null -> displayStatus.accentColor
+        gradeSnapshot.pageLevel -> GradePageLevel
+        gradeSnapshot.wrongCount > 0 -> GradeWrong
+        gradeSnapshot.unansweredCount > 0 -> GradeUnanswered
+        gradeSnapshot.correctCount > 0 -> GradeCorrect
+        else -> displayStatus.accentColor
+    }
+    val resultLabel = gradeSnapshot?.conciseLabel()?.let { label ->
+        if (
+            perspective == LibraryPerspective.TEACHER &&
+            !gradeSnapshot.pageLevel &&
+            summary.pageLevelTeacherMarkCount > 0
+        ) {
+            "$label · 쪽표시 ${summary.pageLevelTeacherMarkCount}"
+        } else {
+            label
+        }
+    } ?: displayStatus.labelFor(perspective)
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .shadow(
+                elevation = 2.dp,
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(13.dp),
+                clip = false,
+            ),
         onClick = onOpen,
-        shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
-        color = PaperIvory.copy(alpha = 0.96f),
+        enabled = true,
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(13.dp),
+        color = if (
+            displayStatus == PageProgressStatus.IN_PROGRESS &&
+            perspective == LibraryPerspective.STUDENT
+        ) {
+            PaperYellowSoft.copy(alpha = 0.74f)
+        } else {
+            PaperIvory.copy(alpha = 0.94f)
+        },
         contentColor = PaperInk,
         border = paperEdge(),
         tonalElevation = 0.dp,
-        shadowElevation = 2.dp,
+        shadowElevation = 0.dp,
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = 50.dp)
-                .paperSurfaceTexture(intensity = 0.86f, seed = page + 1)
-                .padding(horizontal = 14.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
+                .heightIn(min = if (expanded) 112.dp else 90.dp)
+                .paperSurfaceTexture(intensity = 0.76f, seed = summary.pageNumber + 1),
         ) {
-            Text("${page + 1}쪽", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-            Text("열기", color = PaperMutedInk, style = MaterialTheme.typography.labelMedium)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .padding(
+                        horizontal = if (expanded) 11.dp else 7.dp,
+                        vertical = if (expanded) 11.dp else 8.dp,
+                    ),
+                verticalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    "${summary.pageNumber + 1}쪽",
+                    style = if (expanded) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        resultLabel,
+                        color = if (gradeSnapshot?.wrongCount?.let { it > 0 } == true) GradeWrong else PaperInk,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = if (gradeSnapshot != null) FontWeight.SemiBold else FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    gradeSnapshot?.let { snapshot ->
+                        PageGradeBundle(
+                            snapshot = snapshot,
+                            expanded = expanded,
+                        )
+                    }
+                }
+            }
+            Spacer(
+                Modifier
+                    .fillMaxWidth()
+                    .height(6.dp)
+                    .background(accent),
+            )
         }
     }
+}
+
+@Composable
+private fun PageGradeBundle(
+    snapshot: PageGradeSnapshot,
+    expanded: Boolean,
+) {
+    if (snapshot.cells.isEmpty()) return
+    // The approved eight-problem bundle is 4 x 2. Slightly tall cells keep its outer silhouette
+    // close to a square; the same aspect-aware rule grows naturally for any problem count.
+    val cellAspect = 1.75f
+    val grid = remember(snapshot.cells.size) { resultBundleGrid(snapshot.cells.size) }
+    val columns = grid.columns
+    val rows = grid.rows
+    val gap = if (expanded) 2.dp else 1.5.dp
+    val preferredCellWidth = if (expanded) 9.dp else 6.5.dp
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val availableForCells = (maxWidth - gap * (columns - 1)).coerceAtLeast(1.dp)
+        val cellWidth = minOf(preferredCellWidth, availableForCells / columns).coerceAtLeast(2.dp)
+        val cellHeight = cellWidth * cellAspect
+        val bundleWidth = cellWidth * columns + gap * (columns - 1)
+        val bundleHeight = cellHeight * rows + gap * (rows - 1)
+        Canvas(Modifier.width(bundleWidth).height(bundleHeight)) {
+            val cellWidthPx = cellWidth.toPx()
+            val cellHeightPx = cellHeight.toPx()
+            val gapPx = gap.toPx()
+            val radius = (cellWidthPx * 0.42f).coerceAtLeast(1f)
+            snapshot.cells.forEachIndexed { index, grade ->
+                val gridCell = grid.cells[index]
+                val topLeft = Offset(
+                    gridCell.column * (cellWidthPx + gapPx),
+                    gridCell.row * (cellHeightPx + gapPx),
+                )
+                val color = grade.color.gradeColor()
+                drawRoundRect(
+                    color = color.copy(alpha = if (grade.color == MarkColor.GRAY) 0.58f else 0.94f),
+                    topLeft = topLeft,
+                    size = androidx.compose.ui.geometry.Size(cellWidthPx, cellHeightPx),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(radius, radius),
+                )
+                drawRoundRect(
+                    color = PaperHighlight.copy(alpha = 0.30f),
+                    topLeft = Offset(topLeft.x + cellWidthPx * 0.14f, topLeft.y + cellHeightPx * 0.08f),
+                    size = androidx.compose.ui.geometry.Size(cellWidthPx * 0.52f, cellHeightPx * 0.08f),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(radius, radius),
+                )
+                grade.previousColors.takeLast(2).forEachIndexed { historyIndex, previous ->
+                    val historySize = cellWidthPx * 0.24f
+                    drawRoundRect(
+                        color = previous.gradeColor().copy(alpha = 0.34f),
+                        topLeft = Offset(
+                            topLeft.x + cellWidthPx - historySize - cellWidthPx * 0.10f -
+                                historyIndex * (historySize + cellWidthPx * 0.06f),
+                            topLeft.y + cellHeightPx - historySize - cellWidthPx * 0.10f,
+                        ),
+                        size = androidx.compose.ui.geometry.Size(historySize, historySize),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(historySize * 0.34f),
+                    )
+                }
+                if (grade.pageLevel) {
+                    drawRoundRect(
+                        color = GradePageLevel.copy(alpha = 0.92f),
+                        topLeft = topLeft,
+                        size = androidx.compose.ui.geometry.Size(cellWidthPx, cellHeightPx),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(radius, radius),
+                        style = Stroke(width = (cellWidthPx * 0.12f).coerceAtLeast(1f)),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun PageGradeSnapshot.conciseLabel(): String = when {
+    pageLevel -> "쪽 표시 ${cells.size}"
+    wrongCount > 0 -> "오답 $wrongCount"
+    unansweredCount == 0 && correctCount > 0 -> "전부 정답"
+    correctCount + wrongCount > 0 -> "미채점 $unansweredCount"
+    else -> "아직 미채점"
+}
+
+private fun MarkColor.gradeColor(): Color = when (this) {
+    MarkColor.BLUE -> GradeCorrect
+    MarkColor.RED -> GradeWrong
+    MarkColor.GRAY -> GradeUnanswered
+}
+
+private val LibraryPerspective.label: String
+    get() = when (this) {
+        LibraryPerspective.STUDENT -> "학생 화면"
+        LibraryPerspective.TEACHER -> "선생님 검토"
+    }
+
+private val PageProgressStatus.accentColor: Color
+    get() = when (this) {
+        PageProgressStatus.NOT_STARTED -> ProgressNeutral
+        PageProgressStatus.IN_PROGRESS -> ProgressWorking
+        PageProgressStatus.SUBMITTED -> ProgressSubmitted
+        PageProgressStatus.REVIEW_IN_PROGRESS -> ProgressReview
+        PageProgressStatus.TEACHER_MARKED -> ProgressReview
+    }
+
+private fun PageProgressStatus.labelFor(perspective: LibraryPerspective): String = when (this) {
+    PageProgressStatus.NOT_STARTED -> if (perspective == LibraryPerspective.TEACHER) "미제출" else "미시작"
+    PageProgressStatus.IN_PROGRESS -> "풀이 중"
+    PageProgressStatus.SUBMITTED -> if (perspective == LibraryPerspective.TEACHER) "채점 필요" else "제출됨"
+    PageProgressStatus.REVIEW_IN_PROGRESS -> if (perspective == LibraryPerspective.TEACHER) "표시 있음" else "채점 중"
+    PageProgressStatus.TEACHER_MARKED -> "표시 있음"
 }
 
 @Composable
@@ -771,6 +1652,149 @@ private fun paperEdge() = BorderStroke(
     brush = Brush.verticalGradient(
         colors = listOf(PaperHighlight.copy(alpha = 0.92f), PaperStroke.copy(alpha = 0.86f)),
     ),
+)
+
+private object LibraryPreviewFixtures {
+    val students = listOf(
+        Student(id = "student-1", displayName = "학생 1", createdAtEpochMillis = 1L),
+        Student(id = "student-2", displayName = "학생 2", createdAtEpochMillis = 2L),
+    )
+    val books = listOf(
+        Book(
+            id = "book-math",
+            studentId = students[0].id,
+            title = "초등 수학 5-2 · 분수와 소수",
+            pageCount = 32,
+            pdfRelativePath = "preview/math.pdf",
+            createdAtEpochMillis = 3L,
+        ),
+        Book(
+            id = "book-reading",
+            studentId = students[0].id,
+            title = "영어 독해 · 문장 구조와 어휘 연습",
+            pageCount = 24,
+            pdfRelativePath = "preview/reading.pdf",
+            createdAtEpochMillis = 4L,
+        ),
+    )
+    val state = LibraryState(students = students, selectedStudentId = students[0].id, books = books)
+
+    fun progress(book: Book): List<PageProgressSummary> = List(book.pageCount) { page ->
+        val attemptStatuses = when {
+            page % 11 == 5 -> listOf(AttemptProgressStatus.SUBMITTED, AttemptProgressStatus.IN_PROGRESS)
+            page % 7 == 3 -> listOf(AttemptProgressStatus.REVIEW_IN_PROGRESS)
+            page % 5 == 2 -> listOf(AttemptProgressStatus.SUBMITTED)
+            page < 9 -> listOf(AttemptProgressStatus.IN_PROGRESS)
+            else -> emptyList()
+        }
+        val attempts = attemptStatuses.mapIndexed { index, status ->
+            AttemptProgressSummary(
+                attemptNo = index + 1,
+                status = status,
+                markCount = if (status == AttemptProgressStatus.REVIEW_IN_PROGRESS) 2 else 0,
+                startedAtEpochMillis = 1_000L + page * 100L + index,
+                submittedAtEpochMillis = if (status == AttemptProgressStatus.IN_PROGRESS) null else 2_000L + page,
+                latestMarkAtEpochMillis = if (status == AttemptProgressStatus.REVIEW_IN_PROGRESS) 3_000L + page else null,
+            )
+        }
+        val latest = attempts.lastOrNull()
+        val pageLevelTeacherMarkCount = if (attempts.isEmpty() && page % 9 == 8) 2 else 0
+        val previewProblemCount = when {
+            attempts.isNotEmpty() -> 5 + page % 7
+            pageLevelTeacherMarkCount > 0 -> pageLevelTeacherMarkCount
+            else -> 0
+        }
+        val problemGrades = List(previewProblemCount) { problem ->
+            val attemptNo = latest?.attemptNo ?: TEACHER_PAGE_REVIEW_ATTEMPT_NO
+            ProblemGradeSummary(
+                groupId = "preview-$page-$problem",
+                pageLevel = attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO,
+                history = listOf(
+                    AttemptGradeSummary(
+                        attemptNo = attemptNo,
+                        color = when {
+                            problem % 5 == 2 -> MarkColor.RED
+                            problem % 7 == 4 -> MarkColor.GRAY
+                            else -> MarkColor.BLUE
+                        },
+                        gradedAtEpochMillis = 3_000L + page * 100L + problem,
+                    ),
+                ),
+            )
+        }
+        PageProgressSummary(
+            pageNumber = page,
+            status = when (latest?.status) {
+                null -> PageProgressStatus.NOT_STARTED
+                AttemptProgressStatus.IN_PROGRESS -> PageProgressStatus.IN_PROGRESS
+                AttemptProgressStatus.SUBMITTED -> PageProgressStatus.SUBMITTED
+                AttemptProgressStatus.REVIEW_IN_PROGRESS -> PageProgressStatus.REVIEW_IN_PROGRESS
+            },
+            attempts = attempts,
+            latestAttemptNo = latest?.attemptNo,
+            attemptCount = attempts.size,
+            submittedAttemptCount = attempts.count { it.status != AttemptProgressStatus.IN_PROGRESS },
+            markCount = attempts.sumOf(AttemptProgressSummary::markCount),
+            pageLevelTeacherMarkCount = pageLevelTeacherMarkCount,
+            latestActivityAtEpochMillis = latest?.latestMarkAtEpochMillis ?: latest?.submittedAtEpochMillis
+                ?: latest?.startedAtEpochMillis ?: if (pageLevelTeacherMarkCount > 0) 4_000L + page else null,
+            problemGrades = problemGrades,
+        )
+    }
+}
+
+@Composable
+private fun LibraryDevicePreview(
+    selectedBook: Book?,
+    perspective: LibraryPerspective,
+) {
+    MaterialTheme {
+        LibraryScreen(
+            state = LibraryPreviewFixtures.state,
+            selectedBook = selectedBook,
+            perspective = perspective,
+            progressRevision = 0,
+            importing = false,
+            progressForBook = { bookId ->
+                LibraryPreviewFixtures.books.firstOrNull { it.id == bookId }
+                    ?.let(LibraryPreviewFixtures::progress)
+                    .orEmpty()
+            },
+            onSelectStudent = {},
+            onSelectPerspective = {},
+            onImport = {},
+            onSelectBook = {},
+            onBackToBooks = {},
+            onOpenPage = { _, _, _, _, _ -> },
+            onRename = {},
+            onImportAnswers = {},
+            onStartStudentSync = {},
+            onStartTeacherSync = {},
+            onScanTeacherQr = {},
+            onStopSync = {},
+        )
+    }
+}
+
+@Preview(name = "Galaxy S23 Ultra · 책장", widthDp = 412, heightDp = 884, showBackground = true)
+@Composable
+private fun GalaxyS23UltraShelfPreview() = LibraryDevicePreview(
+    selectedBook = null,
+    perspective = LibraryPerspective.STUDENT,
+)
+
+@Preview(name = "Galaxy S23 Ultra · 학생 페이지", widthDp = 412, heightDp = 884, showBackground = true)
+@Composable
+private fun GalaxyS23UltraStudentPagesPreview() = LibraryDevicePreview(
+    selectedBook = LibraryPreviewFixtures.books.first(),
+    perspective = LibraryPerspective.STUDENT,
+)
+
+@Preview(name = "Galaxy Tab S11 · 선생님 검토", widthDp = 800, heightDp = 1280, showBackground = true)
+@Composable
+private fun GalaxyTabS11TeacherPagesPreview() = LibraryDevicePreview(
+    selectedBook = LibraryPreviewFixtures.books.first(),
+    perspective = LibraryPerspective.TEACHER,
 )
 
 @Composable

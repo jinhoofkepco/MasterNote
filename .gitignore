@@ -1,7 +1,9 @@
 *.iml
 .gradle/
+/.kotlin/
 local.properties
 .idea/
 **/build/
 captures/
+/masternote-*.png
 .DS_Store

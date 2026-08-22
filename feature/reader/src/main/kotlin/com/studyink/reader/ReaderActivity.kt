@@ -32,6 +32,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.studyink.core.model.MarkColor
 import com.studyink.core.model.PagePoint
+import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.document.pdf.PdfViewportAdapter
 import com.studyink.document.pdf.ReaderPdfFragment
 import com.studyink.library.data.LibraryRepository
@@ -55,38 +56,62 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var selectedPenOpacity by mutableStateOf(1f)
     private var latestState by mutableStateOf(ReaderUiState())
     private var initialPage = 0
+    private var initialAttemptNo: Int? = null
+    private var workflow = ReaderWorkflow.STUDY
     private var role by mutableStateOf(ReaderRole.STUDENT)
     private var stylusMenuExpanded by mutableStateOf(false)
     private var topMenuExpanded by mutableStateOf(false)
     private var pinDialogVisible by mutableStateOf(false)
     private var selectedMarkGroupId by mutableStateOf<String?>(null)
-    private var movingMarkGroupId: String? = null
+    private var selectedMarkTarget: ReaderAnnotationTarget? = null
+    private var pendingMarkMove: PendingMarkMove? = null
     private var requestedTeacherRole: ReaderRole? = null
+    private var requestedTeacherWorkflow: ReaderWorkflow? = null
+    private var exitOnPinCancel = false
     private var stylusButtonPressed = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         bookId = intent.getStringExtra(EXTRA_BOOK_ID) ?: run { finish(); return }
         initialPage = intent.getIntExtra(EXTRA_PAGE_NUMBER, 0)
+        initialAttemptNo = if (intent.hasExtra(EXTRA_ATTEMPT_NUMBER)) {
+            intent.getIntExtra(EXTRA_ATTEMPT_NUMBER, 1).takeIf { it >= TEACHER_PAGE_REVIEW_ATTEMPT_NO }
+        } else {
+            null
+        }
         teacherAccess = TeacherAccessController(this)
         val requestedRole = intent.getStringExtra(EXTRA_ROLE)
             ?.let { runCatching { ReaderRole.valueOf(it) }.getOrNull() }
             ?: ReaderRole.STUDENT
+        workflow = intent.getStringExtra(EXTRA_WORKFLOW)
+            ?.let { runCatching { ReaderWorkflow.valueOf(it) }.getOrNull() }
+            ?: ReaderWorkflow.defaultFor(requestedRole)
+        if (requestedRole == ReaderRole.STUDENT) workflow = ReaderWorkflow.STUDY
         if (requestedRole != ReaderRole.STUDENT && !teacherAccess.isSessionAuthenticated()) {
             role = ReaderRole.STUDENT
             requestedTeacherRole = requestedRole
+            requestedTeacherWorkflow = workflow
+            exitOnPinCancel = true
             pinDialogVisible = true
         } else {
+            exitOnPinCancel = false
             role = requestedRole
         }
 
-        val readerBackgroundColor = Color.rgb(225, 226, 231)
-        val root = FrameLayout(this).apply { setBackgroundColor(readerBackgroundColor) }
+        val readerBackgroundColor = ReaderPaperBackdropDrawable.NAVIGATION_BAR_COLOR
+        val root = FrameLayout(this).apply {
+            background = ReaderPaperBackdropDrawable(resources.displayMetrics.density)
+        }
         setContentView(root)
         @Suppress("DEPRECATION")
         window.navigationBarColor = readerBackgroundColor
+        @Suppress("DEPRECATION")
+        window.statusBarColor = readerBackgroundColor
         window.isNavigationBarContrastEnforced = false
-        WindowCompat.getInsetsController(window, root).isAppearanceLightNavigationBars = true
+        WindowCompat.getInsetsController(window, root).apply {
+            isAppearanceLightNavigationBars = true
+            isAppearanceLightStatusBars = true
+        }
         val fragmentContainer = FragmentContainerView(this).apply { id = PDF_CONTAINER_ID }
         root.addView(fragmentContainer, FrameLayout.LayoutParams(MATCH, MATCH))
 
@@ -156,13 +181,21 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 viewModel.uiState.collect { state ->
                     latestState = state
+                    if (selectedMarkGroupId != null && selectedMarkTarget?.matches(state) != true) {
+                        clearMarkSelection()
+                    }
+                    if (pendingMarkMove?.target?.matches(state) == false) {
+                        pendingMarkMove = null
+                    }
                     dryInkView.snapshot = state.snapshot
                     dryInkView.activePage = state.pageNumber
                     dryInkView.visibleAttemptNo = state.attemptNo
                     dryInkView.showTeacherDrafts = state.role != ReaderRole.STUDENT
                     dryInkView.markGroups = state.marks
                     if (!state.capabilities.canGrade && selectedTool == ReaderTool.GRADE) selectTool(ReaderTool.PEN)
-                    inputView.isEnabled = state.capabilities.canWrite && state.storageAvailable
+                    inputView.isEnabled = state.documentReady &&
+                        state.capabilities.canWrite &&
+                        state.storageAvailable
                     ReaderDebugSessionStore.save(this@ReaderActivity, state)
                 }
             }
@@ -175,6 +208,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     override fun onPdfViewReady(view: androidx.pdf.view.PdfView) {
+        // The PDF pages remain fully opaque; only the unused viewport around them reveals paper.
+        view.setBackgroundColor(Color.TRANSPARENT)
         viewport.attach(view)
         dryInkView.invalidate()
     }
@@ -183,7 +218,19 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         viewport.setPageWidths(pageWidths)
         val target = initialPage.coerceIn(0, (pageCount - 1).coerceAtLeast(0))
         viewport.showPage(target)
-        viewModel.openBook(bookId, target, role, confirmedPageCount = pageCount)
+        val targetAttempt = if (workflow == ReaderWorkflow.REVIEW && role != ReaderRole.STUDENT) {
+            reviewableAttemptForPage(target, initialAttemptNo)
+        } else {
+            initialAttemptNo.takeUnless { role == ReaderRole.STUDENT }
+        }
+        viewModel.openBook(
+            bookId = bookId,
+            pageNumber = target,
+            role = role,
+            selectedAttemptNo = targetAttempt,
+            confirmedPageCount = pageCount,
+            workflow = if (role == ReaderRole.STUDENT) ReaderWorkflow.STUDY else workflow,
+        )
     }
 
     override fun onDocumentError(error: Throwable) {
@@ -196,7 +243,18 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         val target = pageNumber.coerceIn(0, state.pageCount - 1)
         dryInkView.activePage = target
         viewport.showPage(target)
-        viewModel.openBook(bookId, target, role, attemptNo)
+        val targetAttempt = attemptNo ?: if (workflow == ReaderWorkflow.REVIEW && role != ReaderRole.STUDENT) {
+            reviewableAttemptForPage(target)
+        } else {
+            null
+        }
+        viewModel.openBook(
+            bookId = bookId,
+            pageNumber = target,
+            role = role,
+            selectedAttemptNo = targetAttempt,
+            workflow = if (role == ReaderRole.STUDENT) ReaderWorkflow.STUDY else workflow,
+        )
     }
 
     private fun submitCurrentPage() {
@@ -208,24 +266,44 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private fun toggleTeacherMode() {
         if (role != ReaderRole.STUDENT) {
             role = ReaderRole.STUDENT
+            workflow = ReaderWorkflow.STUDY
             TeacherAccessController.invalidateSession()
             showPage(latestState.pageNumber)
             return
         }
         if (teacherAccess.isSessionAuthenticated()) {
             role = ReaderRole.TEACHER_TABLET
-            showPage(latestState.pageNumber, latestAttemptForPage())
+            workflow = ReaderWorkflow.defaultFor(role)
+            showPage(latestState.pageNumber)
         } else {
             requestedTeacherRole = ReaderRole.TEACHER_TABLET
+            requestedTeacherWorkflow = ReaderWorkflow.defaultFor(ReaderRole.TEACHER_TABLET)
+            exitOnPinCancel = false
             pinDialogVisible = true
         }
     }
 
-    private fun latestAttemptForPage(): Int? = LibraryRepository.get(this)
-        .attempts(bookId, latestState.pageNumber).maxOfOrNull { it.attemptNo }
+    private fun reviewableAttemptForPage(
+        pageNumber: Int = latestState.pageNumber,
+        preferred: Int? = null,
+    ): Int {
+        val attempts = LibraryRepository.get(this).attempts(bookId, pageNumber)
+        return preferred?.takeIf { candidate ->
+            candidate == TEACHER_PAGE_REVIEW_ATTEMPT_NO ||
+                attempts.any { it.attemptNo == candidate && it.locked }
+        } ?: attempts.lastOrNull { it.locked }?.attemptNo
+            ?: TEACHER_PAGE_REVIEW_ATTEMPT_NO
+    }
 
     private fun changeAttempt(delta: Int) {
-        val attempts = LibraryRepository.get(this).attempts(bookId, latestState.pageNumber).map { it.attemptNo }
+        val storedAttempts = LibraryRepository.get(this).attempts(bookId, latestState.pageNumber)
+            .filter { workflow != ReaderWorkflow.REVIEW || it.locked }
+            .map { it.attemptNo }
+        val attempts = if (workflow == ReaderWorkflow.REVIEW && role != ReaderRole.STUDENT) {
+            listOf(TEACHER_PAGE_REVIEW_ATTEMPT_NO) + storedAttempts
+        } else {
+            storedAttempts
+        }
         if (attempts.isEmpty()) return
         val index = attempts.indexOf(latestState.attemptNo)
         if (index < 0) {
@@ -238,9 +316,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun handleGradeTap(page: Int, point: PagePoint, tapCount: Int, viewX: Float, viewY: Float) {
         if (!latestState.capabilities.canGrade || selectedTool != ReaderTool.GRADE || page != latestState.pageNumber) return
-        movingMarkGroupId?.let { groupId ->
-            viewModel.moveMarkGroup(groupId, point)
-            movingMarkGroupId = null
+        pendingMarkMove?.let { move ->
+            pendingMarkMove = null
+            if (!move.canApply(latestState) || page != move.target.pageNumber) return
+            viewModel.moveMarkGroup(move, point)
             return
         }
         viewModel.addGrade(
@@ -253,6 +332,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private fun handleGradeLongPress(page: Int, point: PagePoint, viewX: Float, viewY: Float) {
         if (!latestState.capabilities.canGrade || selectedTool != ReaderTool.GRADE || page != latestState.pageNumber) return
         selectedMarkGroupId = dryInkView.markGroupAt(viewX, viewY)
+        selectedMarkTarget = selectedMarkGroupId?.let { latestState.annotationTarget() }
         dryInkView.pressedMarkGroupId = selectedMarkGroupId
     }
 
@@ -291,7 +371,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 onToggleExpanded = { topMenuExpanded = !topMenuExpanded },
                 onPrevious = { showPage(latestState.pageNumber - 1) },
                 onNext = { showPage(latestState.pageNumber + 1) },
-                onExitToLibrary = { finish() },
+                onExitToLibrary =(::returnToBookOverview),
                 onSubmit =(::submitCurrentPage),
                 onPreviousAttempt = { changeAttempt(-1) },
                 onNextAttempt = { changeAttempt(1) },
@@ -301,7 +381,13 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             if (pinDialogVisible) {
                 TeacherPinDialog(
                     setup = !teacherAccess.hasPin,
-                    onCancel = { pinDialogVisible = false; requestedTeacherRole = null },
+                    onCancel = {
+                        pinDialogVisible = false
+                        requestedTeacherRole = null
+                        requestedTeacherWorkflow = null
+                        if (exitOnPinCancel) finish()
+                        exitOnPinCancel = false
+                    },
                     onConfirm = { pin, remember ->
                         val valid = if (!teacherAccess.hasPin) {
                             teacherAccess.setPin(pin) && teacherAccess.verify(pin, remember)
@@ -309,8 +395,16 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                         if (valid) {
                             pinDialogVisible = false
                             role = requestedTeacherRole ?: ReaderRole.TEACHER_TABLET
+                            workflow = requestedTeacherWorkflow ?: ReaderWorkflow.defaultFor(role)
                             requestedTeacherRole = null
-                            showPage(latestState.pageNumber, latestAttemptForPage())
+                            requestedTeacherWorkflow = null
+                            val targetAttempt = if (workflow == ReaderWorkflow.REVIEW) {
+                                reviewableAttemptForPage(preferred = initialAttemptNo)
+                            } else {
+                                initialAttemptNo
+                            }
+                            showPage(latestState.pageNumber, targetAttempt)
+                            exitOnPinCancel = false
                         }
                         valid
                     },
@@ -318,10 +412,30 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             }
             selectedMarkGroupId?.let { groupId ->
                 MarkEditDialog(
-                    onBlue = { viewModel.changeGrade(groupId, MarkColor.BLUE); clearMarkSelection() },
-                    onRed = { viewModel.changeGrade(groupId, MarkColor.RED); clearMarkSelection() },
-                    onMove = { movingMarkGroupId = groupId; clearMarkSelection() },
-                    onHide = { viewModel.hideMarkGroup(groupId); clearMarkSelection() },
+                    onBlue = {
+                        if (selectedMarkTarget?.matches(latestState) == true && latestState.documentReady) {
+                            viewModel.changeGrade(groupId, MarkColor.BLUE)
+                        }
+                        clearMarkSelection()
+                    },
+                    onRed = {
+                        if (selectedMarkTarget?.matches(latestState) == true && latestState.documentReady) {
+                            viewModel.changeGrade(groupId, MarkColor.RED)
+                        }
+                        clearMarkSelection()
+                    },
+                    onMove = {
+                        pendingMarkMove = selectedMarkTarget
+                            ?.takeIf { target -> target.matches(latestState) }
+                            ?.let { target -> PendingMarkMove(groupId, target) }
+                        clearMarkSelection()
+                    },
+                    onHide = {
+                        if (selectedMarkTarget?.matches(latestState) == true && latestState.documentReady) {
+                            viewModel.hideMarkGroup(groupId)
+                        }
+                        clearMarkSelection()
+                    },
                     onCancel =(::clearMarkSelection),
                 )
             }
@@ -415,7 +529,26 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun clearMarkSelection() {
         selectedMarkGroupId = null
+        selectedMarkTarget = null
         dryInkView.pressedMarkGroupId = null
+    }
+
+    /**
+     * Return to this book's page overview even when Reader was restored directly from a debug
+     * session or launched without an existing LibraryActivity underneath it.
+     */
+    private fun returnToBookOverview() {
+        val libraryIntent = packageManager.getLaunchIntentForPackage(packageName)
+        if (libraryIntent == null) {
+            finish()
+            return
+        }
+        libraryIntent
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            .putExtra(EXTRA_RETURN_LIBRARY_BOOK_ID, bookId)
+            .putExtra(EXTRA_RETURN_LIBRARY_TEACHER_VIEW, latestState.role != ReaderRole.STUDENT)
+        startActivity(libraryIntent)
+        finish()
     }
 
     companion object {
@@ -425,12 +558,25 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         private const val EXTRA_BOOK_ID = "bookId"
         private const val EXTRA_PAGE_NUMBER = "pageNumber"
+        private const val EXTRA_ATTEMPT_NUMBER = "attemptNumber"
         private const val EXTRA_ROLE = "role"
+        private const val EXTRA_WORKFLOW = "workflow"
+        const val EXTRA_RETURN_LIBRARY_BOOK_ID = "reader.returnLibraryBookId"
+        const val EXTRA_RETURN_LIBRARY_TEACHER_VIEW = "reader.returnLibraryTeacherView"
 
-        fun intent(context: Context, bookId: String, pageNumber: Int, role: ReaderRole = ReaderRole.STUDENT) =
+        fun intent(
+            context: Context,
+            bookId: String,
+            pageNumber: Int,
+            role: ReaderRole = ReaderRole.STUDENT,
+            attemptNo: Int? = null,
+            workflow: ReaderWorkflow = ReaderWorkflow.defaultFor(role),
+        ) =
             Intent(context, ReaderActivity::class.java)
                 .putExtra(EXTRA_BOOK_ID, bookId)
                 .putExtra(EXTRA_PAGE_NUMBER, pageNumber)
                 .putExtra(EXTRA_ROLE, role.name)
+                .putExtra(EXTRA_WORKFLOW, workflow.name)
+                .apply { attemptNo?.let { putExtra(EXTRA_ATTEMPT_NUMBER, it) } }
     }
 }

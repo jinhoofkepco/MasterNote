@@ -18,4 +18,5 @@ kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarg
 
 dependencies {
     api(project(":core:model"))
+    testImplementation("junit:junit:4.13.2")
 }

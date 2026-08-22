@@ -54,6 +54,8 @@ object LanSyncBus {
         fun onLocalOperation(bookId: String, pageNumber: Int) {}
         fun onPageChanged(bookId: String, pageNumber: Int, revision: Long) {}
         fun onRemoteOperation(bookId: String, pageNumber: Int) {}
+        fun onRemoteMarkGroup(bookId: String, pageNumber: Int) {}
+        fun onRemoteAttempt(bookId: String, pageNumber: Int) {}
         fun onRemotePageChanged(bookId: String, pageNumber: Int) {}
         fun onPairingReady(bookId: String, pairingUri: String) {}
         fun onSessionIssue(message: String) {}
@@ -71,6 +73,12 @@ object LanSyncBus {
     }
     @Synchronized internal fun remoteOperation(bookId: String, pageNumber: Int) = listeners.toList().forEach {
         it.onRemoteOperation(bookId, pageNumber)
+    }
+    @Synchronized internal fun remoteMarkGroup(bookId: String, pageNumber: Int) = listeners.toList().forEach {
+        it.onRemoteMarkGroup(bookId, pageNumber)
+    }
+    @Synchronized internal fun remoteAttempt(bookId: String, pageNumber: Int) = listeners.toList().forEach {
+        it.onRemoteAttempt(bookId, pageNumber)
     }
     @Synchronized internal fun remotePageChanged(bookId: String, pageNumber: Int) = listeners.toList().forEach {
         it.onRemotePageChanged(bookId, pageNumber)

@@ -8,6 +8,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -44,7 +45,9 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
@@ -69,10 +72,15 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.window.Popup
-import androidx.compose.ui.window.PopupProperties
+import com.studyink.core.model.MarkColor
+import com.studyink.core.model.Mark
+import com.studyink.core.model.MarkGroup
+import com.studyink.core.model.PagePoint
+import com.studyink.core.model.ResultBundleGrid
+import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
+import com.studyink.core.model.resultBundleGrid
 import java.security.MessageDigest
+import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -664,11 +672,15 @@ fun ReaderTopChrome(
     onPublish: () -> Unit,
     onDismissDataError: () -> Unit,
     previewHoveredDescription: String? = null,
+    /**
+     * Optional compact, one-line page/attempt history. The caller owns its data and gestures so
+     * this chrome never needs to open a second row or popup. When absent, the production summary
+     * is derived directly from [ReaderUiState.marks].
+     */
+    markHistoryContent: (@Composable () -> Unit)? = null,
 ) {
     MaterialTheme {
         val tokens = readerChromeTokens(state.role)
-        val attemptPopupOffset = with(LocalDensity.current) { tokens.popupVerticalOffset.roundToPx() }
-        var attemptPickerExpanded by remember(state.pageNumber, state.role) { mutableStateOf(false) }
         Box(
             Modifier.fillMaxSize().padding(
                 horizontal = tokens.chromeHorizontalPadding,
@@ -724,109 +736,75 @@ fun ReaderTopChrome(
                         ),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        // Give the expanded chrome an exact lane between the two navigation hit
-                        // targets. Fixed offsets avoid Row's compact-width child compression from
-                        // borrowing the space reserved for either page arrow.
-                            ReaderContextButton(
-                                title = state.bookTitle.ifBlank { "책장" },
-                                compact = compact,
-                                role = state.role,
-                                forceHovered = previewHoveredDescription == "책장으로 나가기",
-                                onAction = onExitToLibrary,
-                                modifier = if (compact) {
-                                    Modifier.width(tokens.minimumTouchSize)
-                                } else {
-                                    Modifier
-                                        .weight(1f)
-                                        .widthIn(max = tokens.expandedContextMaxWidth)
-                                },
-                            )
-                            Box(
-                                modifier = Modifier.widthIn(
+                        // The title is the only route back to this book's page overview. Keeping
+                        // it in the same lane on phone and tablet removes the old book-icon-only
+                        // compact variant and guarantees that expanded chrome is always one row.
+                        ReaderTitleButton(
+                            title = state.bookTitle.ifBlank { "교재 페이지" },
+                            compact = compact,
+                            role = state.role,
+                            forceHovered = previewHoveredDescription == "교재 페이지로 돌아가기",
+                            onAction = onExitToLibrary,
+                            modifier = Modifier
+                                .weight(1f)
+                                .widthIn(max = tokens.expandedContextMaxWidth),
+                        )
+                        Box(
+                            modifier = Modifier
+                                .widthIn(
                                     max = if (compact) {
                                         tokens.compactStatusMaxWidth
                                     } else {
                                         tokens.expandedStatusMaxWidth
                                     },
-                                ),
-                                contentAlignment = Alignment.TopCenter,
-                            ) {
-                                ReaderStatus(
+                                )
+                                .height(tokens.minimumTouchSize),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (markHistoryContent != null) {
+                                markHistoryContent()
+                            } else {
+                                ReaderAttemptMarkHistory(
                                     state = state,
-                                    compact = compact,
-                                    role = state.role,
-                                    onAction = {
-                                        if (state.capabilities.canBrowseAttempts) attemptPickerExpanded = true
-                                    },
-                                )
-                                if (attemptPickerExpanded) {
-                                    Popup(
-                                        alignment = Alignment.TopCenter,
-                                        offset = IntOffset(0, attemptPopupOffset),
-                                        onDismissRequest = { attemptPickerExpanded = false },
-                                        properties = PopupProperties(focusable = true),
-                                    ) {
-                                        Surface(
-                                            shape = RoundedCornerShape(tokens.cornerRadius),
-                                            color = tokens.buttonBackground,
-                                            shadowElevation = tokens.hoveredElevation,
-                                        ) {
-                                            Row(
-                                                modifier = Modifier.padding(tokens.popupContentPadding),
-                                                horizontalArrangement = Arrangement.spacedBy(tokens.popupItemGap),
-                                                verticalAlignment = Alignment.CenterVertically,
-                                            ) {
-                                                IconPenButton(
-                                                    description = "이전 풀이",
-                                                    iconRes = R.drawable.ic_page_prev,
-                                                    onAction = onPreviousAttempt,
-                                                    role = state.role,
-                                                    visualSize = tokens.actionButtonSize,
-                                                )
-                                                StatusChip(text = "${state.attemptNo}회", role = state.role)
-                                                IconPenButton(
-                                                    description = "다음 풀이",
-                                                    iconRes = R.drawable.ic_page_next,
-                                                    onAction = onNextAttempt,
-                                                    role = state.role,
-                                                    visualSize = tokens.actionButtonSize,
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(tokens.itemGap),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                if (state.capabilities.canSubmit) {
-                                    PrimaryPenButton(
-                                        text = "제출",
-                                        description = "현재 페이지 제출",
-                                        iconRes = R.drawable.ic_submit,
-                                        onAction = onSubmit,
-                                        role = state.role,
-                                    )
-                                }
-                                if (state.capabilities.canPublishTeacherInk) {
-                                    PrimaryPenButton(
-                                        text = "발행",
-                                        description = "첨삭 발행",
-                                        iconRes = R.drawable.ic_publish,
-                                        onAction = onPublish,
-                                        role = state.role,
-                                    )
-                                }
-                                IconPenButton(
-                                    description = "상단 메뉴 닫기",
-                                    iconRes = R.drawable.ic_menu_close,
-                                    onAction = onToggleExpanded,
-                                    visualSize = tokens.menuOpenButtonSize,
-                                    role = state.role,
-                                    style = PenButtonSurfaceStyle.GHOST,
+                                    maxVisibleBundles = if (compact) 1 else 3,
+                                    onPreviousAttempt = onPreviousAttempt,
+                                    onNextAttempt = onNextAttempt,
                                 )
                             }
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(tokens.itemGap),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            if (state.capabilities.canSubmit) {
+                                PrimaryPenButton(
+                                    text = "제출",
+                                    description = "현재 페이지 제출",
+                                    iconRes = R.drawable.ic_submit,
+                                    onAction = onSubmit,
+                                    role = state.role,
+                                    enabled = state.canSubmitNow,
+                                )
+                            }
+                            if (state.capabilities.canPublishTeacherInk) {
+                                PrimaryPenButton(
+                                    text = "발행",
+                                    description = "첨삭 발행",
+                                    iconRes = R.drawable.ic_publish,
+                                    onAction = onPublish,
+                                    role = state.role,
+                                    enabled = state.canPublishTeacherInkNow,
+                                )
+                            }
+                            IconPenButton(
+                                description = "상단 메뉴 닫기",
+                                iconRes = R.drawable.ic_menu_close,
+                                onAction = onToggleExpanded,
+                                visualSize = tokens.menuOpenButtonSize,
+                                role = state.role,
+                                style = PenButtonSurfaceStyle.GHOST,
+                            )
+                        }
                     }
                 }
             }
@@ -851,7 +829,7 @@ fun ReaderTopChrome(
 }
 
 @Composable
-private fun ReaderContextButton(
+private fun ReaderTitleButton(
     title: String,
     compact: Boolean,
     role: ReaderRole,
@@ -860,49 +838,267 @@ private fun ReaderContextButton(
     modifier: Modifier = Modifier,
 ) {
     val tokens = readerChromeTokens(role)
-    Row(
+    PenInteractionTarget(
+        description = "교재 페이지로 돌아가기",
+        onAction = onAction,
         modifier = modifier.height(tokens.minimumTouchSize),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(tokens.itemGap),
-    ) {
-        IconPenButton(
-            description = "책장으로 나가기",
-            iconRes = R.drawable.ic_back_shelf,
-            onAction = onAction,
+        forceHoveredForPreview = forceHovered,
+    ) { hovered, pressed ->
+        AnimatedPenSurface(
+            hovered = hovered,
+            pressed = pressed,
+            enabled = true,
+            selected = false,
             role = role,
-            visualSize = tokens.generalButtonSize,
-            forceHoveredForPreview = forceHovered,
-        )
-        if (!compact) {
+            visualWidth = null,
+            visualHeight = tokens.generalButtonSize,
+            shape = RoundedCornerShape(tokens.cornerRadius),
+            style = PenButtonSurfaceStyle.DEFAULT,
+            modifier = Modifier.fillMaxWidth(),
+            textureSeed = title.hashCode(),
+        ) {
             Text(
                 text = title,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.padding(horizontal = tokens.primaryHorizontalPadding),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.titleSmall,
+                style = if (compact) {
+                    MaterialTheme.typography.labelMedium
+                } else {
+                    MaterialTheme.typography.titleSmall
+                },
                 color = tokens.buttonForeground,
             )
         }
     }
 }
 
-@Composable
-private fun ReaderStatus(state: ReaderUiState, compact: Boolean, role: ReaderRole, onAction: () -> Unit) {
-    val location = if (state.capabilities.showsStudentLocation) {
-        state.studentPageNumber?.let { "학생 ${it + 1}쪽" } ?: "학생 대기"
+internal data class ReaderAttemptMarkBundle(
+    val attemptNo: Int,
+    val colors: List<MarkColor>,
+)
+
+/**
+ * Packs problem results into one compact, slightly-wide bundle. Eight results intentionally form
+ * the approved 4 x 2 shape. Larger pages add both columns and rows instead of becoming a long
+ * strip; unusually large bundles are scaled into the fixed top-chrome lane by the renderer.
+ */
+internal fun readerAttemptSummaryGrid(problemCount: Int): ResultBundleGrid =
+    resultBundleGrid(problemCount)
+
+/**
+ * Projects one page into one color bundle per attempt. Problem order follows paper position so the
+ * same cell always refers to the same visible mark group: top-to-bottom, then left-to-right.
+ * Teacher page-level marks (attempt 0) never share a bundle with student attempt history.
+ */
+internal fun readerAttemptMarkBundles(
+    groups: List<MarkGroup>,
+    pageNumber: Int,
+    selectedAttemptNo: Int,
+): List<ReaderAttemptMarkBundle> {
+    val pageLevel = selectedAttemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO
+    val sortedGroups = groups.asSequence()
+        .filter { it.pageNumber == pageNumber && it.hiddenAtEpochMillis == null }
+        .filter { group ->
+            group.marks.any { mark ->
+                mark.hiddenAtEpochMillis == null &&
+                    (mark.attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO) == pageLevel
+            }
+        }
+        .sortedWith(compareBy<MarkGroup>({ it.anchor.y }, { it.anchor.x }, { it.id }))
+        .toList()
+    if (sortedGroups.isEmpty()) return emptyList()
+
+    val attemptNumbers = if (pageLevel) {
+        listOf(TEACHER_PAGE_REVIEW_ATTEMPT_NO)
     } else {
-        null
+        buildSet {
+            sortedGroups.forEach { group ->
+                group.marks.asSequence()
+                    .filter { mark ->
+                        mark.hiddenAtEpochMillis == null &&
+                            mark.attemptNo > TEACHER_PAGE_REVIEW_ATTEMPT_NO
+                    }
+                    .mapTo(this) { it.attemptNo }
+            }
+            if (selectedAttemptNo > TEACHER_PAGE_REVIEW_ATTEMPT_NO) add(selectedAttemptNo)
+        }.sorted()
     }
-    val text = listOfNotNull("${state.attemptNo}회", location).joinToString(" · ")
-    StatusChip(
-        text = text,
-        role = role,
-        description = if (state.capabilities.canBrowseAttempts) "풀이 회차 선택" else "현재 풀이 상태",
-        onAction = onAction.takeIf { state.capabilities.canBrowseAttempts },
-    )
+
+    return attemptNumbers.map { attemptNo ->
+        ReaderAttemptMarkBundle(
+            attemptNo = attemptNo,
+            colors = sortedGroups.map { group ->
+                group.marks.asSequence()
+                    .filter { mark ->
+                        mark.attemptNo == attemptNo && mark.hiddenAtEpochMillis == null
+                    }
+                    .maxByOrNull { it.gradedAtEpochMillis }
+                    ?.color
+                    ?: MarkColor.GRAY
+            },
+        )
+    }
+}
+
+@Composable
+private fun ReaderAttemptMarkHistory(
+    state: ReaderUiState,
+    maxVisibleBundles: Int,
+    onPreviousAttempt: () -> Unit,
+    onNextAttempt: () -> Unit,
+) {
+    val bundles = remember(state.marks, state.pageNumber, state.attemptNo) {
+        readerAttemptMarkBundles(
+            groups = state.marks,
+            pageNumber = state.pageNumber,
+            selectedAttemptNo = state.attemptNo,
+        )
+    }
+    if (bundles.isEmpty()) return
+
+    val selectedIndex = bundles.indexOfFirst { it.attemptNo == state.attemptNo }
+        .takeIf { it >= 0 }
+        ?: bundles.lastIndex
+    val visibleBundles = bundles.subList(0, selectedIndex + 1)
+        .takeLast(maxVisibleBundles.coerceAtLeast(1))
+    val tokens = readerChromeTokens(state.role)
+    val dragThresholdPx = with(LocalDensity.current) { 16.dp.toPx() }
+    var stylusDragStartX by remember(state.pageNumber, state.attemptNo) { mutableStateOf<Float?>(null) }
+    var stylusDragOffset by remember(state.pageNumber, state.attemptNo) { mutableStateOf(0f) }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(tokens.minimumTouchSize)
+            .clip(RoundedCornerShape(tokens.cornerRadius))
+            .semantics {
+                contentDescription = "현재 회차 문제별 정오답. S펜으로 좌우로 밀어 회차 이동"
+            }
+            .pointerInteropFilter { event ->
+                if (event.pointerCount == 0 || event.getToolType(0) != MotionEvent.TOOL_TYPE_STYLUS) {
+                    return@pointerInteropFilter false
+                }
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        stylusDragStartX = event.x
+                        stylusDragOffset = 0f
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        stylusDragOffset = event.x - (stylusDragStartX ?: event.x)
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        val distance = event.x - (stylusDragStartX ?: event.x)
+                        stylusDragStartX = null
+                        stylusDragOffset = 0f
+                        if (state.capabilities.canBrowseAttempts && abs(distance) >= dragThresholdPx) {
+                            if (distance > 0f) onPreviousAttempt() else onNextAttempt()
+                        }
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        stylusDragStartX = null
+                        stylusDragOffset = 0f
+                    }
+                }
+                true
+            },
+        contentAlignment = Alignment.CenterEnd,
+    ) {
+        Row(
+            modifier = Modifier
+                .padding(horizontal = 3.dp)
+                .graphicsLayer { translationX = stylusDragOffset.coerceIn(-20f, 20f) },
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            visibleBundles.forEachIndexed { index, bundle ->
+                val distanceFromCurrent = visibleBundles.lastIndex - index
+                AttemptMarkMicroGrid(
+                    colors = bundle.colors,
+                    alpha = when (distanceFromCurrent) {
+                        0 -> 1f
+                        1 -> 0.34f
+                        else -> 0.18f
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AttemptMarkMicroGrid(
+    colors: List<MarkColor>,
+    alpha: Float,
+) {
+    if (colors.isEmpty()) return
+    val grid = remember(colors.size) { readerAttemptSummaryGrid(colors.size) }
+    val naturalWidth = grid.columns * 3f + (grid.columns - 1).coerceAtLeast(0)
+    val naturalHeight = grid.rows * 5f + (grid.rows - 1).coerceAtLeast(0)
+    val scale = minOf(1f, 40f / naturalWidth, 30f / naturalHeight)
+    val cellWidth = 3.dp * scale
+    val cellHeight = 5.dp * scale
+    val gap = 1.dp * scale
+    val width = cellWidth * grid.columns + gap * (grid.columns - 1).coerceAtLeast(0)
+    val height = cellHeight * grid.rows + gap * (grid.rows - 1).coerceAtLeast(0)
+    val canvasTokens = readerCanvasTokens()
+    Canvas(
+        modifier = Modifier
+            .size(width = width, height = height)
+            .alpha(alpha),
+    ) {
+        val cellWidthPx = cellWidth.toPx()
+        val cellHeightPx = cellHeight.toPx()
+        val gapPx = gap.toPx()
+        val radius = minOf(cellWidthPx, cellHeightPx) * 0.42f
+        colors.forEachIndexed { index, color ->
+            val gridCell = grid.cells[index]
+            drawRoundRect(
+                color = Color(
+                    when (color) {
+                        MarkColor.BLUE -> canvasTokens.markBlueArgb
+                        MarkColor.RED -> canvasTokens.markRedArgb
+                        MarkColor.GRAY -> canvasTokens.markGrayArgb
+                    },
+                ),
+                topLeft = Offset(
+                    x = gridCell.column * (cellWidthPx + gapPx),
+                    y = gridCell.row * (cellHeightPx + gapPx),
+                ),
+                size = Size(cellWidthPx, cellHeightPx),
+                cornerRadius = CornerRadius(radius, radius),
+            )
+        }
+    }
 }
 
 private object ReaderTopChromePreviewFixtures {
+    private fun marks(pageNumber: Int): List<MarkGroup> = List(8) { index ->
+        MarkGroup(
+            id = "preview-problem-$index",
+            bookId = "preview-book",
+            pageNumber = pageNumber,
+            anchor = PagePoint(
+                x = (index % 2) * 100f,
+                y = (index / 2) * 100f,
+            ),
+            marks = listOf(
+                Mark(
+                    attemptNo = 1,
+                    color = if (index % 3 == 0) MarkColor.RED else MarkColor.BLUE,
+                ),
+                Mark(
+                    attemptNo = 2,
+                    color = when (index % 4) {
+                        0 -> MarkColor.RED
+                        3 -> MarkColor.GRAY
+                        else -> MarkColor.BLUE
+                    },
+                ),
+            ),
+        )
+    }
+
     fun state(role: ReaderRole, title: String, studentPageNumber: Int? = null) = ReaderUiState(
         bookId = "preview-book",
         bookTitle = title,
@@ -911,7 +1107,9 @@ private object ReaderTopChromePreviewFixtures {
         pageNumber = 2,
         attemptNo = 2,
         role = role,
-        capabilities = ReaderCapabilities.forRole(role),
+        workflow = ReaderWorkflow.defaultFor(role),
+        capabilities = ReaderCapabilities.forSession(role, ReaderWorkflow.defaultFor(role), 2),
+        marks = marks(pageNumber = 2),
         studentPageNumber = studentPageNumber,
     )
 }
@@ -988,9 +1186,9 @@ private fun TeacherPhoneChromePreview() = ReaderTopChromePreviewContent(
 )
 
 @Preview(
-    name = "선생태블릿 · 1600 · 펼침",
+    name = "선생태블릿 · Tab S11 800 · 펼침",
     group = "상단바 검증",
-    widthDp = 1600,
+    widthDp = 800,
     heightDp = 76,
     showBackground = true,
 )

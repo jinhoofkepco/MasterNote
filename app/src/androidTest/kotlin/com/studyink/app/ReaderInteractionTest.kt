@@ -1,13 +1,14 @@
 package com.studyink.app
 
 import android.graphics.Color
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
-import android.view.accessibility.AccessibilityNodeInfo
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -22,6 +23,7 @@ import com.studyink.core.model.MarkColor
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
+import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.library.data.LibraryRepository
 import com.studyink.reader.DryInkView
 import com.studyink.reader.InkInputView
@@ -29,6 +31,7 @@ import com.studyink.reader.ReaderActivity
 import com.studyink.reader.ReaderDebugSessionStore
 import com.studyink.reader.ReaderRole
 import com.studyink.reader.ReaderTool
+import com.studyink.reader.ReaderWorkflow
 import com.studyink.sync.lan.PairingPayload
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -112,21 +115,23 @@ class ReaderInteractionTest {
         scenario.close()
         scenario = ActivityScenario.launch(ReaderActivity.intent(context, bookId, 0))
         waitForBook()
-        val root = InstrumentationRegistry.getInstrumentation().uiAutomation.rootInActiveWindow
-        val menu = requireNotNull(root.findByDescription("상단 메뉴 열기"))
-        assertTrue(menu.performAction(AccessibilityNodeInfo.ACTION_CLICK))
-        assertTrue(device.wait(Until.hasObject(By.desc("책장으로 나가기")), 3_000))
+        val menu = device.findObject(By.desc("상단 메뉴 열기")).visibleBounds
+        dispatchTap(
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            menu.centerX().toFloat(),
+            menu.centerY().toFloat(),
+        )
+        assertTrue(device.wait(Until.hasObject(By.desc("교재 페이지로 돌아가기")), 3_000))
 
         val previous = device.findObject(By.desc("이전 페이지")).visibleBounds
-        val contextButton = device.findObject(By.desc("책장으로 나가기")).visibleBounds
-        val status = device.findObject(By.desc("현재 풀이 상태")).visibleBounds
+        val contextButton = device.findObject(By.desc("교재 페이지로 돌아가기")).visibleBounds
         val submit = device.findObject(By.desc("현재 페이지 제출")).visibleBounds
         val close = device.findObject(By.desc("상단 메뉴 닫기")).visibleBounds
         val next = device.findObject(By.desc("다음 페이지")).visibleBounds
-        val layout = "previous=$previous context=$contextButton status=$status submit=$submit close=$close next=$next"
+        val layout = "previous=$previous context=$contextButton submit=$submit close=$close next=$next"
         assertTrue(layout, previous.right <= contextButton.left)
-        assertTrue(layout, contextButton.right <= status.left)
-        assertTrue(layout, status.right <= submit.left)
+        assertTrue(layout, contextButton.right <= submit.left)
         assertTrue(layout, submit.right <= close.left)
         assertTrue(layout, close.right <= next.left)
     }
@@ -190,6 +195,11 @@ class ReaderInteractionTest {
     @Test
     fun rightmostMarkCellUsesWholeGroupHitboxAndOpensItsAttempt() {
         val repository = LibraryRepository.get(context)
+        repeat(3) { index ->
+            val attempt = requireNotNull(repository.writableAttempt(bookId, 0, create = true))
+            assertEquals(index + 1, attempt.attemptNo)
+            repository.lockAttempt(bookId, 0, attempt.attemptNo)
+        }
         val first = repository.addMark(bookId, 0, 1, PagePoint(220f, 300f), MarkColor.BLUE)
         repository.addMark(bookId, 0, 2, first.anchor, MarkColor.RED, first.id)
         repository.addMark(bookId, 0, 3, first.anchor, MarkColor.BLUE, first.id)
@@ -235,6 +245,61 @@ class ReaderInteractionTest {
     }
 
     @Test
+    fun teacherCanGradeAnUnstartedPageWithoutTakingTheStudentsFirstAttempt() {
+        val repository = LibraryRepository.get(context)
+        assertTrue(repository.attempts(bookId, 0).isEmpty())
+        scenario.close()
+        scenario = ActivityScenario.launch(
+            ReaderActivity.intent(
+                context = context,
+                bookId = bookId,
+                pageNumber = 0,
+                role = ReaderRole.TEACHER_TABLET,
+                attemptNo = TEACHER_PAGE_REVIEW_ATTEMPT_NO,
+                workflow = ReaderWorkflow.REVIEW,
+            )
+        )
+        waitForBook()
+        selectToolFromFan("채점")
+        scenario.onActivity { assertEquals(ReaderTool.GRADE, it.findInkInputView().tool) }
+
+        dispatchTap(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 440f, 720f)
+        repeat(30) {
+            if (repository.markGroups(bookId, 0).any { group ->
+                    group.marks.any { mark -> mark.attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO }
+                }
+            ) return@repeat
+            SystemClock.sleep(100)
+        }
+        assertTrue(repository.attempts(bookId, 0).isEmpty())
+        assertTrue(
+            repository.markGroups(bookId, 0).any { group ->
+                group.marks.any { mark -> mark.attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO }
+            }
+        )
+
+        scenario.close()
+        scenario = ActivityScenario.launch(
+            ReaderActivity.intent(
+                context = context,
+                bookId = bookId,
+                pageNumber = 0,
+                role = ReaderRole.STUDENT,
+                workflow = ReaderWorkflow.STUDY,
+            )
+        )
+        waitForBook()
+        val before = revision()
+        dispatchStroke(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 360f, 820f, 520f, 870f)
+        assertTrue(waitForRevisionAfter(before))
+        assertEquals(listOf(1), repository.attempts(bookId, 0).map { it.attemptNo })
+        assertTrue(
+            repository.markGroups(bookId, 0).flatMap { it.marks }
+                .all { it.attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO }
+        )
+    }
+
+    @Test
     fun pageNavigationIgnoresFingerAndAcceptsStylus() {
         assertTrue(device.wait(Until.hasObject(By.desc("다음 페이지")), 3_000))
         val bounds = device.findObject(By.desc("다음 페이지")).visibleBounds
@@ -260,6 +325,32 @@ class ReaderInteractionTest {
             SystemClock.sleep(100)
         }
         throw AssertionError("S펜 페이지 버튼이 동작하지 않았습니다")
+    }
+
+    @Test
+    fun currentPageMaskIsOpaqueOutsidePageAndTransparentInside() {
+        scenario.onActivity { activity ->
+            val dryInk = activity.findDryInkView()
+            val page = requireNotNull(dryInk.viewport?.activePageBounds())
+            val bitmap = Bitmap.createBitmap(dryInk.width, dryInk.height, Bitmap.Config.ARGB_8888)
+            dryInk.draw(Canvas(bitmap))
+
+            val insideX = page.centerX().toInt().coerceIn(1, bitmap.width - 2)
+            val insideY = page.centerY().toInt().coerceIn(1, bitmap.height - 2)
+            assertEquals(0, Color.alpha(bitmap.getPixel(insideX, insideY)))
+
+            val outside = when {
+                page.top >= 4f -> insideX to (page.top / 2f).toInt()
+                page.bottom <= bitmap.height - 4f ->
+                    insideX to ((page.bottom + bitmap.height) / 2f).toInt()
+                page.left >= 4f -> (page.left / 2f).toInt() to insideY
+                page.right <= bitmap.width - 4f ->
+                    ((page.right + bitmap.width) / 2f).toInt() to insideY
+                else -> error("Test PDF page unexpectedly covers the complete reader viewport: $page")
+            }
+            assertEquals(255, Color.alpha(bitmap.getPixel(outside.first, outside.second)))
+            bitmap.recycle()
+        }
     }
 
     @Test
@@ -418,6 +509,48 @@ class ReaderInteractionTest {
         events.forEach(MotionEvent::recycle)
     }
 
+    private fun selectToolFromFan(description: String) {
+        val open = motionEvent(
+            MotionEvent.ACTION_BUTTON_PRESS,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            520f,
+            920f,
+            MotionEvent.BUTTON_STYLUS_PRIMARY,
+        )
+        scenario.onActivity { assertTrue(it.dispatchGenericMotionEvent(open)) }
+        open.recycle()
+        assertTrue(device.wait(Until.hasObject(By.desc(description)), 3_000))
+        val bounds = device.findObject(By.desc(description)).visibleBounds
+        injectStylusTapOnScreen(bounds.centerX().toFloat(), bounds.centerY().toFloat())
+        SystemClock.sleep(250)
+    }
+
+    private fun injectStylusTapOnScreen(x: Float, y: Float) {
+        val downAt = SystemClock.uptimeMillis()
+        val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
+        val down = motionEvent(
+            MotionEvent.ACTION_DOWN,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            x,
+            y,
+            eventTime = downAt,
+        )
+        val up = motionEvent(
+            MotionEvent.ACTION_UP,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            x,
+            y,
+            eventTime = downAt + 40,
+        )
+        assertTrue(automation.injectInputEvent(down, true))
+        assertTrue(automation.injectInputEvent(up, true))
+        down.recycle()
+        up.recycle()
+    }
+
     private fun dispatchDownInsideUpOutside(x: Float, y: Float) {
         val down = SystemClock.uptimeMillis()
         val events = listOf(
@@ -446,14 +579,6 @@ class ReaderInteractionTest {
             eventTime, eventTime, action, 1, properties, coordinates, 0, buttons,
             1f, 1f, 0, 0, source, 0,
         )
-    }
-
-    private fun AccessibilityNodeInfo.findByDescription(description: String): AccessibilityNodeInfo? {
-        if (contentDescription?.toString() == description) return this
-        repeat(childCount) { index ->
-            getChild(index)?.findByDescription(description)?.let { return it }
-        }
-        return null
     }
 
     private fun ReaderActivity.findDryInkView(): DryInkView {

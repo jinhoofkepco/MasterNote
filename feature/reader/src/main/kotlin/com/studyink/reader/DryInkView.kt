@@ -9,11 +9,14 @@ import android.graphics.RectF
 import android.view.View
 import com.studyink.annotation.engine.EraseEngine
 import com.studyink.core.model.AnnotationSnapshot
+import com.studyink.core.model.Mark
 import com.studyink.core.model.MarkColor
 import com.studyink.core.model.MarkGroup
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
+import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
+import com.studyink.core.model.resultBundleGrid
 import com.studyink.document.pdf.PdfViewportAdapter
 import kotlin.math.hypot
 import kotlin.math.max
@@ -43,18 +46,18 @@ class DryInkView(context: Context) : View(context) {
     var hoverPreview: StylusHoverPreview? = null
         set(value) { field = value; invalidate() }
     var activePage: Int = 0
-        set(value) { field = value; invalidate() }
+        set(value) { field = value; clearMarkHitCache(); invalidate() }
     var visibleAttemptNo: Int = 1
-        set(value) { field = value; invalidate() }
+        set(value) { field = value; clearMarkHitCache(); invalidate() }
     var showTeacherDrafts: Boolean = false
         set(value) { field = value; rebuildPageCache(); invalidate() }
     var markGroups: List<MarkGroup> = emptyList()
-        set(value) { field = value; invalidate() }
+        set(value) { field = value; clearMarkHitCache(); invalidate() }
     var pressedMarkGroupId: String? = null
         set(value) { field = value; invalidate() }
 
     private var cachedPageStrokes: Map<Int, List<StrokeAsset>> = emptyMap()
-    private val pageMaskPaint = Paint().apply { color = Color.rgb(225, 226, 231) }
+    private val pageIsolationPaper = ReaderPaperBackdropDrawable(resources.displayMetrics.density)
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
@@ -71,10 +74,7 @@ class DryInkView(context: Context) : View(context) {
     }
     private val markHistoryBounds = mutableMapOf<String, RectF>()
     private val markHistoryAnchors = mutableMapOf<String, android.graphics.PointF>()
-    private val markHistoryCounts = mutableMapOf<String, Int>()
     private val markCellHits = mutableListOf<MarkCellHit>()
-    private val markHistoryOffsets = mutableMapOf<String, Int>()
-    private val markHistoryDragRemainders = mutableMapOf<String, Float>()
 
     init {
         isClickable = false
@@ -84,7 +84,7 @@ class DryInkView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val adapter = viewport ?: return
-        drawPageMask(canvas, adapter.activePageBounds())
+        drawPageIsolationMask(canvas, adapter.activePageBounds())
         val visibleBounds = RectF(0f, 0f, width.toFloat(), height.toFloat())
         val active = cachedPageStrokes[activePage].orEmpty().filter { stroke ->
             stroke.attemptNo == visibleAttemptNo && isOnScreen(adapter, stroke, visibleBounds)
@@ -99,6 +99,22 @@ class DryInkView(context: Context) : View(context) {
         }
         drawMarks(canvas, adapter)
         drawHover(canvas)
+    }
+
+    /**
+     * AndroidX PdfView's SINGLE_PAGE constant means one page per row, not one page per viewport.
+     * Keep its sharp tiled renderer and zoom support, but cover every PDF pixel outside the page
+     * selected by MasterNote. Drawing the same paper layer used behind PdfView preserves the
+     * textured margins instead of exposing the vertically adjacent PDF pages.
+     */
+    private fun drawPageIsolationMask(canvas: Canvas, page: RectF?) {
+        pageIsolationPaper.bounds = android.graphics.Rect(0, 0, width, height)
+        val saveCount = canvas.save()
+        if (page != null) {
+            canvas.clipOutRect(page)
+        }
+        pageIsolationPaper.draw(canvas)
+        canvas.restoreToCount(saveCount)
     }
 
     private fun rebuildPageCache() {
@@ -122,17 +138,6 @@ class DryInkView(context: Context) : View(context) {
             maxOf(topLeft.y, bottomRight.y) + padding,
         )
         return RectF.intersects(bounds, viewportBounds)
-    }
-
-    private fun drawPageMask(canvas: Canvas, page: RectF?) {
-        if (page == null) {
-            canvas.drawColor(pageMaskPaint.color)
-            return
-        }
-        canvas.drawRect(0f, 0f, width.toFloat(), page.top.coerceAtLeast(0f), pageMaskPaint)
-        canvas.drawRect(0f, page.bottom.coerceAtMost(height.toFloat()), width.toFloat(), height.toFloat(), pageMaskPaint)
-        canvas.drawRect(0f, page.top, page.left.coerceAtLeast(0f), page.bottom, pageMaskPaint)
-        canvas.drawRect(page.right.coerceAtMost(width.toFloat()), page.top, width.toFloat(), page.bottom, pageMaskPaint)
     }
 
     private fun drawStroke(canvas: Canvas, adapter: PdfViewportAdapter, stroke: StrokeAsset, preview: Boolean) {
@@ -171,66 +176,111 @@ class DryInkView(context: Context) : View(context) {
     }
 
     private fun drawMarks(canvas: Canvas, adapter: PdfViewportAdapter) {
-        val groups = markGroups.filter { it.pageNumber == activePage && it.hiddenAtEpochMillis == null }
-            .sortedBy { it.anchor.y }
-        val cell = dp(readerTokens.markCellDp)
-        val gap = dp(readerTokens.markGapDp)
+        val groups = markGroups.asSequence()
+            .filter { it.pageNumber == activePage && it.hiddenAtEpochMillis == null }
+            .mapNotNull { group ->
+                marksForVisibleTarget(group).takeIf(List<*>::isNotEmpty)?.let { group to it }
+            }
+            .sortedWith(
+                compareBy<Pair<MarkGroup, List<Mark>>>(
+                    { (group, _) -> group.anchor.y },
+                    { (group, _) -> group.anchor.x },
+                    { (group, _) -> group.id },
+                )
+            )
+            .toList()
+        val historyWidth = dp(readerTokens.markHistoryCellWidthDp)
+        val historyHeight = dp(readerTokens.markHistoryCellHeightDp)
+        val slotWidth = dp(readerTokens.markCurrentCellWidthDp)
+        val slotHeight = dp(readerTokens.markCurrentCellHeightDp)
+        val horizontalGap = dp(readerTokens.markHorizontalGapDp)
+        val verticalGap = dp(readerTokens.markVerticalGapDp)
+        val activePageBounds = adapter.activePageBounds()
+            ?: RectF(0f, 0f, width.toFloat(), height.toFloat())
+        val occupiedBundles = mutableListOf<MarkBundleBox>()
         markHistoryBounds.clear()
         markHistoryAnchors.clear()
-        markHistoryCounts.clear()
         markCellHits.clear()
-        groups.forEachIndexed { groupIndex, group ->
-            val anchor = adapter.canonicalToView(activePage, group.anchor) ?: return@forEachIndexed
-            val history = group.marks.filter { it.hiddenAtEpochMillis == null }.toMutableList()
-            if (history.none { it.attemptNo == visibleAttemptNo }) {
-                history += com.studyink.core.model.Mark(visibleAttemptNo, MarkColor.GRAY)
-            }
-            val maxOffset = (history.size - 3).coerceAtLeast(0)
-            val offset = (markHistoryOffsets[group.id] ?: 0).coerceIn(0, maxOffset)
-            markHistoryOffsets[group.id] = offset
-            val end = (history.size - offset).coerceAtLeast(0)
-            val start = (end - 3).coerceAtLeast(0)
-            val visibleHistory = history.subList(start, end)
-            visibleHistory.forEachIndexed { markIndex, mark ->
+        groups.forEach { (group, targetMarks) ->
+            val anchor = adapter.canonicalToView(activePage, group.anchor) ?: return@forEach
+            val latestByAttempt = latestMarksByAttempt(targetMarks)
+            val current = latestByAttempt.firstOrNull { it.attemptNo == visibleAttemptNo }
+                ?: Mark(visibleAttemptNo, MarkColor.GRAY)
+            val displayMarks = latestByAttempt.filter { it.attemptNo < visibleAttemptNo } + current
+            val grid = resultBundleGrid(displayMarks.size)
+            val bundleWidth = grid.columns * slotWidth + (grid.columns - 1) * horizontalGap
+            val bundleHeight = grid.rows * slotHeight + (grid.rows - 1) * verticalGap
+            val edgePadding = dp(readerTokens.markPageEdgePaddingDp)
+            val aligned = alignedMarkBundleOrigin(
+                anchorX = anchor.x,
+                anchorY = anchor.y,
+                pageLeft = activePageBounds.left,
+                pageTop = activePageBounds.top,
+                pageRight = activePageBounds.right,
+                pageBottom = activePageBounds.bottom,
+                bundleWidth = bundleWidth,
+                bundleHeight = bundleHeight,
+                horizontalSnap = dp(readerTokens.markHorizontalSnapDp),
+                verticalSnap = dp(readerTokens.markVerticalSnapDp),
+                edgePadding = edgePadding,
+            )
+            val origin = nonOverlappingMarkBundleOrigin(
+                candidate = aligned,
+                bundleWidth = bundleWidth,
+                bundleHeight = bundleHeight,
+                minY = activePageBounds.top + edgePadding,
+                maxY = activePageBounds.bottom - edgePadding - bundleHeight,
+                verticalStep = dp(readerTokens.markVerticalSnapDp),
+                separation = verticalGap,
+                occupied = occupiedBundles,
+            )
+            val occupied = MarkBundleBox(
+                origin.x,
+                origin.y,
+                origin.x + bundleWidth,
+                origin.y + bundleHeight,
+            )
+            occupiedBundles += occupied
+
+            displayMarks.zip(grid.cells).forEach { (mark, gridCell) ->
+                val isCurrent = mark.attemptNo == visibleAttemptNo
+                val slotLeft = origin.x + gridCell.column * (slotWidth + horizontalGap)
+                val slotTop = origin.y + gridCell.row * (slotHeight + verticalGap)
+                val visualWidth = if (isCurrent) slotWidth else historyWidth
+                val visualHeight = if (isCurrent) slotHeight else historyHeight
+                val left = slotLeft + (slotWidth - visualWidth) / 2f
+                // Small historical cells sit on the same baseline as the active result rather
+                // than floating at different heights within a row.
+                val top = slotTop + slotHeight - visualHeight
+                val visualBounds = RectF(left, top, left + visualWidth, top + visualHeight)
                 markPaint.color = mark.color.toArgb()
-                markPaint.alpha = readerTokens.markAlpha
-                val left = anchor.x + markIndex * (cell + gap)
-                val cellBounds = RectF(left, anchor.y, left + cell, anchor.y + cell)
+                markPaint.alpha = when {
+                    isCurrent && mark.color == MarkColor.GRAY -> readerTokens.markPlaceholderAlpha
+                    isCurrent -> readerTokens.markAlpha
+                    else -> readerTokens.markHistoryAlpha
+                }
                 canvas.drawRoundRect(
-                    cellBounds,
-                    dp(readerTokens.markCornerDp),
-                    dp(readerTokens.markCornerDp),
+                    visualBounds,
+                    dp(if (isCurrent) readerTokens.markCornerDp else readerTokens.markHistoryCornerDp),
+                    dp(if (isCurrent) readerTokens.markCornerDp else readerTokens.markHistoryCornerDp),
                     markPaint,
                 )
-                markCellHits += MarkCellHit(group.id, mark.attemptNo, cellBounds, anchor.x, anchor.y)
+                // The faded historical result remains an easy S Pen target even though its visible
+                // rectangle is deliberately narrow.
+                val hitBounds = RectF(slotLeft, slotTop, slotLeft + slotWidth, slotTop + slotHeight)
+                markCellHits += MarkCellHit(group.id, mark.attemptNo, hitBounds, origin.x, origin.y)
             }
-            val historyWidth = visibleHistory.size * cell + (visibleHistory.size - 1).coerceAtLeast(0) * gap
             val groupBounds = RectF(
-                anchor.x - dp(readerTokens.markHitPaddingDp),
-                anchor.y - dp(readerTokens.markHitPaddingDp),
-                anchor.x + historyWidth + dp(readerTokens.markHitPaddingDp),
-                anchor.y + cell + dp(readerTokens.markHitPaddingDp),
+                origin.x - dp(readerTokens.markHitPaddingDp),
+                origin.y - dp(readerTokens.markHitPaddingDp),
+                origin.x + bundleWidth + dp(readerTokens.markHitPaddingDp),
+                origin.y + bundleHeight + dp(readerTokens.markHitPaddingDp),
             )
             markHistoryBounds[group.id] = groupBounds
-            markHistoryAnchors[group.id] = android.graphics.PointF(anchor.x, anchor.y)
-            markHistoryCounts[group.id] = history.size
+            markHistoryAnchors[group.id] = android.graphics.PointF(origin.x, origin.y)
             if (pressedMarkGroupId == group.id) {
                 canvas.drawRoundRect(groupBounds, dp(6f), dp(6f), markFocusPaint)
             }
-            val current = history.lastOrNull { it.attemptNo == visibleAttemptNo }?.color ?: MarkColor.GRAY
-            markPaint.color = current.toArgb()
-            markPaint.alpha = readerTokens.markAlpha
-            val barTop = dp(readerTokens.markBarTopDp) + groupIndex * (cell + gap)
-            val barRight = width - dp(readerTokens.markBarRightInsetDp)
-            canvas.drawRoundRect(
-                barRight - dp(readerTokens.markBarWidthDp),
-                barTop,
-                barRight,
-                barTop + cell,
-                dp(readerTokens.markCornerDp),
-                dp(readerTokens.markCornerDp),
-                markPaint,
-            )
         }
     }
 
@@ -247,33 +297,17 @@ class DryInkView(context: Context) : View(context) {
         .minByOrNull { hypot(it.anchorX - viewX, it.anchorY - viewY) }
         ?.attemptNo
 
-    fun scrollableMarkGroupAt(viewX: Float, viewY: Float): String? = markGroupAt(viewX, viewY)
-        ?.takeIf { (markHistoryCounts[it] ?: 0) > 3 }
+    // Every attempt is now visible in the compact grid; older attempts are opened by tapping
+    // their own S Pen hit cell. Horizontal history paging belongs to the top page summary.
+    fun scrollableMarkGroupAt(viewX: Float, viewY: Float): String? = null
 
     fun dragMarkHistory(groupId: String, deltaX: Float) {
-        val group = markGroups.firstOrNull { it.id == groupId } ?: return
-        val visibleMarkCount = group.marks.count { it.hiddenAtEpochMillis == null } +
-            if (group.marks.none { it.hiddenAtEpochMillis == null && it.attemptNo == visibleAttemptNo }) 1 else 0
-        val maxOffset = (visibleMarkCount - 3).coerceAtLeast(0)
-        if (maxOffset == 0) return
-        var remainder = (markHistoryDragRemainders[groupId] ?: 0f) + deltaX
-        val threshold = dp(12f)
-        var offset = (markHistoryOffsets[groupId] ?: 0).coerceIn(0, maxOffset)
-        while (remainder >= threshold) {
-            offset = (offset + 1).coerceAtMost(maxOffset)
-            remainder -= threshold
-        }
-        while (remainder <= -threshold) {
-            offset = (offset - 1).coerceAtLeast(0)
-            remainder += threshold
-        }
-        markHistoryOffsets[groupId] = offset
-        markHistoryDragRemainders[groupId] = remainder
-        invalidate()
+        // Kept as a compatibility callback for InkInputView. Per-question bundles no longer hide
+        // old attempts behind a three-item viewport, so there is nothing to page here.
     }
 
     fun endMarkHistoryDrag(groupId: String) {
-        markHistoryDragRemainders.remove(groupId)
+        // See dragMarkHistory().
     }
 
     private fun drawHover(canvas: Canvas) {
@@ -290,6 +324,32 @@ class DryInkView(context: Context) : View(context) {
         MarkColor.BLUE -> readerTokens.markBlueArgb
         MarkColor.RED -> readerTokens.markRedArgb
         MarkColor.GRAY -> readerTokens.markGrayArgb
+    }
+
+    private fun clearMarkHitCache() {
+        markHistoryBounds.clear()
+        markHistoryAnchors.clear()
+        markCellHits.clear()
+    }
+
+    private fun latestMarksByAttempt(marks: List<Mark>): List<Mark> {
+        val latest = linkedMapOf<Int, Mark>()
+        marks.forEach { mark ->
+            val previous = latest[mark.attemptNo]
+            if (previous == null || mark.gradedAtEpochMillis >= previous.gradedAtEpochMillis) {
+                latest[mark.attemptNo] = mark
+            }
+        }
+        return latest.values.sortedBy(Mark::attemptNo)
+    }
+
+    /** Page-level teacher marks and student-attempt history must never leak into each other. */
+    private fun marksForVisibleTarget(group: MarkGroup) = group.marks.filter { mark ->
+        mark.hiddenAtEpochMillis == null && if (visibleAttemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO) {
+            mark.attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO
+        } else {
+            mark.attemptNo != TEACHER_PAGE_REVIEW_ATTEMPT_NO
+        }
     }
 
     private fun dp(value: Float): Float = value * resources.displayMetrics.density

@@ -16,6 +16,7 @@ import com.studyink.core.model.MarkGroup
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.PageBounds
 import com.studyink.core.model.Student
+import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -207,6 +208,47 @@ class LibraryRepository private constructor(private val context: Context) {
         .filter { it.bookId == bookId && it.pageNumber == pageNumber }
         .sortedBy(Attempt::attemptNo)
 
+    /** Transport snapshot for reconnect recovery, ordered deterministically by page and attempt. */
+    @Synchronized
+    fun attemptsForSync(bookId: String): List<Attempt> {
+        book(bookId)
+        return catalog.attempts
+            .filter { it.bookId == bookId }
+            .sortedWith(compareBy(Attempt::pageNumber, Attempt::attemptNo))
+    }
+
+    /**
+     * Returns one summary for every page without changing catalog format or stored entities.
+     * Page indices stay zero-based to match ReaderActivity and the annotation store.
+     */
+    @Synchronized
+    fun pageProgressSummaries(bookId: String): List<PageProgressSummary> {
+        val book = book(bookId)
+        return projectBookPageProgress(
+            pageCount = book.pageCount,
+            attempts = catalog.attempts.filter { it.bookId == bookId },
+            markGroups = catalog.markGroups.filter { it.bookId == bookId },
+        )
+    }
+
+    /** Ensures a student/perspective selection cannot accidentally open another student's book. */
+    @Synchronized
+    fun pageProgressSummaries(
+        libraryContext: LibraryContext,
+        bookId: String,
+    ): List<PageProgressSummary> {
+        val book = book(bookId)
+        require(book.studentId == libraryContext.studentId) { "선택한 학생의 교재가 아닙니다." }
+        return pageProgressSummaries(bookId)
+    }
+
+    @Synchronized
+    fun pageProgressSummary(bookId: String, pageNumber: Int): PageProgressSummary {
+        val book = book(bookId)
+        require(pageNumber in 0 until book.pageCount) { "페이지가 교재 범위를 벗어납니다." }
+        return pageProgressSummaries(bookId)[pageNumber]
+    }
+
     @Synchronized
     fun writableAttempt(bookId: String, pageNumber: Int, create: Boolean): Attempt? {
         val attempts = attempts(bookId, pageNumber)
@@ -215,6 +257,7 @@ class LibraryRepository private constructor(private val context: Context) {
         val next = Attempt(bookId, pageNumber, (attempts.maxOfOrNull(Attempt::attemptNo) ?: 0) + 1)
         catalog = catalog.copy(attempts = catalog.attempts + next)
         persist()
+        LibraryAttemptBus.attemptChanged(next)
         return next
     }
 
@@ -227,6 +270,7 @@ class LibraryRepository private constructor(private val context: Context) {
         val locked = existing.copy(locked = true, lockedAtEpochMillis = System.currentTimeMillis())
         catalog = catalog.copy(attempts = catalog.attempts.map { if (it == existing) locked else it })
         persist()
+        LibraryAttemptBus.attemptChanged(locked)
         return locked
     }
 
@@ -234,6 +278,15 @@ class LibraryRepository private constructor(private val context: Context) {
     fun markGroups(bookId: String, pageNumber: Int): List<MarkGroup> = catalog.markGroups
         .filter { it.bookId == bookId && it.pageNumber == pageNumber && it.hiddenAtEpochMillis == null }
         .sortedBy { it.anchor.y }
+
+    /** Transport snapshot for reconnect recovery, including hidden group tombstones. */
+    @Synchronized
+    fun markGroupsForSync(bookId: String): List<MarkGroup> {
+        book(bookId)
+        return catalog.markGroups
+            .filter { it.bookId == bookId }
+            .sortedWith(compareBy(MarkGroup::pageNumber, MarkGroup::id))
+    }
 
     @Synchronized
     fun addMark(
@@ -243,48 +296,147 @@ class LibraryRepository private constructor(private val context: Context) {
         anchor: PagePoint,
         color: MarkColor,
         groupId: String? = null,
+        allowObservedStudentAttempt: Boolean = false,
     ): MarkGroup {
+        val targetBook = book(bookId)
+        require(pageNumber in 0 until targetBook.pageCount) { "채점 대상 페이지가 교재 범위를 벗어납니다." }
+        require(
+            isValidMarkAttemptTarget(bookId, pageNumber, attemptNo, catalog.attempts) ||
+                allowObservedStudentAttempt && attemptNo > TEACHER_PAGE_REVIEW_ATTEMPT_NO
+        ) {
+            "채점 대상 풀이 회차가 없습니다."
+        }
         val mark = Mark(attemptNo = attemptNo, color = color)
         val existing = groupId?.let { id -> catalog.markGroups.firstOrNull { it.id == id } }
-        val updated = existing?.copy(marks = existing.marks + mark)
-            ?: MarkGroup(bookId = bookId, pageNumber = pageNumber, anchor = anchor, marks = listOf(mark))
+        require(existing == null || existing.bookId == bookId && existing.pageNumber == pageNumber) {
+            "다른 페이지의 채점 표시를 변경할 수 없습니다."
+        }
+        require(existing == null || isCompatibleMarkGroupTarget(existing, attemptNo)) {
+            "페이지 표시와 학생 풀이 채점을 같은 표시 묶음에 섞을 수 없습니다."
+        }
+        val updated = existing?.copy(
+            marks = existing.marks + mark,
+            syncRevision = existing.nextSyncRevision(),
+            lastModifiedByDeviceId = deviceId,
+        ) ?: MarkGroup(
+            bookId = bookId,
+            pageNumber = pageNumber,
+            anchor = anchor,
+            marks = listOf(mark),
+            syncRevision = 1L,
+            lastModifiedByDeviceId = deviceId,
+        )
         catalog = catalog.copy(markGroups = if (existing == null) {
             catalog.markGroups + updated
         } else {
             catalog.markGroups.map { if (it.id == existing.id) updated else it }
         })
         persist()
+        LibraryMarkGroupBus.markGroupChanged(updated)
         return updated
     }
 
     @Synchronized
     fun changeLatestMarkColor(groupId: String, attemptNo: Int, color: MarkColor) {
+        val existing = catalog.markGroups.firstOrNull { it.id == groupId } ?: return
+        val lastIndex = existing.marks.indexOfLast {
+            it.attemptNo == attemptNo && it.hiddenAtEpochMillis == null
+        }
+        if (lastIndex < 0 || existing.marks[lastIndex].color == color) return
+        val updated = existing.copy(
+            marks = existing.marks.mapIndexed { index, mark ->
+                if (index == lastIndex) mark.copy(color = color) else mark
+            },
+            syncRevision = existing.nextSyncRevision(),
+            lastModifiedByDeviceId = deviceId,
+        )
         catalog = catalog.copy(markGroups = catalog.markGroups.map { group ->
-            if (group.id != groupId) group else group.copy(
-                marks = group.marks.mapIndexed { index, mark ->
-                    val lastIndex = group.marks.indexOfLast { it.attemptNo == attemptNo && it.hiddenAtEpochMillis == null }
-                    if (index == lastIndex) mark.copy(color = color) else mark
-                }
-            )
+            if (group.id == groupId) updated else group
         })
         persist()
+        LibraryMarkGroupBus.markGroupChanged(updated)
     }
 
     @Synchronized
     fun moveMarkGroup(groupId: String, anchor: PagePoint) {
+        val existing = catalog.markGroups.firstOrNull {
+            it.id == groupId && it.hiddenAtEpochMillis == null
+        } ?: return
+        if (existing.anchor == anchor) return
+        val updated = existing.copy(
+            anchor = anchor,
+            syncRevision = existing.nextSyncRevision(),
+            lastModifiedByDeviceId = deviceId,
+        )
         catalog = catalog.copy(markGroups = catalog.markGroups.map { group ->
-            if (group.id == groupId && group.hiddenAtEpochMillis == null) group.copy(anchor = anchor) else group
+            if (group.id == groupId) updated else group
         })
         persist()
+        LibraryMarkGroupBus.markGroupChanged(updated)
     }
 
     @Synchronized
     fun hideMarkGroup(groupId: String) {
+        val existing = catalog.markGroups.firstOrNull {
+            it.id == groupId && it.hiddenAtEpochMillis == null
+        } ?: return
         val now = System.currentTimeMillis()
+        val updated = existing.copy(
+            hiddenAtEpochMillis = now,
+            syncRevision = existing.nextSyncRevision(),
+            lastModifiedByDeviceId = deviceId,
+        )
         catalog = catalog.copy(markGroups = catalog.markGroups.map {
-            if (it.id == groupId) it.copy(hiddenAtEpochMillis = now) else it
+            if (it.id == groupId) updated else it
         })
         persist()
+        LibraryMarkGroupBus.markGroupChanged(updated)
+    }
+
+    /**
+     * Applies a full peer snapshot by identity. Replaying the same snapshot is a no-op, and this
+     * path intentionally does not notify [LibraryMarkGroupBus] so received data cannot echo.
+     */
+    @Synchronized
+    fun upsertMarkGroupFromSync(
+        bookId: String,
+        pageNumber: Int,
+        incoming: MarkGroup,
+    ): Boolean {
+        val targetBook = book(bookId)
+        val result = mergeRemoteMarkGroup(
+            markGroups = catalog.markGroups,
+            bookId = bookId,
+            pageNumber = pageNumber,
+            pageCount = targetBook.pageCount,
+            attempts = catalog.attempts,
+            incoming = incoming,
+        )
+        if (!result.changed) return false
+        catalog = catalog.copy(markGroups = result.markGroups)
+        persist()
+        return true
+    }
+
+    /** Idempotent peer upsert. Received attempts are not emitted back onto [LibraryAttemptBus]. */
+    @Synchronized
+    fun upsertAttemptFromSync(
+        bookId: String,
+        pageNumber: Int,
+        incoming: Attempt,
+    ): Boolean {
+        val targetBook = book(bookId)
+        val result = mergeRemoteAttempt(
+            attempts = catalog.attempts,
+            bookId = bookId,
+            pageNumber = pageNumber,
+            pageCount = targetBook.pageCount,
+            incoming = incoming,
+        )
+        if (!result.changed) return false
+        catalog = catalog.copy(attempts = result.attempts)
+        persist()
+        return true
     }
 
     private fun probePageCount(file: File): Int {
@@ -342,6 +494,157 @@ class LibraryRepository private constructor(private val context: Context) {
     }
 }
 
+internal fun isValidMarkAttemptTarget(
+    bookId: String,
+    pageNumber: Int,
+    attemptNo: Int,
+    attempts: List<Attempt>,
+): Boolean = attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO || attempts.any {
+    it.bookId == bookId && it.pageNumber == pageNumber && it.attemptNo == attemptNo
+}
+
+internal fun isCompatibleMarkGroupTarget(group: MarkGroup, attemptNo: Int): Boolean {
+    val pageLevel = attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO
+    return group.marks.all { mark ->
+        (mark.attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO) == pageLevel
+    }
+}
+
+private fun MarkGroup.nextSyncRevision(): Long {
+    check(syncRevision < Long.MAX_VALUE) { "채점 표시 변경 번호가 한도를 초과했습니다." }
+    return syncRevision + 1L
+}
+
+internal data class MarkGroupUpsertResult(
+    val markGroups: List<MarkGroup>,
+    val changed: Boolean,
+)
+
+internal data class AttemptUpsertResult(
+    val attempts: List<Attempt>,
+    val changed: Boolean,
+)
+
+internal fun mergeRemoteAttempt(
+    attempts: List<Attempt>,
+    bookId: String,
+    pageNumber: Int,
+    pageCount: Int,
+    incoming: Attempt,
+): AttemptUpsertResult {
+    require(pageNumber in 0 until pageCount) { "풀이 회차 페이지가 교재 범위를 벗어납니다." }
+    require(incoming.bookId == bookId && incoming.pageNumber == pageNumber) {
+        "다른 교재 또는 페이지의 풀이 회차를 동기화할 수 없습니다."
+    }
+    require(incoming.attemptNo > TEACHER_PAGE_REVIEW_ATTEMPT_NO) {
+        "학생 풀이 회차 번호가 올바르지 않습니다."
+    }
+    require(incoming.startedAtEpochMillis >= 0L) { "풀이 시작 시간이 올바르지 않습니다." }
+    val lockedAt = incoming.lockedAtEpochMillis
+    require(
+        if (incoming.locked) {
+            lockedAt != null && lockedAt >= incoming.startedAtEpochMillis
+        } else {
+            lockedAt == null
+        }
+    ) { "풀이 제출 상태가 올바르지 않습니다." }
+
+    val existing = attempts.firstOrNull {
+        it.bookId == bookId && it.pageNumber == pageNumber && it.attemptNo == incoming.attemptNo
+    }
+    if (existing == incoming || existing?.locked == true && !incoming.locked) {
+        return AttemptUpsertResult(attempts, changed = false)
+    }
+    return AttemptUpsertResult(
+        attempts = if (existing == null) {
+            attempts + incoming
+        } else {
+            attempts.map { if (it == existing) incoming else it }
+        },
+        changed = true,
+    )
+}
+
+/** Pure merge used by the repository and JVM tests; all peer-controlled fields are checked here. */
+internal fun mergeRemoteMarkGroup(
+    markGroups: List<MarkGroup>,
+    bookId: String,
+    pageNumber: Int,
+    pageCount: Int,
+    attempts: List<Attempt>,
+    incoming: MarkGroup,
+): MarkGroupUpsertResult {
+    require(pageNumber in 0 until pageCount) { "채점 대상 페이지가 교재 범위를 벗어납니다." }
+    require(incoming.bookId == bookId && incoming.pageNumber == pageNumber) {
+        "다른 교재 또는 페이지의 채점 표시를 동기화할 수 없습니다."
+    }
+    require(incoming.id.isNotBlank() && incoming.id.length <= 256) { "채점 표시 ID가 올바르지 않습니다." }
+    require(incoming.createdAtEpochMillis >= 0L && (incoming.hiddenAtEpochMillis ?: 0L) >= 0L) {
+        "채점 표시 시간이 올바르지 않습니다."
+    }
+    require(incoming.syncRevision >= 0L && incoming.lastModifiedByDeviceId.length <= 256) {
+        "채점 표시 변경 정보가 올바르지 않습니다."
+    }
+    require(incoming.syncRevision == 0L || incoming.lastModifiedByDeviceId.isNotBlank()) {
+        "채점 표시 변경 기기가 비어 있습니다."
+    }
+    require(
+        incoming.anchor.x.isFinite() && incoming.anchor.x in 0f..1000f &&
+            incoming.anchor.y.isFinite() && incoming.anchor.y in 0f..1_000_000f &&
+            incoming.anchor.pressure.isFinite() && incoming.anchor.pressure >= 0f
+    ) { "채점 표시 위치가 올바르지 않습니다." }
+    require(incoming.marks.isNotEmpty() && incoming.marks.size <= 4_096) {
+        "채점 표시 이력이 올바르지 않습니다."
+    }
+    val includesPageTarget = incoming.marks.any {
+        it.attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO
+    }
+    require(!includesPageTarget || incoming.marks.all {
+        it.attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO
+    }) { "페이지 표시와 학생 풀이 채점을 같은 표시 묶음에 섞을 수 없습니다." }
+    require(incoming.marks.all { mark ->
+        mark.gradedAtEpochMillis >= 0L && (mark.hiddenAtEpochMillis ?: 0L) >= 0L &&
+            isValidMarkAttemptTarget(bookId, pageNumber, mark.attemptNo, attempts)
+    }) { "채점 대상 풀이 회차가 없습니다." }
+
+    val existing = markGroups.firstOrNull { it.id == incoming.id }
+    require(existing == null || existing.bookId == bookId && existing.pageNumber == pageNumber) {
+        "같은 ID의 채점 표시가 다른 교재 또는 페이지에 있습니다."
+    }
+    if (existing == incoming) return MarkGroupUpsertResult(markGroups, changed = false)
+    if (existing != null && incoming.compareSyncOrder(existing) <= 0) {
+        return MarkGroupUpsertResult(markGroups, changed = false)
+    }
+    return MarkGroupUpsertResult(
+        markGroups = if (existing == null) {
+            markGroups + incoming
+        } else {
+            markGroups.map { if (it.id == incoming.id) incoming else it }
+        },
+        changed = true,
+    )
+}
+
+private fun MarkGroup.compareSyncOrder(other: MarkGroup): Int {
+    syncRevision.compareTo(other.syncRevision).takeIf { it != 0 }?.let { return it }
+    lastModifiedByDeviceId.compareTo(other.lastModifiedByDeviceId).takeIf { it != 0 }?.let { return it }
+    return syncStateKey().compareTo(other.syncStateKey())
+}
+
+private fun MarkGroup.syncStateKey(): String = buildString {
+        append(createdAtEpochMillis).append('|')
+        append(hiddenAtEpochMillis ?: -1L).append('|')
+        append(anchor.x.toRawBits()).append(',')
+        append(anchor.y.toRawBits()).append(',')
+        append(anchor.pressure.toRawBits()).append('|')
+        marks.forEach { mark ->
+            append(mark.attemptNo).append(',')
+            append(mark.color.name).append(',')
+            append(mark.gradedAtEpochMillis).append(',')
+            append(mark.hiddenAtEpochMillis ?: -1L).append(';')
+        }
+    }
+
 private fun encodeCatalog(catalog: LibraryCatalog): JSONObject {
     return JSONObject().put("formatVersion", 2).put("selectedStudentId", catalog.selectedStudentId)
         .put("students", JSONArray().apply { catalog.students.forEach { put(it.toJson()) } })
@@ -362,7 +665,10 @@ private fun Attempt.toJson() = JSONObject().put("bookId", bookId).put("page", pa
     .put("lockedAt", lockedAtEpochMillis ?: JSONObject.NULL)
 private fun MarkGroup.toJson() = JSONObject().put("id", id).put("bookId", bookId).put("page", pageNumber)
     .put("anchor", JSONArray().put(anchor.x).put(anchor.y)).put("createdAt", createdAtEpochMillis)
-    .put("hiddenAt", hiddenAtEpochMillis ?: JSONObject.NULL).put("marks", JSONArray().apply {
+    .put("hiddenAt", hiddenAtEpochMillis ?: JSONObject.NULL)
+    .put("syncRevision", syncRevision)
+    .put("lastModifiedByDeviceId", lastModifiedByDeviceId)
+    .put("marks", JSONArray().apply {
         marks.forEach { mark -> put(JSONObject().put("attemptNo", mark.attemptNo).put("color", mark.color.name)
             .put("gradedAt", mark.gradedAtEpochMillis).put("hiddenAt", mark.hiddenAtEpochMillis ?: JSONObject.NULL)) }
     })
@@ -396,6 +702,8 @@ private fun decodeCatalog(root: JSONObject): LibraryCatalog {
                 gradedAtEpochMillis = getLong("gradedAt"), hiddenAtEpochMillis = nullableLong("hiddenAt"),
             ) },
             createdAtEpochMillis = group.getLong("createdAt"), hiddenAtEpochMillis = group.nullableLong("hiddenAt"),
+            syncRevision = group.optLong("syncRevision", 0L),
+            lastModifiedByDeviceId = group.optString("lastModifiedByDeviceId", ""),
         )
     }
     return LibraryCatalog(students, root.getString("selectedStudentId"), books, attempts, groups)

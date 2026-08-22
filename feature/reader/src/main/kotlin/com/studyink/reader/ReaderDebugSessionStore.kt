@@ -7,6 +7,8 @@ data class ReaderDebugSession(
     val bookId: String,
     val pageNumber: Int,
     val role: ReaderRole,
+    val workflow: ReaderWorkflow,
+    val attemptNo: Int?,
 )
 
 /** Debug-only shortcut state. Every entry point checks the debuggable application flag. */
@@ -15,6 +17,8 @@ object ReaderDebugSessionStore {
     private const val BOOK_ID = "bookId"
     private const val PAGE_NUMBER = "pageNumber"
     private const val ROLE = "role"
+    private const val WORKFLOW = "workflow"
+    private const val ATTEMPT_NUMBER = "attemptNumber"
 
     fun isEnabled(context: Context): Boolean =
         context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
@@ -26,6 +30,8 @@ object ReaderDebugSessionStore {
             .putString(BOOK_ID, state.bookId)
             .putInt(PAGE_NUMBER, state.pageNumber)
             .putString(ROLE, state.role.name)
+            .putString(WORKFLOW, state.workflow.name)
+            .putInt(ATTEMPT_NUMBER, state.attemptNo)
             .apply()
     }
 
@@ -36,10 +42,16 @@ object ReaderDebugSessionStore {
         val role = preferences.getString(ROLE, null)
             ?.let { runCatching { ReaderRole.valueOf(it) }.getOrNull() }
             ?: ReaderRole.STUDENT
+        val workflow = preferences.getString(WORKFLOW, null)
+            ?.let { runCatching { ReaderWorkflow.valueOf(it) }.getOrNull() }
+            ?: ReaderWorkflow.defaultFor(role)
         return ReaderDebugSession(
             bookId = bookId,
             pageNumber = preferences.getInt(PAGE_NUMBER, 0).coerceAtLeast(0),
             role = role,
+            workflow = workflow,
+            attemptNo = preferences.getInt(ATTEMPT_NUMBER, 1)
+                .takeIf { preferences.contains(ATTEMPT_NUMBER) && it >= 0 },
         )
     }
 }

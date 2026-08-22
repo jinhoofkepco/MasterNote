@@ -16,6 +16,10 @@ import android.os.Looper
 import android.os.Build
 import android.util.Base64
 import com.studyink.annotation.storage.PageOperationLogStore
+import com.studyink.core.model.Attempt
+import com.studyink.core.model.MarkGroup
+import com.studyink.library.data.LibraryAttemptBus
+import com.studyink.library.data.LibraryMarkGroupBus
 import com.studyink.library.data.LibraryRepository
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -31,11 +35,16 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * One-student/one-teacher LAN transport. It transfers only append-log records for the page the
- * teacher subscribed to. Local persistence never waits for this service.
+ * One-student/one-teacher LAN transport. Stroke operations follow the subscribed page, while
+ * student attempts and teacher mark groups use idempotent full-state upserts. Local persistence
+ * never waits for this service.
  */
-class LanSyncService : Service(), LanSyncBus.Listener {
+class LanSyncService : Service(),
+    LanSyncBus.Listener,
+    LibraryAttemptBus.Listener,
+    LibraryMarkGroupBus.Listener {
     private val io = Executors.newCachedThreadPool()
+    private val metadataIo = Executors.newSingleThreadExecutor()
     private val handler = Handler(Looper.getMainLooper())
     private val store by lazy { PageOperationLogStore(this) }
     private val library by lazy { LibraryRepository.get(this) }
@@ -48,6 +57,7 @@ class LanSyncService : Service(), LanSyncBus.Listener {
     private var socket: Socket? = null
     private var writer: BufferedWriter? = null
     private var role: LanPeerRole? = null
+    private var peerRole: LanPeerRole? = null
     private var bookId: String = ""
     private var peerBookId: String = ""
     private var documentHash: String = ""
@@ -69,6 +79,8 @@ class LanSyncService : Service(), LanSyncBus.Listener {
         super.onCreate()
         createNotificationChannel()
         LanSyncBus.addListener(this)
+        LibraryAttemptBus.addListener(this)
+        LibraryMarkGroupBus.addListener(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -233,11 +245,18 @@ class LanSyncService : Service(), LanSyncBus.Listener {
                 require(message.getString("documentHash") == documentHash && message.getString("token") == pairingToken)
                 peerBookId = message.getString("bookId")
                 peerDeviceId = message.getString("deviceId")
+                peerRole = LanPeerRole.valueOf(message.getString("role")).also { announcedRole ->
+                    require(
+                        role == LanPeerRole.STUDENT_SERVER && announcedRole == LanPeerRole.TEACHER_CLIENT ||
+                            role == LanPeerRole.TEACHER_CLIENT && announcedRole == LanPeerRole.STUDENT_SERVER
+                    ) { "Peer role does not match this session" }
+                }
                 val pairingKey = "${role?.name}:$bookId"
                 val pairedDeviceId = pairingPreferences.getString(pairingKey, null)
                 require(pairedDeviceId == null || pairedDeviceId == peerDeviceId) { "Another device is already paired" }
                 if (pairedDeviceId == null) pairingPreferences.edit().putString(pairingKey, peerDeviceId).apply()
                 send(LanWire.message("HELLO_OK"))
+                sendMetadataSnapshot()
                 if (role == LanPeerRole.STUDENT_SERVER && currentStudentPage >= 0) {
                     send(LanWire.message("PAGE_STATE") { put("page", currentStudentPage); put("revision", 0L) })
                 }
@@ -268,7 +287,37 @@ class LanSyncService : Service(), LanSyncBus.Listener {
                 }
             }
             "PAGE_STATE" -> LanSyncBus.remotePageChanged(bookId, message.getInt("page"))
+            "ATTEMPT_UPSERT" -> {
+                require(
+                    role == LanPeerRole.TEACHER_CLIENT && peerRole == LanPeerRole.STUDENT_SERVER
+                ) { "Only a student peer may send attempts" }
+                require(message.getString("bookId") == peerBookId) { "Attempt book does not match peer" }
+                val page = message.getInt("page")
+                val attempt = AttemptWireCodec.decode(message.getJSONObject("payload"), bookId, page)
+                if (library.upsertAttemptFromSync(bookId, page, attempt)) {
+                    LanSyncBus.remoteAttempt(bookId, page)
+                }
+            }
+            "MARK_GROUP_UPSERT" -> {
+                require(role != null) { "Mark received outside a LAN session" }
+                require(message.getString("bookId") == peerBookId) { "Mark book does not match peer" }
+                val page = message.getInt("page")
+                val group = MarkGroupWireCodec.decode(message.getJSONObject("payload"), bookId, page)
+                if (library.upsertMarkGroupFromSync(bookId, page, group)) {
+                    LanSyncBus.remoteMarkGroup(bookId, page)
+                }
+            }
         }
+    }
+
+    override fun onLocalAttemptChanged(attempt: Attempt) {
+        if (role != LanPeerRole.STUDENT_SERVER || attempt.bookId != bookId) return
+        enqueueAttempt(attempt)
+    }
+
+    override fun onLocalMarkGroupChanged(group: MarkGroup) {
+        if (role == null || group.bookId != bookId) return
+        enqueueMarkGroup(group)
     }
 
     override fun onLocalOperation(bookId: String, pageNumber: Int) {
@@ -307,6 +356,55 @@ class LanSyncService : Service(), LanSyncBus.Listener {
             store.maxOperationClock(bookId, subscribedPage, peerDeviceId)
         }.getOrDefault(0L)
         send(LanWire.message("SUBSCRIBE") { put("page", subscribedPage); put("receivedClock", receivedClock) })
+    }
+
+    /**
+     * Repairs events that occurred before connection or during a disconnect. Attempts come from
+     * the student role; versioned mark groups converge in both directions.
+     */
+    private fun sendMetadataSnapshot() {
+        val expectedBookId = bookId
+        val expectedRole = role ?: return
+        metadataIo.execute {
+            if (role != expectedRole || bookId != expectedBookId || writer == null) return@execute
+            if (expectedRole == LanPeerRole.STUDENT_SERVER) {
+                library.attemptsForSync(expectedBookId).forEach(::sendAttemptNow)
+            }
+            // Either physical device may enter teacher perspective, so marks converge both ways.
+            library.markGroupsForSync(expectedBookId).forEach(::sendMarkGroupNow)
+        }
+    }
+
+    private fun enqueueAttempt(attempt: Attempt) {
+        metadataIo.execute {
+            if (role == LanPeerRole.STUDENT_SERVER && bookId == attempt.bookId && writer != null) {
+                sendAttemptNow(attempt)
+            }
+        }
+    }
+
+    private fun enqueueMarkGroup(group: MarkGroup) {
+        metadataIo.execute {
+            if (role != null && bookId == group.bookId && writer != null) {
+                sendMarkGroupNow(group)
+            }
+        }
+    }
+
+    private fun sendAttemptNow(attempt: Attempt) {
+        send(LanWire.message("ATTEMPT_UPSERT") {
+            put("bookId", attempt.bookId)
+            put("page", attempt.pageNumber)
+            put("payload", AttemptWireCodec.encode(attempt))
+        })
+    }
+
+    private fun sendMarkGroupNow(group: MarkGroup) {
+        send(LanWire.message("MARK_GROUP_UPSERT") {
+            put("bookId", group.bookId)
+            put("page", group.pageNumber)
+            put("payload", MarkGroupWireCodec.encode(group))
+        })
     }
 
     private fun flushPendingAtStrokeBoundary() {
@@ -386,6 +484,7 @@ class LanSyncService : Service(), LanSyncBus.Listener {
         runCatching { serverSocket?.close() }
         socket = null; serverSocket = null; writer = null
         peerBookId = ""
+        peerRole = null
         peerDeviceId = ""
         peerHost = ""
         peerPort = 0
@@ -394,8 +493,11 @@ class LanSyncService : Service(), LanSyncBus.Listener {
 
     override fun onDestroy() {
         LanSyncBus.removeListener(this)
+        LibraryAttemptBus.removeListener(this)
+        LibraryMarkGroupBus.removeListener(this)
         closeSession()
         io.shutdownNow()
+        metadataIo.shutdownNow()
         super.onDestroy()
     }
 
