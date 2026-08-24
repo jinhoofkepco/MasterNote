@@ -9,6 +9,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -26,6 +29,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -41,25 +45,35 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
-import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.RectangleShape
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInteropFilter
+import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.studyink.core.model.Mark
 import com.studyink.core.model.MarkColor
 import com.studyink.core.model.MarkGroup
 import com.studyink.core.model.PagePoint
+import com.studyink.monitor.core.HybridLinkDecision
+import com.studyink.monitor.core.HybridLinkHealth
+import com.studyink.monitor.core.HybridLinkMode
 import com.studyink.sync.lan.LanConnectionState
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -67,6 +81,148 @@ import kotlin.math.roundToInt
 internal const val S23_ULTRA_MODEL_PREFIX = "SM-S918"
 internal const val S23_STRIP_CELL_COUNT = 10
 internal const val S23_STRIP_HISTORY_CELL_COUNT = 4
+
+/** S Pen taps belong exclusively to the parent drag/tap interop path. */
+internal fun s23AttemptCellHandlesDirectPointer(pointerType: PointerType): Boolean =
+    pointerType == PointerType.Touch
+
+/** The one transport cell shows the route currently capable of carrying the teacher session. */
+enum class S23TransportMode {
+    LIVE,
+    TELEGRAM,
+}
+
+/**
+ * Transport detail deliberately stays independent of LAN and Telegram implementation classes.
+ * The app coordinator can therefore map its richer health model without making the reader own
+ * reconnection or fallback policy.
+ */
+enum class S23TransportLinkState {
+    CONNECTED,
+    READY,
+    CONNECTING,
+    QUEUED,
+    ERROR,
+    UNAVAILABLE,
+}
+
+enum class S23TransportTone {
+    CONNECTED,
+    TRANSITIONING,
+    ERROR,
+    UNAVAILABLE,
+}
+
+/**
+ * Input and resolved state for the S23 Ultra's single compact transport cell.
+ *
+ * A usable LAN route always owns the cell. Telegram is shown only after LAN becomes unavailable;
+ * this prevents a queued Telegram document from visually replacing a healthy live session.
+ */
+@Immutable
+data class S23TransportCellModel(
+    val lan: S23TransportLinkState,
+    val telegram: S23TransportLinkState,
+    val telegramUnreadCount: Int = 0,
+    /** Lets the hybrid policy show a gray 텔 even before Telegram has been configured. */
+    val preferredMode: S23TransportMode? = null,
+) {
+    val activeMode: S23TransportMode
+        get() = when {
+            preferredMode != null -> preferredMode
+            lan != S23TransportLinkState.UNAVAILABLE -> S23TransportMode.LIVE
+            telegram != S23TransportLinkState.UNAVAILABLE -> S23TransportMode.TELEGRAM
+            else -> S23TransportMode.LIVE
+        }
+
+    val activeLinkState: S23TransportLinkState
+        get() = when (activeMode) {
+            S23TransportMode.LIVE -> lan
+            S23TransportMode.TELEGRAM -> telegram
+        }
+
+    val activeTone: S23TransportTone
+        get() = when (activeLinkState) {
+            S23TransportLinkState.CONNECTED,
+            S23TransportLinkState.READY,
+            -> S23TransportTone.CONNECTED
+
+            S23TransportLinkState.CONNECTING,
+            S23TransportLinkState.QUEUED,
+            -> S23TransportTone.TRANSITIONING
+
+            S23TransportLinkState.ERROR -> S23TransportTone.ERROR
+
+            S23TransportLinkState.UNAVAILABLE -> S23TransportTone.UNAVAILABLE
+        }
+
+    val label: String
+        get() = when (activeMode) {
+            S23TransportMode.LIVE -> "실"
+            S23TransportMode.TELEGRAM -> "텔"
+        }
+}
+
+internal fun s23TransportCellModelForLan(connection: LanConnectionState): S23TransportCellModel =
+    S23TransportCellModel(
+        lan = when (connection) {
+            LanConnectionState.CONNECTED -> S23TransportLinkState.READY
+            LanConnectionState.CONNECTING -> S23TransportLinkState.CONNECTING
+            LanConnectionState.IDLE,
+            LanConnectionState.DISCONNECTED,
+            -> S23TransportLinkState.UNAVAILABLE
+        },
+        telegram = S23TransportLinkState.UNAVAILABLE,
+    )
+
+internal fun s23TransportCellModelForHybrid(
+    decision: HybridLinkDecision?,
+    legacyLanConnection: LanConnectionState,
+    telegramUnreadCount: Int,
+): S23TransportCellModel {
+    if (decision == null) {
+        return s23TransportCellModelForLan(legacyLanConnection).copy(
+            telegramUnreadCount = telegramUnreadCount.coerceAtLeast(0),
+        )
+    }
+    return when (decision.mode) {
+        HybridLinkMode.LAN_LIVE -> S23TransportCellModel(
+            lan = S23TransportLinkState.READY,
+            telegram = S23TransportLinkState.UNAVAILABLE,
+            telegramUnreadCount = telegramUnreadCount.coerceAtLeast(0),
+            preferredMode = S23TransportMode.LIVE,
+        )
+        HybridLinkMode.LAN_GRACE -> S23TransportCellModel(
+            lan = S23TransportLinkState.CONNECTING,
+            telegram = S23TransportLinkState.UNAVAILABLE,
+            telegramUnreadCount = telegramUnreadCount.coerceAtLeast(0),
+            preferredMode = S23TransportMode.LIVE,
+        )
+        HybridLinkMode.TELEGRAM_FALLBACK -> S23TransportCellModel(
+            lan = S23TransportLinkState.UNAVAILABLE,
+            telegram = S23TransportLinkState.READY,
+            telegramUnreadCount = telegramUnreadCount.coerceAtLeast(0),
+            preferredMode = S23TransportMode.TELEGRAM,
+        )
+        HybridLinkMode.OFFLINE_QUEUEING -> S23TransportCellModel(
+            lan = S23TransportLinkState.UNAVAILABLE,
+            telegram = when (decision.health) {
+                HybridLinkHealth.ERROR -> S23TransportLinkState.ERROR
+                HybridLinkHealth.TRANSITIONING -> S23TransportLinkState.QUEUED
+                HybridLinkHealth.READY -> S23TransportLinkState.READY
+                HybridLinkHealth.INACTIVE -> S23TransportLinkState.UNAVAILABLE
+            },
+            telegramUnreadCount = telegramUnreadCount.coerceAtLeast(0),
+            preferredMode = S23TransportMode.TELEGRAM,
+        )
+    }
+}
+
+internal fun s23UnreadBadgeLabel(unreadCount: Int): String? = when {
+    unreadCount <= 0 -> null
+    unreadCount > 9 -> "9+"
+    else -> unreadCount.toString()
+}
 
 /**
  * The strip is deliberately a device exception, not another compact-width breakpoint. A tablet in
@@ -122,6 +278,11 @@ internal fun S23UltraTopStrip(
     onSelectAttempt: (Int) -> Unit,
     onShowStudentActivity: () -> Unit,
     onResumeStudentFollow: () -> Unit,
+    transportCellModel: S23TransportCellModel =
+        s23TransportCellModelForLan(state.liveConnection),
+    onTransportClick: (S23TransportMode) -> Unit = { mode ->
+        if (mode == S23TransportMode.LIVE) onResumeStudentFollow()
+    },
     previewHoveredDescription: String? = null,
     markHistoryContent: (@Composable () -> Unit)? = null,
 ) {
@@ -178,11 +339,13 @@ internal fun S23UltraTopStrip(
                         forceHovered =
                             previewHoveredDescription == "교재 페이지로 돌아가기",
                     )
-                    S23LiveCell(
-                        state = state,
-                        onResumeStudentFollow = onResumeStudentFollow,
+                    S23TransportCell(
+                        model = transportCellModel,
+                        onTransportClick = onTransportClick,
+                        role = state.role,
                         cellWidth = cellWidth,
-                        forceHovered = previewHoveredDescription == "학생 화면 다시 따라가기",
+                        forceHovered = previewHoveredDescription == "학생 화면 다시 따라가기" ||
+                            previewHoveredDescription == "전송 상태",
                     )
                     if (markHistoryContent != null) {
                         Box(
@@ -329,61 +492,77 @@ private fun S23StripButton(
 }
 
 @Composable
-private fun S23LiveCell(
-    state: ReaderUiState,
-    onResumeStudentFollow: () -> Unit,
+private fun S23TransportCell(
+    model: S23TransportCellModel,
+    onTransportClick: (S23TransportMode) -> Unit,
+    role: ReaderRole,
     cellWidth: Dp,
     forceHovered: Boolean,
 ) {
-    val tokens = readerChromeTokens(state.role)
-    val connected = state.liveConnection == LanConnectionState.CONNECTED
-    val following = state.isFollowingStudent
-    val description = when {
-        !state.capabilities.showsStudentLocation -> "실시간 감독 사용 불가"
-        following && connected -> "실시간 감독 중"
-        following -> "학생 기기 연결 끊김"
-        else -> state.studentPageNumber?.let { "학생 ${it + 1}쪽 다시 따라가기" }
-            ?: "학생 화면 다시 따라가기"
+    val tokens = readerChromeTokens(role)
+    val description = when (model.activeMode) {
+        S23TransportMode.LIVE -> when (model.activeLinkState) {
+            S23TransportLinkState.CONNECTED,
+            S23TransportLinkState.READY,
+            -> "실시간 연결됨"
+
+            S23TransportLinkState.CONNECTING,
+            S23TransportLinkState.QUEUED,
+            -> "실시간 연결 중"
+
+            S23TransportLinkState.ERROR -> "실시간 연결 오류"
+            S23TransportLinkState.UNAVAILABLE -> "실시간 연결 없음"
+        }
+        S23TransportMode.TELEGRAM -> when (model.activeLinkState) {
+            S23TransportLinkState.CONNECTED,
+            S23TransportLinkState.READY,
+            -> "Telegram 연결됨"
+
+            S23TransportLinkState.CONNECTING -> "Telegram 연결 중"
+            S23TransportLinkState.QUEUED -> "Telegram 전송 대기 중"
+            S23TransportLinkState.ERROR -> "Telegram 연결 오류"
+            S23TransportLinkState.UNAVAILABLE -> "Telegram 연결 없음"
+        }
     }
     S23StripButton(
         description = description,
-        onAction = onResumeStudentFollow,
-        enabled = state.capabilities.showsStudentLocation && !following,
-        role = state.role,
+        onAction = { onTransportClick(model.activeMode) },
+        role = role,
         cellWidth = cellWidth,
         forceHovered = forceHovered,
     ) {
-        Canvas(modifier = Modifier.size(19.dp)) {
-            val eyeColor = if (connected) tokens.liveBadge else tokens.statusForeground
-            val outline = Path().apply {
-                moveTo(size.width * 0.04f, size.height * 0.5f)
-                quadraticTo(
-                    size.width * 0.5f,
-                    size.height * 0.06f,
-                    size.width * 0.96f,
-                    size.height * 0.5f,
-                )
-                quadraticTo(
-                    size.width * 0.5f,
-                    size.height * 0.94f,
-                    size.width * 0.04f,
-                    size.height * 0.5f,
-                )
-                close()
-            }
-            drawPath(outline, eyeColor, style = Stroke(width = size.width * 0.1f))
-            if (connected) {
-                drawCircle(
-                    color = eyeColor,
-                    radius = size.width * 0.19f,
-                    center = Offset(size.width * 0.5f, size.height * 0.5f),
-                )
-            } else {
-                drawLine(
-                    color = eyeColor,
-                    start = Offset(size.width * 0.12f, size.height * 0.86f),
-                    end = Offset(size.width * 0.88f, size.height * 0.14f),
-                    strokeWidth = size.width * 0.12f,
+        val foreground = when (model.activeTone) {
+            S23TransportTone.CONNECTED -> tokens.paletteGreen
+            S23TransportTone.TRANSITIONING -> tokens.paletteOrange
+            S23TransportTone.ERROR -> tokens.palettePink
+            S23TransportTone.UNAVAILABLE -> tokens.statusForeground
+        }
+        Text(
+            text = model.label,
+            color = foreground,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Black,
+        )
+        // Old Telegram unread state must not make the live-owned cell look like a second active
+        // transport. It reappears on this same cell as soon as fallback selects 텔.
+        s23UnreadBadgeLabel(model.telegramUnreadCount)
+            ?.takeIf { model.activeMode == S23TransportMode.TELEGRAM }
+            ?.let { badge ->
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .offset(x = (-2).dp, y = 3.dp)
+                    .defaultMinSize(minWidth = 15.dp, minHeight = 15.dp)
+                    .background(tokens.palettePink, RoundedCornerShape(50))
+                    .padding(horizontal = 2.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = badge,
+                    color = tokens.paletteCream,
+                    fontSize = 8.sp,
+                    lineHeight = 8.sp,
+                    fontWeight = FontWeight.Bold,
                 )
             }
         }
@@ -498,6 +677,33 @@ private fun S23AttemptHistory(
                         .onGloballyPositioned { coordinates ->
                             val bounds = coordinates.boundsInWindow()
                             bundleBounds[bundle.attemptNo] = bounds.left..bounds.right
+                        }
+                        .pointerInput(state.capabilities.canBrowseAttempts, bundle.attemptNo) {
+                            if (!state.capabilities.canBrowseAttempts) return@pointerInput
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                if (!s23AttemptCellHandlesDirectPointer(down.type)) {
+                                    return@awaitEachGesture
+                                }
+                                down.consume()
+                                waitForUpOrCancellation()?.let { up ->
+                                    up.consume()
+                                    onSelectAttempt(bundle.attemptNo)
+                                }
+                            }
+                        }
+                        .semantics(mergeDescendants = true) {
+                            role = Role.Button
+                            contentDescription = "${bundle.attemptNo}회차 정오답"
+                            this.selected = selected
+                            if (state.capabilities.canBrowseAttempts) {
+                                onClick(label = "${bundle.attemptNo}회차 열기") {
+                                    onSelectAttempt(bundle.attemptNo)
+                                    true
+                                }
+                            } else {
+                                disabled()
+                            }
                         },
                     contentAlignment = Alignment.Center,
                 ) {

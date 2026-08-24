@@ -30,6 +30,11 @@
             android:exported="false"
             android:screenOrientation="fullSensor" />
         <activity
+            android:name=".RemotePeerChatActivity"
+            android:configChanges="keyboardHidden|orientation|screenSize"
+            android:exported="false"
+            android:screenOrientation="fullSensor" />
+        <activity
             android:name="com.studyink.library.ui.LibraryActivity"
             android:configChanges="keyboardHidden|orientation|screenSize"
             android:exported="true"

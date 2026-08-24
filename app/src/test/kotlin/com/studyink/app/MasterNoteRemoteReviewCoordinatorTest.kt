@@ -2,17 +2,25 @@ package com.studyink.app
 
 import com.studyink.core.model.AnnotationSnapshot
 import com.studyink.core.model.PagePoint
+import com.studyink.core.model.MarkColor
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeId
 import com.studyink.core.model.StrokeTool
 import com.studyink.monitor.core.NormalizedTeacherPoint
 import com.studyink.monitor.core.NormalizedTeacherStroke
+import com.studyink.monitor.core.NormalizedGradeAnchor
+import com.studyink.monitor.core.HybridLinkMode
+import com.studyink.monitor.core.PageSnapshotEnvelope
+import com.studyink.monitor.core.RemoteGradeEnvelope
+import com.studyink.monitor.core.RemoteReviewDocumentCodec
 import com.studyink.monitor.core.ReviewCanvasDimensions
+import com.studyink.monitor.core.SnapshotImageFormat
 import com.studyink.monitor.core.SnapshotReference
 import com.studyink.monitor.core.StudentWorkHeartbeat
 import com.studyink.monitor.core.StudentWorkKind
 import com.studyink.monitor.core.TeacherFeedbackEnvelope
 import com.studyink.monitor.core.TeacherInkTool
+import com.studyink.sync.lan.LanConnectionState
 import java.io.File
 import kotlin.io.path.createTempDirectory
 import org.junit.Assert.assertEquals
@@ -22,6 +30,92 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MasterNoteRemoteReviewCoordinatorTest {
+    @Test fun undecodableInboxDocumentIsRetainedWithoutTransportAcknowledgement() {
+        val valid = RemoteReviewDocumentCodec.encode(
+            PageSnapshotEnvelope(
+                transferId = "snapshot_decode_0001",
+                createdAtEpochMs = 1L,
+                pageToken = PAGE_TOKEN,
+                workbookLabel = "수학",
+                pageNumber = 1,
+                attemptNo = 1,
+                revision = 1L,
+                dimensions = ReviewCanvasDimensions(100, 200),
+                imageFormat = SnapshotImageFormat.JPEG,
+                renderedPageBytes = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte()),
+            ),
+        ).copyBytes()
+        assertTrue(decodeRemoteReviewInboxDocument(valid) is RemoteReviewInboxDecodeResult.Decoded)
+
+        val unsupportedVersion = valid.copyOf().also { it[4] = 99 }
+        assertEquals(
+            RemoteReviewInboxDecodeResult.RetainWithoutAcknowledgement,
+            decodeRemoteReviewInboxDocument(unsupportedVersion),
+        )
+        val corrupted = valid.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() }
+        assertEquals(
+            RemoteReviewInboxDecodeResult.RetainWithoutAcknowledgement,
+            decodeRemoteReviewInboxDocument(corrupted),
+        )
+    }
+
+    @Test fun retainedUndecodableInboxEntryDoesNotStarveLaterDocuments() {
+        assertEquals(
+            listOf(102L, 103L),
+            selectRemoteReviewInboxUpdateIds(
+                pendingUpdateIds = listOf(101L, 102L, 103L),
+                retainedUpdateIds = setOf(101L),
+                limit = 2,
+            ),
+        )
+        assertEquals(
+            listOf(104L),
+            selectRemoteReviewInboxUpdateIds(
+                pendingUpdateIds = listOf(101L, 102L, 103L, 104L),
+                retainedUpdateIds = setOf(101L, 102L, 103L),
+                limit = 2,
+            ),
+        )
+    }
+
+    @Test fun telegramOnlyTeacherCanSendWithoutEverOpeningALanSession() {
+        assertTrue(shouldAllowTelegramUserAction(hasActiveLanSession = false, hybridMode = null))
+        // A decision retained from a closed LAN session must not suppress Telegram-only actions.
+        assertTrue(
+            shouldAllowTelegramUserAction(
+                hasActiveLanSession = false,
+                hybridMode = HybridLinkMode.LAN_LIVE,
+            ),
+        )
+    }
+
+    @Test fun activeLanSessionRequiresAnExplicitTelegramOwningMode() {
+        assertFalse(shouldAllowTelegramUserAction(true, null))
+        assertFalse(shouldAllowTelegramUserAction(true, HybridLinkMode.LAN_LIVE))
+        assertFalse(shouldAllowTelegramUserAction(true, HybridLinkMode.LAN_GRACE))
+        assertTrue(shouldAllowTelegramUserAction(true, HybridLinkMode.TELEGRAM_FALLBACK))
+        assertTrue(shouldAllowTelegramUserAction(true, HybridLinkMode.OFFLINE_QUEUEING))
+    }
+
+    @Test fun onlyConnectedLanTransportMayUseCatchUpGrace() {
+        assertFalse(isLanTransportDefinitelyDisconnected(LanConnectionState.CONNECTED))
+        assertTrue(isLanTransportDefinitelyDisconnected(LanConnectionState.IDLE))
+        assertTrue(isLanTransportDefinitelyDisconnected(LanConnectionState.CONNECTING))
+        assertTrue(isLanTransportDefinitelyDisconnected(LanConnectionState.DISCONNECTED))
+    }
+
+    @Test fun enteringTelegramFallbackForcesTheCurrentPageImmediately() {
+        val state = RemoteReviewCaptureState(settleMs = 30_000L)
+        state.onPresence(PAGE_ONE, observedRevision = 7L, nowElapsedMs = 0L)
+
+        state.forceCurrent(nowElapsedMs = 12L)
+
+        val forced = requireNotNull(state.nextDue(12L) { RemoteReviewOutboundState.SENT })
+        assertEquals(PAGE_ONE, forced.target)
+        assertTrue(forced.forceSend)
+        assertTrue(state.shouldTransmit(forced, observedRevision = 7L, imageSha256 = "same"))
+    }
+
     @Test fun contactIsOnlySentAfterDurableRevisionActuallyChanges() {
         val state = RemoteReviewCaptureState(
             intervalMs = 60_000L,
@@ -58,6 +152,39 @@ class MasterNoteRemoteReviewCoordinatorTest {
         val latest = requireNotNull(state.nextDue(60_001L) { RemoteReviewOutboundState.SENT })
         assertEquals(PAGE_ONE, latest.target)
         assertTrue(state.shouldTransmit(latest, 2L, "image-2"))
+    }
+
+    @Test fun restartRebindsOutstandingPageAndDoesNotRenderDuplicateWhilePending() {
+        val state = RemoteReviewCaptureState(intervalMs = 60_000L, settleMs = 0L)
+        state.onPresence(PAGE_ONE, observedRevision = 4L, nowElapsedMs = 0L)
+        assertTrue(state.restoreOutstanding(PAGE_ONE, "snapshot_pending_0001", 4L, 0L))
+        state.onHeartbeat(heartbeat(StudentWorkKind.PEN_CONTACT), nowElapsedMs = 1L)
+
+        assertNull(state.nextDue(60_000L) { RemoteReviewOutboundState.PENDING })
+        val afterAck = requireNotNull(state.nextDue(60_000L) { RemoteReviewOutboundState.SENT })
+        assertEquals(PAGE_ONE, afterAck.target)
+    }
+
+    @Test fun fallbackForceDoesNotResendUnchangedRestoredOutboxPageAfterAck() {
+        val state = RemoteReviewCaptureState(intervalMs = 60_000L, settleMs = 0L)
+        state.onPresence(PAGE_ONE, observedRevision = 4L, nowElapsedMs = 0L)
+        assertTrue(state.restoreOutstanding(PAGE_ONE, "snapshot_pending_0002", 4L, 0L))
+
+        state.forceCurrent(nowElapsedMs = 1L)
+
+        assertNull(state.nextDue(1L) { RemoteReviewOutboundState.SENT })
+    }
+
+    @Test fun restartCanRebindPendingPageBeforeItBecomesCurrent() {
+        val state = RemoteReviewCaptureState(intervalMs = 60_000L, settleMs = 0L)
+        assertTrue(state.restoreOutstanding(PAGE_TWO, "snapshot_pending_0003", 2L, 0L))
+        state.onPresence(PAGE_TWO, observedRevision = 2L, nowElapsedMs = 1L)
+        state.onHeartbeat(
+            StudentWorkHeartbeat(1L, StudentWorkKind.PEN_CONTACT, "book-id", 2),
+            1L,
+        )
+
+        assertNull(state.nextDue(60_000L) { RemoteReviewOutboundState.PENDING })
     }
 
     @Test fun leavingDirtyPageOverridesMinuteDeadlineButPageChangeHeartbeatDoesNotDirtyNewPage() {
@@ -202,6 +329,95 @@ class MasterNoteRemoteReviewCoordinatorTest {
         assertTrue(feedback().matches(source))
         assertFalse(feedback(sourceRevision = 8L).matches(source))
         assertFalse(feedback(width = 999).matches(source))
+    }
+
+    @Test fun studentInkDigestIsStableAndIgnoresTeacherAndOtherAttempts() {
+        val student = stroke(
+            id = "student-stroke-a",
+            author = "student",
+            attempt = 1,
+            device = "student-device",
+            itemId = null,
+        )
+        val teacher = stroke(
+            id = "teacher-stroke-a",
+            author = "teacher",
+            attempt = 1,
+            device = PEER_DEVICE,
+            itemId = "remote-review:$PAGE_TOKEN",
+        )
+        val otherAttempt = stroke(
+            id = "student-stroke-b",
+            author = "student",
+            attempt = 2,
+            device = "student-device",
+            itemId = null,
+        )
+
+        val base = studentInkDigest(snapshot(student), 1)
+        assertEquals(base, studentInkDigest(snapshot(otherAttempt, teacher, student), 1))
+        assertFalse(
+            base == studentInkDigest(
+                snapshot(student.copy(points = listOf(PagePoint(11f, 20f)))),
+                1,
+            ),
+        )
+        assertTrue(base.matches(Regex("[0-9a-f]{64}")))
+    }
+
+    @Test fun legacySnapshotTransferDigestParserAndGradeRequireExactVisualState() {
+        val digest = "a".repeat(64)
+        val transferId = "snapshot_${digest}_0123456789abcdef0123456789abcdef"
+        assertEquals(digest, snapshotStudentInkDigest(transferId))
+        assertNull(snapshotStudentInkDigest("snapshot_0123456789abcdef"))
+        val source = OutgoingRemoteSnapshot(
+            transferId = transferId,
+            pageToken = PAGE_TOKEN,
+            bookId = "book-id",
+            pageNumber = 0,
+            attemptNo = 2,
+            studentRevision = 9L,
+            widthPx = 1_000,
+            heightPx = 2_000,
+            createdAtEpochMs = 1L,
+            studentInkDigest = digest,
+        )
+        val grade = RemoteGradeEnvelope(
+            transferId = "grade_transfer_0001",
+            createdAtEpochMs = 2L,
+            actionId = "grade_action_0001",
+            sourceSnapshot = SnapshotReference(transferId, PAGE_TOKEN, 9L, ReviewCanvasDimensions(1_000, 2_000)),
+            attemptNo = 2,
+            studentInkDigest = digest,
+            gradeGroupId = "grade_group_0001",
+            syncRevision = 1L,
+            lastModifiedByDeviceId = "telegrambot_12345678",
+            anchor = NormalizedGradeAnchor(0.2f, 0.3f),
+            score = 1,
+            maximumScore = 1,
+        )
+
+        assertTrue(grade.matches(source))
+        assertTrue(grade.matches(source, "telegrambot_12345678"))
+        assertFalse(grade.matches(source, "telegrambot_87654321"))
+        assertFalse(grade.copy(attemptNo = 1).matches(source))
+        assertFalse(grade.copy(studentInkDigest = "b".repeat(64)).matches(source))
+        assertFalse(grade.copy(sourceSnapshot = grade.sourceSnapshot.copy(revision = 10L)).matches(source))
+
+        val correct = buildRemoteGradeMarkGroup(source, grade)
+        assertEquals("grade_group_0001", correct.id)
+        assertEquals("book-id", correct.bookId)
+        assertEquals(0, correct.pageNumber)
+        assertEquals(200f, correct.anchor.x, 0.0001f)
+        assertEquals(600f, correct.anchor.y, 0.0001f)
+        assertEquals(2, correct.marks.single().attemptNo)
+        assertEquals(MarkColor.BLUE, correct.marks.single().color)
+
+        val incorrect = buildRemoteGradeMarkGroup(
+            source,
+            grade.copy(score = 0, gradeGroupId = "grade_group_0002"),
+        )
+        assertEquals(MarkColor.RED, incorrect.marks.single().color)
     }
 
     @Test fun teacherRevisionIsMonotonicAcrossUiResetAndProcessRestart() {

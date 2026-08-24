@@ -1,12 +1,51 @@
 package com.studyink.app
 
 import java.io.File
+import java.nio.charset.StandardCharsets
+import java.util.Base64
 import kotlin.io.path.createTempDirectory
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RemoteReviewLedgerTest {
+    @Test
+    fun ledgerFromWorkingVersionReplaysWithoutDigestAndRemainsUsable() {
+        val root = createTempDirectory("remote-review-ledger-v1-compat").toFile()
+        try {
+            fun encoded(value: String): String = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(value.toByteArray(StandardCharsets.UTF_8))
+            File(root, "review-ledger.v1").writeText(
+                listOf(
+                    "RR1",
+                    "OUT",
+                    encoded("snapshot_old_0001"),
+                    encoded("page_token_old_0001"),
+                    encoded("book-old"),
+                    "3",
+                    "1",
+                    "7",
+                    "1400",
+                    "1980",
+                    "10",
+                ).joinToString("\t") + "\n",
+                StandardCharsets.UTF_8,
+            )
+
+            val restored = requireNotNull(RemoteReviewLedger(root).outgoing("snapshot_old_0001"))
+            assertEquals(null, restored.studentInkDigest)
+            assertEquals(7L, restored.studentRevision)
+
+            RemoteReviewLedger(root).recordOutgoing(outgoing("snapshot_new_0001", revision = 8L))
+            assertEquals(
+                "a".repeat(64),
+                RemoteReviewLedger(root).outgoing("snapshot_new_0001")?.studentInkDigest,
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     @Test
     fun outgoingMappingAndAppliedFeedbackSurviveRestart() {
         val root = createTempDirectory("remote-review-ledger").toFile()
@@ -57,6 +96,7 @@ class RemoteReviewLedgerTest {
                     heightPx = 1_980,
                     receivedAtEpochMs = 200L,
                     imagePath = "pending",
+                    studentInkDigest = "b".repeat(64),
                 ),
                 source,
                 maximumBytes = 10L,
@@ -191,5 +231,6 @@ class RemoteReviewLedgerTest {
         widthPx = 1_400,
         heightPx = 1_980,
         createdAtEpochMs = 10L,
+        studentInkDigest = "a".repeat(64),
     )
 }

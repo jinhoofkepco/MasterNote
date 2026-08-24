@@ -20,6 +20,12 @@ import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.library.data.LibraryRepository
 import com.studyink.monitor.core.RemoteReviewFeedbackBus
 import com.studyink.monitor.core.RemoteTeacherFeedbackApplied
+import com.studyink.monitor.core.HybridLinkDecision
+import com.studyink.monitor.core.HybridLinkStatusBus
+import com.studyink.monitor.core.RemoteGradeAppliedBus
+import com.studyink.monitor.core.RemotePeerChatStateBus
+import com.studyink.monitor.telegram.RemoteMonitorGateway
+import com.studyink.monitor.telegram.RemoteReviewPeerStatus
 import com.studyink.sync.lan.LanConnectionState
 import com.studyink.sync.lan.LanSyncBus
 import com.studyink.sync.lan.StudentLocation
@@ -182,6 +188,10 @@ data class ReaderUiState(
     val attemptPinned: Boolean = false,
     /** Whether the paired device is actually reachable right now, not merely whether live mode is on. */
     val liveConnection: LanConnectionState = LanConnectionState.IDLE,
+    /** LAN-first/Telegram-fallback decision for this exact book. */
+    val hybridLink: HybridLinkDecision? = null,
+    /** Durable peer chat messages not yet opened in the conversation screen. */
+    val telegramUnreadCount: Int = 0,
     /** Ten second buckets of the student's writing, newest last. Teacher live monitoring only. */
     val activitySamples: List<StudentActivitySample> = emptyList(),
     /**
@@ -286,6 +296,7 @@ internal fun AnnotationSnapshot.studentAttemptNos(): Set<Int> = assets.values.as
 class ReaderViewModel(application: Application) : AndroidViewModel(application) {
     private val store = PageOperationLogStore.get(application)
     private val library = LibraryRepository.get(application)
+    private val remoteMonitorGateway = RemoteMonitorGateway.get(application)
     private val mutationMutex = Mutex()
     private val pendingDocumentMutations = AtomicInteger(0)
     private val submissionGate = AtomicBoolean(false)
@@ -310,6 +321,28 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             // attempt selection, and student stroke data untouched.
             refreshCurrentPage(event.bookId, event.pageNumber, state.studentAttemptNo)
             _remoteFeedbackArrivals.tryEmit(event)
+        }
+    }
+    private val hybridLinkSubscription = HybridLinkStatusBus.subscribe { status ->
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            val latest = _uiState.value
+            if (latest.bookId != status.bookId) return@launch
+            _uiState.value = latest.copy(hybridLink = status.decision)
+        }
+    }
+    private val remoteGradeSubscription = RemoteGradeAppliedBus.subscribe { event ->
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            val latest = _uiState.value
+            if (latest.bookId != event.bookId || latest.pageNumber != event.pageNumber) return@launch
+            _uiState.value = latest.copy(marks = library.markGroups(event.bookId, event.pageNumber))
+        }
+    }
+    private val peerChatSubscription = RemotePeerChatStateBus.subscribe { chatState ->
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            val peer = remoteMonitorGateway.remoteReviewPeerStatus() as? RemoteReviewPeerStatus.Connected
+                ?: return@launch
+            if (chatState.scope.pairId != peer.pairId) return@launch
+            _uiState.update { latest -> latest.copy(telegramUnreadCount = chatState.unreadCount) }
         }
     }
     private val syncListener = object : LanSyncBus.Listener {
@@ -395,6 +428,9 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     override fun onCleared() {
         stopActivitySampling()
         remoteFeedbackSubscription.close()
+        hybridLinkSubscription.close()
+        remoteGradeSubscription.close()
+        peerChatSubscription.close()
         LanSyncBus.removeListener(syncListener)
         val state = _uiState.value
         if (state.bookId.isNotBlank() && state.storageAvailable) {
@@ -530,6 +566,8 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                         submissionInProgress = submissionGate.get(),
                         attemptPinned = pinAttempt && attemptNo == selectedAttemptNo,
                         liveConnection = LanSyncBus.connectionState(book.id),
+                        hybridLink = HybridLinkStatusBus.current(book.id)?.decision,
+                        telegramUnreadCount = _uiState.value.telegramUnreadCount,
                         pageAttemptNos = attempts.map { it.attemptNo },
                     )
                     if (_uiState.value.capabilities.showsStudentLocation) {

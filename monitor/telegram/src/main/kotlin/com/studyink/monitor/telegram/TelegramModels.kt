@@ -190,6 +190,23 @@ data class TelegramDeliveryReceipt(
     val acknowledgementMessageId: Long? = null,
 )
 
+/** Path-free view of one durable encrypted peer document waiting in the local outbox. */
+data class PendingTelegramPeerDocumentTransfer(
+    val transferId: String,
+    val payloadType: String,
+    val createdAtEpochMs: Long,
+    val nextAttemptEpochMs: Long,
+    val attempts: Int,
+    val ciphertextBytes: Long,
+) {
+    init {
+        require(PEER_IDENTIFIER.matches(transferId))
+        require(PEER_PAYLOAD_TYPE.matches(payloadType))
+        require(createdAtEpochMs >= 0L && nextAttemptEpochMs >= 0L && attempts >= 0)
+        require(ciphertextBytes >= 0L)
+    }
+}
+
 data class PendingTelegramPeerDocument(
     val updateId: Long,
     val telegramMessageId: Long,
@@ -265,6 +282,7 @@ data class TelegramOutboxEntry(
 
 private val TELEGRAM_USERNAME = Regex("^[a-z0-9_]{5,32}$")
 internal val PEER_IDENTIFIER = Regex("^[A-Za-z0-9_-]{8,128}$")
+internal val PEER_PAYLOAD_TYPE = Regex("^[A-Z][A-Z0-9_]{0,39}$")
 
 private fun decodePeerKey(value: String): ByteArray = runCatching {
     java.util.Base64.getUrlDecoder().decode(value)

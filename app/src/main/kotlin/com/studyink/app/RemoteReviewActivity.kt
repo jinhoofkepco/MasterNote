@@ -19,8 +19,13 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import com.studyink.core.model.MarkColor
 import com.studyink.monitor.telegram.TelegramEnqueueResult
 import com.studyink.reader.RemotePageSnapshotRef
+import com.studyink.reader.RemoteReviewGradeTap
 import com.studyink.reader.RemoteReviewView
 import com.studyink.reader.RemoteSnapshotOpenResult
 import com.studyink.reader.RemoteTeacherFeedback
@@ -48,6 +53,7 @@ class RemoteReviewActivity : ComponentActivity() {
     private var displayedSnapshot: IncomingRemoteSnapshot? = null
     private var loadingTransferId: String? = null
     private var publishBusy = false
+    private var gradeBusy = false
     private var stalePromptTransferId: String? = null
     private var historyBlockedTransferId: String? = null
 
@@ -61,8 +67,10 @@ class RemoteReviewActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(buildContent())
         reviewView.onPublishRequested = ::publishFeedback
+        reviewView.onGradeTap = ::requestGrade
         reviewView.onStateChanged = { renderHeader() }
         onBackPressedDispatcher.addCallback(
             this,
@@ -146,7 +154,27 @@ class RemoteReviewActivity : ComponentActivity() {
 
         previousButton.setOnClickListener { requestOpen(currentIndex + 1) }
         nextButton.setOnClickListener { requestOpen(currentIndex - 1) }
+        applyWindowInsets(root, header)
         return root
+    }
+
+    private fun applyWindowInsets(root: View, header: View) {
+        val headerLeft = dp(10)
+        val headerTop = dp(8)
+        val headerRight = dp(10)
+        val headerBottom = dp(8)
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, windowInsets ->
+            val safe = windowInsets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            // Keep the review canvas and controls out of gesture/navigation insets, while only
+            // the header consumes the status-bar inset. This remains correct under Android 15's
+            // enforced edge-to-edge mode and does not double-pad the content vertically.
+            root.setPadding(safe.left, 0, safe.right, safe.bottom)
+            header.setPadding(headerLeft, headerTop + safe.top, headerRight, headerBottom)
+            windowInsets
+        }
+        ViewCompat.requestApplyInsets(root)
     }
 
     private fun refreshSnapshotList(openNewestWhenEmpty: Boolean = false) {
@@ -322,6 +350,63 @@ class RemoteReviewActivity : ComponentActivity() {
         }
     }
 
+    private fun requestGrade(tap: RemoteReviewGradeTap) {
+        if (gradeBusy || publishBusy || displayedSnapshot?.transferId != tap.snapshot.transferId) return
+        val attempt = displayedSnapshot?.attemptNo
+        if (attempt == null) {
+            Toast.makeText(this, "학생 풀이 회차가 포함된 새 페이지를 받은 뒤 채점해주세요.", Toast.LENGTH_LONG).show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("${displayedSnapshot?.pageNumber ?: tap.snapshot.pageNumber + 1}쪽 ${attempt}회 채점")
+            .setMessage("선택한 위치에 보낼 채점 표시를 고르세요.")
+            .setNegativeButton("오답") { _, _ -> publishGrade(tap, MarkColor.RED) }
+            .setNeutralButton("취소", null)
+            .setPositiveButton("정답") { _, _ -> publishGrade(tap, MarkColor.BLUE) }
+            .show()
+    }
+
+    private fun publishGrade(tap: RemoteReviewGradeTap, color: MarkColor) {
+        if (gradeBusy || displayedSnapshot?.transferId != tap.snapshot.transferId) return
+        gradeBusy = true
+        renderHeader()
+        worker.execute {
+            val result = runCatching {
+                MasterNoteRemoteReviewCoordinator.publishRemoteGrade(
+                    snapshotTransferId = tap.snapshot.transferId,
+                    anchorX = tap.anchor.x,
+                    anchorY = tap.anchor.y,
+                    color = color,
+                )
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                gradeBusy = false
+                result.fold(
+                    onSuccess = { enqueue ->
+                        val message = if (enqueue.accepted()) {
+                            if (color == MarkColor.BLUE) "정답 표시를 전송 대기열에 저장했습니다."
+                            else "오답 표시를 전송 대기열에 저장했습니다."
+                        } else if (enqueue == TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED) {
+                            "실시간 연결 중에는 텔 채점이 꺼집니다. 텔로 바뀐 뒤 새 페이지에서 다시 채점해주세요."
+                        } else {
+                            enqueue.userText()
+                        }
+                        Toast.makeText(
+                            this,
+                            message,
+                            if (enqueue.accepted()) Toast.LENGTH_SHORT else Toast.LENGTH_LONG,
+                        ).show()
+                    },
+                    onFailure = {
+                        Toast.makeText(this, "채점을 저장하지 못했습니다. 연결을 확인해주세요.", Toast.LENGTH_LONG).show()
+                    },
+                )
+                renderHeader()
+            }
+        }
+    }
+
     private fun renderHeader() {
         val current = displayedSnapshot?.takeIf { snapshot ->
             snapshot.transferId == reviewView.reviewState.snapshot?.transferId
@@ -339,8 +424,8 @@ class RemoteReviewActivity : ComponentActivity() {
                 "보관 목록에서 제외됨 · $time"
             }
         } ?: "0/0"
-        previousButton.isEnabled = currentIndex in 0 until snapshots.lastIndex && !publishBusy
-        nextButton.isEnabled = currentIndex > 0 && !publishBusy
+        previousButton.isEnabled = currentIndex in 0 until snapshots.lastIndex && !publishBusy && !gradeBusy
+        nextButton.isEnabled = currentIndex > 0 && !publishBusy && !gradeBusy
     }
 
     private fun leaveSafely(action: () -> Unit) {
@@ -375,8 +460,10 @@ class RemoteReviewActivity : ComponentActivity() {
         TelegramEnqueueResult.NOT_CONFIGURED, TelegramEnqueueResult.CHAT_CHANGED ->
             "원격 첨삭 연결을 먼저 확인해주세요."
         TelegramEnqueueResult.QUEUE_FULL -> "전송 대기열이 가득 찼습니다. 잠시 뒤 다시 눌러주세요."
-        TelegramEnqueueResult.PREVIOUSLY_DEAD, TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED ->
+        TelegramEnqueueResult.PREVIOUSLY_DEAD ->
             "이 첨삭은 전송할 수 없습니다. 새 획을 추가한 뒤 다시 보내주세요."
+        TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED ->
+            "실시간 연결 중에는 텔 첨삭이 꺼집니다. 텔로 바뀐 뒤 다시 보내주세요."
         else -> "첨삭을 전송 대기열에 넣지 못했습니다."
     }
 

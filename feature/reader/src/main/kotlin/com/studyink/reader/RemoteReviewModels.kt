@@ -67,7 +67,17 @@ data class RemoteTeacherFeedback(
     val formatVersion: Int = REMOTE_FEEDBACK_FORMAT_VERSION,
 )
 
-enum class RemoteReviewTool { PEN, HIGHLIGHTER, ERASER }
+enum class RemoteReviewTool { PEN, HIGHLIGHTER, ERASER, GRADE }
+
+/**
+ * Exact immutable target selected by the teacher before the host opens its correct/incorrect UI.
+ * Carrying the snapshot reference with the normalized anchor prevents a delayed chooser result
+ * from being applied to whichever page happens to be visible later.
+ */
+data class RemoteReviewGradeTap(
+    val snapshot: RemotePageSnapshotRef,
+    val anchor: RemoteNormalizedPoint,
+)
 
 enum class RemoteSnapshotOpenResult {
     OPENED,
@@ -84,4 +94,3 @@ data class RemoteReviewState(
     val canUndo: Boolean = false,
     val hasUnpublishedChanges: Boolean = false,
 )
-

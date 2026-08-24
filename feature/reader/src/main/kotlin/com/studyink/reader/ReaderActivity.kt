@@ -45,6 +45,9 @@ import com.studyink.document.pdf.PdfViewportAdapter
 import com.studyink.document.pdf.ReaderPdfFragment
 import com.studyink.library.data.LibraryRepository
 import com.studyink.monitor.core.ParentMessage
+import com.studyink.monitor.core.RemotePeerChatDirection
+import com.studyink.monitor.core.RemotePeerChatState
+import com.studyink.monitor.core.RemotePeerChatStateBus
 import com.studyink.monitor.core.StudentStudyPresence
 import com.studyink.monitor.core.StudentStudyPresenceBus
 import com.studyink.monitor.core.StudentWorkHeartbeat
@@ -52,6 +55,7 @@ import com.studyink.monitor.core.StudentWorkHeartbeatBus
 import com.studyink.monitor.core.StudentWorkKind
 import com.studyink.monitor.telegram.RemoteMonitorGateway
 import com.studyink.monitor.telegram.RemoteMonitorPreferences
+import com.studyink.monitor.telegram.RemoteReviewPeerStatus
 import com.studyink.monitor.telegram.TelegramEnqueueResult
 import kotlinx.coroutines.launch
 
@@ -106,6 +110,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var remoteMonitorPreferences = RemoteMonitorPreferences()
     private var parentMessageSubscription: AutoCloseable? = null
     private var preferenceSubscription: AutoCloseable? = null
+    private var peerChatSubscription: AutoCloseable? = null
+    private var peerChatPrimed = false
+    private var lastPeerChatMessageId: String? = null
+    private val peerChatOverlayDeliveryGate = PeerChatOverlayDeliveryGate()
     private var readerStarted = false
     private var readerResumed = false
     private var activeStudentPresence: StudentStudyPresence? = null
@@ -710,9 +718,64 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun openRemoteMonitorSetup() {
         topMenuExpanded = false
-        val setupIntent = Intent().setClassName(packageName, TELEGRAM_SETUP_ACTIVITY_CLASS)
+        val targetClass = if (remoteMonitorGateway.remoteReviewPeerStatus() is RemoteReviewPeerStatus.Connected) {
+            REMOTE_CHAT_ACTIVITY_CLASS
+        } else {
+            REMOTE_REVIEW_SETUP_ACTIVITY_CLASS
+        }
+        val setupIntent = Intent().setClassName(packageName, targetClass)
         runCatching { startActivity(setupIntent) }.onFailure {
             studentStatusOverlay.showMessage("Telegram 연결 화면을 열 수 없습니다.")
+        }
+    }
+
+    private fun handlePeerChatState(state: RemotePeerChatState) {
+        if (!readerStarted) return
+        val peer = remoteMonitorGateway.remoteReviewPeerStatus() as? RemoteReviewPeerStatus.Connected
+            ?: return
+        if (state.scope.pairId != peer.pairId) return
+        val latest = state.latestMessage
+        if (!peerChatPrimed) {
+            peerChatPrimed = true
+            lastPeerChatMessageId = latest?.messageId
+            val newestUnreadIncoming = state.recentMessages.lastOrNull { message ->
+                message.direction == RemotePeerChatDirection.INCOMING && !message.isRead
+            }
+            if (state.unreadCount > 0 && newestUnreadIncoming != null) {
+                offerIncomingPeerChat(
+                    state.scope.pairId,
+                    newestUnreadIncoming.messageId,
+                    newestUnreadIncoming.text,
+                )
+            }
+            return
+        }
+        if (latest == null || latest.messageId == lastPeerChatMessageId) return
+        lastPeerChatMessageId = latest.messageId
+        if (latest.direction != RemotePeerChatDirection.INCOMING) return
+        offerIncomingPeerChat(state.scope.pairId, latest.messageId, latest.text)
+    }
+
+    private fun offerIncomingPeerChat(pairId: String, messageId: String, text: String) {
+        peerChatOverlayDeliveryGate.offer(
+            pairId = pairId,
+            messageId = messageId,
+            text = text,
+            canDisplayNow = readerResumed,
+        )?.let { showIncomingPeerChat(it.text) }
+    }
+
+    private fun deliverPendingPeerChat() {
+        val activePairId = (remoteMonitorGateway.remoteReviewPeerStatus()
+            as? RemoteReviewPeerStatus.Connected)?.pairId
+        peerChatOverlayDeliveryGate.resume(activePairId)?.let { showIncomingPeerChat(it.text) }
+    }
+
+    private fun showIncomingPeerChat(text: String) {
+        parentMessageOverlay.showMessage(text)
+        if (latestState.role == ReaderRole.STUDENT && remoteMonitorPreferences.ttsEnabled) {
+            if (voiceState.blocksParentSpeech()) deferredParentSpeech = text
+            else parentMessageSpeaker.speak(text)
         }
     }
 
@@ -982,6 +1045,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 updateStudentVoiceEnabled()
             }
         }
+        peerChatPrimed = false
+        peerChatSubscription?.close()
+        peerChatSubscription = RemotePeerChatStateBus.subscribe { state ->
+            runOnUiThread { handlePeerChatState(state) }
+        }
         startRemoteMonitorServiceIfEnabled()
         publishStudentPresence(latestState, force = true)
     }
@@ -992,6 +1060,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         studentVoiceController.onResume()
         updateStudentVoiceEnabled()
         deliverPendingParentMessageIfStudent()
+        deliverPendingPeerChat()
     }
 
     override fun onPause() {
@@ -1012,6 +1081,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         parentMessageSubscription = null
         preferenceSubscription?.close()
         preferenceSubscription = null
+        peerChatSubscription?.close()
+        peerChatSubscription = null
+        peerChatOverlayDeliveryGate.clearPending()
         deferredParentSpeech = null
         if (::parentMessageOverlay.isInitialized) parentMessageOverlay.clearMessage()
         if (::studentStatusOverlay.isInitialized) studentStatusOverlay.clearMessage()
@@ -1021,6 +1093,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     override fun onDestroy() {
         parentMessageSubscription?.close()
         preferenceSubscription?.close()
+        peerChatSubscription?.close()
         if (::studentVoiceController.isInitialized) studentVoiceController.close()
         if (::parentMessageSpeaker.isInitialized) parentMessageSpeaker.close()
         super.onDestroy()
@@ -1201,7 +1274,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         private const val SUBMITTED_BLUR_RADIUS_DP = 5f
         private const val PEN_INPUT_LOG_TAG = "MasterNotePenInput"
         private const val REMOTE_MONITOR_LOG_TAG = "MasterNoteRemoteMonitor"
-        private const val TELEGRAM_SETUP_ACTIVITY_CLASS = "com.studyink.app.TelegramSetupActivity"
+        private const val REMOTE_REVIEW_SETUP_ACTIVITY_CLASS =
+            "com.studyink.app.RemoteReviewSetupActivity"
+        private const val REMOTE_CHAT_ACTIVITY_CLASS = "com.studyink.app.RemotePeerChatActivity"
         private const val REMOTE_MONITOR_SERVICE_CLASS = "com.studyink.app.RemoteMonitorService"
         private const val PARENT_MESSAGE_MAX_WIDTH_DP = 560
         private const val PARENT_MESSAGE_SIDE_MARGIN_DP = 20

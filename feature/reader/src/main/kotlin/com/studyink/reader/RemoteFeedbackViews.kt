@@ -8,11 +8,14 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
+import android.text.TextUtils
 import android.util.AttributeSet
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.studyink.document.pdf.PdfViewportAdapter
@@ -79,7 +82,12 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
     private var pageBitmap: Bitmap? = null
     private var activePointerId = NO_POINTER
     private var activeGestureTool = RemoteReviewTool.PEN
+    private var activeGestureSnapshot: RemotePageSnapshotRef? = null
+    private var gestureDownX = 0f
+    private var gestureDownY = 0f
+    private var maxGestureTravelPixels = 0f
     private val gesturePoints = mutableListOf<RemoteNormalizedPoint>()
+    private val gradeTapSlopPixels = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
 
     var selectedTool: RemoteReviewTool = RemoteReviewTool.PEN
         set(value) { field = value; invalidate() }
@@ -91,6 +99,7 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
     /** Remote review is a static page, so finger and S Pen drawing are both safe here. */
     var acceptFingerInput: Boolean = true
     var onStateChanged: (RemoteReviewState) -> Unit = {}
+    var onGradeTap: (RemoteReviewGradeTap) -> Unit = {}
 
     val reviewState: RemoteReviewState get() = editor.state
 
@@ -169,6 +178,10 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
                 } else {
                     selectedTool
                 }
+                activeGestureSnapshot = editor.state.snapshot
+                gestureDownX = event.x
+                gestureDownY = event.y
+                maxGestureTravelPixels = 0f
                 gesturePoints.clear()
                 gesturePoints += point.copy(pressure = event.pressure.coerceIn(0f, 1f))
                 parent.requestDisallowInterceptTouchEvent(true)
@@ -181,8 +194,9 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
                 return activePointerId != NO_POINTER
             }
             MotionEvent.ACTION_UP -> {
+                val releasePoint = activePointerNormalizedPoint(event)
                 collectEventPoints(event)
-                finishGesture()
+                finishGesture(releasePoint)
                 return true
             }
             MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
@@ -206,7 +220,25 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
         collectViewPoint(event.getX(index), event.getY(index), event.getPressure(index))
     }
 
+    private fun activePointerNormalizedPoint(event: MotionEvent): RemoteNormalizedPoint? {
+        val index = event.findPointerIndex(activePointerId)
+        if (index < 0) return null
+        return RemoteReviewGeometry.viewToNormalized(
+            event.getX(index),
+            event.getY(index),
+            currentPageRect(),
+        )
+    }
+
     private fun collectViewPoint(x: Float, y: Float, pressure: Float) {
+        if (activeGestureTool == RemoteReviewTool.GRADE) {
+            val dx = x - gestureDownX
+            val dy = y - gestureDownY
+            maxGestureTravelPixels = max(
+                maxGestureTravelPixels,
+                kotlin.math.sqrt(dx * dx + dy * dy),
+            )
+        }
         val mapped = RemoteReviewGeometry.viewToNormalized(x, y, currentPageRect()) ?: return
         val point = mapped.copy(pressure = pressure.coerceIn(0f, 1f))
         val previous = gesturePoints.lastOrNull()
@@ -215,8 +247,20 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
         }
     }
 
-    private fun finishGesture() {
-        when (activeGestureTool) {
+    private fun finishGesture(releasePoint: RemoteNormalizedPoint?) {
+        val completedTool = activeGestureTool
+        val gradeTap = if (completedTool == RemoteReviewTool.GRADE) {
+            resolveRemoteReviewGradeTap(
+                snapshotAtDown = activeGestureSnapshot,
+                currentSnapshot = editor.state.snapshot,
+                releasePoint = releasePoint,
+                maxTravelPixels = maxGestureTravelPixels,
+                tapSlopPixels = gradeTapSlopPixels,
+            )
+        } else {
+            null
+        }
+        when (completedTool) {
             RemoteReviewTool.PEN -> editor.addStroke(
                 tool = RemoteFeedbackStrokeTool.PEN,
                 colorArgb = penColorArgb,
@@ -231,13 +275,18 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
             )
             // Erase calculation deliberately runs once, only after ACTION_UP.
             RemoteReviewTool.ERASER -> editor.erase(gesturePoints, eraserRadiusFraction)
+            // Grade selection is a host action, never an edit to the correction stroke layer.
+            RemoteReviewTool.GRADE -> Unit
         }
         cancelGesture()
-        publishState()
+        if (completedTool != RemoteReviewTool.GRADE) publishState()
+        gradeTap?.let(onGradeTap)
     }
 
     private fun cancelGesture() {
         activePointerId = NO_POINTER
+        activeGestureSnapshot = null
+        maxGestureTravelPixels = 0f
         gesturePoints.clear()
         parent.requestDisallowInterceptTouchEvent(false)
         invalidate()
@@ -275,6 +324,7 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
                 else canvas.drawPath(path, paint)
                 return
             }
+            RemoteReviewTool.GRADE -> return
         }
         RemoteFeedbackPainter.drawStroke(canvas, page, preview, paint)
     }
@@ -299,6 +349,28 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
     }
 }
 
+/** Pure tap qualification kept outside the View so snapshot binding and drag rejection are tested. */
+internal fun resolveRemoteReviewGradeTap(
+    snapshotAtDown: RemotePageSnapshotRef?,
+    currentSnapshot: RemotePageSnapshotRef?,
+    releasePoint: RemoteNormalizedPoint?,
+    maxTravelPixels: Float,
+    tapSlopPixels: Float,
+): RemoteReviewGradeTap? {
+    if (snapshotAtDown == null || snapshotAtDown != currentSnapshot) return null
+    val point = releasePoint ?: return null
+    if (
+        !point.x.isFinite() || !point.y.isFinite() ||
+        point.x !in 0f..1f || point.y !in 0f..1f ||
+        !maxTravelPixels.isFinite() || !tapSlopPixels.isFinite() ||
+        maxTravelPixels < 0f || tapSlopPixels < 0f || maxTravelPixels > tapSlopPixels
+    ) return null
+    return RemoteReviewGradeTap(
+        snapshot = snapshotAtDown,
+        anchor = point.copy(pressure = 1f),
+    )
+}
+
 /**
  * Drop-in teacher review surface. Transport supplies a decoded bitmap and receives an immutable
  * payload callback; it acknowledges only after the payload is durably queued.
@@ -315,6 +387,7 @@ class RemoteReviewView @JvmOverloads constructor(
 
     var onPublishRequested: (RemoteTeacherFeedback) -> Unit = {}
     var onStateChanged: (RemoteReviewState) -> Unit = {}
+    var onGradeTap: (RemoteReviewGradeTap) -> Unit = {}
 
     val reviewState: RemoteReviewState get() = canvasView.reviewState
     val hasUnpublishedChanges: Boolean get() = reviewState.hasUnpublishedChanges
@@ -322,39 +395,62 @@ class RemoteReviewView @JvmOverloads constructor(
     init {
         addView(canvasView, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         val toolbar = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.VERTICAL
             setPadding(dp(8f), dp(6f), dp(8f), dp(6f))
             background = roundedBackground(0xE6FFFFFF.toInt(), 14f)
             elevation = dp(4f).toFloat()
         }
+        val actionRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val actionScroller = HorizontalScrollView(context).apply {
+            isHorizontalScrollBarEnabled = false
+            isFillViewport = false
+            overScrollMode = OVER_SCROLL_IF_CONTENT_SCROLLS
+            addView(
+                actionRow,
+                LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT),
+            )
+        }
+        toolbar.addView(
+            actionScroller,
+            LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT),
+        )
         fun toolButton(label: String, tool: RemoteReviewTool): TextView = actionButton(label).also { button ->
             toolButtons[tool] = button
             button.setOnClickListener {
                 canvasView.selectedTool = tool
                 refreshControls(canvasView.reviewState)
             }
-            toolbar.addView(button)
+            actionRow.addView(button)
         }
         toolButton("펜", RemoteReviewTool.PEN)
         toolButton("형광펜", RemoteReviewTool.HIGHLIGHTER)
         toolButton("지우개", RemoteReviewTool.ERASER)
+        toolButton("채점", RemoteReviewTool.GRADE)
         undoButton = actionButton("실행취소").also { button ->
             button.setOnClickListener { canvasView.undo() }
-            toolbar.addView(button)
+            actionRow.addView(button)
         }
         publishButton = actionButton("첨삭 보내기").also { button ->
             button.setOnClickListener {
                 canvasView.buildFeedback()?.let(onPublishRequested)
             }
-            toolbar.addView(button)
+            actionRow.addView(button)
         }
         status.apply {
             textSize = 12f
             setTextColor(Color.rgb(55, 61, 70))
-            setPadding(dp(8f), 0, 0, 0)
+            gravity = Gravity.END
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(dp(4f), dp(2f), dp(4f), 0)
         }
-        toolbar.addView(status, LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+        toolbar.addView(
+            status,
+            LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT),
+        )
         addView(
             toolbar,
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT, Gravity.TOP).apply {
@@ -367,6 +463,7 @@ class RemoteReviewView @JvmOverloads constructor(
             refreshControls(state)
             onStateChanged(state)
         }
+        canvasView.onGradeTap = { tap -> onGradeTap(tap) }
         refreshControls(canvasView.reviewState)
     }
 

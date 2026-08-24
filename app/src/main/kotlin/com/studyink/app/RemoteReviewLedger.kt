@@ -50,6 +50,9 @@ internal class RemoteReviewLedger(
     fun outgoing(transferId: String): OutgoingRemoteSnapshot? = outgoing[transferId]
 
     @Synchronized
+    fun outgoingSnapshots(): List<OutgoingRemoteSnapshot> = outgoing.values.toList()
+
+    @Synchronized
     fun storeIncoming(
         value: IncomingRemoteSnapshot,
         sourceImage: File,
@@ -204,10 +207,11 @@ internal class RemoteReviewLedger(
         value.widthPx.toString(),
         value.heightPx.toString(),
         value.createdAtEpochMs.toString(),
+        value.studentInkDigest.orEmpty(),
     ).joinToString("\t")
 
     private fun decodeOutgoing(fields: List<String>): OutgoingRemoteSnapshot {
-        require(fields.size == 11)
+        require(fields.size == 11 || fields.size == 12)
         return OutgoingRemoteSnapshot(
             transferId = decode(fields[2]),
             pageToken = decode(fields[3]),
@@ -218,6 +222,7 @@ internal class RemoteReviewLedger(
             widthPx = fields[8].toInt(),
             heightPx = fields[9].toInt(),
             createdAtEpochMs = fields[10].toLong(),
+            studentInkDigest = fields.getOrNull(11)?.ifBlank { null },
         ).also(::validate)
     }
 
@@ -235,10 +240,11 @@ internal class RemoteReviewLedger(
         value.heightPx.toString(),
         value.receivedAtEpochMs.toString(),
         encode(value.imagePath),
+        value.studentInkDigest.orEmpty(),
     ).joinToString("\t")
 
     private fun decodeIncoming(fields: List<String>): IncomingRemoteSnapshot {
-        require(fields.size == 13)
+        require(fields.size == 13 || fields.size == 14)
         return IncomingRemoteSnapshot(
             transferId = decode(fields[2]),
             pageToken = decode(fields[3]),
@@ -251,6 +257,7 @@ internal class RemoteReviewLedger(
             heightPx = fields[10].toInt(),
             receivedAtEpochMs = fields[11].toLong(),
             imagePath = decode(fields[12]),
+            studentInkDigest = fields.getOrNull(13)?.ifBlank { null },
         ).also(::validate)
     }
 
@@ -352,6 +359,7 @@ internal class RemoteReviewLedger(
         require(value.studentRevision >= 0L)
         require(value.widthPx > 0 && value.heightPx > 0)
         require(value.createdAtEpochMs >= 0L)
+        require(value.studentInkDigest == null || SHA256_HEX.matches(value.studentInkDigest))
     }
 
     private fun validate(value: IncomingRemoteSnapshot) {
@@ -365,6 +373,7 @@ internal class RemoteReviewLedger(
         require(value.widthPx > 0 && value.heightPx > 0)
         require(value.receivedAtEpochMs >= 0L)
         require(value.imagePath.isNotBlank())
+        require(value.studentInkDigest == null || SHA256_HEX.matches(value.studentInkDigest))
     }
 
     private fun validateToken(value: String) {
@@ -403,6 +412,7 @@ internal class RemoteReviewLedger(
         const val MAX_LATEST_FEEDBACK_PAGES = 10_000
         const val DEFAULT_COMPACTION_RECORDS = 4_096
         val TOKEN = Regex("[A-Za-z0-9_-]{8,128}")
+        val SHA256_HEX = Regex("[0-9a-f]{64}")
     }
 }
 
@@ -423,6 +433,8 @@ internal data class OutgoingRemoteSnapshot(
     val widthPx: Int,
     val heightPx: Int,
     val createdAtEpochMs: Long,
+    /** Exact student-only visual state; null for snapshots created by an older app version. */
+    val studentInkDigest: String? = null,
 )
 
 internal data class IncomingRemoteSnapshot(
@@ -438,6 +450,8 @@ internal data class IncomingRemoteSnapshot(
     val heightPx: Int,
     val receivedAtEpochMs: Long,
     val imagePath: String,
+    /** Parsed from the authenticated snapshot transfer id; null means grading is disabled. */
+    val studentInkDigest: String? = null,
 ) {
     val imageFile: File get() = File(imagePath)
 }

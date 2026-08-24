@@ -17,9 +17,13 @@ object RemoteReviewLimits {
     const val MAX_POINTS_PER_STROKE: Int = 8_192
     const val MAX_TOTAL_POINTS: Int = 120_000
     const val MAX_NOTE_UTF8_BYTES: Int = 2_000
+    const val MAX_CHAT_TEXT_UTF8_BYTES: Int = 4_096
+    const val MAX_CHAT_STATE_MESSAGES: Int = 64
     const val MAX_TOKEN_UTF8_BYTES: Int = 128
     const val MAX_WORKBOOK_LABEL_UTF8_BYTES: Int = 160
     const val MAX_STUDENT_LABEL_UTF8_BYTES: Int = 80
+    const val SHA256_HEX_BYTES: Int = 64
+    const val MAX_GRADE_SCORE: Int = 1_000_000
 }
 
 class RemoteReviewValidationException(
@@ -31,6 +35,8 @@ enum class RemoteReviewEnvelopeType {
     PAGE_SNAPSHOT,
     TEACHER_FEEDBACK,
     ACK,
+    CHAT_MESSAGE,
+    REMOTE_GRADE,
 }
 
 sealed interface RemoteReviewEnvelope {
@@ -84,6 +90,11 @@ class PageSnapshotEnvelope(
     val dimensions: ReviewCanvasDimensions,
     val imageFormat: SnapshotImageFormat,
     renderedPageBytes: ByteArray,
+    /**
+     * Optional exact student-only state. The codec embeds it in encrypted image metadata so the v1
+     * snapshot field layout remains readable by checkpoint apps; it is never placed in the caption.
+     */
+    val studentInkDigest: String? = null,
 ) : RemoteReviewEnvelope {
     override val type: RemoteReviewEnvelopeType = RemoteReviewEnvelopeType.PAGE_SNAPSHOT
 
@@ -126,6 +137,11 @@ class PageSnapshotEnvelope(
             hasImageSignature(imageFormat, immutableRenderedPageBytes),
             "renderedPageBytes",
         ) { "does not match ${imageFormat.mimeType}" }
+        studentInkDigest?.let { digest ->
+            checkProtocol(SHA256_HEX.matches(digest), "studentInkDigest") {
+                "must be exactly ${RemoteReviewLimits.SHA256_HEX_BYTES} lower-case hexadecimal characters"
+            }
+        }
     }
 }
 
@@ -139,6 +155,27 @@ data class SnapshotReference(
         validateOpaqueToken(transferId, "sourceSnapshot.transferId")
         validateOpaqueToken(pageToken, "sourceSnapshot.pageToken")
         checkProtocol(revision >= 0L, "sourceSnapshot.revision") { "must not be negative" }
+    }
+}
+
+/** A small peer-to-peer text message carried only inside the authenticated encrypted document. */
+data class ChatMessageEnvelope(
+    override val transferId: String,
+    override val createdAtEpochMs: Long,
+    val messageId: String,
+    /** Stable installation identity used by the receiver to enforce the configured pair scope. */
+    val senderDeviceId: String,
+    val sentAtEpochMs: Long,
+    val text: String,
+) : RemoteReviewEnvelope {
+    override val type: RemoteReviewEnvelopeType = RemoteReviewEnvelopeType.CHAT_MESSAGE
+
+    init {
+        validateCommonEnvelope(transferId, createdAtEpochMs)
+        validateOpaqueToken(messageId, "messageId")
+        validateOpaqueToken(senderDeviceId, "senderDeviceId")
+        checkProtocol(sentAtEpochMs >= 0L, "sentAtEpochMs") { "must not be negative" }
+        validateChatText(text)
     }
 }
 
@@ -227,6 +264,56 @@ class TeacherFeedbackEnvelope(
     }
 }
 
+/** A page-bound, conflict-resolvable numeric grade. It never carries or mutates student ink. */
+data class RemoteGradeEnvelope(
+    override val transferId: String,
+    override val createdAtEpochMs: Long,
+    val actionId: String,
+    val sourceSnapshot: SnapshotReference,
+    /** Exact student attempt being graded; unlike snapshots this can never be absent. */
+    val attemptNo: Int,
+    /** Lower-case SHA-256 of the student-ink state the teacher actually reviewed. */
+    val studentInkDigest: String,
+    /** Stable across edits so one logical grade can be replaced without creating duplicates. */
+    val gradeGroupId: String,
+    val syncRevision: Long,
+    val lastModifiedByDeviceId: String,
+    val anchor: NormalizedGradeAnchor,
+    val score: Int,
+    val maximumScore: Int,
+) : RemoteReviewEnvelope {
+    override val type: RemoteReviewEnvelopeType = RemoteReviewEnvelopeType.REMOTE_GRADE
+
+    init {
+        validateCommonEnvelope(transferId, createdAtEpochMs)
+        validateOpaqueToken(actionId, "actionId")
+        checkProtocol(attemptNo > 0, "attemptNo") { "must be one-based" }
+        checkProtocol(SHA256_HEX.matches(studentInkDigest), "studentInkDigest") {
+            "must be exactly ${RemoteReviewLimits.SHA256_HEX_BYTES} lower-case hexadecimal characters"
+        }
+        validateOpaqueToken(gradeGroupId, "gradeGroupId")
+        checkProtocol(syncRevision >= 1L, "syncRevision") { "must be at least 1" }
+        validateOpaqueToken(lastModifiedByDeviceId, "lastModifiedByDeviceId")
+        checkProtocol(maximumScore in 1..RemoteReviewLimits.MAX_GRADE_SCORE, "maximumScore") {
+            "must be between 1 and ${RemoteReviewLimits.MAX_GRADE_SCORE}"
+        }
+        checkProtocol(score in 0..maximumScore, "score") {
+            "must be between 0 and maximumScore"
+        }
+    }
+}
+
+/** Page-size-independent grade marker location. */
+data class NormalizedGradeAnchor(
+    val x: Float,
+    val y: Float,
+) {
+    init {
+        validateUnitFloat(x, "anchor.x")
+        validateUnitFloat(y, "anchor.y")
+    }
+}
+
 enum class RemoteReviewAckDisposition {
     APPLIED,
     SUPERSEDED,
@@ -287,6 +374,34 @@ internal inline fun checkProtocol(condition: Boolean, field: String, lazyMessage
 
 internal fun String.utf8Size(): Int = toByteArray(Charsets.UTF_8).size
 
+internal fun validateChatText(text: String) {
+    checkProtocol(text.isNotBlank(), "text") { "must not be blank" }
+    checkProtocol(text.utf8Size() <= RemoteReviewLimits.MAX_CHAT_TEXT_UTF8_BYTES, "text") {
+        "exceeds ${RemoteReviewLimits.MAX_CHAT_TEXT_UTF8_BYTES} UTF-8 bytes"
+    }
+    checkProtocol(text.hasWellFormedSurrogatePairs(), "text") { "contains malformed Unicode" }
+    checkProtocol(
+        text.none { it.isISOControl() && it != '\n' && it != '\r' && it != '\t' },
+        "text",
+    ) { "contains an unsupported control character" }
+}
+
+private fun String.hasWellFormedSurrogatePairs(): Boolean {
+    var index = 0
+    while (index < length) {
+        val current = this[index]
+        when {
+            Character.isHighSurrogate(current) -> {
+                if (index + 1 >= length || !Character.isLowSurrogate(this[index + 1])) return false
+                index += 2
+            }
+            Character.isLowSurrogate(current) -> return false
+            else -> index += 1
+        }
+    }
+    return true
+}
+
 private fun validateUnitFloat(value: Float, field: String) {
     checkProtocol(value.isFinite(), field) { "must be finite" }
     checkProtocol(value in 0f..1f, field) { "must be normalized to 0..1" }
@@ -301,6 +416,7 @@ private fun hasImageSignature(format: SnapshotImageFormat, bytes: ByteArray): Bo
 
 private const val MIN_TOKEN_BYTES = 8
 private val OPAQUE_TOKEN = Regex("[A-Za-z0-9_-]+")
+private val SHA256_HEX = Regex("[0-9a-f]{${RemoteReviewLimits.SHA256_HEX_BYTES}}")
 private val PNG_SIGNATURE = byteArrayOf(
     0x89.toByte(),
     0x50,

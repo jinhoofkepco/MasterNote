@@ -77,6 +77,7 @@ dependencies {
     implementation(project(":monitor:render"))
     implementation(project(":library:data"))
     implementation(project(":annotation:storage"))
+    implementation(project(":sync:lan"))
     implementation("androidx.activity:activity-ktx:1.13.0")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("com.google.zxing:core:3.5.4")

@@ -10,6 +10,7 @@ import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.util.zip.CRC32
 
 enum class RemoteReviewCodecError {
     TOO_LARGE,
@@ -173,9 +174,17 @@ object RemoteReviewDocumentCodec {
                     output.writeLong(envelope.revision)
                     output.writeDimensions(envelope.dimensions)
                     output.writeByte(envelope.imageFormat.wireCode())
-                    val image = envelope.renderedPageBytesForCodec()
+                    val image = envelope.studentInkDigest?.let { digest ->
+                        embedSnapshotDigest(
+                            format = envelope.imageFormat,
+                            image = envelope.renderedPageBytesForCodec(),
+                            digest = digest,
+                        )
+                    } ?: envelope.renderedPageBytesForCodec()
                     output.writeInt(image.size)
                     output.write(image)
+                    // Keep the v1 payload ending at the image so checkpoint readers can decode it.
+                    // The optional digest lives in standard, decoder-ignored image metadata instead.
                 }
 
                 is TeacherFeedbackEnvelope -> {
@@ -201,6 +210,27 @@ object RemoteReviewDocumentCodec {
                     output.writeBoundedString(envelope.acknowledgedTransferId)
                     output.writeByte(envelope.disposition.wireCode())
                     output.writeNullableString(envelope.detailCode)
+                }
+
+                is ChatMessageEnvelope -> {
+                    output.writeBoundedString(envelope.messageId)
+                    output.writeBoundedString(envelope.senderDeviceId)
+                    output.writeLong(envelope.sentAtEpochMs)
+                    output.writeBoundedString(envelope.text)
+                }
+
+                is RemoteGradeEnvelope -> {
+                    output.writeBoundedString(envelope.actionId)
+                    output.writeSnapshotReference(envelope.sourceSnapshot)
+                    output.writeInt(envelope.attemptNo)
+                    output.writeBoundedString(envelope.studentInkDigest)
+                    output.writeBoundedString(envelope.gradeGroupId)
+                    output.writeLong(envelope.syncRevision)
+                    output.writeBoundedString(envelope.lastModifiedByDeviceId)
+                    output.writeFloat(envelope.anchor.x)
+                    output.writeFloat(envelope.anchor.y)
+                    output.writeInt(envelope.score)
+                    output.writeInt(envelope.maximumScore)
                 }
             }
         }
@@ -229,6 +259,22 @@ object RemoteReviewDocumentCodec {
                 val dimensions = input.readDimensions()
                 val format = imageFormatFromWire(input.readUnsignedByte())
                 val image = input.readBoundedBytes(RemoteReviewLimits.MAX_SNAPSHOT_IMAGE_BYTES)
+                val embeddedStudentInkDigest = extractSnapshotDigest(format, image)
+                // Transitional builds wrote the digest after the image. Continue reading those
+                // already-durable documents, but never emit that old extension again: checkpoint
+                // readers reject any bytes after the v1 image field.
+                val trailingStudentInkDigest = if (input.available() == 0) {
+                    null
+                } else {
+                    input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES)
+                }
+                if (embeddedStudentInkDigest != null && trailingStudentInkDigest != null &&
+                    embeddedStudentInkDigest != trailingStudentInkDigest
+                ) {
+                    fail(RemoteReviewCodecError.MALFORMED_PAYLOAD) {
+                        "Snapshot image metadata and trailing digest disagree."
+                    }
+                }
                 PageSnapshotEnvelope(
                     transferId = transferId,
                     createdAtEpochMs = createdAtEpochMs,
@@ -241,6 +287,7 @@ object RemoteReviewDocumentCodec {
                     dimensions = dimensions,
                     imageFormat = format,
                     renderedPageBytes = image,
+                    studentInkDigest = embeddedStudentInkDigest ?: trailingStudentInkDigest,
                 )
             }
 
@@ -298,6 +345,35 @@ object RemoteReviewDocumentCodec {
                 acknowledgedTransferId = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
                 disposition = ackDispositionFromWire(input.readUnsignedByte()),
                 detailCode = input.readNullableString(MAX_DETAIL_CODE_BYTES),
+            )
+
+            RemoteReviewEnvelopeType.CHAT_MESSAGE -> ChatMessageEnvelope(
+                transferId = transferId,
+                createdAtEpochMs = createdAtEpochMs,
+                messageId = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                senderDeviceId = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                sentAtEpochMs = input.readLong(),
+                text = input.readBoundedString(RemoteReviewLimits.MAX_CHAT_TEXT_UTF8_BYTES),
+            )
+
+            RemoteReviewEnvelopeType.REMOTE_GRADE -> RemoteGradeEnvelope(
+                transferId = transferId,
+                createdAtEpochMs = createdAtEpochMs,
+                actionId = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                sourceSnapshot = input.readSnapshotReference(),
+                attemptNo = input.readInt(),
+                studentInkDigest = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES),
+                gradeGroupId = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                syncRevision = input.readLong(),
+                lastModifiedByDeviceId = input.readBoundedString(
+                    RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES,
+                ),
+                anchor = NormalizedGradeAnchor(
+                    x = input.readFloat(),
+                    y = input.readFloat(),
+                ),
+                score = input.readInt(),
+                maximumScore = input.readInt(),
             )
         }
         if (input.available() != 0) {
@@ -404,12 +480,16 @@ object RemoteReviewDocumentCodec {
         RemoteReviewEnvelopeType.PAGE_SNAPSHOT -> 1
         RemoteReviewEnvelopeType.TEACHER_FEEDBACK -> 2
         RemoteReviewEnvelopeType.ACK -> 3
+        RemoteReviewEnvelopeType.CHAT_MESSAGE -> 4
+        RemoteReviewEnvelopeType.REMOTE_GRADE -> 5
     }
 
     private fun envelopeTypeFromWire(code: Int): RemoteReviewEnvelopeType = when (code) {
         1 -> RemoteReviewEnvelopeType.PAGE_SNAPSHOT
         2 -> RemoteReviewEnvelopeType.TEACHER_FEEDBACK
         3 -> RemoteReviewEnvelopeType.ACK
+        4 -> RemoteReviewEnvelopeType.CHAT_MESSAGE
+        5 -> RemoteReviewEnvelopeType.REMOTE_GRADE
         else -> fail(RemoteReviewCodecError.UNKNOWN_TYPE) { "Unknown envelope type $code." }
     }
 
@@ -450,6 +530,180 @@ object RemoteReviewDocumentCodec {
         else -> fail(RemoteReviewCodecError.MALFORMED_PAYLOAD) { "Unknown ACK disposition $code." }
     }
 
+    /**
+     * Carries the exact-ink digest without changing the v1 PAGE_SNAPSHOT field layout. JPEG COM and
+     * PNG tEXt are standard ancillary metadata, so a checkpoint reader still sees an ordinary image
+     * ending at the legacy image field. The whole image remains covered by the document SHA and the
+     * transport AES-GCM envelope.
+     */
+    private fun embedSnapshotDigest(
+        format: SnapshotImageFormat,
+        image: ByteArray,
+        digest: String,
+    ): ByteArray {
+        extractSnapshotDigest(format, image)?.let { embedded ->
+            if (embedded != digest) {
+                fail(RemoteReviewCodecError.VALIDATION_FAILED) {
+                    "Snapshot image already contains a different student-ink digest."
+                }
+            }
+            return image
+        }
+        val embedded = when (format) {
+            SnapshotImageFormat.JPEG -> embedJpegSnapshotDigest(image, digest)
+            SnapshotImageFormat.PNG -> embedPngSnapshotDigest(image, digest)
+        }
+        if (embedded.size > RemoteReviewLimits.MAX_SNAPSHOT_IMAGE_BYTES) {
+            fail(RemoteReviewCodecError.TOO_LARGE) {
+                "Snapshot image plus compatibility metadata exceeds " +
+                    "${RemoteReviewLimits.MAX_SNAPSHOT_IMAGE_BYTES} bytes."
+            }
+        }
+        return embedded
+    }
+
+    private fun extractSnapshotDigest(
+        format: SnapshotImageFormat,
+        image: ByteArray,
+    ): String? = when (format) {
+        SnapshotImageFormat.JPEG -> extractJpegSnapshotDigest(image)
+        SnapshotImageFormat.PNG -> extractPngSnapshotDigest(image)
+    }
+
+    private fun embedJpegSnapshotDigest(image: ByteArray, digest: String): ByteArray {
+        if (image.size < 3 || image[0] != JPEG_SOI_FIRST || image[1] != JPEG_SOI_SECOND) {
+            fail(RemoteReviewCodecError.VALIDATION_FAILED) {
+                "Digest-bearing JPEG snapshot has no SOI marker."
+            }
+        }
+        val payload = SNAPSHOT_DIGEST_JPEG_PREFIX + digest.toByteArray(StandardCharsets.US_ASCII)
+        val segmentLength = payload.size + 2
+        return ByteArray(image.size + payload.size + 4).also { result ->
+            result[0] = image[0]
+            result[1] = image[1]
+            result[2] = JPEG_MARKER_PREFIX
+            result[3] = JPEG_COMMENT_MARKER
+            result[4] = (segmentLength ushr 8).toByte()
+            result[5] = segmentLength.toByte()
+            payload.copyInto(result, destinationOffset = 6)
+            image.copyInto(result, destinationOffset = 6 + payload.size, startIndex = 2)
+        }
+    }
+
+    private fun extractJpegSnapshotDigest(image: ByteArray): String? {
+        if (image.size < 6 || image[0] != JPEG_SOI_FIRST || image[1] != JPEG_SOI_SECOND ||
+            image[2] != JPEG_MARKER_PREFIX || image[3] != JPEG_COMMENT_MARKER
+        ) return null
+        val segmentLength = ((image[4].toInt() and 0xff) shl 8) or
+            (image[5].toInt() and 0xff)
+        if (segmentLength < 2) return null
+        val payloadStart = 6
+        val payloadEnd = 4 + segmentLength
+        if (payloadEnd > image.size) return null
+        return decodeSnapshotDigestMetadata(image, payloadStart, payloadEnd, SNAPSHOT_DIGEST_JPEG_PREFIX)
+    }
+
+    private fun embedPngSnapshotDigest(image: ByteArray, digest: String): ByteArray {
+        val ihdrEnd = pngFirstChunkEnd(image)
+            ?: fail(RemoteReviewCodecError.VALIDATION_FAILED) {
+                "Digest-bearing PNG snapshot has no valid first IHDR chunk."
+            }
+        val payload = SNAPSHOT_DIGEST_PNG_PREFIX + digest.toByteArray(StandardCharsets.US_ASCII)
+        val chunk = ByteArray(12 + payload.size)
+        writeIntBigEndian(chunk, 0, payload.size)
+        PNG_TEXT_CHUNK.copyInto(chunk, destinationOffset = 4)
+        payload.copyInto(chunk, destinationOffset = 8)
+        val crc = CRC32().apply {
+            update(PNG_TEXT_CHUNK)
+            update(payload)
+        }.value
+        writeIntBigEndian(chunk, 8 + payload.size, crc.toInt())
+        return ByteArray(image.size + chunk.size).also { result ->
+            image.copyInto(result, endIndex = ihdrEnd)
+            chunk.copyInto(result, destinationOffset = ihdrEnd)
+            image.copyInto(result, destinationOffset = ihdrEnd + chunk.size, startIndex = ihdrEnd)
+        }
+    }
+
+    private fun extractPngSnapshotDigest(image: ByteArray): String? {
+        if (!image.startsWith(PNG_FILE_SIGNATURE)) return null
+        var offset = PNG_FILE_SIGNATURE.size
+        while (offset <= image.size - PNG_CHUNK_OVERHEAD_BYTES) {
+            val length = readUnsignedIntBigEndian(image, offset)
+            if (length > Int.MAX_VALUE.toLong()) return null
+            val dataStart = offset + 8
+            val dataEndLong = dataStart.toLong() + length
+            val chunkEndLong = dataEndLong + 4L
+            if (chunkEndLong > image.size.toLong()) return null
+            val dataEnd = dataEndLong.toInt()
+            val chunkEnd = chunkEndLong.toInt()
+            if (image.matchesAt(offset + 4, PNG_TEXT_CHUNK)) {
+                decodeSnapshotDigestMetadata(
+                    image,
+                    dataStart,
+                    dataEnd,
+                    SNAPSHOT_DIGEST_PNG_PREFIX,
+                )?.let { return it }
+            }
+            if (image.matchesAt(offset + 4, PNG_END_CHUNK)) return null
+            offset = chunkEnd
+        }
+        return null
+    }
+
+    private fun pngFirstChunkEnd(image: ByteArray): Int? {
+        if (!image.startsWith(PNG_FILE_SIGNATURE) ||
+            image.size < PNG_FILE_SIGNATURE.size + PNG_CHUNK_OVERHEAD_BYTES
+        ) return null
+        val offset = PNG_FILE_SIGNATURE.size
+        val length = readUnsignedIntBigEndian(image, offset)
+        if (length != PNG_IHDR_DATA_BYTES.toLong() || !image.matchesAt(offset + 4, PNG_IHDR_CHUNK)) {
+            return null
+        }
+        val end = offset.toLong() + PNG_CHUNK_OVERHEAD_BYTES + length
+        return end.takeIf { it <= image.size.toLong() }?.toInt()
+    }
+
+    private fun decodeSnapshotDigestMetadata(
+        bytes: ByteArray,
+        start: Int,
+        end: Int,
+        prefix: ByteArray,
+    ): String? {
+        if (end - start != prefix.size + RemoteReviewLimits.SHA256_HEX_BYTES ||
+            !bytes.matchesAt(start, prefix)
+        ) return null
+        val digest = String(
+            bytes,
+            start + prefix.size,
+            RemoteReviewLimits.SHA256_HEX_BYTES,
+            StandardCharsets.US_ASCII,
+        )
+        return digest.takeIf(SNAPSHOT_DIGEST_HEX::matches)
+    }
+
+    private fun ByteArray.startsWith(prefix: ByteArray): Boolean = matchesAt(0, prefix)
+
+    private fun ByteArray.matchesAt(offset: Int, expected: ByteArray): Boolean {
+        if (offset < 0 || offset > size - expected.size) return false
+        return expected.indices.all { index -> this[offset + index] == expected[index] }
+    }
+
+    private fun readUnsignedIntBigEndian(bytes: ByteArray, offset: Int): Long {
+        if (offset < 0 || offset > bytes.size - 4) return Long.MAX_VALUE
+        return ((bytes[offset].toLong() and 0xffL) shl 24) or
+            ((bytes[offset + 1].toLong() and 0xffL) shl 16) or
+            ((bytes[offset + 2].toLong() and 0xffL) shl 8) or
+            (bytes[offset + 3].toLong() and 0xffL)
+    }
+
+    private fun writeIntBigEndian(bytes: ByteArray, offset: Int, value: Int) {
+        bytes[offset] = (value ushr 24).toByte()
+        bytes[offset + 1] = (value ushr 16).toByte()
+        bytes[offset + 2] = (value ushr 8).toByte()
+        bytes[offset + 3] = value.toByte()
+    }
+
     private fun sha256(bytes: ByteArray): ByteArray =
         MessageDigest.getInstance("SHA-256").digest(bytes)
 
@@ -467,4 +721,20 @@ object RemoteReviewDocumentCodec {
     private const val SHA256_BYTES: Int = 32
     private const val FRAME_BYTES: Int = 4 + 1 + 1 + 4 + SHA256_BYTES
     private const val MAX_DETAIL_CODE_BYTES: Int = 64
+    private const val PNG_CHUNK_OVERHEAD_BYTES: Int = 12
+    private const val PNG_IHDR_DATA_BYTES: Int = 13
+    private val SNAPSHOT_DIGEST_HEX = Regex("[0-9a-f]{${RemoteReviewLimits.SHA256_HEX_BYTES}}")
+    private val SNAPSHOT_DIGEST_JPEG_PREFIX = "MNRRINK1:".toByteArray(StandardCharsets.US_ASCII)
+    private val SNAPSHOT_DIGEST_PNG_PREFIX =
+        "MasterNoteInkDigest\u0000".toByteArray(StandardCharsets.US_ASCII)
+    private val PNG_FILE_SIGNATURE = byteArrayOf(
+        0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    )
+    private val PNG_IHDR_CHUNK = byteArrayOf(0x49, 0x48, 0x44, 0x52)
+    private val PNG_TEXT_CHUNK = byteArrayOf(0x74, 0x45, 0x58, 0x74)
+    private val PNG_END_CHUNK = byteArrayOf(0x49, 0x45, 0x4e, 0x44)
+    private val JPEG_SOI_FIRST = 0xff.toByte()
+    private val JPEG_SOI_SECOND = 0xd8.toByte()
+    private val JPEG_MARKER_PREFIX = 0xff.toByte()
+    private val JPEG_COMMENT_MARKER = 0xfe.toByte()
 }

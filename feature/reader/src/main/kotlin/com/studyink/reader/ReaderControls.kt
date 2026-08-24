@@ -13,6 +13,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -72,6 +73,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -283,7 +285,11 @@ internal fun PenInteractionTarget(
                     }
                 }
                 true
-            },
+            }
+            // The interop handler consumes S Pen taps so they retain the precise down/up hit
+            // contract above. Finger taps pass through to this Compose click target, which also
+            // supplies keyboard and TalkBack button semantics.
+            .clickable(enabled = enabled, role = Role.Button, onClick = onAction),
         contentAlignment = Alignment.Center,
     ) {
         content(effectiveHovered, armed)
@@ -732,6 +738,17 @@ fun ReaderTopChrome(
             onSelectAttempt = onSelectAttempt,
             onShowStudentActivity = onShowStudentActivity,
             onResumeStudentFollow = onResumeStudentFollow,
+            transportCellModel = s23TransportCellModelForHybrid(
+                decision = state.hybridLink,
+                legacyLanConnection = state.liveConnection,
+                telegramUnreadCount = state.telegramUnreadCount,
+            ),
+            onTransportClick = { mode ->
+                when (mode) {
+                    S23TransportMode.LIVE -> onResumeStudentFollow()
+                    S23TransportMode.TELEGRAM -> onOpenRemoteMonitor()
+                }
+            },
             previewHoveredDescription = previewHoveredDescription,
             markHistoryContent = markHistoryContent,
         )

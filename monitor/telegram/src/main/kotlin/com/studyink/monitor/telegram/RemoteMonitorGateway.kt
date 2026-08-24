@@ -169,6 +169,34 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
 
     fun peerDeliveryReceipt(transferId: String): TelegramDeliveryReceipt? = peerReceipts.receipt(transferId)
 
+    /** Durable outbound peer documents of the requested protocol types, without exposing paths. */
+    fun pendingPeerDocumentTransfers(
+        payloadTypes: Set<String>,
+    ): List<PendingTelegramPeerDocumentTransfer> = inspectPendingPeerDocumentTransfers(
+        entries = outbox.pendingSnapshot(),
+        payloadTypes = payloadTypes,
+    )
+
+    /**
+     * Stops retries for the requested peer payload types and removes only owned ciphertext files.
+     * The worker mutation boundary interrupts a possible upload before the durable cancellation;
+     * Telegram content already accepted by the server cannot be recalled.
+     */
+    fun cancelPendingPeerDocumentTransfers(
+        payloadTypes: Set<String>,
+    ): List<PendingTelegramPeerDocumentTransfer> = synchronized(lifecycleLock) {
+        val requested = validatePeerPayloadTypes(payloadTypes)
+        if (requested.isEmpty()) return@synchronized emptyList()
+        mutatePeerWorkersLocked {
+            cancelPeerDocumentPayloads(
+                outbox = outbox,
+                ownedPeerOutboxRoot = paths.peerOutboxDirectory,
+                payloadTypes = requested,
+                cancelledAtEpochMs = System.currentTimeMillis(),
+            )
+        }
+    }
+
     /** Encrypts and durably queues an opaque page/feedback envelope for the exact pinned peer bot. */
     fun enqueuePeerDocument(
         transferId: String,
@@ -826,7 +854,8 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         return try {
             block()
         } finally {
-            if (restart && preferenceStore.get().monitoringEnabled) start()
+            val remoteReviewConfigured = credentials.load()?.remoteReviewRole != null
+            if (restart && (preferenceStore.get().monitoringEnabled || remoteReviewConfigured)) start()
         }
     }
 
@@ -840,10 +869,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
     }
 
     private fun deleteOwnedPeerFile(file: File?) {
-        if (file == null) return
-        val root = paths.peerOutboxDirectory.canonicalFile
-        val candidate = runCatching { file.canonicalFile }.getOrNull() ?: return
-        if (candidate.toPath().startsWith(root.toPath())) runCatching { candidate.delete() }
+        deleteOwnedPeerOutboxFile(paths.peerOutboxDirectory, file)
     }
 
     private fun safePeerFileToken(value: String): String = java.security.MessageDigest.getInstance("SHA-256")
@@ -1063,6 +1089,66 @@ internal fun shouldDeleteRejectedOwnedMedia(result: TelegramEnqueueResult): Bool
     -> false
     else -> true
 }
+
+internal fun inspectPendingPeerDocumentTransfers(
+    entries: List<TelegramOutboxEntry>,
+    payloadTypes: Set<String>,
+): List<PendingTelegramPeerDocumentTransfer> {
+    val requested = validatePeerPayloadTypes(payloadTypes)
+    if (requested.isEmpty()) return emptyList()
+    return entries.mapNotNull { entry -> entry.toPendingPeerDocumentTransfer(requested) }
+}
+
+internal fun cancelPeerDocumentPayloads(
+    outbox: TelegramOutbox,
+    ownedPeerOutboxRoot: File,
+    payloadTypes: Set<String>,
+    cancelledAtEpochMs: Long,
+): List<PendingTelegramPeerDocumentTransfer> {
+    require(cancelledAtEpochMs >= 0L)
+    val requested = validatePeerPayloadTypes(payloadTypes)
+    if (requested.isEmpty()) return emptyList()
+    val transferIds = inspectPendingPeerDocumentTransfers(outbox.pendingSnapshot(), requested)
+        .mapTo(linkedSetOf(), PendingTelegramPeerDocumentTransfer::transferId)
+    if (transferIds.isEmpty()) return emptyList()
+    val cancelled = outbox.cancelPeerDocumentTransfers(transferIds, cancelledAtEpochMs)
+    cancelled.forEach { entry ->
+        if (entry.deleteAfterSend) deleteOwnedPeerOutboxFile(ownedPeerOutboxRoot, entry.file)
+    }
+    return cancelled.mapNotNull { entry -> entry.toPendingPeerDocumentTransfer(requested) }
+}
+
+private fun TelegramOutboxEntry.toPendingPeerDocumentTransfer(
+    requestedPayloadTypes: Set<String>,
+): PendingTelegramPeerDocumentTransfer? {
+    if (route != TelegramOutboxRoute.PEER || kind != TelegramOutboxKind.DOCUMENT) return null
+    val header = TelegramPeerProtocol.parseDocumentCaption(text) ?: return null
+    if (header.transferId != peerTransferId || header.payloadType !in requestedPayloadTypes) return null
+    return PendingTelegramPeerDocumentTransfer(
+        transferId = header.transferId,
+        payloadType = header.payloadType,
+        createdAtEpochMs = createdAtEpochMs,
+        nextAttemptEpochMs = nextAttemptEpochMs,
+        attempts = attempts,
+        ciphertextBytes = file?.takeIf(File::isFile)?.length() ?: 0L,
+    )
+}
+
+private fun validatePeerPayloadTypes(payloadTypes: Set<String>): Set<String> {
+    require(payloadTypes.size <= MAX_PEER_PAYLOAD_FILTER_TYPES)
+    require(payloadTypes.all(PEER_PAYLOAD_TYPE::matches))
+    return payloadTypes.toSet()
+}
+
+private fun deleteOwnedPeerOutboxFile(rootDirectory: File, file: File?): Boolean {
+    if (file == null) return false
+    val root = runCatching { rootDirectory.canonicalFile }.getOrNull() ?: return false
+    val candidate = runCatching { file.canonicalFile }.getOrNull() ?: return false
+    if (!candidate.toPath().startsWith(root.toPath())) return false
+    return runCatching { candidate.delete() }.getOrDefault(false)
+}
+
+private const val MAX_PEER_PAYLOAD_FILTER_TYPES = 32
 
 internal fun withinPeerDocumentDiskQuota(
     pendingDocumentCount: Int,

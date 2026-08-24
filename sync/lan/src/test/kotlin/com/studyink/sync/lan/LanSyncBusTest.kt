@@ -11,6 +11,112 @@ import org.junit.Test
 
 class LanSyncBusTest {
     @Test
+    fun activeSessionSnapshotTracksTheServiceSessionAndClearsAfterBothStatesAreIdle() {
+        val bookId = "active-book-${UUID.randomUUID()}"
+        try {
+            LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTED)
+            LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.READY)
+
+            assertEquals(
+                LanActiveSessionSnapshot(
+                    bookId,
+                    LanSessionSnapshot(LanConnectionState.CONNECTED, LanSessionPhase.READY),
+                ),
+                LanSyncBus.activeSessionSnapshot(),
+            )
+
+            // closeSession publishes these two changes in order. The intermediate view remains
+            // active but is already definitively disconnected, so routing cannot trust READY.
+            LanSyncBus.connectionStateChanged(bookId, LanConnectionState.IDLE)
+            assertEquals(
+                LanActiveSessionSnapshot(
+                    bookId,
+                    LanSessionSnapshot(LanConnectionState.IDLE, LanSessionPhase.READY),
+                ),
+                LanSyncBus.activeSessionSnapshot(),
+            )
+            LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.IDLE)
+            assertNull(LanSyncBus.activeSessionSnapshot())
+        } finally {
+            LanSyncBus.clearConnectionState(bookId)
+        }
+    }
+
+    @Test
+    fun closingCurrentSessionDoesNotReactivateAnOlderStickyReadyBook() {
+        val oldBookId = "old-book-${UUID.randomUUID()}"
+        val currentBookId = "current-book-${UUID.randomUUID()}"
+        try {
+            LanSyncBus.connectionStateChanged(oldBookId, LanConnectionState.CONNECTED)
+            LanSyncBus.sessionPhaseChanged(oldBookId, LanSessionPhase.READY)
+            LanSyncBus.connectionStateChanged(currentBookId, LanConnectionState.CONNECTING)
+            LanSyncBus.sessionPhaseChanged(currentBookId, LanSessionPhase.CONNECTING)
+
+            assertEquals(currentBookId, LanSyncBus.activeSessionSnapshot()?.bookId)
+            LanSyncBus.clearConnectionState(currentBookId)
+
+            assertNull(LanSyncBus.activeSessionSnapshot())
+            assertEquals(
+                LanSessionSnapshot(LanConnectionState.CONNECTED, LanSessionPhase.READY),
+                LanSyncBus.sessionSnapshot(oldBookId),
+            )
+        } finally {
+            LanSyncBus.clearConnectionState(currentBookId)
+            LanSyncBus.clearConnectionState(oldBookId)
+        }
+    }
+
+    @Test
+    fun sessionSnapshotReturnsConnectionAndPhaseFromOneStickyView() {
+        val bookId = "snapshot-book"
+        try {
+            LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTED)
+            LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.READY)
+
+            assertEquals(
+                LanSessionSnapshot(LanConnectionState.CONNECTED, LanSessionPhase.READY),
+                LanSyncBus.sessionSnapshot(bookId),
+            )
+        } finally {
+            LanSyncBus.clearConnectionState(bookId)
+        }
+    }
+
+    @Test
+    fun sessionPhaseIsStickyAndClearedWithTheConnection() {
+        val bookId = "book-${UUID.randomUUID()}"
+        val received = mutableListOf<LanSessionPhase>()
+        val listener = object : LanSyncBus.Listener {
+            override fun onSessionPhaseChanged(bookId: String, phase: LanSessionPhase) {
+                received += phase
+            }
+        }
+        LanSyncBus.addListener(listener)
+        try {
+            LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.SOCKET_CONNECTED)
+            LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.PAGE_CATCHING_UP)
+            LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.READY)
+
+            assertEquals(LanSessionPhase.READY, LanSyncBus.sessionPhase(bookId))
+            assertEquals(
+                listOf(
+                    LanSessionPhase.SOCKET_CONNECTED,
+                    LanSessionPhase.PAGE_CATCHING_UP,
+                    LanSessionPhase.READY,
+                ),
+                received,
+            )
+
+            LanSyncBus.clearConnectionState(bookId)
+            assertEquals(LanSessionPhase.IDLE, LanSyncBus.sessionPhase(bookId))
+            assertEquals(LanSessionPhase.IDLE, received.last())
+        } finally {
+            LanSyncBus.clearConnectionState(bookId)
+            LanSyncBus.removeListener(listener)
+        }
+    }
+
+    @Test
     fun pagePresenceIsStickyPerBookAndKeepsLegacyListenerCompatibility() {
         val firstBook = "book-${UUID.randomUUID()}"
         val secondBook = "book-${UUID.randomUUID()}"

@@ -113,6 +113,34 @@ class TelegramOutbox(
         return cancelled
     }
 
+    /**
+     * Durably cancels only peer documents with the requested transport ids. Peer text controls,
+     * parent traffic, and every other peer document remain untouched. In-flight ids are removed so
+     * a sender interrupted by the gateway cannot put a stale document back into the queue.
+     */
+    @Synchronized
+    fun cancelPeerDocumentTransfers(
+        transferIds: Set<String>,
+        cancelledAtEpochMs: Long,
+    ): List<TelegramOutboxEntry> {
+        require(cancelledAtEpochMs >= 0L)
+        require(transferIds.all(PEER_IDENTIFIER::matches))
+        if (transferIds.isEmpty()) return emptyList()
+        val cancelled = pending.values.filter { entry ->
+            entry.route == TelegramOutboxRoute.PEER &&
+                entry.kind == TelegramOutboxKind.DOCUMENT &&
+                entry.peerTransferId in transferIds
+        }
+        cancelled.forEach { entry ->
+            append(encodeSuperseded(entry.idempotencyKey, cancelledAtEpochMs))
+            pending.remove(entry.idempotencyKey)
+            inFlight.remove(entry.idempotencyKey)
+            rememberBounded(superseded, entry.idempotencyKey, cancelledAtEpochMs, MAX_SUPERSEDED_KEYS)
+        }
+        compactIfNeeded()
+        return cancelled
+    }
+
     @Synchronized
     fun due(nowEpochMs: Long): TelegramOutboxEntry? = pending.values
         .asSequence()

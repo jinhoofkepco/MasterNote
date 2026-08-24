@@ -158,6 +158,7 @@ class LanSyncService : Service(),
         logSessionStart()
         startForeground(NOTIFICATION_ID, notification("선생 기기 연결 대기 중"))
         LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTING)
+        LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.CONNECTING)
         io.execute {
             val server = ServerSocket(0).also { serverSocket = it }
             registerService(server.localPort)
@@ -190,6 +191,7 @@ class LanSyncService : Service(),
         logSessionStart()
         startForeground(NOTIFICATION_ID, notification("학생 기기 찾는 중"))
         LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTING)
+        LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.CONNECTING)
         acquireMulticast()
         val listener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) = Unit
@@ -224,6 +226,7 @@ class LanSyncService : Service(),
         logSessionStart()
         startForeground(NOTIFICATION_ID, notification("학생 기기에 연결 중"))
         LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTING)
+        LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.CONNECTING)
         startTeacherSocket(payload.host, payload.port, payload.bookId, payload.token)
     }
 
@@ -300,6 +303,7 @@ class LanSyncService : Service(),
         updateNotification("연결됨")
         Log.i(TAG, "LAN attached role=$role book=$bookId generation=$connectionGeneration")
         LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTED)
+        LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.SOCKET_CONNECTED)
         io.execute { readLoop(connected) }
     }
 
@@ -336,6 +340,7 @@ class LanSyncService : Service(),
                 updateNotification("연결 끊김")
                 Log.i(TAG, "LAN detached role=$role book=$bookId generation=$connectionGeneration")
                 LanSyncBus.connectionStateChanged(bookId, LanConnectionState.DISCONNECTED)
+                LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.DISCONNECTED)
                 scheduleReconnect()
             }
         }
@@ -367,12 +372,16 @@ class LanSyncService : Service(),
                 val pairedDeviceId = pairingPreferences.getString(pairingKey, null)
                 require(pairedDeviceId == null || pairedDeviceId == peerDeviceId) { "Another device is already paired" }
                 if (pairedDeviceId == null) pairingPreferences.edit().putString(pairingKey, peerDeviceId).apply()
+                LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.HANDSHAKE_COMPLETE)
                 send(LanWire.message("HELLO_OK"))
                 sendMetadataSnapshot()
                 if (role == LanPeerRole.STUDENT_SERVER) sendStudentPageState("hello")
                 repairTeacherConnection()
             }
-            "HELLO_OK" -> repairTeacherConnection()
+            "HELLO_OK" -> {
+                LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.HANDSHAKE_COMPLETE)
+                repairTeacherConnection()
+            }
             "SUBSCRIBE" -> {
                 require(
                     role == LanPeerRole.STUDENT_SERVER && peerRole == LanPeerRole.TEACHER_CLIENT
@@ -385,11 +394,15 @@ class LanSyncService : Service(),
                     deviceId = library.deviceId,
                     logicalClock = message.getLong("receivedClock"),
                 )
+                LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.PAGE_CATCHING_UP)
                 // A teacher may enter Live Monitor after the original page event. Repeating the
                 // state is safe because the teacher's subscription sender is connection-idempotent.
                 sendStudentPageState("subscription")
-                if (flushPage(subscribedPage) && pendingPage == subscribedPage) {
-                    pendingPage = -1
+                if (flushPage(subscribedPage)) {
+                    if (pendingPage == subscribedPage) pendingPage = -1
+                    if (sendPageSynced(subscribedPage)) {
+                        LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.READY)
+                    }
                 }
             }
             "OPERATION" -> {
@@ -435,6 +448,16 @@ class LanSyncService : Service(),
                 // silently unsubscribed and receive no live ink.
                 ensureSubscription()
                 LanSyncBus.remotePageChanged(location)
+            }
+            "PAGE_SYNCED" -> {
+                require(
+                    role == LanPeerRole.TEACHER_CLIENT && peerRole == LanPeerRole.STUDENT_SERVER
+                ) { "Only a student peer may complete page catch-up" }
+                val page = message.getInt("page")
+                require(isPageInBook(page)) { "Synchronized page is outside the book" }
+                if (page == subscribedPage) {
+                    LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.READY)
+                }
             }
             "ATTEMPT_UPSERT" -> {
                 require(
@@ -502,6 +525,10 @@ class LanSyncService : Service(),
             currentStudentPage = presence.pageNumber
             currentStudentAttemptNo = presence.attemptNo
             currentStudentRevision = presence.revision
+            // Local presence is also published after ordinary strokes and attempt updates. Those
+            // mutations are already delivered by the operation/attempt queues and must not make a
+            // healthy LAN session look unavailable to the LAN-first transport selector. Only an
+            // actual teacher subscription changes the page catch-up phase (SUBSCRIBE -> READY).
             sendStudentPageState("local-presence")
         } else if (role == LanPeerRole.TEACHER_CLIENT) {
             currentTeacherAttemptNo = presence.attemptNo
@@ -560,6 +587,7 @@ class LanSyncService : Service(),
         }
         if (!isPageInBook(subscribedPage)) return
         if (lastTeacherRepairGeneration == connectionGeneration) return
+        LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.PAGE_CATCHING_UP)
         if (!ensureSubscription()) return
         lastTeacherRepairGeneration = connectionGeneration
         // A reconnect must repair published teacher operations as well as request student ink.
@@ -570,6 +598,9 @@ class LanSyncService : Service(),
         if (!isPageInBook(pageNumber)) return
         if (subscribedPage == pageNumber) return
         subscribedPage = pageNumber
+        if (writer != null) {
+            LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.PAGE_CATCHING_UP)
+        }
         Log.i(TAG, "subscription target book=$bookId page=$pageNumber reason=$reason")
     }
 
@@ -590,6 +621,17 @@ class LanSyncService : Service(),
             )
         }
         return sent
+    }
+
+    /** Ordered after every operation emitted by [flushPage] on the same synchronized writer. */
+    private fun sendPageSynced(page: Int): Boolean {
+        if (role != LanPeerRole.STUDENT_SERVER || page != subscribedPage || writer == null) return false
+        return send(LanWire.message("PAGE_SYNCED") {
+            put("page", page)
+            put("revision", currentStudentRevision.coerceAtLeast(0L))
+        }).also { sent ->
+            if (sent) Log.i(TAG, "PAGE_SYNCED send book=$bookId page=$page generation=$connectionGeneration")
+        }
     }
 
     private fun bootstrapLocalPresence() {

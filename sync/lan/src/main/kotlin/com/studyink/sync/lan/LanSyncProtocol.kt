@@ -114,9 +114,44 @@ data class StudentLocation(
 /** What the local device can currently say about its paired peer. */
 enum class LanConnectionState { IDLE, CONNECTING, CONNECTED, DISCONNECTED }
 
+/**
+ * Application-level readiness kept separate from the socket state.
+ *
+ * A connected socket is not yet safe to prefer over the Telegram fallback: the peer still has to
+ * authenticate and the teacher must receive every durable operation for the subscribed page.
+ */
+enum class LanSessionPhase {
+    IDLE,
+    CONNECTING,
+    SOCKET_CONNECTED,
+    HANDSHAKE_COMPLETE,
+    PAGE_CATCHING_UP,
+    READY,
+    DISCONNECTED,
+}
+
+/** One lock-consistent view used by transport arbitration immediately before durable enqueue. */
+data class LanSessionSnapshot(
+    val connectionState: LanConnectionState,
+    val phase: LanSessionPhase,
+)
+
+/**
+ * The LAN service's one current session and its lock-consistent transport state.
+ *
+ * Per-book sticky state is intentionally retained for late UI subscribers, so callers deciding
+ * whether LAN owns application traffic must use this view instead of guessing a book id from a
+ * Reader/session that may never have been opened or may already have closed.
+ */
+data class LanActiveSessionSnapshot(
+    val bookId: String,
+    val session: LanSessionSnapshot,
+)
+
 object LanSyncBus {
     interface Listener {
         fun onConnectionStateChanged(bookId: String, state: LanConnectionState) {}
+        fun onSessionPhaseChanged(bookId: String, phase: LanSessionPhase) {}
         fun onLocalOperation(bookId: String, pageNumber: Int) {}
         fun onPageChanged(bookId: String, pageNumber: Int, revision: Long) {}
         fun onPagePresenceChanged(presence: PagePresence) {
@@ -137,7 +172,9 @@ object LanSyncBus {
     private val localPagePresences = mutableMapOf<String, PagePresence>()
     private val remoteStudentLocations = mutableMapOf<String, StudentLocation>()
     private val connectionStates = mutableMapOf<String, LanConnectionState>()
+    private val sessionPhases = mutableMapOf<String, LanSessionPhase>()
     private val pairingUris = mutableMapOf<String, String>()
+    private var activeSessionBookId: String? = null
 
     fun addListener(listener: Listener) {
         synchronized(this) { listeners += listener }
@@ -160,6 +197,24 @@ object LanSyncBus {
         connectionStates[bookId] ?: LanConnectionState.IDLE
     }
 
+    /** Sticky application-level readiness for late coordinator/reader startup. */
+    fun sessionPhase(bookId: String): LanSessionPhase = synchronized(this) {
+        sessionPhases[bookId] ?: LanSessionPhase.IDLE
+    }
+
+    fun sessionSnapshot(bookId: String): LanSessionSnapshot = synchronized(this) {
+        sessionSnapshotLocked(bookId)
+    }
+
+    /** The service's active book and state, read under the same monitor as both state maps. */
+    fun activeSessionSnapshot(): LanActiveSessionSnapshot? = synchronized(this) {
+        val bookId = activeSessionBookId ?: return@synchronized null
+        LanActiveSessionSnapshot(
+            bookId = bookId,
+            session = sessionSnapshotLocked(bookId),
+        )
+    }
+
     /**
      * The pairing code of the session already running for this book, if any. Retained so the QR can
      * be shown on demand without restarting a session that a peer may already be using.
@@ -171,6 +226,7 @@ object LanSyncBus {
         val snapshot = synchronized(this) {
             if (connectionStates[bookId] == state) return
             connectionStates[bookId] = state
+            refreshActiveSessionLocked(bookId)
             listeners.toList()
         }
         snapshot.forEach { it.onConnectionStateChanged(bookId, state) }
@@ -180,6 +236,33 @@ object LanSyncBus {
         if (bookId.isBlank()) return
         synchronized(this) { pairingUris.remove(bookId) }
         connectionStateChanged(bookId, LanConnectionState.IDLE)
+        sessionPhaseChanged(bookId, LanSessionPhase.IDLE)
+    }
+
+    internal fun sessionPhaseChanged(bookId: String, phase: LanSessionPhase) {
+        if (bookId.isBlank()) return
+        val snapshot = synchronized(this) {
+            if (sessionPhases[bookId] == phase) return
+            sessionPhases[bookId] = phase
+            refreshActiveSessionLocked(bookId)
+            listeners.toList()
+        }
+        snapshot.forEach { it.onSessionPhaseChanged(bookId, phase) }
+    }
+
+    private fun sessionSnapshotLocked(bookId: String) = LanSessionSnapshot(
+        connectionState = connectionStates[bookId] ?: LanConnectionState.IDLE,
+        phase = sessionPhases[bookId] ?: LanSessionPhase.IDLE,
+    )
+
+    private fun refreshActiveSessionLocked(bookId: String) {
+        val session = sessionSnapshotLocked(bookId)
+        if (session.connectionState != LanConnectionState.IDLE || session.phase != LanSessionPhase.IDLE) {
+            activeSessionBookId = bookId
+        } else if (activeSessionBookId == bookId) {
+            // Do not select another sticky per-book record: it belongs to an older service session.
+            activeSessionBookId = null
+        }
     }
 
     internal fun clearRemoteStudentLocation(bookId: String) {

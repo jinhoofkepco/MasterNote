@@ -4,7 +4,22 @@ package com.studyink.monitor.core
 data class RemoteSnapshotCursor(
     val reference: SnapshotReference,
     val createdAtEpochMs: Long,
-)
+    /** Null for legacy snapshots and page-only captures that cannot be graded exactly. */
+    val attemptNo: Int? = null,
+    /** Null for the legacy v1 snapshot payload without the encrypted digest extension. */
+    val studentInkDigest: String? = null,
+) {
+    init {
+        checkProtocol(attemptNo == null || attemptNo > 0, "attemptNo") {
+            "must be null or one-based"
+        }
+        studentInkDigest?.let { digest ->
+            checkProtocol(GRADE_DIGEST.matches(digest), "studentInkDigest") {
+                "must be exactly ${RemoteReviewLimits.SHA256_HEX_BYTES} lower-case hexadecimal characters"
+            }
+        }
+    }
+}
 
 /** Each feedback document replaces the complete teacher layer for one opaque page token. */
 data class RemoteFeedbackCursor(
@@ -13,6 +28,27 @@ data class RemoteFeedbackCursor(
     val feedbackRevision: Long,
     val sourceSnapshotTransferId: String,
     val createdAtEpochMs: Long,
+)
+
+/** Exact student state that may authorize a later [RemoteGradeEnvelope]. */
+data class RemoteGradeSourceCursor(
+    val reference: SnapshotReference,
+    val attemptNo: Int,
+    val studentInkDigest: String,
+    val createdAtEpochMs: Long,
+) {
+    init {
+        checkProtocol(attemptNo > 0, "attemptNo") { "must be one-based" }
+        checkProtocol(GRADE_DIGEST.matches(studentInkDigest), "studentInkDigest") {
+            "must be exactly ${RemoteReviewLimits.SHA256_HEX_BYTES} lower-case hexadecimal characters"
+        }
+        checkProtocol(createdAtEpochMs >= 0L, "createdAtEpochMs") { "must not be negative" }
+    }
+}
+
+/** Last committed state of one stable grade group. */
+data class RemoteGradeCursor(
+    val envelope: RemoteGradeEnvelope,
 )
 
 /**
@@ -24,11 +60,36 @@ interface RemoteReviewStateView {
     fun snapshotByTransferId(transferId: String): RemoteSnapshotCursor?
     fun latestSnapshot(pageToken: String): RemoteSnapshotCursor?
     fun latestFeedback(pageToken: String): RemoteFeedbackCursor?
+
+    /**
+     * Defaults keep existing implementations source-compatible, but a missing cursor deliberately
+     * defers rather than trusting a grade that cannot be tied to exact durable student state.
+     */
+    fun gradeSourceByTransferId(transferId: String): RemoteGradeSourceCursor? {
+        val snapshot = snapshotByTransferId(transferId) ?: return null
+        val attemptNo = snapshot.attemptNo ?: return null
+        val studentInkDigest = snapshot.studentInkDigest ?: return null
+        return RemoteGradeSourceCursor(
+            reference = snapshot.reference,
+            attemptNo = attemptNo,
+            studentInkDigest = studentInkDigest,
+            createdAtEpochMs = snapshot.createdAtEpochMs,
+        )
+    }
+
+    /** Latest committed state for this exact page/attempt/stable grade group. */
+    fun latestGrade(
+        pageToken: String,
+        attemptNo: Int,
+        gradeGroupId: String,
+    ): RemoteGradeCursor? = null
 }
 
 enum class RemoteReviewIncomingAction {
     APPLY_PAGE_SNAPSHOT,
     APPLY_TEACHER_FEEDBACK,
+    APPLY_CHAT_MESSAGE,
+    APPLY_REMOTE_GRADE,
     COMPLETE_OUTBOX,
     IGNORE_DUPLICATE,
     IGNORE_SUPERSEDED,
@@ -59,6 +120,7 @@ sealed interface RemoteReviewStateMutation {
     data class RecordCommittedTransfer(val transferId: String) : RemoteReviewStateMutation
     data class SetLatestSnapshot(val cursor: RemoteSnapshotCursor) : RemoteReviewStateMutation
     data class SetLatestFeedback(val cursor: RemoteFeedbackCursor) : RemoteReviewStateMutation
+    data class SetLatestGrade(val cursor: RemoteGradeCursor) : RemoteReviewStateMutation
 
     /** The outbox decides whether a rejected record is deleted or retained for diagnostics. */
     data class SettleOutboxTransfer(
@@ -131,6 +193,11 @@ object RemoteReviewExchangeStateMachine {
                 ),
                 ackAfterCommit = null,
             )
+            is ChatMessageEnvelope -> planPeerArtifact(
+                envelope = envelope,
+                action = RemoteReviewIncomingAction.APPLY_CHAT_MESSAGE,
+            )
+            is RemoteGradeEnvelope -> planGrade(envelope, state)
         }
     }
 
@@ -139,6 +206,9 @@ object RemoteReviewExchangeStateMachine {
         is PageSnapshotEnvelope -> "PAGE:${envelope.pageToken}"
         is TeacherFeedbackEnvelope -> "FEEDBACK:${envelope.sourceSnapshot.pageToken}"
         is RemoteReviewAckEnvelope -> null
+        is ChatMessageEnvelope -> null
+        is RemoteGradeEnvelope -> "GRADE:${envelope.sourceSnapshot.pageToken}:" +
+            "${envelope.attemptNo}:${envelope.gradeGroupId}"
     }
 
     /**
@@ -169,6 +239,8 @@ object RemoteReviewExchangeStateMachine {
                 candidate.revision > existing.envelope.revision
             candidate is TeacherFeedbackEnvelope && existing.envelope is TeacherFeedbackEnvelope ->
                 candidate.feedbackRevision > existing.envelope.feedbackRevision
+            candidate is RemoteGradeEnvelope && existing.envelope is RemoteGradeEnvelope ->
+                candidate.syncRevision > existing.envelope.syncRevision
             else -> false
         }
         return if (candidateIsNewer) {
@@ -187,7 +259,14 @@ object RemoteReviewExchangeStateMachine {
         state: RemoteReviewStateView,
     ): RemoteReviewIncomingPlan {
         val latest = state.latestSnapshot(snapshot.pageToken)
-        if (latest != null && snapshot.revision <= latest.reference.revision) {
+        val upgradesLegacyDigestAtSameRevision = latest != null &&
+            snapshot.revision == latest.reference.revision &&
+            latest.studentInkDigest == null && snapshot.studentInkDigest != null &&
+            latest.attemptNo == snapshot.attemptNo &&
+            latest.reference.dimensions == snapshot.dimensions
+        if (latest != null && snapshot.revision <= latest.reference.revision &&
+            !upgradesLegacyDigestAtSameRevision
+        ) {
             return RemoteReviewIncomingPlan(
                 action = RemoteReviewIncomingAction.IGNORE_SUPERSEDED,
                 commitMutations = listOf(
@@ -209,6 +288,8 @@ object RemoteReviewExchangeStateMachine {
                 dimensions = snapshot.dimensions,
             ),
             createdAtEpochMs = snapshot.createdAtEpochMs,
+            attemptNo = snapshot.attemptNo,
+            studentInkDigest = snapshot.studentInkDigest,
         )
         return RemoteReviewIncomingPlan(
             action = RemoteReviewIncomingAction.APPLY_PAGE_SNAPSHOT,
@@ -284,6 +365,113 @@ object RemoteReviewExchangeStateMachine {
         )
     }
 
+    private fun planPeerArtifact(
+        envelope: RemoteReviewEnvelope,
+        action: RemoteReviewIncomingAction,
+    ): RemoteReviewIncomingPlan = RemoteReviewIncomingPlan(
+        action = action,
+        commitMutations = listOf(
+            RemoteReviewStateMutation.RecordCommittedTransfer(envelope.transferId),
+        ),
+        ackAfterCommit = RemoteReviewAckDirective(
+            acknowledgedTransferId = envelope.transferId,
+            disposition = RemoteReviewAckDisposition.APPLIED,
+        ),
+    )
+
+    private fun planGrade(
+        grade: RemoteGradeEnvelope,
+        state: RemoteReviewStateView,
+    ): RemoteReviewIncomingPlan {
+        val source = state.gradeSourceByTransferId(grade.sourceSnapshot.transferId)
+            ?: return RemoteReviewIncomingPlan(
+                action = RemoteReviewIncomingAction.DEFER_MISSING_SOURCE,
+            )
+        if (!grade.matchesExactly(source)) {
+            return rejectedGradePlan(grade, "GRADE_SOURCE_MISMATCH")
+        }
+
+        val latest = state.latestGrade(
+            pageToken = grade.sourceSnapshot.pageToken,
+            attemptNo = grade.attemptNo,
+            gradeGroupId = grade.gradeGroupId,
+        )?.envelope
+        if (latest != null) {
+            require(
+                latest.sourceSnapshot.pageToken == grade.sourceSnapshot.pageToken &&
+                    latest.attemptNo == grade.attemptNo &&
+                    latest.gradeGroupId == grade.gradeGroupId,
+            ) { "latestGrade returned a cursor for another grade group" }
+            if (grade.syncRevision < latest.syncRevision) {
+                return supersededGradePlan(grade)
+            }
+            if (grade.syncRevision == latest.syncRevision) {
+                return if (grade.hasSameCommittedState(latest)) {
+                    supersededGradePlan(grade)
+                } else {
+                    rejectedGradePlan(grade, "GRADE_REVISION_CONFLICT")
+                }
+            }
+        }
+
+        return RemoteReviewIncomingPlan(
+            action = RemoteReviewIncomingAction.APPLY_REMOTE_GRADE,
+            commitMutations = listOf(
+                RemoteReviewStateMutation.RecordCommittedTransfer(grade.transferId),
+                RemoteReviewStateMutation.SetLatestGrade(RemoteGradeCursor(grade)),
+            ),
+            ackAfterCommit = RemoteReviewAckDirective(
+                acknowledgedTransferId = grade.transferId,
+                disposition = RemoteReviewAckDisposition.APPLIED,
+            ),
+        )
+    }
+
+    private fun RemoteGradeEnvelope.matchesExactly(source: RemoteGradeSourceCursor): Boolean =
+        sourceSnapshot == source.reference &&
+            attemptNo == source.attemptNo &&
+            studentInkDigest == source.studentInkDigest
+
+    /** Event IDs/timestamps may change on a safe re-envelope; committed grade state may not. */
+    private fun RemoteGradeEnvelope.hasSameCommittedState(other: RemoteGradeEnvelope): Boolean =
+        sourceSnapshot == other.sourceSnapshot &&
+            attemptNo == other.attemptNo &&
+            studentInkDigest == other.studentInkDigest &&
+            gradeGroupId == other.gradeGroupId &&
+            syncRevision == other.syncRevision &&
+            lastModifiedByDeviceId == other.lastModifiedByDeviceId &&
+            anchor == other.anchor &&
+            score == other.score &&
+            maximumScore == other.maximumScore
+
+    private fun supersededGradePlan(grade: RemoteGradeEnvelope): RemoteReviewIncomingPlan =
+        RemoteReviewIncomingPlan(
+            action = RemoteReviewIncomingAction.IGNORE_SUPERSEDED,
+            commitMutations = listOf(
+                RemoteReviewStateMutation.RecordCommittedTransfer(grade.transferId),
+            ),
+            ackAfterCommit = RemoteReviewAckDirective(
+                acknowledgedTransferId = grade.transferId,
+                disposition = RemoteReviewAckDisposition.SUPERSEDED,
+                detailCode = "GRADE_REVISION_NOT_NEWER",
+            ),
+        )
+
+    private fun rejectedGradePlan(
+        grade: RemoteGradeEnvelope,
+        detailCode: String,
+    ): RemoteReviewIncomingPlan = RemoteReviewIncomingPlan(
+        action = RemoteReviewIncomingAction.REJECT,
+        commitMutations = listOf(
+            RemoteReviewStateMutation.RecordCommittedTransfer(grade.transferId),
+        ),
+        ackAfterCommit = RemoteReviewAckDirective(
+            acknowledgedTransferId = grade.transferId,
+            disposition = RemoteReviewAckDisposition.REJECTED,
+            detailCode = detailCode,
+        ),
+    )
+
     private fun duplicatePlan(envelope: RemoteReviewEnvelope): RemoteReviewIncomingPlan =
         RemoteReviewIncomingPlan(
             action = RemoteReviewIncomingAction.IGNORE_DUPLICATE,
@@ -297,3 +485,5 @@ object RemoteReviewExchangeStateMachine {
             },
         )
 }
+
+private val GRADE_DIGEST = Regex("[0-9a-f]{${RemoteReviewLimits.SHA256_HEX_BYTES}}")
