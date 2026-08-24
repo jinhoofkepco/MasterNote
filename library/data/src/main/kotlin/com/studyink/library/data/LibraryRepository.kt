@@ -13,6 +13,7 @@ import com.studyink.core.model.Book
 import com.studyink.core.model.Mark
 import com.studyink.core.model.MarkColor
 import com.studyink.core.model.MarkGroup
+import com.studyink.core.model.MasterNoteDataCommitBus
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.PageBounds
 import com.studyink.core.model.Student
@@ -54,6 +55,13 @@ class LibraryRepository private constructor(private val context: Context) {
     val state: LibraryState @Synchronized get() = catalog.toLibraryState()
     val deviceId: String = preferences.getString("deviceId", null)
         ?: UUID.randomUUID().toString().also { preferences.edit().putString("deviceId", it).apply() }
+
+    /**
+     * Runs [block] while catalog and owned-PDF mutations are excluded from this repository.
+     * Backup code must finish reading [root] before the block returns.
+     */
+    @Synchronized
+    fun <T> withStableDataRoot(block: (File) -> T): T = block(root)
 
     @Synchronized
     fun selectStudent(studentId: String) {
@@ -478,6 +486,7 @@ class LibraryRepository private constructor(private val context: Context) {
             catalogFile.failWrite(stream)
             throw error
         }
+        MasterNoteDataCommitBus.recordDurableCommit()
     }
 
     companion object {
@@ -490,6 +499,21 @@ class LibraryRepository private constructor(private val context: Context) {
 
         fun get(context: Context): LibraryRepository = instance ?: synchronized(this) {
             instance ?: LibraryRepository(context.applicationContext).also { instance = it }
+        }
+
+        /**
+         * Drops the process singleton after a validated restore has replaced the data root.
+         * Existing holders are refreshed under their repository lock before a new instance may be
+         * created, so a still-finishing Activity cannot write a stale pre-restore catalog.
+         */
+        @Synchronized
+        fun resetForRestore() {
+            instance?.let { current ->
+                synchronized(current) {
+                    current.catalog = current.loadCatalog()
+                    instance = null
+                }
+            }
         }
     }
 }

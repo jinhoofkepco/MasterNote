@@ -6,20 +6,24 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.absoluteOffset
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -42,10 +46,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Popup
-import androidx.compose.ui.window.PopupProperties
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -56,18 +57,139 @@ import kotlin.math.sin
 
 private enum class RadialMenuPage { MAIN, COLORS, PEN }
 
+internal const val COMMON_RADIAL_MENU_ITEM_COUNT = 8
 private const val FanStartDegrees = 180f
-private const val FanSweepDegrees = 120f
-private const val PenWidthSweepDegrees = 67f
-private const val PenOpacityStartDegrees = 256f
-private const val PenOpacitySweepDegrees = 44f
+private const val FanSweepDegrees = 100f
+private const val PenWidthSweepDegrees = 58f
+private const val PenOpacityStartDegrees = 248f
+private const val PenOpacitySweepDegrees = 20f
+private const val PenOpacityHitToleranceDegrees = 3f
+private const val PenBackDegrees = 280f
+
+internal data class PenMenuAngleSpec(
+    val widthAnglesDegrees: List<Float>,
+    val opacityStartDegrees: Float,
+    val opacityEndDegrees: Float,
+    val opacityHitToleranceDegrees: Float,
+    val backDegrees: Float,
+)
+
+internal fun penMenuAngleSpec(): PenMenuAngleSpec = PenMenuAngleSpec(
+    widthAnglesDegrees = List(5) { index ->
+        radialItemAngleDegrees(index, 5, PenWidthSweepDegrees)
+    },
+    opacityStartDegrees = PenOpacityStartDegrees,
+    opacityEndDegrees = PenOpacityStartDegrees + PenOpacitySweepDegrees,
+    opacityHitToleranceDegrees = PenOpacityHitToleranceDegrees,
+    backDegrees = PenBackDegrees,
+)
+
+internal fun commonRadialMenuGeometry(tokens: ReaderChromeTokens): RadialFanGeometry =
+    commonRadialMenuGeometry(
+        toolButtonSize = tokens.toolButtonSize,
+        radialItemGap = tokens.radialItemGap,
+        radialMinRadius = tokens.radialMinRadius,
+        radialEdgeMargin = tokens.radialEdgeMargin,
+        radialArtworkHorizontalPadding = tokens.radialArtworkHorizontalPadding,
+        radialTopMargin = tokens.radialTopMargin,
+    )
+
+internal fun commonRadialMenuGeometry(
+    toolButtonSize: Dp,
+    radialItemGap: Dp,
+    radialMinRadius: Dp,
+    radialEdgeMargin: Dp,
+    radialArtworkHorizontalPadding: Dp,
+    radialTopMargin: Dp,
+): RadialFanGeometry {
+    val stepRadians = Math.toRadians(
+        (FanSweepDegrees / (COMMON_RADIAL_MENU_ITEM_COUNT - 1)).toDouble(),
+    )
+    val neededRadius = (toolButtonSize + radialItemGap) /
+        (2f * sin(stepRadians / 2.0).toFloat())
+    val radius = maxOf(radialMinRadius, neededRadius)
+    val horizontalPadding = toolButtonSize / 2 + radialEdgeMargin +
+        radialArtworkHorizontalPadding
+    val rightExtentFactor = cos(
+        Math.toRadians((FanStartDegrees + FanSweepDegrees).toDouble()),
+    ).toFloat().coerceAtLeast(0f)
+    val originY = radialTopMargin + radius + toolButtonSize / 2
+    return RadialFanGeometry(
+        radius = radius,
+        originX = radius + horizontalPadding,
+        originY = originY,
+        menuWidth = horizontalPadding * 2 + radius * (1f + rightExtentFactor),
+        menuHeight = originY + toolButtonSize / 2 + radialEdgeMargin,
+    )
+}
+
+internal data class RadialItemCenter(val x: Dp, val y: Dp)
+
+internal fun radialItemCenter(
+    originX: Dp,
+    originY: Dp,
+    radius: Dp,
+    angleDegrees: Float,
+): RadialItemCenter {
+    val angleRadians = Math.toRadians(angleDegrees.toDouble())
+    return RadialItemCenter(
+        x = originX + radius * cos(angleRadians).toFloat(),
+        y = originY + radius * sin(angleRadians).toFloat(),
+    )
+}
+
+internal fun radialMenuInputHalfThickness(tokens: ReaderChromeTokens): Dp =
+    radialMenuInputHalfThickness(
+        opacityTouchTolerance = tokens.opacityTouchTolerance,
+        toolButtonSize = tokens.toolButtonSize,
+    )
+
+internal fun radialMenuInputHalfThickness(
+    opacityTouchTolerance: Dp,
+    toolButtonSize: Dp,
+): Dp = minOf(opacityTouchTolerance, toolButtonSize / 2)
+
+private data class MainToolSlot(
+    val index: Int,
+    val tool: ReaderTool,
+)
+
+private fun mainToolSlots(canGrade: Boolean): List<MainToolSlot> = buildList {
+    add(MainToolSlot(1, ReaderTool.PARTIAL_ERASER))
+    add(MainToolSlot(2, ReaderTool.PEN))
+    add(MainToolSlot(3, ReaderTool.HIGHLIGHTER))
+    if (canGrade) add(MainToolSlot(5, ReaderTool.GRADE))
+}
+
+internal fun radialItemAngleDegrees(index: Int, itemCount: Int, sweepAngleDegrees: Float): Float =
+    if (itemCount <= 1) FanStartDegrees
+    else FanStartDegrees + (index / (itemCount - 1f)) * sweepAngleDegrees
+
+internal fun isToolExtensionGestureArmed(
+    startedTool: ReaderTool?,
+    currentTool: ReaderTool?,
+): Boolean = startedTool != null && startedTool == currentTool
 
 /** The ring is sized for the busiest page so it never resizes as the user pages through it. */
-private fun mainMenuItemCount(state: ReaderUiState) = if (state.capabilities.canGrade) 9 else 8
+private fun mainMenuItemCount(state: ReaderUiState) = if (state.capabilities.canGrade) 7 else 6
+
+/**
+ * Whether an S Pen side button is held down, read straight from the platform event.
+ *
+ * Compose cannot answer this: on Android it folds BUTTON_STYLUS_PRIMARY into isPrimaryPressed, the
+ * flag the pen tip already raises, so a Compose-level check either misses the button or fires on
+ * every stroke. Both windows that watch for the button share this one reading.
+ */
+internal fun MotionEvent.stylusSideButtonDown(): Boolean {
+    val mask = MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_STYLUS_SECONDARY
+    if (buttonState and mask != 0) return true
+    return actionMasked == MotionEvent.ACTION_BUTTON_PRESS && actionButton and mask != 0
+}
 
 @Composable
 fun StylusToolMenu(
     expanded: Boolean,
+    anchorInHost: Offset,
     state: ReaderUiState,
     selectedTool: ReaderTool,
     selectedColorArgb: Int,
@@ -77,200 +199,184 @@ fun StylusToolMenu(
     onSelectColor: (Int) -> Unit,
     onSelectWidth: (Float) -> Unit,
     onSelectOpacity: (Float) -> Unit,
-    onResetZoom: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
-    onToggleRole: () -> Unit,
-    onDismissRequest: () -> Unit,
+    onInputRegionChanged: (StylusMenuInputRegion?) -> Unit,
 ) {
     val tokens = readerChromeTokens(state.role)
-    var menuPage by remember { mutableStateOf(RadialMenuPage.MAIN) }
-    LaunchedEffect(expanded) {
-        if (expanded) {
-            menuPage = RadialMenuPage.MAIN
-        }
+    var menuPage by remember(expanded) { mutableStateOf(RadialMenuPage.MAIN) }
+    var forcedHoveredTool by remember(expanded) { mutableStateOf<ReaderTool?>(null) }
+    val reportInputRegion by rememberUpdatedState(onInputRegionChanged)
+    LaunchedEffect(menuPage) { forcedHoveredTool = null }
+    DisposableEffect(expanded) {
+        if (!expanded) reportInputRegion(null)
+        onDispose { reportInputRegion(null) }
     }
     if (!expanded) return
 
     MaterialTheme {
-        Popup(
-            alignment = Alignment.BottomCenter,
-            offset = IntOffset.Zero,
-            onDismissRequest = onDismissRequest,
-            properties = PopupProperties(
-                focusable = false,
-                dismissOnBackPress = false,
-                dismissOnClickOutside = false,
-                clippingEnabled = true,
-            ),
-        ) {
-            val rootGeometry = radialFanGeometry(
-                tokens,
-                mainMenuItemCount(state),
-                FanSweepDegrees,
-            )
-            val geometry = when (menuPage) {
-                RadialMenuPage.MAIN -> rootGeometry
-                RadialMenuPage.COLORS -> radialFanGeometry(
-                    tokens = tokens,
-                    itemCount = 7,
-                    sweepAngleDegrees = FanSweepDegrees,
-                )
-                RadialMenuPage.PEN -> radialFanGeometry(
-                    tokens = tokens,
-                    itemCount = 5,
-                    sweepAngleDegrees = PenWidthSweepDegrees,
-                    boundsSweepAngleDegrees = FanSweepDegrees,
-                )
-            }.copy(
-                // Every page shares the exact left-start baseline. Only its radius changes so
-                // pages with fewer choices remain just as compact as the main tools page.
-                originY = rootGeometry.originY,
-            )
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val density = LocalDensity.current
-            val dismissOriginXPx = with(density) { geometry.originX.toPx() }
-            val dismissOriginYPx = with(density) { geometry.originY.toPx() }
-            val dismissClearance = maxOf(
-                // Radial items use square 48/60dp targets. Clear their inward-facing diagonal
-                // corners as well as their side, then leave a small no-man's-land between them and
-                // the blank-sector dismiss target.
-                maxOf(tokens.toolButtonSize, tokens.minimumTouchSize) * 0.7071068f + 2.dp,
-                tokens.opacityTouchTolerance,
+            // Every page uses one polar frame. Eight slots are the busiest layout (seven colours
+            // plus Back), so deriving the frame from that page keeps R, a, b, c and the viewport
+            // invariant while MAIN/COLORS/PEN are exchanged.
+            val geometry = commonRadialMenuGeometry(tokens)
+            val penAngles = penMenuAngleSpec()
+            val reveal = radialToolRevealGeometry(
+                fanRadius = geometry.radius,
+                toolButtonSize = tokens.toolButtonSize,
+                protrusionDistance = tokens.toolProtrusionDistance,
             )
-            val dismissRadiusPx = with(density) { (geometry.radius - dismissClearance).toPx() }
-            fun isInsideDismissSector(position: Offset): Boolean {
-                val dx = position.x - dismissOriginXPx
-                val dy = position.y - dismissOriginYPx
-                val distanceSquared = dx * dx + dy * dy
-                if (distanceSquared > dismissRadiusPx * dismissRadiusPx) return false
-                if (distanceSquared <= 1f) return true
-                var angle = atan2(dy, dx) * 180f / PI.toFloat()
-                if (angle < 0f) angle += 360f
-                val angleFromStart = (angle - FanStartDegrees + 360f) % 360f
-                return angleFromStart <= FanSweepDegrees
+            val viewportOriginPx = Offset(
+                x = with(density) { geometry.originX.toPx() },
+                y = with(density) { geometry.originY.toPx() },
+            )
+            val viewportSizePx = Offset(
+                x = with(density) { geometry.menuWidth.toPx() },
+                y = with(density) { geometry.menuHeight.toPx() },
+            )
+            val hostSizePx = Offset(
+                x = with(density) { maxWidth.toPx() },
+                y = with(density) { maxHeight.toPx() },
+            )
+            val safeAnchor = anchorInHost.takeIf { it.x.isFinite() && it.y.isFinite() }
+                ?: Offset(hostSizePx.x / 2f, hostSizePx.y / 2f)
+            val preferredOrigin = stylusAnchoredFanOrigin(
+                stylusPoint = safeAnchor,
+                innerRadiusPx = with(density) { reveal.a.toPx() },
+                middleAngleDegrees = FanStartDegrees + FanSweepDegrees / 2f,
+                anchorRadiusFraction = tokens.stylusAnchorRadiusFraction,
+            )
+            val menuTopLeft = clampRadialMenuTopLeft(
+                preferred = preferredOrigin - viewportOriginPx,
+                viewportWidthPx = viewportSizePx.x,
+                viewportHeightPx = viewportSizePx.y,
+                hostWidthPx = hostSizePx.x,
+                hostHeightPx = hostSizePx.y,
+            )
+            val actualOrigin = menuTopLeft + viewportOriginPx
+            val mainSlots = mainToolSlots(state.capabilities.canGrade)
+            val mainItemCount = mainMenuItemCount(state)
+            val pageItemAngles = when (menuPage) {
+                RadialMenuPage.MAIN -> List(mainItemCount) { index ->
+                    radialItemAngleDegrees(index, mainItemCount, FanSweepDegrees)
+                }
+                RadialMenuPage.COLORS -> List(COMMON_RADIAL_MENU_ITEM_COUNT) { index ->
+                    radialItemAngleDegrees(index, COMMON_RADIAL_MENU_ITEM_COUNT, FanSweepDegrees)
+                }
+                RadialMenuPage.PEN -> penAngles.widthAnglesDegrees + penAngles.backDegrees
             }
-            val selectedToolIndex = if (menuPage == RadialMenuPage.MAIN) {
-                when (selectedTool) {
-                    ReaderTool.PARTIAL_ERASER -> 1
-                    ReaderTool.PEN -> 2
-                    ReaderTool.HIGHLIGHTER -> 3
-                    ReaderTool.GRADE -> if (state.capabilities.canGrade) 5 else null
-                    ReaderTool.PAN,
-                    ReaderTool.WHOLE_ERASER,
-                    -> null
+            val toolAngles = if (menuPage == RadialMenuPage.MAIN) {
+                mainSlots.map { slot ->
+                    radialItemAngleDegrees(slot.index, mainItemCount, FanSweepDegrees)
                 }
             } else {
-                null
+                emptyList()
             }
-            val selectedToolAngleRadians = selectedToolIndex?.let { index ->
-                val itemCount = mainMenuItemCount(state)
-                val angleDegrees = FanStartDegrees +
-                    (index / (itemCount - 1f)) * FanSweepDegrees
-                Math.toRadians(angleDegrees.toDouble())
+            val originInViewportPx = viewportOriginPx
+            val aPx = with(density) { reveal.a.toPx() }
+            val bPx = with(density) { reveal.b.toPx() }
+            val cPx = with(density) { reveal.c.toPx() }
+            val toolHalfWidthPx = with(density) { (tokens.toolButtonSize / 2).toPx() }
+
+            fun extensionToolAt(position: Offset): ReaderTool? {
+                if (menuPage != RadialMenuPage.MAIN) return null
+                val dx = position.x - originInViewportPx.x
+                val dy = position.y - originInViewportPx.y
+                return mainSlots.firstOrNull { slot ->
+                    val angle = Math.toRadians(
+                        radialItemAngleDegrees(slot.index, mainItemCount, FanSweepDegrees).toDouble(),
+                    )
+                    val directionX = cos(angle).toFloat()
+                    val directionY = sin(angle).toFloat()
+                    val radial = dx * directionX + dy * directionY
+                    val tangential = abs(-dx * directionY + dy * directionX)
+                    radial > bPx && radial <= cPx && tangential <= toolHalfWidthPx
+                }?.tool
             }
-            val selectedToolOuterRadiusStartPx = with(density) {
-                (geometry.radius + tokens.toolButtonSize / 2).toPx()
-            }
-            val selectedToolOuterRadiusEndPx = with(density) {
-                (geometry.radius + tokens.toolButtonSize / 2 + tokens.toolProtrusionDistance).toPx()
-            }
-            val selectedToolHalfWidthPx = with(density) {
-                (tokens.toolButtonSize / 2).toPx()
-            }
-            fun isInsideSelectedToolExtension(position: Offset): Boolean {
-                val angle = selectedToolAngleRadians ?: return false
-                val dx = position.x - dismissOriginXPx
-                val dy = position.y - dismissOriginYPx
-                val directionX = cos(angle).toFloat()
-                val directionY = sin(angle).toFloat()
-                val radial = dx * directionX + dy * directionY
-                val tangential = abs(-dx * directionY + dy * directionX)
-                return radial >= selectedToolOuterRadiusStartPx &&
-                    radial <= selectedToolOuterRadiusEndPx &&
-                    tangential <= selectedToolHalfWidthPx
-            }
-            fun activateSelectedTool() {
-                when (selectedTool) {
-                    ReaderTool.PEN -> menuPage = RadialMenuPage.PEN
-                    ReaderTool.PARTIAL_ERASER,
-                    ReaderTool.HIGHLIGHTER,
-                    ReaderTool.GRADE,
-                    -> onSelectTool(selectedTool)
-                    ReaderTool.PAN,
-                    ReaderTool.WHOLE_ERASER,
-                    -> Unit
+
+            fun activateExtension(tool: ReaderTool) {
+                forcedHoveredTool = null
+                if (tool == ReaderTool.PEN && selectedTool == ReaderTool.PEN) {
+                    menuPage = RadialMenuPage.PEN
+                } else {
+                    onSelectTool(tool)
                 }
             }
+
+            val inputRegion = StylusMenuInputRegion(
+                originX = actualOrigin.x,
+                originY = actualOrigin.y,
+                a = aPx,
+                b = bPx,
+                c = cPx,
+                startAngleDegrees = FanStartDegrees,
+                endAngleDegrees = FanStartDegrees + FanSweepDegrees,
+                itemAnglesDegrees = pageItemAngles,
+                itemCenterRadius = with(density) { geometry.radius.toPx() },
+                itemHitRadius = toolHalfWidthPx,
+                toolCorridorAnglesDegrees = toolAngles,
+                toolCorridorHalfWidth = toolHalfWidthPx,
+            )
+            SideEffect {
+                // Geometry is computed from the same immutable frame used to place every item, so
+                // the host can own the A/B/C region as soon as this page is composed. Waiting for a
+                // global-position callback left the visible fan without any Android input region
+                // on Samsung after some menu opens/page swaps.
+                reportInputRegion(inputRegion)
+            }
+
             CompositionLocalProvider(LocalPenRestingAlpha provides tokens.menuRestingAlpha) {
                 Box(
                     modifier = Modifier
-                        .size(width = rootGeometry.menuWidth, height = rootGeometry.menuHeight)
-                        // Observe the stylus at Final pass without consuming it. A parent
-                        // pointerInteropFilter interrupts the child interop streams used by every
-                        // S Pen button, which is why the buttons previously stopped responding.
-                        .pointerInput(
-                            dismissOriginXPx,
-                            dismissOriginYPx,
-                            dismissRadiusPx,
-                            selectedToolIndex,
-                            selectedToolOuterRadiusStartPx,
-                            selectedToolOuterRadiusEndPx,
-                            onDismissRequest,
-                        ) {
+                        .absoluteOffset(
+                            x = with(density) { menuTopLeft.x.toDp() },
+                            y = with(density) { menuTopLeft.y.toDp() },
+                        )
+                        .size(
+                            width = geometry.menuWidth,
+                            height = geometry.menuHeight,
+                        )
+                        .pointerInput(menuPage, actualOrigin, aPx, bPx, cPx, toolAngles) {
                             var activePointerId: PointerId? = null
+                            var startedTool: ReaderTool? = null
                             var armed = false
-                            var selectedToolExtension = false
                             awaitPointerEventScope {
                                 while (true) {
                                     val event = awaitPointerEvent(PointerEventPass.Final)
+                                    val change = event.changes.firstOrNull { it.type == PointerType.Stylus }
+                                    if (change == null) {
+                                        forcedHoveredTool = null
+                                        activePointerId = null
+                                        startedTool = null
+                                        armed = false
+                                        continue
+                                    }
+                                    val extensionTool = extensionToolAt(change.position)
                                     if (activePointerId == null) {
-                                        val down = event.changes.firstOrNull { change ->
-                                            change.type == PointerType.Stylus &&
-                                                !change.previousPressed && change.pressed &&
-                                                !change.isConsumed
-                                        }
-                                        if (down != null) {
-                                            when {
-                                                isInsideSelectedToolExtension(down.position) -> {
-                                                    activePointerId = down.id
-                                                    selectedToolExtension = true
-                                                    armed = true
-                                                }
-                                                isInsideDismissSector(down.position) -> {
-                                                    activePointerId = down.id
-                                                    selectedToolExtension = false
-                                                    armed = true
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        val change = event.changes.firstOrNull {
-                                            it.id == activePointerId
-                                        }
-                                        if (change == null) {
-                                            activePointerId = null
-                                            armed = false
-                                            selectedToolExtension = false
+                                        if (!change.previousPressed && change.pressed && extensionTool != null) {
+                                            activePointerId = change.id
+                                            startedTool = extensionTool
+                                            armed = true
+                                            forcedHoveredTool = extensionTool
                                         } else if (!change.pressed) {
-                                            val shouldAct = armed && !change.isConsumed &&
-                                                if (selectedToolExtension) {
-                                                    isInsideSelectedToolExtension(change.position)
-                                                } else {
-                                                    isInsideDismissSector(change.position)
-                                                }
-                                            val activateTool = selectedToolExtension
+                                            forcedHoveredTool = extensionTool
+                                        }
+                                    } else if (change.id == activePointerId) {
+                                        if (!change.pressed) {
+                                            val toolToActivate = startedTool?.takeIf {
+                                                armed && isToolExtensionGestureArmed(it, extensionTool)
+                                            }
                                             activePointerId = null
+                                            startedTool = null
                                             armed = false
-                                            selectedToolExtension = false
-                                            if (shouldAct) {
-                                                if (activateTool) activateSelectedTool() else onDismissRequest()
+                                            forcedHoveredTool = extensionTool
+                                            if (change.previousPressed && toolToActivate != null) {
+                                                activateExtension(toolToActivate)
                                             }
                                         } else {
-                                            armed = if (selectedToolExtension) {
-                                                isInsideSelectedToolExtension(change.position)
-                                            } else {
-                                                isInsideDismissSector(change.position)
-                                            }
+                                            armed = isToolExtensionGestureArmed(startedTool, extensionTool)
+                                            forcedHoveredTool = extensionTool
                                         }
                                     }
                                 }
@@ -292,10 +398,9 @@ fun StylusToolMenu(
                             },
                             onOpenColors = { menuPage = RadialMenuPage.COLORS },
                             onSelectTool = onSelectTool,
-                            onResetZoom = onResetZoom,
                             onUndo = onUndo,
                             onRedo = onRedo,
-                            onToggleRole = onToggleRole,
+                            forceHoveredToolForPreview = forcedHoveredTool,
                         )
 
                         RadialMenuPage.COLORS -> ColorRadialMenu(
@@ -314,6 +419,7 @@ fun StylusToolMenu(
                             selectedOpacity = selectedOpacity,
                             onSelectWidth = onSelectWidth,
                             onSelectOpacity = onSelectOpacity,
+                            onBack = { menuPage = RadialMenuPage.MAIN },
                         )
                     }
                 }
@@ -331,17 +437,14 @@ private fun MainRadialMenu(
     onPenClick: () -> Unit,
     onOpenColors: () -> Unit,
     onSelectTool: (ReaderTool) -> Unit,
-    onResetZoom: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
-    onToggleRole: () -> Unit,
     previewStatic: Boolean = false,
     forceHoveredToolForPreview: ReaderTool? = null,
 ) {
     val tokens = readerChromeTokens(state.role)
     val canGrade = state.capabilities.canGrade
-    val resetIndex = if (canGrade) 6 else 5
-    val modeIndex = resetIndex + 1
+    val redoIndex = if (canGrade) 6 else 5
     RadialFan(
         itemCount = mainMenuItemCount(state),
         geometry = geometry,
@@ -406,26 +509,13 @@ private fun MainRadialMenu(
                 radialAngleDegrees = angleDegrees,
                 radialRadius = geometry.radius,
             )
-            index == resetIndex -> RadialActionButton(
-                iconRes = R.drawable.ic_zoom_reset,
-                label = "확대 초기화",
-                role = state.role,
-            ) { onResetZoom() }
-            index == modeIndex -> RadialActionButton(
-                iconRes = if (state.role == ReaderRole.STUDENT) {
-                    R.drawable.ic_teacher_mode
-                } else {
-                    R.drawable.ic_student_switch
-                },
-                label = if (state.role == ReaderRole.STUDENT) "선생 모드" else "학생 모드",
-                role = state.role,
-            ) { onToggleRole() }
-            else -> RadialActionButton(
+            index == redoIndex -> RadialActionButton(
                 iconRes = R.drawable.ic_redo,
                 label = "다시 실행",
                 enabled = state.canRedo,
                 role = state.role,
             ) { onRedo() }
+            else -> Unit
         }
     }
 }
@@ -441,6 +531,7 @@ private fun ColorRadialMenu(
 ) {
     val tokens = readerChromeTokens(role)
     val colors = listOf(
+        Triple(tokens.paletteInk, "먹색", tokens.paletteInk.toArgb()),
         Triple(tokens.paletteBlue, "파랑", tokens.paletteBlue.toArgb()),
         Triple(tokens.paletteGreen, "초록", tokens.paletteGreen.toArgb()),
         Triple(tokens.paletteYellow, "노랑", tokens.paletteYellow.toArgb()),
@@ -464,7 +555,12 @@ private fun ColorRadialMenu(
             val (color, label) = colors[index]
             ColorChoice(color, selectedColorArgb, label, role, onSelect = onSelectColor)
         } else {
-            PaletteButton(selectedColorArgb = selectedColorArgb, role = role, onClick = onBack)
+            RadialActionButton(
+                iconRes = R.drawable.ic_page_prev,
+                label = "도구 메뉴로 돌아가기",
+                role = role,
+                onClick = onBack,
+            )
         }
     }
 }
@@ -478,10 +574,12 @@ private fun PenRadialMenu(
     selectedOpacity: Float,
     onSelectWidth: (Float) -> Unit,
     onSelectOpacity: (Float) -> Unit,
+    onBack: () -> Unit,
     previewStatic: Boolean = false,
 ) {
     val tokens = readerChromeTokens(role)
     val widths = listOf(6.4f, 4.8f, 3.2f, 2.4f, 1.6f)
+    val angles = penMenuAngleSpec()
     CurvedOpacitySlider(
         color = Color(selectedColorArgb),
         widthDp = selectedWidthDp,
@@ -489,30 +587,38 @@ private fun PenRadialMenu(
         centerX = geometry.originX,
         centerY = geometry.originY,
         radius = geometry.radius,
-        startAngle = PenOpacityStartDegrees,
-        sweepAngle = PenOpacitySweepDegrees,
+        startAngle = angles.opacityStartDegrees,
+        sweepAngle = angles.opacityEndDegrees - angles.opacityStartDegrees,
+        angleHitTolerance = angles.opacityHitToleranceDegrees,
         tokens = tokens,
         onOpacityChange = onSelectOpacity,
         modifier = Modifier.fillMaxSize(),
     )
-    RadialFan(
-        itemCount = widths.size,
+    RadialFanAtAngles(
+        anglesDegrees = angles.widthAnglesDegrees + angles.backDegrees,
         geometry = geometry,
-        startAngleDegrees = FanStartDegrees,
-        sweepAngleDegrees = PenWidthSweepDegrees,
         itemSize = tokens.toolButtonSize,
-        animationKey = "pen-widths",
+        animationKey = "pen-settings",
         entranceStartScale = tokens.radialEntranceStartScale,
         dampingRatio = tokens.springDampingRatio,
         stiffness = tokens.springStiffness,
         staticProgress = if (previewStatic) 1f else null,
     ) { index, _ ->
-        StrokeWidthChoice(
-            widthDp = widths[index],
-            selectedWidthDp = selectedWidthDp,
-            role = role,
-            onSelect = onSelectWidth,
-        )
+        if (index < widths.size) {
+            StrokeWidthChoice(
+                widthDp = widths[index],
+                selectedWidthDp = selectedWidthDp,
+                role = role,
+                onSelect = onSelectWidth,
+            )
+        } else {
+            RadialActionButton(
+                iconRes = R.drawable.ic_page_prev,
+                label = "도구 메뉴로 돌아가기",
+                role = role,
+                onClick = onBack,
+            )
+        }
     }
 }
 
@@ -535,9 +641,38 @@ private fun RadialFan(
     staticProgress: Float? = null,
     content: @Composable (index: Int, angleDegrees: Float) -> Unit,
 ) {
-    val progress = remember(animationKey, itemCount) { Animatable(0f) }
+    val angles = List(itemCount) { index ->
+        radialItemAngleDegrees(index, itemCount, sweepAngleDegrees) +
+            (startAngleDegrees - FanStartDegrees)
+    }
+    RadialFanAtAngles(
+        anglesDegrees = angles,
+        geometry = geometry,
+        itemSize = itemSize,
+        animationKey = animationKey,
+        entranceStartScale = entranceStartScale,
+        dampingRatio = dampingRatio,
+        stiffness = stiffness,
+        staticProgress = staticProgress,
+        content = content,
+    )
+}
+
+@Composable
+private fun RadialFanAtAngles(
+    anglesDegrees: List<Float>,
+    geometry: RadialFanGeometry,
+    itemSize: Dp,
+    animationKey: Any,
+    entranceStartScale: Float,
+    dampingRatio: Float,
+    stiffness: Float,
+    staticProgress: Float? = null,
+    content: @Composable (index: Int, angleDegrees: Float) -> Unit,
+) {
+    val progress = remember(animationKey, anglesDegrees) { Animatable(0f) }
     if (staticProgress == null) {
-        LaunchedEffect(animationKey, itemCount) {
+        LaunchedEffect(animationKey, anglesDegrees) {
             progress.snapTo(0f)
             progress.animateTo(
                 targetValue = 1f,
@@ -549,35 +684,33 @@ private fun RadialFan(
         }
     }
     val renderedProgress = staticProgress ?: progress.value
-    val positionProgress = renderedProgress.coerceIn(0f, 1f)
+    val visibleProgress = renderedProgress.coerceIn(0f, 1f)
 
-    val density = LocalDensity.current
-    repeat(itemCount) { index ->
-        val angleDegrees = if (itemCount == 1) {
-            startAngleDegrees
-        } else {
-            startAngleDegrees + (index / (itemCount - 1f)) * sweepAngleDegrees
-        }
-        val angleRadians = Math.toRadians(angleDegrees.toDouble())
-        val deltaXPx = with(density) { (geometry.radius * cos(angleRadians).toFloat()).toPx() }
-        val deltaYPx = with(density) { (geometry.radius * sin(angleRadians).toFloat()).toPx() }
+    anglesDegrees.forEachIndexed { index, angleDegrees ->
+        val center = radialItemCenter(
+            originX = geometry.originX,
+            originY = geometry.originY,
+            radius = geometry.radius,
+            angleDegrees = angleDegrees,
+        )
+        val itemLeft = center.x - itemSize / 2
+        val itemTop = center.y - itemSize / 2
         Box(
             modifier = Modifier
-                .offset(geometry.originX - itemSize / 2, geometry.originY - itemSize / 2)
+                // The interactive slot is laid out at its final polar coordinate from the first
+                // frame. Entrance motion changes only scale/alpha, so rendering and hit-testing
+                // can never disagree about the fan centre.
+                .absoluteOffset(x = itemLeft, y = itemTop)
                 .size(itemSize)
                 .graphicsLayer {
                     // Alpha normally promotes the 48/60dp slot to an offscreen layer while the
                     // fan enters, which can crop artwork protruding beyond that slot. Each slot
                     // has a single child, so direct alpha modulation preserves the overflow.
                     compositingStrategy = CompositingStrategy.ModulateAlpha
-                    // The spring may overshoot 1.0. Keep that playfulness in scale, but never move
-                    // a slot beyond its final radius where the protruding artwork could be clipped.
-                    translationX = deltaXPx * positionProgress
-                    translationY = deltaYPx * positionProgress
                     val scale = entranceStartScale + (1f - entranceStartScale) * renderedProgress
                     scaleX = scale
                     scaleY = scale
-                    alpha = positionProgress
+                    alpha = visibleProgress
                 },
             contentAlignment = Alignment.Center,
         ) {
@@ -723,6 +856,7 @@ private fun CurvedOpacitySlider(
     radius: Dp,
     startAngle: Float,
     sweepAngle: Float,
+    angleHitTolerance: Float,
     tokens: ReaderChromeTokens,
     onOpacityChange: (Float) -> Unit,
     modifier: Modifier = Modifier,
@@ -733,14 +867,16 @@ private fun CurvedOpacitySlider(
         y = with(density) { centerY.toPx() },
     )
     val radiusPx = with(density) { radius.toPx() }
-    val touchTolerance = with(density) { tokens.opacityTouchTolerance.toPx() }
+    val touchTolerance = with(density) { radialMenuInputHalfThickness(tokens).toPx() }
     fun opacityAt(position: Offset): Float? {
         var angle = (atan2(position.y - center.y, position.x - center.x) * 180f / PI.toFloat())
         if (angle < 0f) angle += 360f
         if (angle < 90f) angle += 360f
         val distance = hypot(position.x - center.x, position.y - center.y)
         if (kotlin.math.abs(distance - radiusPx) > touchTolerance) return null
-        if (angle < startAngle - 8f || angle > startAngle + sweepAngle + 8f) return null
+        if (angle < startAngle - angleHitTolerance ||
+            angle > startAngle + sweepAngle + angleHitTolerance
+        ) return null
         val fraction = ((angle - startAngle) / sweepAngle).coerceIn(0f, 1f)
         return tokens.strokeOpacityMin + fraction * (1f - tokens.strokeOpacityMin)
     }
@@ -863,31 +999,13 @@ private fun StylusMenuDevicePreview(
     forceHoveredToolForPreview: ReaderTool? = null,
 ) {
     val tokens = readerChromeTokens(state.role)
-    val rootGeometry = radialFanGeometry(
-        tokens,
-        mainMenuItemCount(state),
-        FanSweepDegrees,
-    )
-    val geometry = when (page) {
-        StylusMenuPreviewPage.TOOLS -> rootGeometry
-        StylusMenuPreviewPage.COLORS -> radialFanGeometry(
-            tokens = tokens,
-            itemCount = 7,
-            sweepAngleDegrees = FanSweepDegrees,
-        )
-        StylusMenuPreviewPage.PEN_SETTINGS -> radialFanGeometry(
-            tokens = tokens,
-            itemCount = 5,
-            sweepAngleDegrees = PenWidthSweepDegrees,
-            boundsSweepAngleDegrees = FanSweepDegrees,
-        )
-    }.copy(originY = rootGeometry.originY)
+    val geometry = commonRadialMenuGeometry(tokens)
     ReaderDevicePreviewFrame(state) {
         CompositionLocalProvider(LocalPenRestingAlpha provides tokens.menuRestingAlpha) {
             Box(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
-                    .size(width = rootGeometry.menuWidth, height = rootGeometry.menuHeight),
+                    .size(width = geometry.menuWidth, height = geometry.menuHeight),
             ) {
                 when (page) {
                     StylusMenuPreviewPage.TOOLS -> MainRadialMenu(
@@ -898,10 +1016,8 @@ private fun StylusMenuDevicePreview(
                         onPenClick = {},
                         onOpenColors = {},
                         onSelectTool = {},
-                        onResetZoom = {},
                         onUndo = {},
                         onRedo = {},
-                        onToggleRole = {},
                         previewStatic = true,
                         forceHoveredToolForPreview = forceHoveredToolForPreview,
                     )
@@ -923,6 +1039,7 @@ private fun StylusMenuDevicePreview(
                         selectedOpacity = 0.72f,
                         onSelectWidth = {},
                         onSelectOpacity = {},
+                        onBack = {},
                         previewStatic = true,
                     )
                 }

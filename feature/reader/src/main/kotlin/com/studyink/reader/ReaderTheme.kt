@@ -2,6 +2,7 @@ package com.studyink.reader
 
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalWindowInfo
@@ -46,6 +47,8 @@ data class ReaderChromeTokens(
     val paletteOrange: Color,
     val palettePink: Color,
     val paletteCream: Color,
+    /** The default writing colour. Without it the palette is a one-way trip away from dark ink. */
+    val paletteInk: Color,
     val buttonBackground: Color,
     val buttonForeground: Color,
     val buttonSelectedBackground: Color,
@@ -53,6 +56,14 @@ data class ReaderChromeTokens(
     val actionForeground: Color,
     val statusForeground: Color,
     val statusBackground: Color,
+    /** Frame drawn around one attempt's result cluster while it still awaits grading. */
+    val markPendingBorder: Color,
+    /** Fluorescent frame marking the attempt the reader is currently showing. */
+    val markPendingHighlight: Color,
+    /** Opacity of the attempts that are not selected, so the current one reads first. */
+    val markBundleDimAlpha: Float,
+    /** Live monitoring indicator in the teacher's chrome. */
+    val liveBadge: Color,
     val outline: Color,
     val disabledBackground: Color,
     val paperSurface: Color,
@@ -101,6 +112,11 @@ data class ReaderChromeTokens(
     val fadeDurationMillis: Int,
     val toolImageWidth: Dp,
     val toolImageHeight: Dp,
+    /**
+     * Distance of the real S Pen tip from the fan centre, expressed as a fraction of radius a.
+     * The menu centre is moved away from the tip so the arc opens immediately in front of it.
+     */
+    val stylusAnchorRadiusFraction: Float,
     /** Radial distance from the old button's outer edge (b) to the extracted tip (c). */
     val toolProtrusionDistance: Dp,
     val toolArtworkBottomPaddingFraction: Float,
@@ -137,6 +153,7 @@ fun readerChromeTokens(role: ReaderRole): ReaderChromeTokens {
     val orange = Color(0xFFFF8A24)
     val pink = Color(0xFFE65398)
     val cream = Color(0xFFFFFBF4)
+    val ink = Color(0xFF17233C)
     // Keep the Reader controls on the same approved paper palette as the library screen.
     val warmIvory = Color(0xFFFFFCF5)
     val graphite = Color(0xFF403D36)
@@ -149,6 +166,7 @@ fun readerChromeTokens(role: ReaderRole): ReaderChromeTokens {
         paletteOrange = orange,
         palettePink = pink,
         paletteCream = cream,
+        paletteInk = ink,
         buttonBackground = warmIvory,
         buttonForeground = graphite,
         buttonSelectedBackground = warmIvory,
@@ -156,6 +174,10 @@ fun readerChromeTokens(role: ReaderRole): ReaderChromeTokens {
         actionForeground = graphite,
         statusForeground = Color(0xFF536078),
         statusBackground = cream.copy(alpha = 0.34f),
+        markPendingBorder = Color(0xFF9AA6BF),
+        markPendingHighlight = Color(0xFFFFE94A),
+        markBundleDimAlpha = 0.5f,
+        liveBadge = Color(0xFFE23B3B),
         outline = if (teacher) Color(0xFF5E83BC) else Color(0xFFD9865B),
         disabledBackground = Color(0xFFEDE5D8),
         paperSurface = warmIvory,
@@ -187,7 +209,11 @@ fun readerChromeTokens(role: ReaderRole): ReaderChromeTokens {
             fiberMaxWidth = 0.54.dp,
             fiberSlope = 0.62f,
         ),
-        toolButtonSize = if (compact) 48.dp else 60.dp,
+        // The derived fan radius is driven by this: radius = (toolButtonSize + gap) / 2sin(step/2).
+        // Shrinking the button is the only lever that pulls the whole ring in.
+        // This is both the radial a..b thickness and the parent interaction slot. Keep it at least
+        // 48dp so the compact parent cannot squeeze the child's minimum S Pen target back to 44dp.
+        toolButtonSize = if (compact) 48.dp else 54.dp,
         navigationButtonSize = if (compact) 44.dp else 52.dp,
         generalButtonSize = if (compact) 38.dp else 44.dp,
         actionButtonSize = if (compact) 34.dp else 40.dp,
@@ -205,7 +231,8 @@ fun readerChromeTokens(role: ReaderRole): ReaderChromeTokens {
         itemGap = if (compact) 6.dp else 8.dp,
         compactContextMaxWidth = 92.dp,
         expandedContextMaxWidth = 420.dp,
-        compactStatusMaxWidth = 48.dp,
+        // Wide enough for a short stack of submission frames on a phone-width chrome.
+        compactStatusMaxWidth = 112.dp,
         expandedStatusMaxWidth = 190.dp,
         popupVerticalOffset = if (compact) 50.dp else 58.dp,
         popupContentPadding = if (compact) 4.dp else 7.dp,
@@ -226,6 +253,7 @@ fun readerChromeTokens(role: ReaderRole): ReaderChromeTokens {
         // artwork to read as a tool tip instead of a few indistinct pixels.
         toolImageWidth = if (compact) 100.dp else 120.dp,
         toolImageHeight = if (compact) 150.dp else 180.dp,
+        stylusAnchorRadiusFraction = 0.66f,
         // c = b + this value. Rest ends exactly at b; hover and persistent selection end at c.
         toolProtrusionDistance = if (compact) 20.dp else 24.dp,
         // The supplied PNGs share a 2:3 canvas with transparent padding below the artwork tip.
@@ -234,7 +262,7 @@ fun readerChromeTokens(role: ReaderRole): ReaderChromeTokens {
         eraserImageWidthScale = 0.82f,
         eraserImageHeightScale = 1f,
         eraserArtworkBottomPaddingFraction = 0.2552083f,
-        radialItemGap = if (compact) 2.dp else 4.dp,
+        radialItemGap = if (compact) 0.dp else 2.dp,
         radialEdgeMargin = if (compact) 12.dp else 16.dp,
         radialArtworkHorizontalPadding = if (compact) 16.dp else 20.dp,
         radialTopMargin = if (compact) 58.dp else 70.dp,
@@ -302,6 +330,36 @@ fun radialToolRevealGeometry(
     )
 }
 
+/**
+ * Places the fan centre away from the physical S Pen point so the arc opens immediately in front
+ * of the hovering pen instead of treating that point as the centre of an otherwise empty circle.
+ */
+internal fun stylusAnchoredFanOrigin(
+    stylusPoint: Offset,
+    innerRadiusPx: Float,
+    middleAngleDegrees: Float,
+    anchorRadiusFraction: Float,
+): Offset {
+    val angle = Math.toRadians(middleAngleDegrees.toDouble())
+    val distance = innerRadiusPx * anchorRadiusFraction
+    return Offset(
+        x = stylusPoint.x - cos(angle).toFloat() * distance,
+        y = stylusPoint.y - sin(angle).toFloat() * distance,
+    )
+}
+
+/** Keeps the complete menu viewport on screen; only this edge fallback may move the 0.66a anchor. */
+internal fun clampRadialMenuTopLeft(
+    preferred: Offset,
+    viewportWidthPx: Float,
+    viewportHeightPx: Float,
+    hostWidthPx: Float,
+    hostHeightPx: Float,
+): Offset = Offset(
+    x = preferred.x.coerceIn(0f, (hostWidthPx - viewportWidthPx).coerceAtLeast(0f)),
+    y = preferred.y.coerceIn(0f, (hostHeightPx - viewportHeightPx).coerceAtLeast(0f)),
+)
+
 fun radialFanGeometry(
     tokens: ReaderChromeTokens,
     itemCount: Int,
@@ -357,6 +415,10 @@ data class ReaderCanvasTokens(
     val markGrayArgb: Int,
     val markFocusArgb: Int,
 )
+
+/** How strongly a published teacher correction glows behind its own trace. */
+const val PUBLISHED_INK_GLOW_WIDTH_SCALE = 2.6f
+const val PUBLISHED_INK_GLOW_ALPHA = 52
 
 fun readerCanvasTokens(): ReaderCanvasTokens = ReaderCanvasTokens(
     // Eight outcomes become the approved 4x2 mosaic. Historical cells are thin and quiet; the

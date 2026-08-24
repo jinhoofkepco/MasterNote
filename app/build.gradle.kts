@@ -72,6 +72,14 @@ kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarg
 
 dependencies {
     implementation(project(":feature:library"))
+    implementation(project(":monitor:core"))
+    implementation(project(":monitor:telegram"))
+    implementation(project(":monitor:render"))
+    implementation(project(":library:data"))
+    implementation(project(":annotation:storage"))
+    implementation("androidx.activity:activity-ktx:1.13.0")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("com.google.zxing:core:3.5.4")
     androidTestImplementation("androidx.test:core-ktx:1.7.0")
     androidTestImplementation("androidx.test.ext:junit-ktx:1.3.0")
     androidTestImplementation("androidx.test:runner:1.7.0")
@@ -80,4 +88,5 @@ dependencies {
     androidTestImplementation(project(":annotation:storage"))
     androidTestImplementation(project(":library:data"))
     androidTestImplementation(project(":sync:lan"))
+    testImplementation("junit:junit:4.13.2")
 }

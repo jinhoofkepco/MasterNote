@@ -20,6 +20,9 @@ kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarg
 
 dependencies {
     api(project(":feature:reader"))
+    implementation(project(":backup:storage"))
+    implementation(project(":monitor:core"))
+    implementation(project(":monitor:telegram"))
     implementation(project(":library:data"))
     implementation(project(":sync:lan"))
     val composeBom = platform("androidx.compose:compose-bom:2026.06.00")

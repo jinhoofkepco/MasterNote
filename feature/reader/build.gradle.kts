@@ -23,6 +23,8 @@ dependencies {
     implementation(project(":annotation:storage"))
     implementation(project(":library:data"))
     implementation(project(":sync:lan"))
+    implementation(project(":monitor:core"))
+    implementation(project(":monitor:telegram"))
 
     val composeBom = platform("androidx.compose:compose-bom:2026.06.00")
     implementation(composeBom)

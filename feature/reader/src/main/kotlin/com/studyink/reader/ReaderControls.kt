@@ -1,6 +1,7 @@
 package com.studyink.reader
 
 import android.content.Context
+import android.util.Log
 import android.view.MotionEvent
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.animateColorAsState
@@ -11,10 +12,12 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -36,6 +39,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -51,6 +55,8 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.TransformOrigin
@@ -60,6 +66,8 @@ import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
@@ -73,6 +81,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntSize
 import com.studyink.core.model.MarkColor
+import com.studyink.sync.lan.LanConnectionState
 import com.studyink.core.model.Mark
 import com.studyink.core.model.MarkGroup
 import com.studyink.core.model.PagePoint
@@ -188,11 +197,12 @@ private fun Modifier.readerPaperTexture(
 }
 
 @Composable
-private fun PenInteractionTarget(
+internal fun PenInteractionTarget(
     description: String,
     onAction: () -> Unit,
     enabled: Boolean = true,
     modifier: Modifier,
+    circularHitTest: Boolean = false,
     forceHoveredForPreview: Boolean = false,
     content: @Composable BoxScope.(hovered: Boolean, pressed: Boolean) -> Unit,
 ) {
@@ -200,8 +210,15 @@ private fun PenInteractionTarget(
     var armed by remember { mutableStateOf(false) }
     var gestureStartedInside by remember { mutableStateOf(false) }
     var componentSize by remember { mutableStateOf(IntSize.Zero) }
-    fun isInside(event: MotionEvent): Boolean =
-        event.x >= 0f && event.y >= 0f && event.x < componentSize.width && event.y < componentSize.height
+    fun isInside(x: Float, y: Float): Boolean {
+        if (x < 0f || y < 0f || x >= componentSize.width || y >= componentSize.height) return false
+        if (!circularHitTest) return true
+        val dx = x - componentSize.width / 2f
+        val dy = y - componentSize.height / 2f
+        val radius = minOf(componentSize.width, componentSize.height) / 2f
+        return dx * dx + dy * dy <= radius * radius
+    }
+    fun isInside(event: MotionEvent): Boolean = isInside(event.x, event.y)
     val effectiveHovered = enabled && (hovered || forceHoveredForPreview)
     Box(
         modifier = modifier
@@ -213,8 +230,14 @@ private fun PenInteractionTarget(
                 awaitPointerEventScope {
                     while (true) {
                         val event = awaitPointerEvent()
-                        if (event.changes.any { it.type == PointerType.Stylus }) {
-                            hovered = enabled && event.type != PointerEventType.Exit
+                        val stylus = event.changes.firstOrNull { it.type == PointerType.Stylus }
+                        if (stylus != null) {
+                            val nextHovered = enabled && event.type != PointerEventType.Exit &&
+                                isInside(stylus.position.x, stylus.position.y)
+                            if (nextHovered != hovered) {
+                                Log.d(PEN_INPUT_LOG_TAG, "hover target=$description active=$nextHovered")
+                            }
+                            hovered = nextHovered
                         }
                     }
                 }
@@ -237,11 +260,20 @@ private fun PenInteractionTarget(
                     MotionEvent.ACTION_DOWN -> {
                         gestureStartedInside = enabled && isInside(event)
                         armed = gestureStartedInside
+                        Log.d(
+                            PEN_INPUT_LOG_TAG,
+                            "down target=$description inside=$gestureStartedInside x=${event.x} y=${event.y} size=$componentSize",
+                        )
                     }
                     // Keep the initial-down contract, but re-arm when the pen re-enters.
                     MotionEvent.ACTION_MOVE -> armed = gestureStartedInside && enabled && isInside(event)
                     MotionEvent.ACTION_UP -> {
-                        if (gestureStartedInside && enabled && isInside(event)) onAction()
+                        val activate = gestureStartedInside && enabled && isInside(event)
+                        Log.d(
+                            PEN_INPUT_LOG_TAG,
+                            "up target=$description activate=$activate x=${event.x} y=${event.y}",
+                        )
+                        if (activate) onAction()
                         armed = false
                         gestureStartedInside = false
                     }
@@ -257,6 +289,8 @@ private fun PenInteractionTarget(
         content(effectiveHovered, armed)
     }
 }
+
+private const val PEN_INPUT_LOG_TAG = "MasterNotePenInput"
 
 @Composable
 private fun AnimatedPenSurface(
@@ -418,6 +452,7 @@ fun IconPenButton(
         // A circle wider than its own layout box would spill over its neighbours and leave
         // its rim untappable, so the box follows the larger of the two.
         modifier = modifier.size(visualSize.coerceAtLeast(tokens.minimumTouchSize)),
+        circularHitTest = true,
         forceHoveredForPreview = forceHoveredForPreview,
     ) { hovered, pressed ->
         AnimatedPenSurface(
@@ -575,6 +610,7 @@ fun ToolPenButton(
         onAction = onAction,
         enabled = enabled,
         modifier = modifier.size(tokens.toolButtonSize.coerceAtLeast(tokens.minimumTouchSize)),
+        circularHitTest = true,
         forceHoveredForPreview = forceHoveredForPreview,
     ) { hovered, pressed ->
         val targetAlpha = when {
@@ -671,6 +707,10 @@ fun ReaderTopChrome(
     onNextAttempt: () -> Unit,
     onPublish: () -> Unit,
     onDismissDataError: () -> Unit,
+    onSelectAttempt: (Int) -> Unit = {},
+    onShowStudentActivity: () -> Unit = {},
+    onResumeStudentFollow: () -> Unit = {},
+    onOpenRemoteMonitor: () -> Unit = {},
     previewHoveredDescription: String? = null,
     /**
      * Optional compact, one-line page/attempt history. The caller owns its data and gestures so
@@ -679,6 +719,24 @@ fun ReaderTopChrome(
      */
     markHistoryContent: (@Composable () -> Unit)? = null,
 ) {
+    if (shouldUseS23UltraTopStrip(state.role)) {
+        S23UltraTopStrip(
+            state = state,
+            onPrevious = onPrevious,
+            onNext = onNext,
+            onExitToLibrary = onExitToLibrary,
+            onPreviousAttempt = onPreviousAttempt,
+            onNextAttempt = onNextAttempt,
+            onPublish = onPublish,
+            onDismissDataError = onDismissDataError,
+            onSelectAttempt = onSelectAttempt,
+            onShowStudentActivity = onShowStudentActivity,
+            onResumeStudentFollow = onResumeStudentFollow,
+            previewHoveredDescription = previewHoveredDescription,
+            markHistoryContent = markHistoryContent,
+        )
+        return
+    }
     MaterialTheme {
         val tokens = readerChromeTokens(state.role)
         Box(
@@ -739,26 +797,63 @@ fun ReaderTopChrome(
                         // The title is the only route back to this book's page overview. Keeping
                         // it in the same lane on phone and tablet removes the old book-icon-only
                         // compact variant and guarantees that expanded chrome is always one row.
-                        ReaderTitleButton(
-                            title = state.bookTitle.ifBlank { "교재 페이지" },
-                            compact = compact,
-                            role = state.role,
-                            forceHovered = previewHoveredDescription == "교재 페이지로 돌아가기",
-                            onAction = onExitToLibrary,
-                            modifier = Modifier
-                                .weight(1f)
-                                .widthIn(max = tokens.expandedContextMaxWidth),
-                        )
-                        Box(
-                            modifier = Modifier
-                                .widthIn(
-                                    max = if (compact) {
-                                        tokens.compactStatusMaxWidth
-                                    } else {
-                                        tokens.expandedStatusMaxWidth
-                                    },
+                        val liveMonitoring = state.capabilities.showsStudentLocation
+                        if (liveMonitoring) {
+                            if (state.isFollowingStudent) {
+                                LiveMonitorBadge(
+                                    role = state.role,
+                                    compact = compact,
+                                    connection = state.liveConnection,
                                 )
-                                .height(tokens.minimumTouchSize),
+                            } else {
+                                ResumeStudentFollowChip(
+                                    role = state.role,
+                                    compact = compact,
+                                    studentPageNumber = state.studentPageNumber,
+                                    onAction = onResumeStudentFollow,
+                                )
+                            }
+                        }
+                        if (liveMonitoring && compact) {
+                            // A phone lane cannot carry the title and the submission stack at once,
+                            // and an ellipsized title says nothing. Give the room to the stack.
+                            IconPenButton(
+                                description = "교재 페이지로 돌아가기",
+                                iconRes = R.drawable.ic_back_shelf,
+                                onAction = onExitToLibrary,
+                                role = state.role,
+                                visualSize = tokens.generalButtonSize,
+                                forceHoveredForPreview =
+                                    previewHoveredDescription == "교재 페이지로 돌아가기",
+                            )
+                        } else {
+                            ReaderTitleButton(
+                                title = state.bookTitle.ifBlank { "교재 페이지" },
+                                compact = compact,
+                                role = state.role,
+                                forceHovered = previewHoveredDescription == "교재 페이지로 돌아가기",
+                                onAction = onExitToLibrary,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .widthIn(max = tokens.expandedContextMaxWidth),
+                            )
+                        }
+                        Box(
+                            modifier = if (liveMonitoring && compact) {
+                                // The stack is the reason this screen exists while monitoring, so
+                                // it takes the lane the title gave up.
+                                Modifier.weight(1f).height(tokens.minimumTouchSize)
+                            } else {
+                                Modifier
+                                    .widthIn(
+                                        max = if (compact) {
+                                            tokens.compactStatusMaxWidth
+                                        } else {
+                                            tokens.expandedStatusMaxWidth
+                                        },
+                                    )
+                                    .height(tokens.minimumTouchSize)
+                            },
                             contentAlignment = Alignment.Center,
                         ) {
                             if (markHistoryContent != null) {
@@ -766,9 +861,10 @@ fun ReaderTopChrome(
                             } else {
                                 ReaderAttemptMarkHistory(
                                     state = state,
-                                    maxVisibleBundles = if (compact) 1 else 3,
+                                    maxVisibleBundles = 5,
                                     onPreviousAttempt = onPreviousAttempt,
                                     onNextAttempt = onNextAttempt,
+                                    onSelectAttempt = onSelectAttempt,
                                 )
                             }
                         }
@@ -785,6 +881,45 @@ fun ReaderTopChrome(
                                     role = state.role,
                                     enabled = state.canSubmitNow,
                                 )
+                            }
+                            if (state.role == ReaderRole.STUDENT) {
+                                IconPenButton(
+                                    description = "Telegram 연결 및 설정",
+                                    iconRes = R.drawable.ic_publish,
+                                    onAction = onOpenRemoteMonitor,
+                                    role = state.role,
+                                    visualSize = tokens.generalButtonSize,
+                                    forceHoveredForPreview =
+                                        previewHoveredDescription == "Telegram 연결 및 설정",
+                                )
+                            }
+                            if (state.capabilities.showsStudentLocation) {
+                                IconPenButton(
+                                    description = "학생 필기량 보기",
+                                    iconRes = null,
+                                    onAction = onShowStudentActivity,
+                                    role = state.role,
+                                    visualSize = tokens.generalButtonSize,
+                                ) {
+                                    // No bar-chart asset exists in the icon set, and slicing one
+                                    // would have to match the rest of the sheet. Three bars drawn
+                                    // here stay crisp at any size and follow the chrome colours.
+                                    Canvas(modifier = Modifier.size(tokens.generalButtonSize * 0.5f)) {
+                                        val gap = size.width * 0.16f
+                                        val barWidth = (size.width - gap * 2f) / 3f
+                                        listOf(0.45f, 1f, 0.7f).forEachIndexed { index, scale ->
+                                            val height = size.height * scale
+                                            drawRect(
+                                                color = tokens.paletteBlue,
+                                                topLeft = androidx.compose.ui.geometry.Offset(
+                                                    index * (barWidth + gap),
+                                                    size.height - height,
+                                                ),
+                                                size = androidx.compose.ui.geometry.Size(barWidth, height),
+                                            )
+                                        }
+                                    }
+                                }
                             }
                             if (state.capabilities.canPublishTeacherInk) {
                                 PrimaryPenButton(
@@ -808,6 +943,12 @@ fun ReaderTopChrome(
                     }
                 }
             }
+            if (state.currentAttemptSubmitted) {
+                SubmittedAttemptBanner(
+                    role = state.role,
+                    modifier = Modifier.align(Alignment.BottomStart),
+                )
+            }
         }
         state.dataError?.let { message ->
             AlertDialog(
@@ -823,6 +964,138 @@ fun ReaderTopChrome(
                         role = state.role,
                     )
                 },
+            )
+        }
+    }
+}
+
+/**
+ * Tells the student the page they are looking at is already handed in. The page itself is blurred
+ * behind this, and the next stroke opens the following attempt, which clears both.
+ */
+@Composable
+private fun SubmittedAttemptBanner(role: ReaderRole, modifier: Modifier = Modifier) {
+    val tokens = readerChromeTokens(role)
+    Row(
+        modifier = modifier
+            .height(tokens.generalButtonSize)
+            .clip(RoundedCornerShape(tokens.cornerRadius))
+            .background(tokens.buttonBackground.copy(alpha = 0.92f))
+            .padding(horizontal = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "제출됨 : 아무데나 필기를 시작하면 새로운 회차 시작",
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.labelMedium,
+            color = tokens.buttonForeground,
+        )
+    }
+}
+
+/**
+ * Marks the teacher chrome while a student's page is being followed in real time. A phone only has
+ * room for the eye itself; the wider chrome spells it out.
+ */
+@Composable
+private fun LiveMonitorBadge(
+    role: ReaderRole,
+    compact: Boolean,
+    connection: LanConnectionState,
+) {
+    val tokens = readerChromeTokens(role)
+    val linked = connection == LanConnectionState.CONNECTED
+    val label = when (connection) {
+        LanConnectionState.CONNECTED -> "실시간 감독 중"
+        LanConnectionState.CONNECTING -> "학생 기기 찾는 중"
+        else -> "학생 기기 연결 끊김"
+    }
+    Row(
+        modifier = Modifier
+            .height(tokens.generalButtonSize)
+            .semantics { contentDescription = label },
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Canvas(modifier = Modifier.size(if (compact) 16.dp else 18.dp)) {
+            // Open red eye only while the peer is actually reachable. A closed, struck-through grey
+            // eye is what tells the teacher the link dropped instead of silently showing nothing.
+            val eye = if (linked) tokens.liveBadge else tokens.statusForeground
+            val width = size.width
+            val height = size.height
+            val outline = Path().apply {
+                moveTo(width * 0.04f, height * 0.5f)
+                quadraticTo(width * 0.5f, height * 0.06f, width * 0.96f, height * 0.5f)
+                quadraticTo(width * 0.5f, height * 0.94f, width * 0.04f, height * 0.5f)
+                close()
+            }
+            drawPath(outline, eye, style = Stroke(width = width * 0.1f))
+            if (linked) {
+                drawCircle(eye, radius = width * 0.19f, center = Offset(width * 0.5f, height * 0.5f))
+            } else {
+                drawLine(
+                    color = eye,
+                    start = Offset(width * 0.12f, height * 0.86f),
+                    end = Offset(width * 0.88f, height * 0.14f),
+                    strokeWidth = width * 0.12f,
+                )
+            }
+        }
+        if (!compact) {
+            Text(
+                text = label,
+                maxLines = 1,
+                style = MaterialTheme.typography.labelMedium,
+                color = tokens.statusForeground,
+            )
+        }
+    }
+}
+
+/**
+ * Manual page navigation only pauses the cursor-following part of LIVE_MONITOR. Keep the last
+ * received student page visible here so returning to the live cursor is one deliberate S Pen tap.
+ */
+@Composable
+private fun ResumeStudentFollowChip(
+    role: ReaderRole,
+    compact: Boolean,
+    studentPageNumber: Int?,
+    onAction: () -> Unit,
+) {
+    val tokens = readerChromeTokens(role)
+    val pageLabel = studentPageNumber?.let { "학생 ${it + 1}쪽 다시 따라가기" }
+        ?: "학생 화면 다시 따라가기"
+    PenInteractionTarget(
+        description = pageLabel,
+        onAction = onAction,
+        modifier = Modifier.height(tokens.minimumTouchSize),
+    ) { hovered, pressed ->
+        AnimatedPenSurface(
+            hovered = hovered,
+            pressed = pressed,
+            enabled = true,
+            selected = false,
+            role = role,
+            visualWidth = null,
+            visualHeight = tokens.generalButtonSize,
+            shape = RoundedCornerShape(tokens.cornerRadius),
+            style = PenButtonSurfaceStyle.FILLED,
+            minVisualWidth = if (compact) tokens.generalButtonSize else tokens.primaryMinWidth,
+            textureSeed = pageLabel.hashCode(),
+        ) {
+            Text(
+                text = if (compact) {
+                    studentPageNumber?.let { "${it + 1}쪽" } ?: "따라가기"
+                } else {
+                    pageLabel
+                },
+                modifier = Modifier.padding(horizontal = tokens.primaryHorizontalPadding),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.labelMedium,
+                color = tokens.buttonForeground,
             )
         }
     }
@@ -895,6 +1168,8 @@ internal fun readerAttemptMarkBundles(
     groups: List<MarkGroup>,
     pageNumber: Int,
     selectedAttemptNo: Int,
+    /** Attempts that exist on the page. A submission with no marks yet still needs a slot. */
+    attemptNos: List<Int> = emptyList(),
 ): List<ReaderAttemptMarkBundle> {
     val pageLevel = selectedAttemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO
     val sortedGroups = groups.asSequence()
@@ -907,7 +1182,10 @@ internal fun readerAttemptMarkBundles(
         }
         .sortedWith(compareBy<MarkGroup>({ it.anchor.y }, { it.anchor.x }, { it.id }))
         .toList()
-    if (sortedGroups.isEmpty()) return emptyList()
+    // A submission that nobody has started grading has no mark groups yet. It still needs its own
+    // empty frame, otherwise the stack silently drops every ungraded attempt on the page.
+    val hasSubmissions = !pageLevel && attemptNos.any { it > TEACHER_PAGE_REVIEW_ATTEMPT_NO }
+    if (sortedGroups.isEmpty() && !hasSubmissions) return emptyList()
 
     val attemptNumbers = if (pageLevel) {
         listOf(TEACHER_PAGE_REVIEW_ATTEMPT_NO)
@@ -921,6 +1199,7 @@ internal fun readerAttemptMarkBundles(
                     }
                     .mapTo(this) { it.attemptNo }
             }
+            attemptNos.filterTo(this) { it > TEACHER_PAGE_REVIEW_ATTEMPT_NO }
             if (selectedAttemptNo > TEACHER_PAGE_REVIEW_ATTEMPT_NO) add(selectedAttemptNo)
         }.sorted()
     }
@@ -947,21 +1226,29 @@ private fun ReaderAttemptMarkHistory(
     maxVisibleBundles: Int,
     onPreviousAttempt: () -> Unit,
     onNextAttempt: () -> Unit,
+    onSelectAttempt: (Int) -> Unit = {},
 ) {
-    val bundles = remember(state.marks, state.pageNumber, state.attemptNo) {
+    val bundles = remember(state.marks, state.pageNumber, state.attemptNo, state.pageAttemptNos) {
         readerAttemptMarkBundles(
             groups = state.marks,
             pageNumber = state.pageNumber,
             selectedAttemptNo = state.attemptNo,
+            attemptNos = state.pageAttemptNos,
         )
     }
     if (bundles.isEmpty()) return
 
+    // Every submission keeps a frame, including the ones after the attempt on screen. Trimming to
+    // the selected attempt is what left a teacher with only the newest submission to look at.
     val selectedIndex = bundles.indexOfFirst { it.attemptNo == state.attemptNo }
         .takeIf { it >= 0 }
         ?: bundles.lastIndex
-    val visibleBundles = bundles.subList(0, selectedIndex + 1)
-        .takeLast(maxVisibleBundles.coerceAtLeast(1))
+    val window = maxVisibleBundles.coerceAtLeast(1)
+    val end = (maxOf(selectedIndex + 1, window)).coerceAtMost(bundles.size)
+    val visibleBundles = bundles.subList((end - window).coerceAtLeast(0), end)
+    val bundleBounds = remember(state.pageNumber) {
+        mutableStateMapOf<Int, ClosedFloatingPointRange<Float>>()
+    }
     val tokens = readerChromeTokens(state.role)
     val dragThresholdPx = with(LocalDensity.current) { 16.dp.toPx() }
     var stylusDragStartX by remember(state.pageNumber, state.attemptNo) { mutableStateOf<Float?>(null) }
@@ -989,10 +1276,19 @@ private fun ReaderAttemptMarkHistory(
                     }
                     MotionEvent.ACTION_UP -> {
                         val distance = event.x - (stylusDragStartX ?: event.x)
+                        val releasedAtX = event.rawX
                         stylusDragStartX = null
                         stylusDragOffset = 0f
-                        if (state.capabilities.canBrowseAttempts && abs(distance) >= dragThresholdPx) {
-                            if (distance > 0f) onPreviousAttempt() else onNextAttempt()
+                        if (state.capabilities.canBrowseAttempts) {
+                            if (abs(distance) >= dragThresholdPx) {
+                                if (distance > 0f) onPreviousAttempt() else onNextAttempt()
+                            } else {
+                                // A tap opens the frame under the pen. Stepping one attempt at a
+                                // time is still available by dragging.
+                                bundleBounds.entries
+                                    .firstOrNull { releasedAtX in it.value }
+                                    ?.let { onSelectAttempt(it.key) }
+                            }
                         }
                     }
                     MotionEvent.ACTION_CANCEL -> {
@@ -1011,16 +1307,36 @@ private fun ReaderAttemptMarkHistory(
             horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            visibleBundles.forEachIndexed { index, bundle ->
-                val distanceFromCurrent = visibleBundles.lastIndex - index
-                AttemptMarkMicroGrid(
-                    colors = bundle.colors,
-                    alpha = when (distanceFromCurrent) {
-                        0 -> 1f
-                        1 -> 0.34f
-                        else -> 0.18f
-                    },
-                )
+            visibleBundles.forEach { bundle ->
+                val selected = bundle.attemptNo == state.attemptNo
+                // Each attempt keeps its own frame so an ungraded submission still reads as
+                // "waiting to be graded", and the selected one is the only fully opaque frame.
+                Box(
+                    modifier = Modifier
+                        .onGloballyPositioned { coordinates ->
+                            val bounds = coordinates.boundsInWindow()
+                            bundleBounds[bundle.attemptNo] = bounds.left..bounds.right
+                        }
+                        .border(
+                            width = if (selected) 2.dp else 1.dp,
+                            color = if (selected) {
+                                tokens.markPendingHighlight
+                            } else {
+                                tokens.markPendingBorder
+                            },
+                            shape = RoundedCornerShape(4.dp),
+                        )
+                        .padding(horizontal = 3.dp, vertical = 2.dp)
+                        // An ungraded submission draws an empty frame, so keep it big enough to
+                        // read as a slot that is still waiting for marks.
+                        .defaultMinSize(minWidth = 10.dp, minHeight = 14.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    AttemptMarkMicroGrid(
+                        colors = bundle.colors,
+                        alpha = if (selected) 1f else tokens.markBundleDimAlpha,
+                    )
+                }
             }
         }
     }
@@ -1111,6 +1427,7 @@ private object ReaderTopChromePreviewFixtures {
         capabilities = ReaderCapabilities.forSession(role, ReaderWorkflow.defaultFor(role), 2),
         marks = marks(pageNumber = 2),
         studentPageNumber = studentPageNumber,
+        isFollowingStudent = role == ReaderRole.TEACHER_PHONE,
     )
 }
 

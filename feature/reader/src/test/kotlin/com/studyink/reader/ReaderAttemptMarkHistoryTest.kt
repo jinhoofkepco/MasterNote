@@ -115,4 +115,68 @@ class ReaderAttemptMarkHistoryTest {
         anchor = PagePoint(x, y),
         marks = marks.toList(),
     )
+
+    @Test
+    fun everySubmissionKeepsAFrameEvenBeforeItIsGraded() {
+        val groups = listOf(
+            group("only", x = 0f, y = 0f, Mark(1, MarkColor.BLUE)),
+        )
+
+        // Attempts 2 and 3 are submitted but not graded yet. Deriving the stack from marks alone
+        // dropped them, which left a teacher able to reach only the newest submission.
+        val bundles = readerAttemptMarkBundles(
+            groups = groups,
+            pageNumber = 4,
+            selectedAttemptNo = 1,
+            attemptNos = listOf(1, 2, 3),
+        )
+
+        assertEquals(listOf(1, 2, 3), bundles.map { it.attemptNo })
+        assertEquals(listOf(MarkColor.BLUE), bundles[0].colors)
+        assertEquals(listOf(MarkColor.GRAY), bundles[1].colors)
+        assertEquals(listOf(MarkColor.GRAY), bundles[2].colors)
+    }
+
+    @Test
+    fun pageLevelTeacherTargetIgnoresStudentSubmissionNumbers() {
+        val groups = listOf(
+            group("page", x = 0f, y = 0f, Mark(TEACHER_PAGE_REVIEW_ATTEMPT_NO, MarkColor.RED)),
+        )
+
+        val bundles = readerAttemptMarkBundles(
+            groups = groups,
+            pageNumber = 4,
+            selectedAttemptNo = TEACHER_PAGE_REVIEW_ATTEMPT_NO,
+            attemptNos = listOf(1, 2, 3),
+        )
+
+        assertEquals(listOf(TEACHER_PAGE_REVIEW_ATTEMPT_NO), bundles.map { it.attemptNo })
+    }
+
+    @Test
+    fun submissionsWithNoGradingYetStillGetTheirOwnFrame() {
+        // Page 3 of the test book: four submissions, nothing graded. Bailing out on an empty mark
+        // list left the teacher with no stack at all on exactly the pages that need grading most.
+        val bundles = readerAttemptMarkBundles(
+            groups = emptyList(),
+            pageNumber = 3,
+            selectedAttemptNo = 4,
+            attemptNos = listOf(1, 2, 3, 4),
+        )
+
+        assertEquals(listOf(1, 2, 3, 4), bundles.map { it.attemptNo })
+        assertTrue(bundles.all { it.colors.isEmpty() })
+    }
+
+    @Test
+    fun aPageWithNeitherMarksNorSubmissionsStaysEmpty() {
+        assertTrue(
+            readerAttemptMarkBundles(
+                groups = emptyList(),
+                pageNumber = 3,
+                selectedAttemptNo = 1,
+                attemptNos = emptyList(),
+            ).isEmpty()
+        )
+    }
 }

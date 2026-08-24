@@ -37,6 +37,7 @@ internal object ReaderDevicePreviewFixtures {
         canUndo = true,
         canRedo = true,
         studentPageNumber = 2,
+        isFollowingStudent = true,
     )
 
     fun studentTablet() = ReaderUiState(

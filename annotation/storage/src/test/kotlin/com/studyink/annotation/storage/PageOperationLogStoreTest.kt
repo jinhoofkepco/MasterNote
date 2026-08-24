@@ -2,6 +2,7 @@ package com.studyink.annotation.storage
 
 import com.studyink.annotation.engine.AnnotationDocument
 import com.studyink.core.model.AnnotationSnapshot
+import com.studyink.core.model.MasterNoteDataCommitBus
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
@@ -12,6 +13,62 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PageOperationLogStoreTest {
+    @Test
+    fun localAppendSignalsExactlyOnceAfterItIsReadableFromTheStableRoot() {
+        val root = Files.createTempDirectory("masternote-commit-local").toFile()
+        try {
+            val store = PageOperationLogStore(root)
+            val change = AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE))
+                .addStroke(stroke("local-device"))
+            val observedRevisions = mutableListOf<Long>()
+            val subscription = MasterNoteDataCommitBus.addListener {
+                store.withStableDataRoot {
+                    observedRevisions += store.loadPage(BOOK_ID, PAGE).revision
+                }
+            }
+            try {
+                store.append(change)
+                store.append(change)
+            } finally {
+                subscription.close()
+            }
+
+            assertEquals(listOf(1L), observedRevisions)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun remoteAppendSignalsExactlyOnceAndDuplicateReplayDoesNotSignal() {
+        val sourceRoot = Files.createTempDirectory("masternote-commit-source").toFile()
+        val targetRoot = Files.createTempDirectory("masternote-commit-target").toFile()
+        try {
+            val source = PageOperationLogStore(sourceRoot)
+            val target = PageOperationLogStore(targetRoot)
+            source.append(
+                AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE))
+                    .addStroke(stroke("remote-device")),
+            )
+            val encoded = source.encodedOperationsAfter(BOOK_ID, PAGE, 0L).single()
+            val observedRevisions = mutableListOf<Long>()
+            val subscription = MasterNoteDataCommitBus.addListener {
+                observedRevisions += target.loadPage(BOOK_ID, PAGE).revision
+            }
+            try {
+                target.appendEncodedOperation(BOOK_ID, PAGE, encoded)
+                target.appendEncodedOperation(BOOK_ID, PAGE, encoded)
+            } finally {
+                subscription.close()
+            }
+
+            assertEquals(listOf(1L), observedRevisions)
+        } finally {
+            sourceRoot.deleteRecursively()
+            targetRoot.deleteRecursively()
+        }
+    }
+
     @Test
     fun staleLocalChangeMergesWithRemoteOperationAndSurvivesReload() {
         val sourceRoot = Files.createTempDirectory("masternote-source").toFile()

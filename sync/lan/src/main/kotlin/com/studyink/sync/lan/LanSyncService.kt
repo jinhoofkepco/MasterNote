@@ -7,6 +7,11 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.LinkAddress
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
@@ -27,6 +32,7 @@ import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.Inet4Address
@@ -51,59 +57,90 @@ class LanSyncService : Service(),
     private val library by lazy { LibraryRepository.get(this) }
     private val pairingPreferences by lazy { getSharedPreferences("masternote-lan-pairs", MODE_PRIVATE) }
     private val nsd by lazy { getSystemService(NsdManager::class.java) }
-    private var multicastLock: WifiManager.MulticastLock? = null
-    private var registration: NsdManager.RegistrationListener? = null
-    private var discovery: NsdManager.DiscoveryListener? = null
-    private var serverSocket: ServerSocket? = null
-    private var socket: Socket? = null
-    private var writer: BufferedWriter? = null
-    private var role: LanPeerRole? = null
-    private var peerRole: LanPeerRole? = null
-    private var bookId: String = ""
-    private var peerBookId: String = ""
-    private var documentHash: String = ""
-    private var peerDeviceId: String = ""
-    private var peerHost: String = ""
-    private var peerPort: Int = 0
-    private var pairingToken: String = ""
-    private var subscribedPage = -1
+    private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
+    @Volatile private var wifiNetwork: Network? = null
+    private var wifiCallback: ConnectivityManager.NetworkCallback? = null
+    // Session state is written by the socket reader, the flush timer on the main looper, the
+    // reader's mutation dispatcher and the metadata executor. Without these barriers a subscription
+    // set on the socket thread could stay invisible to onLocalOperation, which is what stopped live
+    // ink from ever being flushed while page-change repair - running on the socket thread - worked.
+    @Volatile private var multicastLock: WifiManager.MulticastLock? = null
+    @Volatile private var registration: NsdManager.RegistrationListener? = null
+    @Volatile private var discovery: NsdManager.DiscoveryListener? = null
+    @Volatile private var serverSocket: ServerSocket? = null
+    @Volatile private var socket: Socket? = null
+    @Volatile private var writer: BufferedWriter? = null
+    @Volatile private var role: LanPeerRole? = null
+    @Volatile private var peerRole: LanPeerRole? = null
+    @Volatile private var bookId: String = ""
+    @Volatile private var peerBookId: String = ""
+    @Volatile private var documentHash: String = ""
+    @Volatile private var peerDeviceId: String = ""
+    @Volatile private var peerHost: String = ""
+    @Volatile private var peerPort: Int = 0
+    @Volatile private var pairingToken: String = ""
+    @Volatile private var subscribedPage = -1
     private val peerReceivedClocks = PageOperationWatermarks()
-    private var pendingPage = -1
-    private var pendingSince = 0L
-    private var lastFlushAt = 0L
-    private var currentStudentPage = -1
-    private var currentStudentAttemptNo: Int? = null
-    private var currentStudentRevision = 0L
-    private var currentTeacherAttemptNo: Int? = null
-    private var followRemoteStudent = false
-    private var connectionGeneration = 0L
-    private var lastSubscriptionGeneration = -1L
-    private var lastSubscriptionPage = -1
-    private var lastTeacherRepairGeneration = -1L
+    @Volatile private var pendingPage = -1
+    @Volatile private var pendingSince = 0L
+    @Volatile private var lastFlushAt = 0L
+    @Volatile private var currentStudentPage = -1
+    @Volatile private var currentStudentAttemptNo: Int? = null
+    @Volatile private var currentStudentRevision = 0L
+    @Volatile private var currentTeacherAttemptNo: Int? = null
+    @Volatile private var followRemoteStudent = false
+    @Volatile private var cachedPageCountBookId: String? = null
+    @Volatile private var cachedPageCount = 0
+    @Volatile private var connectionGeneration = 0L
+    @Volatile private var lastSubscriptionGeneration = -1L
+    @Volatile private var lastSubscriptionPage = -1
+    @Volatile private var lastTeacherRepairGeneration = -1L
     private val stopping = AtomicBoolean(false)
 
-    private val flushRunnable = Runnable { flushPendingAtStrokeBoundary() }
+    // The debounce timer lives on the main looper, but the flush it triggers writes to a socket.
+    // Doing that inline threw NetworkOnMainThreadException on every live stroke, which send()
+    // swallowed as a generic write failure - so live ink was never transmitted while the paths that
+    // already ran off the main thread (peer SUBSCRIBE, page presence) worked and masked it.
+    private val flushRunnable = Runnable { io.execute { flushPendingAtStrokeBoundary() } }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        trackWifiNetwork()
         LanSyncBus.addListener(this)
         LibraryAttemptBus.addListener(this)
         LibraryMarkGroupBus.addListener(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> stopSelf()
-            ACTION_STUDENT_SERVER -> startStudent(requireNotNull(intent.getStringExtra(EXTRA_BOOK_ID)))
-            ACTION_TEACHER_DISCOVER -> startTeacher(requireNotNull(intent.getStringExtra(EXTRA_BOOK_ID)))
-            ACTION_TEACHER_PAIR_URI -> {
-                val payload = PairingPayload.parse(UriCompat.parse(requireNotNull(intent.getStringExtra(EXTRA_PAIR_URI))))
-                startTeacherPairing(
+        // Every caller uses startForegroundService, which promises a startForeground within a few
+        // seconds or the platform kills the process. Reading the book and parsing the pairing URI
+        // can both throw, and they used to run before that promise was kept, so a missing book or
+        // a malformed QR took the whole app down. Claim the foreground slot first, then start.
+        runCatching { startForeground(NOTIFICATION_ID, notification("원격 수업 준비 중")) }
+            .onFailure { Log.e(TAG, "startForeground failed", it) }
+        val action = intent?.action
+        if (action == null || action == ACTION_STOP) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        runCatching {
+            when (action) {
+                ACTION_STUDENT_SERVER -> startStudent(requireNotNull(intent.getStringExtra(EXTRA_BOOK_ID)))
+                ACTION_TEACHER_DISCOVER -> startTeacher(requireNotNull(intent.getStringExtra(EXTRA_BOOK_ID)))
+                ACTION_TEACHER_PAIR_URI -> startTeacherPairing(
                     targetBookId = requireNotNull(intent.getStringExtra(EXTRA_BOOK_ID)),
-                    payload = payload,
+                    payload = PairingPayload.parse(
+                        UriCompat.parse(requireNotNull(intent.getStringExtra(EXTRA_PAIR_URI)))
+                    ),
                 )
+                else -> Unit
             }
+        }.onFailure { error ->
+            Log.e(TAG, "session start failed action=$action", error)
+            LanSyncBus.sessionIssue("원격 수업을 시작하지 못했습니다. 교재와 연결 정보를 확인해 주세요.")
+            closeSession()
+            stopSelf()
         }
         return START_NOT_STICKY
     }
@@ -120,6 +157,7 @@ class LanSyncService : Service(),
         bootstrapLocalPresence()
         logSessionStart()
         startForeground(NOTIFICATION_ID, notification("선생 기기 연결 대기 중"))
+        LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTING)
         io.execute {
             val server = ServerSocket(0).also { serverSocket = it }
             registerService(server.localPort)
@@ -130,7 +168,13 @@ class LanSyncService : Service(),
                 )
             } ?: LanSyncBus.sessionIssue("현재 Wi-Fi 주소를 찾지 못했습니다.")
             while (!stopping.get()) {
-                runCatching { server.accept() }.getOrNull()?.let(::attachSocket) ?: break
+                val accepted = runCatching { server.accept() }.getOrNull() ?: break
+                // attachSocket writes the greeting, so it can throw for the same reason readLoop
+                // can. Losing one peer must not end the accept loop or the process.
+                runCatching { attachSocket(accepted) }.onFailure {
+                    Log.w(TAG, "LAN attach failed book=$bookId", it)
+                    runCatching { accepted.close() }
+                }
             }
         }
     }
@@ -145,6 +189,7 @@ class LanSyncService : Service(),
         bootstrapLocalPresence()
         logSessionStart()
         startForeground(NOTIFICATION_ID, notification("학생 기기 찾는 중"))
+        LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTING)
         acquireMulticast()
         val listener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) = Unit
@@ -154,7 +199,14 @@ class LanSyncService : Service(),
             }
             override fun onServiceLost(serviceInfo: NsdServiceInfo) = Unit
             override fun onDiscoveryStopped(serviceType: String) = Unit
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) { stopDiscovery() }
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                // Silently stopping here is what let the chrome claim live monitoring while no
+                // discovery was running at all.
+                Log.w(TAG, "discovery start failed book=$bookId error=$errorCode")
+                stopDiscovery()
+                LanSyncBus.connectionStateChanged(bookId, LanConnectionState.DISCONNECTED)
+                LanSyncBus.sessionIssue("학생 기기를 찾지 못했습니다. 다시 연결해 주세요.")
+            }
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = Unit
         }
         discovery = listener
@@ -171,6 +223,7 @@ class LanSyncService : Service(),
         bootstrapLocalPresence()
         logSessionStart()
         startForeground(NOTIFICATION_ID, notification("학생 기기에 연결 중"))
+        LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTING)
         startTeacherSocket(payload.host, payload.port, payload.bookId, payload.token)
     }
 
@@ -218,8 +271,14 @@ class LanSyncService : Service(),
         peerPort = port
         pairingToken = token
         io.execute {
-            runCatching { attachSocket(Socket(host, port)) }
-                .onFailure { scheduleReconnect() }
+            runCatching { attachSocket(openPeerSocket(host, port)) }
+                .onFailure {
+                    Log.w(TAG, "LAN connect failed host=$host port=$port wifi=${wifiNetwork != null}", it)
+                    if (wifiNetwork == null) {
+                        LanSyncBus.sessionIssue("같은 Wi-Fi에 연결되어 있는지 확인해 주세요.")
+                    }
+                    scheduleReconnect()
+                }
         }
     }
 
@@ -239,6 +298,8 @@ class LanSyncService : Service(),
             put("token", pairingToken)
         })
         updateNotification("연결됨")
+        Log.i(TAG, "LAN attached role=$role book=$bookId generation=$connectionGeneration")
+        LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTED)
         io.execute { readLoop(connected) }
     }
 
@@ -247,11 +308,24 @@ class LanSyncService : Service(),
             BufferedReader(InputStreamReader(connected.getInputStream(), Charsets.UTF_8)).use { reader ->
                 while (!stopping.get()) {
                     val line = reader.readLine() ?: break
-                    runCatching { handle(LanWire.decode(line)) }
-                        .onFailure { LanSyncBus.sessionIssue("교재 또는 연결 정보를 확인해 주세요.") }
-                        .getOrElse { break }
+                    val type = runCatching { JSONObject(line).optString("type") }.getOrDefault("")
+                    val failure = runCatching { handle(LanWire.decode(line)) }.exceptionOrNull()
+                        ?: continue
+                    Log.w(TAG, "LAN message failed role=$role type=$type", failure)
+                    // Only the handshake is worth dropping the link for. Tearing the session down
+                    // on any single bad payload is what turned one unusable operation into a dead
+                    // connection that never came back.
+                    if (type == "HELLO" || type == "HELLO_OK" || type.isEmpty()) {
+                        LanSyncBus.sessionIssue("교재 또는 연결 정보를 확인해 주세요.")
+                        break
+                    }
                 }
             }
+        } catch (error: Throwable) {
+            // A peer that disappears mid-read makes readLine throw rather than return null. This
+            // body runs on an executor thread, where an uncaught throwable takes the whole process
+            // down - which is how losing the link killed the app instead of showing "연결 끊김".
+            Log.w(TAG, "LAN read loop ended role=$role book=$bookId", error)
         } finally {
             if (socket === connected) {
                 socket = null
@@ -260,6 +334,8 @@ class LanSyncService : Service(),
                 lastSubscriptionPage = -1
                 lastTeacherRepairGeneration = -1L
                 updateNotification("연결 끊김")
+                Log.i(TAG, "LAN detached role=$role book=$bookId generation=$connectionGeneration")
+                LanSyncBus.connectionStateChanged(bookId, LanConnectionState.DISCONNECTED)
                 scheduleReconnect()
             }
         }
@@ -269,6 +345,7 @@ class LanSyncService : Service(),
         if (stopping.get() || role != LanPeerRole.TEACHER_CLIENT || peerHost.isBlank() || peerPort <= 0) return
         handler.postDelayed({
             if (!stopping.get() && socket?.isConnected != true) {
+                Log.i(TAG, "LAN reconnect attempt book=$bookId host=$peerHost port=$peerPort")
                 startTeacherSocket(peerHost, peerPort, peerBookId, pairingToken)
             }
         }, RECONNECT_DELAY_MILLIS)
@@ -352,8 +429,11 @@ class LanSyncService : Service(),
                 )
                 if (followRemoteStudent) {
                     updateDesiredSubscription(page, "live-follow")
-                    ensureSubscription()
                 }
+                // Assert the subscription on every student page report, not only while following.
+                // A teacher that connected before its reader published a page would otherwise stay
+                // silently unsubscribed and receive no live ink.
+                ensureSubscription()
                 LanSyncBus.remotePageChanged(location)
             }
             "ATTEMPT_UPSERT" -> {
@@ -390,10 +470,18 @@ class LanSyncService : Service(),
     }
 
     override fun onLocalOperation(bookId: String, pageNumber: Int) {
+        // Arrives on the reader's mutation dispatcher. Hop onto the thread that owns the flush
+        // timer so the pending-page bookkeeping is never interleaved with the socket reader.
+        handler.post { scheduleLocalFlush(bookId, pageNumber) }
+    }
+
+    private fun scheduleLocalFlush(bookId: String, pageNumber: Int) {
         if (this.bookId != bookId || pageNumber != subscribedPage) return
         if (role == LanPeerRole.TEACHER_CLIENT) {
             pendingPage = pageNumber
-            flushPendingAtStrokeBoundary()
+            // Published corrections go out immediately, but this runs on the looper that owns the
+            // debounce timer, so the socket write itself has to leave the main thread.
+            io.execute { flushPendingAtStrokeBoundary() }
             return
         }
         if (role != LanPeerRole.STUDENT_SERVER) return
@@ -458,7 +546,19 @@ class LanSyncService : Service(),
     }
 
     private fun repairTeacherConnection() {
-        if (role != LanPeerRole.TEACHER_CLIENT || writer == null || !isPageInBook(subscribedPage)) return
+        if (role != LanPeerRole.TEACHER_CLIENT || writer == null) return
+        if (!isPageInBook(subscribedPage)) {
+            // The reader may have published its page before this session existed, or after the
+            // bootstrap read. Without this the teacher connects and never subscribes at all, and
+            // student ink only appears when a page change happens to trigger a subscription.
+            LanSyncBus.localPagePresence(bookId)
+                ?.takeIf { isPageInBook(it.pageNumber) }
+                ?.let { presence ->
+                    followRemoteStudent = presence.followRemoteStudent
+                    updateDesiredSubscription(presence.pageNumber, "connect-bootstrap")
+                }
+        }
+        if (!isPageInBook(subscribedPage)) return
         if (lastTeacherRepairGeneration == connectionGeneration) return
         if (!ensureSubscription()) return
         lastTeacherRepairGeneration = connectionGeneration
@@ -530,9 +630,24 @@ class LanSyncService : Service(),
         )
     }
 
-    private fun isPageInBook(pageNumber: Int): Boolean = pageNumber >= 0 && runCatching {
-        pageNumber < library.book(bookId).pageCount
-    }.getOrDefault(false)
+    /**
+     * Page count never changes for a book, but reading it takes the library lock, which a catalog
+     * write holds while it fsyncs. This runs for every inbound message, so it caches instead.
+     */
+    private fun bookPageCount(): Int {
+        val current = bookId
+        if (current.isBlank()) return 0
+        cachedPageCountBookId.takeIf { it == current }?.let { return cachedPageCount }
+        val count = runCatching { library.book(current).pageCount }.getOrDefault(0)
+        if (count > 0) {
+            cachedPageCount = count
+            cachedPageCountBookId = current
+        }
+        return count
+    }
+
+    private fun isPageInBook(pageNumber: Int): Boolean =
+        pageNumber >= 0 && pageNumber < bookPageCount()
 
     /**
      * Repairs events that occurred before connection or during a disconnect. Attempts come from
@@ -627,6 +742,14 @@ class LanSyncService : Service(),
     @Synchronized
     private fun send(line: String): Boolean {
         if (line.length > LanWire.MAX_LINE_CHARS) return false
+        // Socket writes on the looper throw NetworkOnMainThreadException, which this method used to
+        // swallow as an ordinary write failure - twice, once per direction. Refuse loudly instead of
+        // failing quietly, and never by throwing: a caller that gets this wrong must not take the
+        // process down with it.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Log.e(TAG, "LAN send attempted on the main thread role=$role", IllegalStateException(line.take(40)))
+            return false
+        }
         val target = writer ?: return false
         return runCatching {
             target.write(line)
@@ -634,7 +757,7 @@ class LanSyncService : Service(),
             target.flush()
             true
         }.onFailure {
-            Log.w(TAG, "LAN write failed role=$role book=$bookId")
+            Log.w(TAG, "LAN write failed role=$role book=$bookId", it)
         }.getOrDefault(false)
     }
 
@@ -671,6 +794,7 @@ class LanSyncService : Service(),
     }
 
     private fun closeSession() {
+        LanSyncBus.clearConnectionState(bookId)
         stopping.set(true)
         handler.removeCallbacksAndMessages(null)
         registration?.let { runCatching { nsd.unregisterService(it) } }
@@ -705,6 +829,8 @@ class LanSyncService : Service(),
     }
 
     override fun onDestroy() {
+        wifiCallback?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
+        wifiCallback = null
         LanSyncBus.removeListener(this)
         LibraryAttemptBus.removeListener(this)
         LibraryMarkGroupBus.removeListener(this)
@@ -741,7 +867,60 @@ class LanSyncService : Service(),
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(text))
     }
 
-    private fun localIpv4Address(): String? = NetworkInterface.getNetworkInterfaces().toList()
+    /**
+     * Keeps a handle on the Wi-Fi network. A phone with mobile data up routes app sockets through
+     * cellular by default, and a classroom LAN address is simply unreachable there - the connect
+     * times out with no hint as to why. Note the request deliberately does not ask for INTERNET:
+     * the Wi-Fi that matters here may have no working uplink at all.
+     */
+    private fun trackWifiNetwork() {
+        if (wifiCallback != null) return
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                wifiNetwork = network
+                Log.i(TAG, "wifi network available")
+            }
+
+            override fun onLost(network: Network) {
+                if (wifiNetwork == network) wifiNetwork = null
+                Log.i(TAG, "wifi network lost")
+            }
+        }
+        wifiCallback = callback
+        runCatching { connectivity.registerNetworkCallback(request, callback) }
+            .onFailure {
+                wifiCallback = null
+                Log.w(TAG, "wifi network callback failed", it)
+            }
+    }
+
+    private fun openPeerSocket(host: String, port: Int): Socket {
+        val network = wifiNetwork
+        val socket = network?.socketFactory?.createSocket() ?: Socket()
+        return socket.apply { connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MILLIS) }
+    }
+
+    /**
+     * Address to advertise in the pairing code. Prefers the Wi-Fi link so a phone that also holds a
+     * cellular address never hands a peer something it cannot reach.
+     */
+    private fun localIpv4Address(): String? = wifiLinkIpv4Address() ?: anyLocalIpv4Address()
+
+    private fun wifiLinkIpv4Address(): String? {
+        val network = wifiNetwork ?: return null
+        return runCatching {
+            connectivity.getLinkProperties(network)?.linkAddresses.orEmpty()
+                .map(LinkAddress::getAddress)
+                .filterIsInstance<Inet4Address>()
+                .firstOrNull { it.isSiteLocalAddress }
+                ?.hostAddress
+        }.getOrNull()
+    }
+
+    private fun anyLocalIpv4Address(): String? = NetworkInterface.getNetworkInterfaces().toList()
         .asSequence()
         .filter { it.isUp && !it.isLoopback }
         .flatMap { it.inetAddresses.toList().asSequence() }
@@ -765,6 +944,8 @@ class LanSyncService : Service(),
         private const val DEBOUNCE_MILLIS = 180L
         private const val MAX_DELAY_MILLIS = 600L
         private const val RECONNECT_DELAY_MILLIS = 2_000L
+        // A LAN peer answers in milliseconds. Waiting out the platform default just stalls retries.
+        private const val CONNECT_TIMEOUT_MILLIS = 5_000
         private const val TAG = "MasterNoteLan"
 
         fun startStudent(context: Context, bookId: String) = context.startForegroundService(

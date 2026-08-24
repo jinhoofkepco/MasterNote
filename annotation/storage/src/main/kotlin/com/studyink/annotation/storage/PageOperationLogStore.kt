@@ -5,6 +5,7 @@ import com.studyink.annotation.engine.AnnotationChange
 import com.studyink.core.model.ANNOTATION_FORMAT_VERSION
 import com.studyink.core.model.AnnotationSnapshot
 import com.studyink.core.model.AssetOperation
+import com.studyink.core.model.MasterNoteDataCommitBus
 import com.studyink.core.model.OperationId
 import com.studyink.core.model.PageBounds
 import com.studyink.core.model.PagePoint
@@ -53,6 +54,13 @@ class PageOperationLogStore(
     init {
         check(rootDirectory.mkdirs() || rootDirectory.isDirectory) { "Cannot create annotation directory" }
     }
+
+    /**
+     * Runs [block] while append, checkpoint, and in-memory page-index mutations are excluded.
+     * Backup code must finish reading [rootDirectory] before the block returns.
+     */
+    @Synchronized
+    fun <T> withStableDataRoot(block: (File) -> T): T = block(rootDirectory)
 
     @Synchronized
     fun loadPage(bookId: String, pageNumber: Int): AnnotationSnapshot =
@@ -143,6 +151,7 @@ class PageOperationLogStore(
         }
         val merged = apply(current, record)
         index.add(record, line.toByteArray(Charsets.UTF_8), merged)
+        MasterNoteDataCommitBus.recordDurableCommit()
         if (merged.revision % checkpointInterval == 0L) writeCheckpoint(merged)
         return merged
     }
@@ -229,6 +238,7 @@ class PageOperationLogStore(
         }
         val updated = apply(current, localRecord)
         index.add(localRecord, localBytes, updated)
+        MasterNoteDataCommitBus.recordDurableCommit()
         if (updated.revision % checkpointInterval == 0L) writeCheckpoint(updated)
         return updated.revision
     }
@@ -528,6 +538,20 @@ class PageOperationLogStore(
                     applicationInstance = it
                 }
             }
+
+        /**
+         * Drops cached page indexes after a validated restore has replaced the data root.
+         * Existing holders are cleared under the store lock, so they also reload restored files.
+         */
+        @Synchronized
+        fun resetForRestore() {
+            applicationInstance?.let { current ->
+                synchronized(current) {
+                    current.pageIndexes.clear()
+                    applicationInstance = null
+                }
+            }
+        }
 
         private const val DEFAULT_CHECKPOINT_INTERVAL = 64
         private const val CHECKPOINT_FILE = "checkpoint.json"

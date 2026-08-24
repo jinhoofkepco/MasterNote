@@ -6,6 +6,7 @@ import com.studyink.core.model.Attempt
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
+import com.studyink.sync.lan.StudentLocation
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -123,6 +124,8 @@ class ReaderWorkflowTest {
         assertFalse(submitState.canSubmitNow)
         assertTrue(submitState.copy(documentReady = true).canSubmitNow)
         assertFalse(submitState.copy(documentReady = true, storageAvailable = false).canSubmitNow)
+        assertFalse(submitState.copy(documentReady = true, pendingDocumentMutations = 1).canSubmitNow)
+        assertFalse(submitState.copy(documentReady = true, submissionInProgress = true).canSubmitNow)
         assertFalse(publishState.canPublishTeacherInkNow)
         assertTrue(publishState.copy(documentReady = true).canPublishTeacherInkNow)
         assertFalse(
@@ -167,6 +170,7 @@ class ReaderWorkflowTest {
             pageNumber = 3,
             role = ReaderRole.TEACHER_PHONE,
             workflow = ReaderWorkflow.LIVE_MONITOR,
+            isFollowingStudent = true,
             capabilities = ReaderCapabilities.forSession(
                 ReaderRole.TEACHER_PHONE,
                 ReaderWorkflow.LIVE_MONITOR,
@@ -179,6 +183,10 @@ class ReaderWorkflowTest {
         assertTrue(live.shouldFollowRemoteStudentPage("book-a", 3, 2))
         assertFalse(live.shouldFollowRemoteStudentPage("book-b", 4, 1))
         assertFalse(
+            live.copy(isFollowingStudent = false)
+                .shouldFollowRemoteStudentPage("book-a", 4, 1)
+        )
+        assertFalse(
             live.copy(
                 workflow = ReaderWorkflow.REVIEW,
                 capabilities = ReaderCapabilities.forSession(
@@ -187,6 +195,48 @@ class ReaderWorkflowTest {
                     attemptNo = 1,
                 ),
             ).shouldFollowRemoteStudentPage("book-a", 4, 1)
+        )
+    }
+
+    @Test
+    fun liveMonitorUsesTheStickyPageAndAttemptOnlyWhileFollowing() {
+        val sticky = StudentLocation(
+            bookId = "book-a",
+            pageNumber = 7,
+            attemptNo = 4,
+            revision = 9L,
+        )
+
+        assertEquals(
+            LiveMonitorTarget(pageNumber = 7, attemptNo = 4),
+            resolveLiveMonitorTarget(
+                requestedPageNumber = 2,
+                liveStudentAttemptNo = 3,
+                stickyStudentLocation = sticky,
+                followRemoteStudent = true,
+            ),
+        )
+        assertEquals(
+            LiveMonitorTarget(pageNumber = 2, attemptNo = null),
+            resolveLiveMonitorTarget(
+                requestedPageNumber = 2,
+                liveStudentAttemptNo = 3,
+                stickyStudentLocation = sticky,
+                followRemoteStudent = false,
+            ),
+        )
+    }
+
+    @Test
+    fun liveMonitorCanStartFollowingBeforeAStudentCursorArrives() {
+        assertEquals(
+            LiveMonitorTarget(pageNumber = 2, attemptNo = 3),
+            resolveLiveMonitorTarget(
+                requestedPageNumber = 2,
+                liveStudentAttemptNo = 3,
+                stickyStudentLocation = null,
+                followRemoteStudent = true,
+            ),
         )
     }
 
@@ -420,4 +470,46 @@ class ReaderWorkflowTest {
         assets = strokes.associateBy { it.id },
         activeStrokeIds = strokes.map { it.id }.toSet(),
     )
+
+    @Test
+    fun liveMonitorOpensThePickedSubmissionInsteadOfTheNewestOne() {
+        val submitted = (1..5).map { no ->
+            Attempt(bookId = "book", pageNumber = 2, attemptNo = no, locked = true, lockedAtEpochMillis = 100L + no)
+        }
+
+        // Ranking live evidence above the pick is what made every submission but the newest
+        // unreachable from the teacher's attempt stack.
+        assertEquals(
+            3,
+            resolveReaderAttemptNo(
+                workflow = ReaderWorkflow.LIVE_MONITOR,
+                selectedAttemptNo = 3,
+                attempts = submitted,
+                observedStudentAttemptNos = setOf(5),
+                liveStudentAttemptNo = 5,
+            ),
+        )
+        // With nothing picked the view still tracks the student's current attempt.
+        assertEquals(
+            5,
+            resolveReaderAttemptNo(
+                workflow = ReaderWorkflow.LIVE_MONITOR,
+                selectedAttemptNo = null,
+                attempts = submitted,
+                observedStudentAttemptNos = setOf(5),
+                liveStudentAttemptNo = 5,
+            ),
+        )
+        // A pick that names an attempt this page does not have is ignored.
+        assertEquals(
+            5,
+            resolveReaderAttemptNo(
+                workflow = ReaderWorkflow.LIVE_MONITOR,
+                selectedAttemptNo = 9,
+                attempts = submitted,
+                observedStudentAttemptNos = setOf(5),
+                liveStudentAttemptNo = 5,
+            ),
+        )
+    }
 }

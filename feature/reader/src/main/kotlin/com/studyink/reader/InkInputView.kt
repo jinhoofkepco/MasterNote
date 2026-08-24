@@ -24,8 +24,17 @@ class InkInputView(context: Context) : View(context) {
     var penOpacity: Float = 1f
     var onStroke: (StrokeAsset) -> Unit = {}
     var onStylusContact: () -> Unit = {}
+    /**
+     * Contact activity for the lightweight study-idle monitor. This is emitted only while a pen,
+     * highlighter, or permitted eraser gesture is actually touching the page, and is throttled in
+     * this view so high-frequency MotionEvents never spill into the rest of the app.
+     */
+    var onWorkActivity: () -> Unit = {}
     var onEraserPreview: (EraserPreview?) -> Unit = {}
-    var onErase: (Int, List<PagePoint>, Float, Boolean) -> Unit = { _, _, _, _ -> }
+    /** Evaluated before an eraser gesture captures the pointer. */
+    var canStartErase: (page: Int) -> Boolean = { true }
+    /** Emitted exactly once on ACTION_UP. Actual erase work must not run during DOWN/MOVE. */
+    var onErase: (EraserGesture) -> Unit = {}
     var onGradeTap: (Int, PagePoint, Int, Float, Float) -> Unit = { _, _, _, _, _ -> }
     var onGradeLongPress: (Int, PagePoint, Float, Float) -> Unit = { _, _, _, _ -> }
     var findMarkAttempt: (Float, Float) -> Int? = { _, _ -> null }
@@ -41,6 +50,9 @@ class InkInputView(context: Context) : View(context) {
     private var activeTool = ReaderTool.PEN
     private var strokeWidthCanonical = 4f
     private var eraserRadiusCanonical = 18f
+    private var nextEraserGestureId = 0L
+    private var activeEraserGestureId = NO_ERASER_GESTURE
+    private var eraseGestureBlocked = false
     private var pendingSingleTap: Runnable? = null
     private var lastTapAtMillis = 0L
     private var lastTapViewX = 0f
@@ -56,6 +68,24 @@ class InkInputView(context: Context) : View(context) {
     private var markHistoryGroupId: String? = null
     private var markHistoryLastX = 0f
     private var draggingMarkHistory = false
+    private var lastWorkActivityEventTime = Long.MIN_VALUE
+
+    val hasActiveGesture: Boolean
+        get() = currentPointer >= 0
+
+    val hasActiveEraserGesture: Boolean
+        get() = currentPointer >= 0 && activeTool.isEraser()
+
+    /**
+     * Abandons an in-flight eraser corridor without emitting [onErase]. Page/attempt changes and
+     * Activity focus loss call this so an old path can never be committed after the target moved.
+     */
+    fun cancelActiveEraserGesture(): Boolean {
+        if (currentPointer < 0 || !activeTool.isEraser()) return false
+        if (activeEraserGestureId != NO_ERASER_GESTURE) onEraserPreview(null)
+        reset()
+        return true
+    }
 
     init {
         setBackgroundColor(Color.TRANSPARENT)
@@ -111,15 +141,22 @@ class InkInputView(context: Context) : View(context) {
     private fun start(event: MotionEvent): Boolean {
         val mapped = viewport.viewToCanonical(event.x, event.y) ?: return false
         if (mapped.pageNumber != viewport.activePage()) return false
+        val requestedTool = when {
+            event.getToolType(event.actionIndex) == MotionEvent.TOOL_TYPE_ERASER -> ReaderTool.PARTIAL_ERASER
+            tool == ReaderTool.PAN -> ReaderTool.PEN
+            else -> tool
+        }
         onStylusContact()
         parent.requestDisallowInterceptTouchEvent(true)
         requestUnbufferedDispatch(event)
         currentPage = mapped.pageNumber
         currentPointer = event.getPointerId(event.actionIndex)
-        activeTool = when {
-            event.getToolType(event.actionIndex) == MotionEvent.TOOL_TYPE_ERASER -> ReaderTool.PARTIAL_ERASER
-            tool == ReaderTool.PAN -> ReaderTool.PEN
-            else -> tool
+        activeTool = requestedTool
+        eraseGestureBlocked = activeTool.isEraser() && !canStartErase(mapped.pageNumber)
+        activeEraserGestureId = if (activeTool.isEraser() && !eraseGestureBlocked) {
+            newEraserGestureId()
+        } else {
+            NO_ERASER_GESTURE
         }
         downViewX = event.x
         downViewY = event.y
@@ -130,6 +167,7 @@ class InkInputView(context: Context) : View(context) {
         markedAttemptInteraction = false
         currentPoints.clear()
         currentPoints += mapped.point.copy(pressure = event.pressure.coerceIn(0f, 1f))
+        if (eraseGestureBlocked) return true
         if (activeTool == ReaderTool.GRADE) {
             markHistoryGroupId = findScrollableMarkGroup(event.x, event.y)
             markHistoryLastX = event.x
@@ -161,13 +199,15 @@ class InkInputView(context: Context) : View(context) {
             )
             wetInkView.startStroke(event, currentPointer, brush, Matrix(), Matrix())
         } else {
-            onEraserPreview(EraserPreview(currentPage, currentPoints.toList(), eraserRadiusCanonical))
+            publishEraserPreview()
         }
+        publishWorkActivity(event.eventTime)
         return true
     }
 
     private fun move(event: MotionEvent): Boolean {
         if (currentPointer < 0) return false
+        if (eraseGestureBlocked) return true
         if (activeTool == ReaderTool.GRADE) {
             val pointerIndex = event.findPointerIndex(currentPointer)
             if (pointerIndex >= 0) {
@@ -203,17 +243,34 @@ class InkInputView(context: Context) : View(context) {
             }
             return true
         }
+        publishWorkActivity(event.eventTime)
         collectHistory(event)
         if (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) {
             wetInkView.addToStroke(event, currentPointer, null)
         } else {
-            onEraserPreview(EraserPreview(currentPage, currentPoints.toList(), eraserRadiusCanonical))
+            publishEraserPreview()
         }
         return true
     }
 
+    private fun publishWorkActivity(eventTime: Long) {
+        if (activeTool != ReaderTool.PEN && activeTool != ReaderTool.HIGHLIGHTER && !activeTool.isEraser()) {
+            return
+        }
+        if (
+            lastWorkActivityEventTime != Long.MIN_VALUE &&
+            eventTime - lastWorkActivityEventTime < WORK_ACTIVITY_THROTTLE_MILLIS
+        ) return
+        lastWorkActivityEventTime = eventTime
+        onWorkActivity()
+    }
+
     private fun finish(event: MotionEvent): Boolean {
         if (currentPointer < 0) return false
+        if (eraseGestureBlocked) {
+            reset()
+            return true
+        }
         if (activeTool == ReaderTool.GRADE) {
             cancelGradeLongPress()
             updateTravel(event.x, event.y)
@@ -251,7 +308,17 @@ class InkInputView(context: Context) : View(context) {
                 )
             }
         } else {
-            onErase(currentPage, currentPoints.toList(), eraserRadiusCanonical, activeTool == ReaderTool.WHOLE_ERASER)
+            val gesture = EraserGesture(
+                id = activeEraserGestureId,
+                page = currentPage,
+                path = currentPoints.toList(),
+                radius = eraserRadiusCanonical,
+                whole = activeTool == ReaderTool.WHOLE_ERASER,
+            )
+            // Keep the completed corridor visible until the owner reports that the asynchronous
+            // erase has completed. reset() deliberately clears input state only.
+            publishEraserPreview()
+            onErase(gesture)
         }
         reset()
         return true
@@ -285,7 +352,7 @@ class InkInputView(context: Context) : View(context) {
         if (currentPointer >= 0 && (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER)) {
             runCatching { wetInkView.cancelStroke(event, currentPointer) }
         }
-        onEraserPreview(null)
+        if (activeEraserGestureId != NO_ERASER_GESTURE) onEraserPreview(null)
         reset()
     }
 
@@ -312,6 +379,23 @@ class InkInputView(context: Context) : View(context) {
         }
     }
 
+    private fun publishEraserPreview() {
+        if (activeEraserGestureId == NO_ERASER_GESTURE || currentPage < 0) return
+        onEraserPreview(
+            EraserPreview(
+                gestureId = activeEraserGestureId,
+                pageNumber = currentPage,
+                path = currentPoints.toList(),
+                radius = eraserRadiusCanonical,
+            )
+        )
+    }
+
+    private fun newEraserGestureId(): Long {
+        nextEraserGestureId = if (nextEraserGestureId == Long.MAX_VALUE) 1L else nextEraserGestureId + 1L
+        return nextEraserGestureId
+    }
+
     private fun reset() {
         cancelGradeLongPress()
         markHistoryGroupId = null
@@ -322,6 +406,8 @@ class InkInputView(context: Context) : View(context) {
         longPressTriggered = false
         currentPointer = -1
         currentPage = -1
+        activeEraserGestureId = NO_ERASER_GESTURE
+        eraseGestureBlocked = false
         currentPoints.clear()
         parent.requestDisallowInterceptTouchEvent(false)
     }
@@ -331,6 +417,9 @@ class InkInputView(context: Context) : View(context) {
         val type = getToolType(index)
         return type == MotionEvent.TOOL_TYPE_STYLUS || type == MotionEvent.TOOL_TYPE_ERASER
     }
+
+    private fun ReaderTool.isEraser(): Boolean =
+        this == ReaderTool.PARTIAL_ERASER || this == ReaderTool.WHOLE_ERASER
 
     private fun penColorWithOpacity(): Int {
         val alpha = (penOpacity.coerceIn(0.15f, 1f) * 255f).toInt().coerceIn(0, 255)
@@ -352,5 +441,7 @@ class InkInputView(context: Context) : View(context) {
 
     private companion object {
         const val LONG_PRESS_MILLIS = 550L
+        const val NO_ERASER_GESTURE = 0L
+        const val WORK_ACTIVITY_THROTTLE_MILLIS = 500L
     }
 }

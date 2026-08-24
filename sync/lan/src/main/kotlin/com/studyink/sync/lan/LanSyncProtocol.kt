@@ -111,8 +111,12 @@ data class StudentLocation(
     }
 }
 
+/** What the local device can currently say about its paired peer. */
+enum class LanConnectionState { IDLE, CONNECTING, CONNECTED, DISCONNECTED }
+
 object LanSyncBus {
     interface Listener {
+        fun onConnectionStateChanged(bookId: String, state: LanConnectionState) {}
         fun onLocalOperation(bookId: String, pageNumber: Int) {}
         fun onPageChanged(bookId: String, pageNumber: Int, revision: Long) {}
         fun onPagePresenceChanged(presence: PagePresence) {
@@ -132,6 +136,8 @@ object LanSyncBus {
     private val listeners = linkedSetOf<Listener>()
     private val localPagePresences = mutableMapOf<String, PagePresence>()
     private val remoteStudentLocations = mutableMapOf<String, StudentLocation>()
+    private val connectionStates = mutableMapOf<String, LanConnectionState>()
+    private val pairingUris = mutableMapOf<String, String>()
 
     fun addListener(listener: Listener) {
         synchronized(this) { listeners += listener }
@@ -147,6 +153,33 @@ object LanSyncBus {
 
     fun remoteStudentLocation(bookId: String): StudentLocation? = synchronized(this) {
         remoteStudentLocations[bookId]
+    }
+
+    /** Retained so a reader opened after the session started still shows the right state. */
+    fun connectionState(bookId: String): LanConnectionState = synchronized(this) {
+        connectionStates[bookId] ?: LanConnectionState.IDLE
+    }
+
+    /**
+     * The pairing code of the session already running for this book, if any. Retained so the QR can
+     * be shown on demand without restarting a session that a peer may already be using.
+     */
+    fun pairingUri(bookId: String): String? = synchronized(this) { pairingUris[bookId] }
+
+    internal fun connectionStateChanged(bookId: String, state: LanConnectionState) {
+        if (bookId.isBlank()) return
+        val snapshot = synchronized(this) {
+            if (connectionStates[bookId] == state) return
+            connectionStates[bookId] = state
+            listeners.toList()
+        }
+        snapshot.forEach { it.onConnectionStateChanged(bookId, state) }
+    }
+
+    internal fun clearConnectionState(bookId: String) {
+        if (bookId.isBlank()) return
+        synchronized(this) { pairingUris.remove(bookId) }
+        connectionStateChanged(bookId, LanConnectionState.IDLE)
     }
 
     internal fun clearRemoteStudentLocation(bookId: String) {
@@ -208,8 +241,12 @@ object LanSyncBus {
         snapshot.forEach { it.onRemoteStudentLocationChanged(location) }
     }
 
-    internal fun pairingReady(bookId: String, pairingUri: String) = listenerSnapshot().forEach {
-        it.onPairingReady(bookId, pairingUri)
+    internal fun pairingReady(bookId: String, pairingUri: String) {
+        val snapshot = synchronized(this) {
+            pairingUris[bookId] = pairingUri
+            listeners.toList()
+        }
+        snapshot.forEach { it.onPairingReady(bookId, pairingUri) }
     }
 
     internal fun sessionIssue(message: String) = listenerSnapshot().forEach {

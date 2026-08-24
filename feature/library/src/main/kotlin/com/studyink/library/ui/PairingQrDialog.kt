@@ -2,10 +2,13 @@ package com.studyink.library.ui
 
 import android.graphics.Bitmap
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -18,7 +21,12 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 
 @Composable
-internal fun PairingQrDialog(uri: String, onDismiss: () -> Unit) {
+internal fun PairingQrDialog(
+    uri: String,
+    autoStart: Boolean,
+    onAutoStartChange: (Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
     val bitmap = remember(uri) { createPairingQr(uri, 720) }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -31,6 +39,16 @@ internal fun PairingQrDialog(uri: String, onDismiss: () -> Unit) {
                     modifier = Modifier.fillMaxWidth().padding(12.dp),
                 )
                 Text("선생 폰에서 ‘QR 연결’을 누르고 이 코드를 비춰 주세요.")
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 12.dp)
+                        .clickable { onAutoStartChange(!autoStart) },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(checked = autoStart, onCheckedChange = onAutoStartChange)
+                    Text("교재를 열면 자동으로 연결 시작")
+                }
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("닫기") } },

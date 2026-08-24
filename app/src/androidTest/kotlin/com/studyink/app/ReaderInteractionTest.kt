@@ -26,6 +26,8 @@ import com.studyink.core.model.StrokeTool
 import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.library.data.LibraryRepository
 import com.studyink.reader.DryInkView
+import com.studyink.reader.EraserGesture
+import com.studyink.reader.EraserPreview
 import com.studyink.reader.InkInputView
 import com.studyink.reader.ReaderActivity
 import com.studyink.reader.ReaderDebugSessionStore
@@ -35,7 +37,9 @@ import com.studyink.reader.ReaderWorkflow
 import com.studyink.sync.lan.PairingPayload
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -44,6 +48,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.hypot
 
 @RunWith(AndroidJUnit4::class)
 class ReaderInteractionTest {
@@ -87,7 +92,130 @@ class ReaderInteractionTest {
         assertTrue(device.hasObject(By.desc("형광펜")))
         assertTrue(device.hasObject(By.desc("지우개")))
         assertTrue(device.hasObject(By.desc("되돌리기")))
-        assertTrue(device.hasObject(By.desc("선생 모드")))
+        assertFalse(device.hasObject(By.desc("선생 모드")))
+        assertFalse(device.hasObject(By.desc("페이지 맞춤")))
+    }
+
+    @Test
+    fun penCenterOpensSettingsAndBackReturnsToTheSameFan() {
+        clickStylusSideButton()
+        assertTrue(device.wait(Until.hasObject(By.desc("펜")), 3_000))
+
+        val pen = device.findObject(By.desc("펜")).visibleBounds
+        injectStylusTapOnScreen(pen.centerX().toFloat(), pen.centerY().toFloat())
+        assertTrue(device.wait(Until.hasObject(By.desc("선 굵기 3.2")), 3_000))
+        assertTrue(device.hasObject(By.desc("도구 메뉴로 돌아가기")))
+
+        val back = device.findObject(By.desc("도구 메뉴로 돌아가기")).visibleBounds
+        injectStylusTapOnScreen(back.centerX().toFloat(), back.centerY().toFloat())
+        assertTrue(device.wait(Until.hasObject(By.desc("색상 팔레트")), 3_000))
+    }
+
+    @Test
+    fun protrudingPenArtworkBeyondTheOldCircleOpensSettings() {
+        clickStylusSideButton()
+        assertTrue(device.wait(Until.hasObject(By.desc("펜")), 3_000))
+
+        val eraser = device.findObject(By.desc("지우개")).visibleBounds
+        val pen = device.findObject(By.desc("펜")).visibleBounds
+        val highlighter = device.findObject(By.desc("형광펜")).visibleBounds
+        val origin = circumcenter(
+            eraser.exactCenterX() to eraser.exactCenterY(),
+            pen.exactCenterX() to pen.exactCenterY(),
+            highlighter.exactCenterX() to highlighter.exactCenterY(),
+        )
+        val centerX = pen.exactCenterX()
+        val centerY = pen.exactCenterY()
+        val radius = hypot(centerX - origin.first, centerY - origin.second)
+        val directionX = (centerX - origin.first) / radius
+        val directionY = (centerY - origin.second) / radius
+
+        // The old circular hit target ends at 0.5 * width. 0.72 * width lands in the b..c
+        // protrusion corridor on both compact and expanded token sets.
+        val beyondOldCircle = pen.width() * 0.72f
+        injectStylusTapOnScreen(
+            centerX + directionX * beyondOldCircle,
+            centerY + directionY * beyondOldCircle,
+        )
+
+        assertTrue(
+            "돌출된 펜 그림(b..c)을 눌러도 굵기 메뉴가 열려야 합니다",
+            device.wait(Until.hasObject(By.desc("선 굵기 3.2")), 3_000),
+        )
+    }
+
+    @Test
+    fun stylusSideButtonTogglesTheFanMenuOnEveryOtherPress() {
+        // One press opens, the next closes, however many times it is repeated. This is dispatched
+        // as a press followed by a release because the menu only counts a press once the previous
+        // one has been let go - without that the single press that opens the menu closes it again.
+        repeat(2) { round ->
+            clickStylusSideButton()
+            assertTrue("round $round: menu did not open", device.wait(Until.hasObject(FAN_ONLY), 3_000))
+            clickStylusSideButton()
+            assertTrue("round $round: menu did not close", device.wait(Until.gone(FAN_ONLY), 3_000))
+        }
+    }
+
+    @Test
+    fun heldHoverAndExplicitPressFromOnePhysicalClickToggleOnlyOnce() {
+        val heldHover = motionEvent(
+            MotionEvent.ACTION_HOVER_MOVE,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            520f,
+            920f,
+            MotionEvent.BUTTON_STYLUS_PRIMARY,
+        )
+        scenario.onActivity { assertTrue(it.dispatchGenericMotionEvent(heldHover)) }
+        heldHover.recycle()
+        assertTrue(device.wait(Until.hasObject(FAN_ONLY), 3_000))
+
+        val duplicateExplicitPress = motionEvent(
+            MotionEvent.ACTION_BUTTON_PRESS,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            520f,
+            920f,
+            MotionEvent.BUTTON_STYLUS_PRIMARY,
+        )
+        scenario.onActivity { assertTrue(it.dispatchGenericMotionEvent(duplicateExplicitPress)) }
+        duplicateExplicitPress.recycle()
+        assertTrue("the duplicate event must not close the menu", device.hasObject(FAN_ONLY))
+
+        val release = motionEvent(
+            MotionEvent.ACTION_BUTTON_RELEASE,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            520f,
+            920f,
+        )
+        scenario.onActivity { assertTrue(it.dispatchGenericMotionEvent(release)) }
+        release.recycle()
+        clickStylusSideButton()
+        assertTrue(device.wait(Until.gone(FAN_ONLY), 3_000))
+    }
+
+    @Test
+    fun contactAtThePhysicalPenAnchorClosesMenuAndKeepsTheFirstStroke() {
+        clickStylusSideButton()
+        assertTrue(device.wait(Until.hasObject(FAN_ONLY), 3_000))
+        val before = revision()
+
+        // The physical pen coordinate is deliberately inside radius a (at 0.66a), not at the fan
+        // centre and not inside the menu-owned annulus. That same DOWN must close the menu and be
+        // delivered to InkInputView instead of disappearing with the overlay.
+        dispatchStroke(
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            520f,
+            920f,
+            560f,
+            955f,
+        )
+
+        assertTrue(device.wait(Until.gone(FAN_ONLY), 3_000))
+        assertTrue(waitForRevisionAfter(before))
     }
 
     @Test
@@ -103,7 +231,180 @@ class ReaderInteractionTest {
         scenario.onActivity { assertTrue(it.dispatchGenericMotionEvent(event)) }
         event.recycle()
         assertTrue(device.wait(Until.hasObject(By.desc("채점")), 3_000))
-        assertTrue(device.hasObject(By.desc("학생 모드")))
+        assertFalse(device.hasObject(By.desc("학생 모드")))
+        assertFalse(device.hasObject(By.desc("페이지 맞춤")))
+    }
+
+    @Test
+    fun eraserPublishesOnlyPreviewUntilPenUpThenEmitsOneOperation() {
+        val previews = mutableListOf<EraserPreview?>()
+        val operations = mutableListOf<EraserGesture>()
+        scenario.onActivity { activity ->
+            activity.findInkInputView().apply {
+                tool = ReaderTool.PARTIAL_ERASER
+                canStartErase = { true }
+                onEraserPreview = previews::add
+                onErase = operations::add
+            }
+        }
+
+        val downAt = SystemClock.uptimeMillis()
+        val down = motionEvent(
+            MotionEvent.ACTION_DOWN,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            360f,
+            820f,
+            eventTime = downAt,
+        )
+        val move = motionEvent(
+            MotionEvent.ACTION_MOVE,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            520f,
+            870f,
+            eventTime = downAt + 20,
+        )
+        scenario.onActivity { activity ->
+            activity.dispatchTouchEvent(down)
+            assertTrue("DOWN should publish the painted eraser corridor", previews.filterNotNull().isNotEmpty())
+            assertTrue("DOWN must not mutate annotations", operations.isEmpty())
+            activity.dispatchTouchEvent(move)
+            assertTrue("MOVE must not mutate annotations", operations.isEmpty())
+        }
+        down.recycle()
+        move.recycle()
+
+        val previewCountBeforeUp = previews.filterNotNull().size
+        val up = motionEvent(
+            MotionEvent.ACTION_UP,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            520f,
+            870f,
+            eventTime = downAt + 40,
+        )
+        scenario.onActivity { activity -> activity.dispatchTouchEvent(up) }
+        up.recycle()
+
+        assertEquals(1, operations.size)
+        assertTrue(previews.filterNotNull().size > previewCountBeforeUp)
+        val gesture = operations.single()
+        assertTrue(gesture.id > 0L)
+        assertEquals(gesture.id, previews.filterNotNull().last().gestureId)
+        assertEquals(gesture.page, previews.filterNotNull().last().pageNumber)
+    }
+
+    @Test
+    fun blockedEraserConsumesTheStylusStreamWithoutPreviewOrOperation() {
+        val previews = mutableListOf<EraserPreview?>()
+        val operations = mutableListOf<EraserGesture>()
+        scenario.onActivity { activity ->
+            activity.findInkInputView().apply {
+                tool = ReaderTool.WHOLE_ERASER
+                canStartErase = { false }
+                onEraserPreview = previews::add
+                onErase = operations::add
+            }
+        }
+
+        dispatchStroke(
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            360f,
+            820f,
+            520f,
+            870f,
+        )
+
+        assertTrue(previews.isEmpty())
+        assertTrue(operations.isEmpty())
+    }
+
+    @Test
+    fun interruptedEraserClearsItsCorridorWithoutCommitting() {
+        val previews = mutableListOf<EraserPreview?>()
+        val operations = mutableListOf<EraserGesture>()
+        val downAt = SystemClock.uptimeMillis()
+        val down = motionEvent(
+            MotionEvent.ACTION_DOWN,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            360f,
+            820f,
+            eventTime = downAt,
+        )
+        scenario.onActivity { activity ->
+            activity.findInkInputView().apply {
+                tool = ReaderTool.PARTIAL_ERASER
+                canStartErase = { true }
+                onEraserPreview = previews::add
+                onErase = operations::add
+            }
+            activity.dispatchTouchEvent(down)
+            assertTrue(previews.filterNotNull().isNotEmpty())
+            assertTrue(activity.findInkInputView().cancelActiveEraserGesture())
+        }
+        down.recycle()
+
+        val up = motionEvent(
+            MotionEvent.ACTION_UP,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            520f,
+            870f,
+            eventTime = downAt + 40,
+        )
+        scenario.onActivity { activity -> activity.dispatchTouchEvent(up) }
+        up.recycle()
+
+        assertNull(previews.last())
+        assertTrue(operations.isEmpty())
+    }
+
+    @Test
+    fun lateCompletionForOlderEraserGestureCannotClearNewerPreview() {
+        var visiblePreview: EraserPreview? = null
+        val pendingCompletions = mutableListOf<() -> Unit>()
+        val completedGestures = mutableListOf<EraserGesture>()
+        scenario.onActivity { activity ->
+            activity.findInkInputView().apply {
+                tool = ReaderTool.PARTIAL_ERASER
+                canStartErase = { true }
+                onEraserPreview = { preview -> if (preview != null) visiblePreview = preview }
+                onErase = { gesture ->
+                    completedGestures += gesture
+                    pendingCompletions += {
+                        if (visiblePreview?.gestureId == gesture.id) visiblePreview = null
+                    }
+                }
+            }
+        }
+
+        dispatchStroke(
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            360f,
+            820f,
+            440f,
+            850f,
+        )
+        dispatchStroke(
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            460f,
+            840f,
+            540f,
+            880f,
+        )
+
+        assertEquals(2, completedGestures.size)
+        assertTrue(completedGestures[0].id != completedGestures[1].id)
+        assertEquals(completedGestures[1].id, visiblePreview?.gestureId)
+        pendingCompletions[0]()
+        assertEquals(completedGestures[1].id, visiblePreview?.gestureId)
+        pendingCompletions[1]()
+        assertNull(visiblePreview)
     }
 
     @Test
@@ -134,6 +435,34 @@ class ReaderInteractionTest {
         assertTrue(layout, contextButton.right <= submit.left)
         assertTrue(layout, submit.right <= close.left)
         assertTrue(layout, close.right <= next.left)
+    }
+
+    @Test
+    fun liveMonitorManualPageNavigationPausesAndCanResumeStudentFollow() {
+        scenario.close()
+        scenario = ActivityScenario.launch(
+            ReaderActivity.intent(
+                context = context,
+                bookId = bookId,
+                pageNumber = 0,
+                role = ReaderRole.TEACHER_PHONE,
+                workflow = ReaderWorkflow.LIVE_MONITOR,
+            )
+        )
+        waitForBook()
+
+        val menu = device.findObject(By.desc("상단 메뉴 열기")).visibleBounds
+        injectStylusTapOnScreen(menu.centerX().toFloat(), menu.centerY().toFloat())
+        assertTrue(device.wait(Until.hasObject(By.desc("학생 기기 연결 끊김")), 3_000))
+
+        val next = device.findObject(By.desc("다음 페이지")).visibleBounds
+        injectStylusTapOnScreen(next.centerX().toFloat(), next.centerY().toFloat())
+        assertTrue(device.wait(Until.hasObject(By.desc("학생 화면 다시 따라가기")), 3_000))
+        scenario.onActivity { assertEquals(1, it.findDryInkView().activePage) }
+
+        val resume = device.findObject(By.desc("학생 화면 다시 따라가기")).visibleBounds
+        injectStylusTapOnScreen(resume.centerX().toFloat(), resume.centerY().toFloat())
+        assertTrue(device.wait(Until.hasObject(By.desc("학생 기기 연결 끊김")), 3_000))
     }
 
     @Test
@@ -551,6 +880,24 @@ class ReaderInteractionTest {
         up.recycle()
     }
 
+    private fun circumcenter(
+        first: Pair<Float, Float>,
+        second: Pair<Float, Float>,
+        third: Pair<Float, Float>,
+    ): Pair<Float, Float> {
+        val (ax, ay) = first
+        val (bx, by) = second
+        val (cx, cy) = third
+        val determinant = 2f * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+        val aSquared = ax * ax + ay * ay
+        val bSquared = bx * bx + by * by
+        val cSquared = cx * cx + cy * cy
+        return ((aSquared * (by - cy) + bSquared * (cy - ay) + cSquared * (ay - by)) /
+            determinant) to
+            ((aSquared * (cx - bx) + bSquared * (ax - cx) + cSquared * (bx - ax)) /
+                determinant)
+    }
+
     private fun dispatchDownInsideUpOutside(x: Float, y: Float) {
         val down = SystemClock.uptimeMillis()
         val events = listOf(
@@ -560,6 +907,19 @@ class ReaderInteractionTest {
         )
         scenario.onActivity { activity -> events.forEach(activity::dispatchTouchEvent) }
         events.forEach(MotionEvent::recycle)
+    }
+
+    private fun clickStylusSideButton() {
+        listOf(
+            MotionEvent.ACTION_BUTTON_PRESS to MotionEvent.BUTTON_STYLUS_PRIMARY,
+            MotionEvent.ACTION_BUTTON_RELEASE to 0,
+        ).forEach { (action, buttons) ->
+            val event = motionEvent(
+                action, InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 520f, 920f, buttons,
+            )
+            scenario.onActivity { it.dispatchGenericMotionEvent(event) }
+            event.recycle()
+        }
     }
 
     private fun motionEvent(
@@ -579,6 +939,11 @@ class ReaderInteractionTest {
             eventTime, eventTime, action, 1, properties, coordinates, 0, buttons,
             1f, 1f, 0, 0, source, 0,
         )
+    }
+
+    private companion object {
+        /** Present only while the radial menu is showing, so it reads as "the fan is open". */
+        private val FAN_ONLY = By.desc("형광펜")
     }
 
     private fun ReaderActivity.findDryInkView(): DryInkView {

@@ -60,14 +60,20 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
+import com.studyink.backup.storage.BackupInspection
+import com.studyink.backup.storage.BackupResult
+import com.studyink.backup.storage.RestoreResult
 import com.studyink.core.model.Book
 import com.studyink.core.model.MarkColor
+import com.studyink.core.model.MasterNoteDataCommitBus
+import com.studyink.monitor.core.RemoteMonitorMaintenanceBus
 import com.studyink.core.model.Student
 import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.core.model.resultBundleGrid
@@ -76,6 +82,7 @@ import com.studyink.library.data.AttemptProgressSummary
 import com.studyink.library.data.AttemptGradeSummary
 import com.studyink.library.data.LibraryContext
 import com.studyink.library.data.LibraryPerspective
+import com.studyink.sync.lan.LanConnectionState
 import com.studyink.library.data.LibraryRepository
 import com.studyink.library.data.LibraryState
 import com.studyink.library.data.PageGradeSnapshot
@@ -86,14 +93,20 @@ import com.studyink.reader.ReaderActivity
 import com.studyink.reader.ReaderDebugSessionStore
 import com.studyink.reader.ReaderRole
 import com.studyink.reader.ReaderWorkflow
+import com.studyink.monitor.telegram.RemoteMonitorGateway
+import com.studyink.monitor.telegram.RemoteReviewPeerStatus
 import com.studyink.sync.lan.LanSyncService
 import com.studyink.sync.lan.LanSyncBus
 import com.studyink.sync.lan.PairingPayload
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
+import java.text.DateFormat
+import java.util.Date
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -101,6 +114,14 @@ import kotlin.math.sin
 
 private const val STATE_SELECTED_BOOK_ID = "library.selectedBookId"
 private const val STATE_PERSPECTIVE = "library.perspective"
+private const val KEY_AUTO_START_STUDENT_SYNC = "autoStartStudentSync"
+private const val RESTORE_SYNC_STOP_TIMEOUT_MILLIS = 10_000L
+private const val RESTORE_COMMIT_QUIET_MILLIS = 750L
+
+private data class RestoreBackupCandidate(
+    val uri: Uri,
+    val inspection: BackupInspection,
+)
 
 class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
     private val repository by lazy { LibraryRepository.get(this) }
@@ -115,6 +136,17 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
     private var pendingSyncStart: (() -> Unit)? = null
     private var pairingUri by mutableStateOf<String?>(null)
     private var qrTargetBookId: String? = null
+    private var showPairingQrOnReady = false
+    private var autoStartStudentSync by mutableStateOf(true)
+    private var backupStatus by mutableStateOf(MasterNoteBackupStatus(dirty = true))
+    private var inspectingBackup by mutableStateOf(false)
+    private var restoreBackupCandidate by mutableStateOf<RestoreBackupCandidate?>(null)
+    private var restoreWorkflowRunning by mutableStateOf(false)
+    private var handledRestoreRevision = 0L
+    private var backupStatusSubscription: AutoCloseable? = null
+    private val studentSyncPreferences by lazy {
+        getSharedPreferences("masternote-student-sync", MODE_PRIVATE)
+    }
 
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         pendingSyncStart?.invoke()
@@ -175,9 +207,28 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
         }
     }
 
+    private val selectBackupToRestore = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri == null) return@registerForActivityResult
+        inspectingBackup = true
+        lifecycleScope.launch {
+            runCatching { MasterNoteBackupCoordinator.inspect(uri) }
+                .onSuccess { inspection ->
+                    restoreBackupCandidate = RestoreBackupCandidate(uri, inspection)
+                }
+                .onFailure { error ->
+                    errorMessage = error.message ?: "선택한 백업 파일을 확인하지 못했습니다."
+                }
+            inspectingBackup = false
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        MasterNoteBackupCoordinator.initialize(applicationContext)
+        backupStatus = MasterNoteBackupCoordinator.currentStatus()
+        handledRestoreRevision = backupStatus.restoreRevision
         state = repository.state
+        autoStartStudentSync = studentSyncPreferences.getBoolean(KEY_AUTO_START_STUDENT_SYNC, true)
         perspective = savedInstanceState?.getString(STATE_PERSPECTIVE)
             ?.let { saved -> runCatching { LibraryPerspective.valueOf(saved) }.getOrNull() }
             ?: LibraryPerspective.STUDENT
@@ -193,6 +244,8 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                         perspective = perspective,
                         progressRevision = progressRevision,
                         importing = importing,
+                        backupStatus = backupStatus,
+                        inspectingBackup = inspectingBackup,
                         progressForBook = { bookId ->
                             repository.pageProgressSummaries(
                                 LibraryContext(repository.state.selectedStudentId, perspective),
@@ -205,7 +258,20 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                             selectedBook = null
                         },
                         onImport = { importPdf.launch(arrayOf("application/pdf")) },
-                        onSelectBook = { selectedBook = it },
+                        onBackupNow = ::createBackupNow,
+                        onSelectBackup = {
+                            selectBackupToRestore.launch(
+                                arrayOf(
+                                    "application/zip",
+                                    "application/octet-stream",
+                                    "application/x-zip-compressed",
+                                )
+                            )
+                        },
+                        onSelectBook = { book ->
+                            selectedBook = book
+                            maybeAutoStartStudentSync(book)
+                        },
                         onSelectPerspective = { perspective = it },
                         onBackToBooks = { selectedBook = null },
                         onOpenPage = { book, page, selectedPerspective, expanded, attemptNo ->
@@ -240,6 +306,10 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                                     role = role,
                                     attemptNo = attemptNo,
                                     workflow = readerWorkflow,
+                                    // A page card is an explicit teacher navigation request. Keep
+                                    // LIVE sync active, but do not let the retained student cursor
+                                    // replace the page the teacher just chose.
+                                    followRemoteStudent = false,
                                 )
                             )
                         },
@@ -249,8 +319,17 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                             importAnswers.launch(arrayOf("application/json", "text/json", "text/plain"))
                         },
                         onStartStudentSync = { book ->
-                            pairingUri = null
-                            startSyncSession { LanSyncService.startStudent(this, book.id) }
+                            val running = LanSyncBus.pairingUri(book.id)
+                                ?.takeIf { LanSyncBus.connectionState(book.id) != LanConnectionState.IDLE }
+                            if (running != null) {
+                                // Usually already auto-started. Show that session's code rather than
+                                // restarting and dropping a teacher who may be connected to it.
+                                pairingUri = running
+                            } else {
+                                pairingUri = null
+                                showPairingQrOnReady = true
+                                startSyncSession { LanSyncService.startStudent(this, book.id) }
+                            }
                         },
                         onStartTeacherSync = { book ->
                             startSyncSession {
@@ -287,7 +366,12 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                         )
                     }
                     pairingUri?.let { uri ->
-                        PairingQrDialog(uri = uri, onDismiss = { pairingUri = null })
+                        PairingQrDialog(
+                            uri = uri,
+                            autoStart = autoStartStudentSync,
+                            onAutoStartChange = ::updateAutoStartStudentSync,
+                            onDismiss = { pairingUri = null },
+                        )
                     }
                     renameTarget?.let { book ->
                         RenameBookDialog(
@@ -298,6 +382,31 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                                 state = repository.state
                                 selectedBook = repository.book(book.id)
                                 renameTarget = null
+                            },
+                        )
+                    }
+                    restoreBackupCandidate?.let { candidate ->
+                        RestoreBackupDialog(
+                            candidate = candidate,
+                            onDismiss = { restoreBackupCandidate = null },
+                            onConfirm = { restoreBackup(candidate) },
+                        )
+                    }
+                    if (restoreWorkflowRunning || backupStatus.isRestoring) {
+                        AlertDialog(
+                            onDismissRequest = {},
+                            title = { Text("안전하게 복원하는 중") },
+                            text = {
+                                Text(
+                                    when {
+                                        backupStatus.isRestoring -> "검증한 백업 데이터로 교체하고 있습니다."
+                                        backupStatus.isBackingUp -> "현재 필기와 문제집을 먼저 별도 보관소에 백업하고 있습니다."
+                                        else -> "실시간 연결을 안전하게 종료하고 있습니다."
+                                    }
+                                )
+                            },
+                            confirmButton = {
+                                TextButton(onClick = {}, enabled = false) { Text("작업 중") }
                             },
                         )
                     }
@@ -359,18 +468,174 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
 
     override fun onStart() {
         super.onStart()
+        if (RemoteMonitorGateway.get(this).preferences().monitoringEnabled) {
+            startForegroundService(
+                Intent().setClassName(packageName, "com.studyink.app.RemoteMonitorService"),
+            )
+        }
+        backupStatusSubscription?.close()
+        backupStatusSubscription = MasterNoteBackupCoordinator.addListener(::onBackupStatusChanged)
         LanSyncBus.addListener(this)
     }
 
     override fun onStop() {
+        backupStatusSubscription?.close()
+        backupStatusSubscription = null
         LanSyncBus.removeListener(this)
         super.onStop()
     }
 
+    private fun createBackupNow() {
+        if (backupStatus.busy || inspectingBackup) return
+        lifecycleScope.launch {
+            when (val result = MasterNoteBackupCoordinator.createManualBackup()) {
+                is BackupResult.Success -> Unit
+                is BackupResult.Failure -> {
+                    errorMessage = result.message
+                }
+            }
+        }
+    }
+
+    private fun onBackupStatusChanged(updated: MasterNoteBackupStatus) {
+        backupStatus = updated
+        if (updated.restoreRevision <= handledRestoreRevision) return
+        handledRestoreRevision = updated.restoreRevision
+        restoreWorkflowRunning = false
+        selectedBook = null
+        // This also covers rotation/Activity replacement while the Application-owned restore task
+        // was running. Every currently visible LibraryActivity drops any pre-swap repository state.
+        recreate()
+    }
+
+    private fun restoreBackup(candidate: RestoreBackupCandidate) {
+        if (backupStatus.busy || inspectingBackup) return
+        restoreBackupCandidate = null
+        restoreWorkflowRunning = true
+        lifecycleScope.launch {
+            if (!stopLanSyncAndAwaitQuiet()) {
+                restoreWorkflowRunning = false
+                errorMessage = "실시간 연결이 완전히 종료되지 않아 복원을 중단했습니다. 현재 데이터는 변경하지 않았습니다."
+                return@launch
+            }
+            try {
+                // A restore is destructive. Do not touch the live data unless the current installation
+                // has first been published to the uninstall-safe Downloads folder. Protecting the
+                // selected URI also prevents retention cleanup from deleting an older chosen backup.
+                when (val safetyBackup = MasterNoteBackupCoordinator.createManualBackup(candidate.uri)) {
+                    is BackupResult.Failure -> {
+                        restoreWorkflowRunning = false
+                        errorMessage = "복원 전 안전 백업에 실패했습니다. 현재 데이터는 변경하지 않았습니다.\n${safetyBackup.message}"
+                        return@launch
+                    }
+
+                    is BackupResult.Success -> Unit
+                }
+
+                // A /화면 request freezes a live book/page identity. Once the safety backup has
+                // succeeded, discard it before swapping roots so it cannot be reinterpreted
+                // against unrelated restored content with coincidentally identical identifiers.
+                val remoteMonitor = RemoteMonitorGateway.get(this@LibraryActivity)
+                remoteMonitor.pendingScreenRequests().forEach { request ->
+                    remoteMonitor.acknowledgeScreenRequest(request.updateId)
+                }
+                when (val result = MasterNoteBackupCoordinator.restoreReplace(candidate.uri)) {
+                    is RestoreResult.Success -> {
+                        // The coordinator increments restoreRevision. The status listener recreates
+                        // whichever LibraryActivity is currently visible, including one replaced while
+                        // this Application-owned IO operation was still running.
+                        restoreWorkflowRunning = false
+                    }
+
+                    is RestoreResult.Failure -> {
+                        restoreWorkflowRunning = false
+                        errorMessage = result.message
+                    }
+                }
+            } finally {
+                RemoteMonitorMaintenanceBus.resume()
+                restartRemoteMonitorIfEnabled()
+            }
+        }
+    }
+
+    private suspend fun stopLanSyncAndAwaitQuiet(): Boolean {
+        val rendererQuiet = withContext(Dispatchers.IO) {
+            RemoteMonitorMaintenanceBus.pauseAndAwait(RESTORE_SYNC_STOP_TIMEOUT_MILLIS)
+        }
+        if (!rendererQuiet) {
+            RemoteMonitorMaintenanceBus.resume()
+            return false
+        }
+        val activeBookIds = repository.state.books.map(Book::id).distinct()
+        // No Telegram command may start a page render while the live data root is being swapped.
+        RemoteMonitorGateway.get(this).stop()
+        stopService(
+            Intent().setClassName(packageName, "com.studyink.app.RemoteMonitorService"),
+        )
+        LanSyncService.stop(this)
+        val quiet = withTimeoutOrNull(RESTORE_SYNC_STOP_TIMEOUT_MILLIS) {
+            while (activeBookIds.any { LanSyncBus.connectionState(it) != LanConnectionState.IDLE }) {
+                delay(50L)
+            }
+
+            // IDLE is published at the start of service teardown. Require a quiet durable-commit
+            // window too, so an operation already executing on the service IO thread cannot land
+            // between the safety snapshot and the destructive swap.
+            var observedGeneration = MasterNoteDataCommitBus.currentGeneration()
+            while (true) {
+                delay(RESTORE_COMMIT_QUIET_MILLIS)
+                val currentGeneration = MasterNoteDataCommitBus.currentGeneration()
+                if (currentGeneration == observedGeneration) break
+                observedGeneration = currentGeneration
+            }
+            true
+        } ?: false
+        if (!quiet) {
+            RemoteMonitorMaintenanceBus.resume()
+            restartRemoteMonitorIfEnabled()
+        }
+        return quiet
+    }
+
+    private fun restartRemoteMonitorIfEnabled() {
+        val remoteMonitor = RemoteMonitorGateway.get(this)
+        if (!remoteMonitor.preferences().monitoringEnabled &&
+            remoteMonitor.remoteReviewPeerStatus() is RemoteReviewPeerStatus.Unconfigured
+        ) return
+        startForegroundService(
+            Intent().setClassName(packageName, "com.studyink.app.RemoteMonitorService"),
+        )
+    }
+
     override fun onPairingReady(bookId: String, pairingUri: String) {
         runOnUiThread {
+            // An auto-started session must not throw its code on screen every time a book is opened.
+            if (!showPairingQrOnReady) return@runOnUiThread
+            showPairingQrOnReady = false
             if (selectedBook?.id == bookId) this.pairingUri = pairingUri
         }
+    }
+
+    private fun updateAutoStartStudentSync(enabled: Boolean) {
+        autoStartStudentSync = enabled
+        studentSyncPreferences.edit().putBoolean(KEY_AUTO_START_STUDENT_SYNC, enabled).apply()
+    }
+
+    /**
+     * Makes a student device reachable as soon as its book is open, so nobody has to remember to
+     * start sharing first. Skipped when a session already exists for this book, so re-entering the
+     * book never drops one a teacher is using, and skipped when the notification permission is still
+     * missing rather than raising a system prompt out of nowhere.
+     */
+    private fun maybeAutoStartStudentSync(book: Book) {
+        if (!autoStartStudentSync || perspective != LibraryPerspective.STUDENT) return
+        if (LanSyncBus.connectionState(book.id) != LanConnectionState.IDLE) return
+        if (
+            Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) return
+        LanSyncService.startStudent(this, book.id)
     }
 
     override fun onRemoteAttempt(bookId: String, pageNumber: Int) {
@@ -457,10 +722,14 @@ private fun LibraryScreen(
     perspective: LibraryPerspective,
     progressRevision: Int,
     importing: Boolean,
+    backupStatus: MasterNoteBackupStatus,
+    inspectingBackup: Boolean,
     progressForBook: (String) -> List<PageProgressSummary>,
     onSelectStudent: (String) -> Unit,
     onSelectPerspective: (LibraryPerspective) -> Unit,
     onImport: () -> Unit,
+    onBackupNow: () -> Unit,
+    onSelectBackup: () -> Unit,
     onSelectBook: (Book) -> Unit,
     onBackToBooks: () -> Unit,
     onOpenPage: (Book, Int, LibraryPerspective, Boolean, Int?) -> Unit,
@@ -525,8 +794,12 @@ private fun LibraryScreen(
                             perspective = perspective,
                             expanded = true,
                             importing = importing,
+                            backupStatus = backupStatus,
+                            inspectingBackup = inspectingBackup,
                             summariesByBook = summariesByBook,
                             onImport = onImport,
+                            onBackupNow = onBackupNow,
+                            onSelectBackup = onSelectBackup,
                             onSelectBook = onSelectBook,
                             onBackToBooks = onBackToBooks,
                             onOpenPage = onOpenPage,
@@ -553,8 +826,12 @@ private fun LibraryScreen(
                         perspective = perspective,
                         expanded = false,
                         importing = importing,
+                        backupStatus = backupStatus,
+                        inspectingBackup = inspectingBackup,
                         summariesByBook = summariesByBook,
                         onImport = onImport,
+                        onBackupNow = onBackupNow,
+                        onSelectBackup = onSelectBackup,
                         onSelectBook = onSelectBook,
                         onBackToBooks = onBackToBooks,
                         onOpenPage = onOpenPage,
@@ -694,8 +971,12 @@ private fun LibraryMainContent(
     perspective: LibraryPerspective,
     expanded: Boolean,
     importing: Boolean,
+    backupStatus: MasterNoteBackupStatus,
+    inspectingBackup: Boolean,
     summariesByBook: Map<String, List<PageProgressSummary>>,
     onImport: () -> Unit,
+    onBackupNow: () -> Unit,
+    onSelectBackup: () -> Unit,
     onSelectBook: (Book) -> Unit,
     onBackToBooks: () -> Unit,
     onOpenPage: (Book, Int, LibraryPerspective, Boolean, Int?) -> Unit,
@@ -712,8 +993,15 @@ private fun LibraryMainContent(
             books = books,
             expanded = expanded,
             importing = importing,
+            backupStatus = backupStatus,
+            inspectingBackup = inspectingBackup,
+            // Teacher devices also need this entry to pair their dedicated bot and open the
+            // remote-review inbox. Student-only controls remain gated inside each setup screen.
+            showTelegramSetup = true,
             summariesByBook = summariesByBook,
             onImport = onImport,
+            onBackupNow = onBackupNow,
+            onSelectBackup = onSelectBackup,
             onSelectBook = onSelectBook,
             onRename = onRename,
         )
@@ -741,8 +1029,13 @@ private fun BookShelfContent(
     books: List<Book>,
     expanded: Boolean,
     importing: Boolean,
+    backupStatus: MasterNoteBackupStatus,
+    inspectingBackup: Boolean,
+    showTelegramSetup: Boolean,
     summariesByBook: Map<String, List<PageProgressSummary>>,
     onImport: () -> Unit,
+    onBackupNow: () -> Unit,
+    onSelectBackup: () -> Unit,
     onSelectBook: (Book) -> Unit,
     onRename: (Book) -> Unit,
 ) {
@@ -769,6 +1062,14 @@ private fun BookShelfContent(
                 Text(if (importing) "가져오는 중" else "+ PDF 가져오기")
             }
         }
+        BackupControls(
+            expanded = expanded,
+            status = backupStatus,
+            inspectingBackup = inspectingBackup,
+            showTelegramSetup = showTelegramSetup,
+            onBackupNow = onBackupNow,
+            onSelectBackup = onSelectBackup,
+        )
         if (books.isEmpty()) {
             EmptyLibraryNotice(Modifier.weight(1f))
         } else {
@@ -793,6 +1094,106 @@ private fun BookShelfContent(
             }
         }
     }
+}
+
+@Composable
+private fun BackupControls(
+    expanded: Boolean,
+    status: MasterNoteBackupStatus,
+    inspectingBackup: Boolean,
+    showTelegramSetup: Boolean,
+    onBackupNow: () -> Unit,
+    onSelectBackup: () -> Unit,
+) {
+    val context = LocalContext.current
+    val controls: @Composable (Modifier) -> Unit = { modifier ->
+        Row(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                modifier = Modifier.weight(1f),
+                onClick = onBackupNow,
+                enabled = !status.busy && !inspectingBackup,
+                border = paperEdge(),
+            ) {
+                Text("지금 백업", maxLines = 1)
+            }
+            OutlinedButton(
+                modifier = Modifier.weight(1f),
+                onClick = onSelectBackup,
+                enabled = !status.busy && !inspectingBackup,
+                border = paperEdge(),
+            ) {
+                Text("백업 복원", maxLines = 1)
+            }
+            if (showTelegramSetup) {
+                OutlinedButton(
+                    modifier = Modifier.weight(1f),
+                    onClick = {
+                        context.startActivity(
+                            Intent().setClassName(
+                                context.packageName,
+                                "com.studyink.app.TelegramSetupActivity",
+                            ),
+                        )
+                    },
+                    enabled = !status.busy && !inspectingBackup,
+                    border = paperEdge(),
+                ) {
+                    Text("Telegram", maxLines = 1)
+                }
+            }
+        }
+    }
+    val statusContent: @Composable (Modifier) -> Unit = { modifier ->
+        Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                text = backupStatusLabel(status, inspectingBackup),
+                color = if (status.error == null) PaperMutedInk else GradeWrong,
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = "앱 삭제 후에도 유지 · 파일 앱 > Download/MasterNote Backups",
+                color = PaperMutedInk.copy(alpha = 0.78f),
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+
+    if (expanded) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            controls(Modifier.width(420.dp))
+            statusContent(Modifier.weight(1f))
+        }
+    } else {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            controls(Modifier.fillMaxWidth())
+            statusContent(Modifier.fillMaxWidth())
+        }
+    }
+}
+
+private fun backupStatusLabel(status: MasterNoteBackupStatus, inspectingBackup: Boolean): String = when {
+    inspectingBackup -> "백업 파일을 확인하는 중…"
+    status.isRestoring -> "백업을 복원하는 중…"
+    status.isBackingUp -> "필기와 문제집을 백업하는 중…"
+    status.error != null -> status.error
+    status.message != null -> status.message
+    status.lastBackupAtEpochMillis != null -> {
+        val time = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+            .format(Date(status.lastBackupAtEpochMillis))
+        if (status.dirty) "저장 후 변경 있음 · 최근 백업 $time" else "최근 백업 $time"
+    }
+    else -> "아직 외부 백업이 없습니다."
 }
 
 private enum class PageFilter {
@@ -1767,6 +2168,12 @@ private fun LibraryDevicePreview(
             perspective = perspective,
             progressRevision = 0,
             importing = false,
+            backupStatus = MasterNoteBackupStatus(
+                dirty = false,
+                lastBackupAtEpochMillis = 1_786_000_000_000L,
+                lastBackupName = "MasterNote_preview.mnbak.zip",
+            ),
+            inspectingBackup = false,
             progressForBook = { bookId ->
                 LibraryPreviewFixtures.books.firstOrNull { it.id == bookId }
                     ?.let(LibraryPreviewFixtures::progress)
@@ -1775,6 +2182,8 @@ private fun LibraryDevicePreview(
             onSelectStudent = {},
             onSelectPerspective = {},
             onImport = {},
+            onBackupNow = {},
+            onSelectBackup = {},
             onSelectBook = {},
             onBackToBooks = {},
             onOpenPage = { _, _, _, _, _ -> },
@@ -1819,4 +2228,45 @@ private fun RenameBookDialog(book: Book, onDismiss: () -> Unit, onSave: (String)
         confirmButton = { TextButton(onClick = { if (title.isNotBlank()) onSave(title) }) { Text("저장") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("취소") } },
     )
+}
+
+@Composable
+private fun RestoreBackupDialog(
+    candidate: RestoreBackupCandidate,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val inspection = candidate.inspection
+    val createdAt = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
+        .format(Date(inspection.createdAtEpochMillis))
+    val size = formatBackupSize(inspection.totalBytes)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("이 백업으로 복원할까요?") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("$createdAt · $size · ${inspection.fileCount}개 파일")
+                Text("MasterNote ${inspection.sourceVersionName.ifBlank { "버전 정보 없음" }}")
+                if (!inspection.identityMatchesThisDevice) {
+                    Text(
+                        "다른 기기에서 만든 백업입니다. 책과 필기는 복원하지만 이 기기의 연결 ID는 유지합니다.",
+                        color = PaperMutedInk,
+                    )
+                }
+                Text(
+                    "현재 문제집·필기·회차·채점 데이터가 선택한 백업으로 교체됩니다. " +
+                        "먼저 현재 상태를 Download/MasterNote Backups에 안전 백업한 뒤 복원합니다.",
+                )
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("취소") } },
+        confirmButton = { Button(onClick = onConfirm) { Text("안전 백업 후 복원") } },
+    )
+}
+
+private fun formatBackupSize(bytes: Long): String = when {
+    bytes >= 1024L * 1024L * 1024L -> "%.1f GB".format(bytes / (1024.0 * 1024.0 * 1024.0))
+    bytes >= 1024L * 1024L -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
+    bytes >= 1024L -> "%.1f KB".format(bytes / 1024.0)
+    else -> "$bytes B"
 }

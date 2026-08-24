@@ -7,7 +7,6 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.view.View
-import com.studyink.annotation.engine.EraseEngine
 import com.studyink.core.model.AnnotationSnapshot
 import com.studyink.core.model.Mark
 import com.studyink.core.model.MarkColor
@@ -22,9 +21,19 @@ import kotlin.math.hypot
 import kotlin.math.max
 
 data class EraserPreview(
+    val gestureId: Long,
     val pageNumber: Int,
     val path: List<PagePoint>,
     val radius: Float,
+)
+
+/** Immutable eraser request emitted once, after the S Pen leaves the screen. */
+data class EraserGesture(
+    val id: Long,
+    val page: Int,
+    val path: List<PagePoint>,
+    val radius: Float,
+    val whole: Boolean,
 )
 
 data class StylusHoverPreview(
@@ -40,7 +49,15 @@ class DryInkView(context: Context) : View(context) {
     var viewport: PdfViewportAdapter? = null
         set(value) { field = value; invalidate() }
     var snapshot: AnnotationSnapshot = AnnotationSnapshot.empty("unopened")
-        set(value) { field = value; rebuildPageCache(); invalidate() }
+        set(value) {
+            // The reader republishes its whole state for unrelated changes such as the live
+            // connection badge. Rebuilding the per-page stroke cache for those costs O(strokes)
+            // on the main thread for nothing.
+            if (field === value) return
+            field = value
+            rebuildPageCache()
+            invalidate()
+        }
     var eraserPreview: EraserPreview? = null
         set(value) { field = value; invalidate() }
     var hoverPreview: StylusHoverPreview? = null
@@ -59,6 +76,16 @@ class DryInkView(context: Context) : View(context) {
     private var cachedPageStrokes: Map<Int, List<StrokeAsset>> = emptyMap()
     private val pageIsolationPaper = ReaderPaperBackdropDrawable(resources.displayMetrics.density)
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    /**
+     * Halo drawn under a teacher correction the student has actually received. The trace itself
+     * still uses the pen the teacher wrote with, so writing feels identical on the teacher device
+     * and only publishing adds this marker.
+     */
+    private val publishedGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
@@ -86,15 +113,14 @@ class DryInkView(context: Context) : View(context) {
         val adapter = viewport ?: return
         drawPageIsolationMask(canvas, adapter.activePageBounds())
         val visibleBounds = RectF(0f, 0f, width.toFloat(), height.toFloat())
-        val active = cachedPageStrokes[activePage].orEmpty().filter { stroke ->
-            stroke.attemptNo == visibleAttemptNo && isOnScreen(adapter, stroke, visibleBounds)
-        }
+        val active = visibleReaderStrokes(
+            strokes = cachedPageStrokes[activePage].orEmpty(),
+            visibleAttemptNo = visibleAttemptNo,
+            showLatestRemoteFeedbackAcrossAttempts = !showTeacherDrafts,
+        ).filter { stroke -> isOnScreen(adapter, stroke, visibleBounds) }
         active.forEach { drawStroke(canvas, adapter, it, false) }
 
         eraserPreview?.let { preview ->
-            EraseEngine.partialErasePreviewSegments(
-                active, preview.pageNumber, preview.path, preview.radius
-            ).forEach { drawStroke(canvas, adapter, it, true) }
             drawEraserPath(canvas, adapter, preview)
         }
         drawMarks(canvas, adapter)
@@ -142,6 +168,9 @@ class DryInkView(context: Context) : View(context) {
 
     private fun drawStroke(canvas: Canvas, adapter: PdfViewportAdapter, stroke: StrokeAsset, preview: Boolean) {
         if (stroke.points.isEmpty()) return
+        val published = !preview &&
+            stroke.authorId == "teacher" &&
+            stroke.publishedAtEpochMillis != null
         paint.color = if (preview) Color.rgb(39, 110, 255) else stroke.colorArgb
         paint.alpha = when {
             preview -> 190
@@ -149,8 +178,16 @@ class DryInkView(context: Context) : View(context) {
             else -> Color.alpha(stroke.colorArgb)
         }
         paint.strokeWidth = max(1f, adapter.canonicalWidthToView(stroke.pageNumber, stroke.width))
+        if (published) {
+            publishedGlowPaint.color = stroke.colorArgb
+            publishedGlowPaint.alpha = PUBLISHED_INK_GLOW_ALPHA
+            publishedGlowPaint.strokeWidth = paint.strokeWidth * PUBLISHED_INK_GLOW_WIDTH_SCALE
+        }
         val first = adapter.canonicalToView(stroke.pageNumber, stroke.points.first()) ?: return
         if (stroke.points.size == 1) {
+            if (published) {
+                canvas.drawCircle(first.x, first.y, publishedGlowPaint.strokeWidth / 2f, publishedGlowPaint)
+            }
             canvas.drawCircle(first.x, first.y, paint.strokeWidth / 2f, paint)
             return
         }
@@ -158,6 +195,7 @@ class DryInkView(context: Context) : View(context) {
         stroke.points.drop(1).forEach { point ->
             adapter.canonicalToView(stroke.pageNumber, point)?.let { path.lineTo(it.x, it.y) }
         }
+        if (published) canvas.drawPath(path, publishedGlowPaint)
         canvas.drawPath(path, paint)
     }
 
@@ -362,3 +400,44 @@ class DryInkView(context: Context) : View(context) {
         val anchorY: Float,
     )
 }
+
+/**
+ * Students must see the newest Telegram correction even if they opened the next writable attempt
+ * before it arrived. Only the specially tagged remote layer crosses the attempt boundary; student
+ * ink, ordinary teacher/LAN ink, and teacher review screens retain exact-attempt isolation.
+ */
+internal fun visibleReaderStrokes(
+    strokes: List<StrokeAsset>,
+    visibleAttemptNo: Int,
+    showLatestRemoteFeedbackAcrossAttempts: Boolean,
+): List<StrokeAsset> {
+    val latestRemoteLayer = if (showLatestRemoteFeedbackAcrossAttempts) {
+        strokes.asSequence()
+            .filter(StrokeAsset::isPublishedTelegramRemoteFeedback)
+            .maxWithOrNull(
+                compareBy<StrokeAsset>(StrokeAsset::logicalClock)
+                    .thenBy { it.publishedAtEpochMillis ?: Long.MIN_VALUE }
+                    .thenBy { it.itemId.orEmpty() }
+                    .thenBy(StrokeAsset::deviceId),
+            )
+            ?.remoteFeedbackLayerKey()
+    } else {
+        null
+    }
+    return strokes.filter { stroke ->
+        if (stroke.isPublishedTelegramRemoteFeedback() && showLatestRemoteFeedbackAcrossAttempts) {
+            stroke.remoteFeedbackLayerKey() == latestRemoteLayer
+        } else {
+            stroke.attemptNo == visibleAttemptNo
+        }
+    }
+}
+
+private fun StrokeAsset.isPublishedTelegramRemoteFeedback(): Boolean =
+    authorId == "teacher" &&
+        publishedAtEpochMillis != null &&
+        deviceId.startsWith("telegram-teacher-") &&
+        itemId?.startsWith("remote-review:") == true
+
+private fun StrokeAsset.remoteFeedbackLayerKey(): String =
+    "$deviceId\u0000$attemptNo\u0000$itemId\u0000$publishedAtEpochMillis\u0000$logicalClock"
