@@ -1,0 +1,1498 @@
+package com.studyink.app
+
+import android.util.AtomicFile
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.security.MessageDigest
+
+internal data class StudentPageSyncRecord(
+    val syncGeneration: Long,
+    val pageToken: String,
+    val workbookToken: String,
+    val bookId: String,
+    val contentSha256: String,
+    val studentLayerSha256: String,
+    val stateFingerprint: String,
+    val workbookLabel: String,
+    val pageNumber: Int,
+    val attemptNos: List<Int>,
+    val submittedAttemptNos: List<Int>,
+    val sourceRevision: Long,
+    val acknowledgedRevision: Long,
+    val acknowledgedStateFingerprint: String?,
+    val originDeviceHighWater: Long,
+    val acknowledgedOriginCursor: Long,
+    val lastChangedAtEpochMs: Long,
+    val approximateBytes: Long,
+    val responseToRequestTransferId: String? = null,
+    val outgoingAnnotationTransferId: String? = null,
+    val outgoingSourceRevision: Long = 0L,
+    val outgoingOriginCursor: Long = 0L,
+    val outgoingStateFingerprint: String? = null,
+    val outgoingResultLayerSha256: String? = null,
+    val outgoingSentAtEpochMs: Long? = null,
+) {
+    val dirty: Boolean get() = sourceRevision > acknowledgedRevision
+}
+
+internal data class TeacherPageSyncRecord(
+    val syncGeneration: Long,
+    val pageToken: String,
+    val workbookToken: String,
+    val contentSha256: String,
+    val studentLayerSha256: String,
+    val workbookLabel: String,
+    val localBookId: String?,
+    val pageNumber: Int,
+    val attemptNos: List<Int>,
+    val submittedAttemptNos: List<Int>,
+    val sourceRevision: Long,
+    /** Last revision advertised by a manifest, distinct from a newer request response. */
+    val manifestRevision: Long = sourceRevision,
+    val manifestStudentLayerSha256: String = studentLayerSha256,
+    val appliedRevision: Long,
+    val appliedStudentLayerSha256: String?,
+    val lastChangedAtEpochMs: Long,
+    val approximateBytes: Long,
+    val requestTransferId: String? = null,
+    val requestCreatedAtEpochMs: Long? = null,
+    val requestTransportAcknowledgedAtEpochMs: Long? = null,
+    val requestedSourceRevision: Long = 0L,
+    val requesterRevision: Long = 0L,
+    /** A rejected/invalid delta must recover with a full checkpoint even after process death. */
+    val forceCheckpoint: Boolean = false,
+    val lastCompletedRequestTransferId: String? = null,
+    val lastCompletedAnnotationTransferId: String? = null,
+) {
+    val mappingRequired: Boolean get() = localBookId == null
+    val pending: Boolean get() = !mappingRequired &&
+        (sourceRevision > appliedRevision || studentLayerSha256 != appliedStudentLayerSha256)
+}
+
+internal data class TeacherPageSyncCursorRecord(
+    val syncGeneration: Long,
+    val sequence: Long,
+    val pageToken: String,
+    val workbookToken: String,
+    val contentSha256: String,
+    val pageNumber: Int,
+    val attemptNo: Int?,
+    val sourceRevision: Long,
+    val updatedAtEpochMs: Long,
+)
+
+internal data class PendingTeacherReviewRecord(
+    val intentId: String,
+    val bookId: String,
+    val contentSha256: String,
+    /** Remote workbook identity captured when the teacher explicitly published. */
+    val workbookToken: String? = null,
+    /**
+     * This newly published review did not have a Telegram workbook identity yet (LAN ownership or
+     * a not-yet-advertised manifest window). Only this explicit state may bind once to an exact,
+     * unambiguous manifest; a null token from an older journal remains permanently held.
+     */
+    val deferredWorkbookBinding: Boolean = false,
+    /** The exact manifest high-water visible when the unresolved live publication was queued. */
+    val deferredAfterManifestGeneration: Long = 0L,
+    val deferredAfterManifestSequence: Long = 0L,
+    val pageNumber: Int,
+    val attemptNo: Int,
+    val queuedAtEpochMs: Long,
+    val retryCount: Int = 0,
+    val inFlightSyncGeneration: Long = 0L,
+    val inFlightPageToken: String? = null,
+    val inFlightTransferId: String? = null,
+    val inFlightSourceRevision: Long = 0L,
+    val inFlightPayloadSha256: String? = null,
+    val inFlightResultLayerSha256: String? = null,
+    val sentAtEpochMs: Long? = null,
+    val transportAcknowledgedAtEpochMs: Long? = null,
+) {
+    /** Local identity is required because two students may own byte-identical PDF imports. */
+    val key: String get() = "$bookId:$pageNumber:$attemptNo"
+    val inFlight: Boolean get() = inFlightTransferId != null
+}
+
+internal data class StudentManifestReservation(
+    val syncGeneration: Long,
+    val sequence: Long,
+    val transferId: String,
+    val createdAtEpochMs: Long,
+    /** Inventory window advances only after this exact document is transport-acknowledged. */
+    val windowOrdinal: Long = 0L,
+)
+
+internal data class WorkbookMappingRecord(
+    val workbookToken: String,
+    val localBookId: String,
+    val contentSha256: String,
+)
+
+/** Pair-scoped safety latch: a deleted mapping may only be restored by explicit user choice. */
+internal data class ExplicitWorkbookMappingRequirement(
+    val workbookToken: String,
+    val contentSha256: String,
+)
+
+internal data class AppliedTeacherReviewRecord(
+    val sourceRevision: Long,
+    val payloadSha256: String?,
+    val resultLayerSha256: String?,
+)
+
+internal enum class TeacherManifestInstallResult { APPLIED, DUPLICATE, STALE, REGRESSION }
+
+/** Atomic pair-scoped journal; handwriting and catalog data remain in their authoritative stores. */
+internal class RemotePageSyncStore(
+    file: File,
+    private val beforePersistWrite: (() -> Unit)? = null,
+) {
+    private val atomicFile = AtomicFile(file)
+    /** Redundant monotonic epoch survives a valid-but-corrupt main pair journal. */
+    private val generationHighWaterFile = AtomicFile(File(file.parentFile, "${file.name}.generation"))
+    private var pairId: String? = null
+
+    private var studentGenerationCounter = 0L
+    private var studentOpenGeneration = 0L
+    private var studentManifestSequence = 0L
+    private var studentManifestWindowOrdinal = 0L
+    private var outstandingStudentManifest: StudentManifestReservation? = null
+    private val studentPages = linkedMapOf<String, StudentPageSyncRecord>()
+
+    private var teacherManifestGeneration = 0L
+    private var teacherManifestSequence = 0L
+    private var teacherInventoryPageCount: Int? = null
+    private val teacherPages = linkedMapOf<String, TeacherPageSyncRecord>()
+    private var teacherCursor: TeacherPageSyncCursorRecord? = null
+    private val workbookMappings = linkedMapOf<String, WorkbookMappingRecord>()
+    private val explicitWorkbookMappingRequirements =
+        linkedSetOf<ExplicitWorkbookMappingRequirement>()
+    private val appliedTeacherReviews = linkedMapOf<String, AppliedTeacherReviewRecord>()
+    private val pendingTeacherReviews = linkedMapOf<String, PendingTeacherReviewRecord>()
+    private val completedTeacherPublications = linkedMapOf<String, Long>()
+
+    init {
+        file.parentFile?.let { check(it.mkdirs() || it.isDirectory) }
+        load()
+    }
+
+    @Synchronized
+    fun bindPair(nextPairId: String) {
+        require(nextPairId.isNotBlank())
+        if (pairId == nextPairId) return
+        pairId = nextPairId
+        clearPairState(resetGenerationCounter = false)
+        persist()
+    }
+
+    @Synchronized fun currentPairId(): String? = pairId
+
+    @Synchronized
+    fun resetCurrentPair() {
+        val retainedCounter = safeIncrement(studentGenerationCounter)
+        persistGenerationHighWater(retainedCounter)
+        clearPairState(resetGenerationCounter = false)
+        studentGenerationCounter = retainedCounter
+        persist()
+    }
+
+    @Synchronized
+    fun beginStudentGeneration(): Long {
+        if (studentOpenGeneration > 0L) return studentOpenGeneration
+        val nextGeneration = safeIncrement(studentGenerationCounter)
+        // Commit the redundant high-water first. If the main journal write then fails, reload keeps
+        // this value and the retry skips it instead of ever reusing an old generation/page token.
+        persistGenerationHighWater(nextGeneration)
+        studentGenerationCounter = nextGeneration
+        studentOpenGeneration = studentGenerationCounter
+        studentManifestSequence = 0L
+        studentManifestWindowOrdinal = 0L
+        outstandingStudentManifest = null
+        studentPages.clear()
+        appliedTeacherReviews.clear()
+        persist()
+        return studentOpenGeneration
+    }
+
+    @Synchronized
+    fun closeStudentGeneration() {
+        if (studentOpenGeneration == 0L && studentPages.isEmpty()) return
+        studentOpenGeneration = 0L
+        studentManifestSequence = 0L
+        studentManifestWindowOrdinal = 0L
+        outstandingStudentManifest = null
+        studentPages.clear()
+        appliedTeacherReviews.clear()
+        persist()
+    }
+
+    @Synchronized fun studentGeneration(): Long = studentOpenGeneration
+
+    @Synchronized
+    fun reserveStudentManifest(transferId: String, createdAtEpochMs: Long): StudentManifestReservation {
+        require(studentOpenGeneration > 0L && transferId.isNotBlank() && createdAtEpochMs >= 0L)
+        outstandingStudentManifest?.let { return it }
+        studentManifestSequence = safeIncrement(studentManifestSequence)
+        return StudentManifestReservation(
+            studentOpenGeneration,
+            studentManifestSequence,
+            transferId,
+            createdAtEpochMs,
+            studentManifestWindowOrdinal,
+        ).also {
+            outstandingStudentManifest = it
+            persist()
+        }
+    }
+
+    @Synchronized fun outstandingStudentManifest(): StudentManifestReservation? = outstandingStudentManifest
+
+    @Synchronized
+    fun clearOutstandingStudentManifest(transferId: String): Boolean {
+        if (outstandingStudentManifest?.transferId != transferId) return false
+        outstandingStudentManifest = null
+        persist()
+        return true
+    }
+
+    @Synchronized
+    fun acknowledgeOutstandingStudentManifest(transferId: String): Boolean {
+        if (outstandingStudentManifest?.transferId != transferId) return false
+        outstandingStudentManifest = null
+        studentManifestWindowOrdinal = safeIncrement(studentManifestWindowOrdinal)
+        persist()
+        return true
+    }
+
+    /** Advances only for a semantic page/attempt change, never by reusing an operation clock. */
+    @Synchronized
+    fun updateStudentPage(
+        pageToken: String,
+        workbookToken: String,
+        bookId: String,
+        contentSha256: String,
+        studentLayerSha256: String,
+        workbookLabel: String,
+        pageNumber: Int,
+        attemptNos: List<Int>,
+        submittedAttemptNos: List<Int>,
+        originDeviceHighWater: Long,
+        lastChangedAtEpochMs: Long,
+        approximateBytes: Long,
+    ): StudentPageSyncRecord {
+        val generation = studentOpenGeneration
+        require(generation > 0L && pageToken.isNotBlank() && workbookToken.isNotBlank())
+        require(bookId.isNotBlank() && pageNumber >= 0 && originDeviceHighWater >= 0L)
+        val attempts = attemptNos.distinct().sorted()
+        val submitted = submittedAttemptNos.distinct().sorted()
+        require(attempts.all { it > 0 } && submitted.all { it in attempts })
+        val fingerprint = pageStateFingerprint(studentLayerSha256, attempts, submitted)
+        val previous = studentPages[pageToken]?.takeIf { it.syncGeneration == generation }
+        require(previous == null || (
+            previous.workbookToken == workbookToken && previous.bookId == bookId &&
+                previous.contentSha256 == contentSha256 && previous.pageNumber == pageNumber
+            )) { "Student page token identity changed inside one generation" }
+        val changed = previous == null || previous.stateFingerprint != fingerprint
+        val revision = nextPageSyncRevision(
+            previous?.stateFingerprint,
+            previous?.sourceRevision ?: 0L,
+            fingerprint,
+        )
+        var acknowledgedRevision = previous?.acknowledgedRevision?.coerceAtMost(revision) ?: 0L
+        val acknowledgedFingerprint = previous?.acknowledgedStateFingerprint
+        var acknowledgedOriginCursor = previous?.acknowledgedOriginCursor?.coerceAtMost(originDeviceHighWater) ?: 0L
+        if (acknowledgedFingerprint == fingerprint) {
+            acknowledgedRevision = revision
+            acknowledgedOriginCursor = originDeviceHighWater
+        }
+        val next = StudentPageSyncRecord(
+            syncGeneration = generation,
+            pageToken = pageToken,
+            workbookToken = workbookToken,
+            bookId = bookId,
+            contentSha256 = contentSha256,
+            studentLayerSha256 = studentLayerSha256,
+            stateFingerprint = fingerprint,
+            workbookLabel = workbookLabel,
+            pageNumber = pageNumber,
+            attemptNos = attempts,
+            submittedAttemptNos = submitted,
+            sourceRevision = revision,
+            acknowledgedRevision = acknowledgedRevision,
+            acknowledgedStateFingerprint = acknowledgedFingerprint,
+            originDeviceHighWater = originDeviceHighWater,
+            acknowledgedOriginCursor = acknowledgedOriginCursor,
+            lastChangedAtEpochMs = if (changed) {
+                maxOf(lastChangedAtEpochMs, previous?.lastChangedAtEpochMs ?: 0L)
+            } else previous.lastChangedAtEpochMs,
+            approximateBytes = approximateBytes.coerceAtLeast(0L),
+            responseToRequestTransferId = previous?.responseToRequestTransferId,
+            outgoingAnnotationTransferId = previous?.outgoingAnnotationTransferId,
+            outgoingSourceRevision = previous?.outgoingSourceRevision ?: 0L,
+            outgoingOriginCursor = previous?.outgoingOriginCursor ?: 0L,
+            outgoingStateFingerprint = previous?.outgoingStateFingerprint,
+            outgoingResultLayerSha256 = previous?.outgoingResultLayerSha256,
+            outgoingSentAtEpochMs = previous?.outgoingSentAtEpochMs,
+        )
+        if (previous != next) {
+            studentPages[pageToken] = next
+            persist()
+        }
+        return next
+    }
+
+    @Synchronized fun studentPage(pageToken: String): StudentPageSyncRecord? = studentPages[pageToken]
+
+    @Synchronized
+    fun removeStudentPage(pageToken: String): Boolean {
+        if (studentPages.remove(pageToken) == null) return false
+        persist()
+        return true
+    }
+
+    @Synchronized
+    fun studentPages(): List<StudentPageSyncRecord> = studentPages.values.sortedWith(
+        compareByDescending<StudentPageSyncRecord>(StudentPageSyncRecord::lastChangedAtEpochMs)
+            .thenByDescending(StudentPageSyncRecord::pageNumber),
+    )
+
+    @Synchronized
+    fun markStudentAnnotationInFlight(
+        pageToken: String,
+        requestTransferId: String,
+        annotationTransferId: String,
+        sourceRevision: Long,
+        originCursor: Long,
+        stateFingerprint: String,
+        resultLayerSha256: String,
+        sentAtEpochMs: Long,
+    ): Boolean {
+        val current = studentPages[pageToken] ?: return false
+        require(sourceRevision in 1L..current.sourceRevision && originCursor >= 0L && sentAtEpochMs >= 0L)
+        studentPages[pageToken] = current.copy(
+            responseToRequestTransferId = requestTransferId,
+            outgoingAnnotationTransferId = annotationTransferId,
+            outgoingSourceRevision = sourceRevision,
+            outgoingOriginCursor = originCursor,
+            outgoingStateFingerprint = stateFingerprint,
+            outgoingResultLayerSha256 = resultLayerSha256,
+            outgoingSentAtEpochMs = sentAtEpochMs,
+        )
+        persist()
+        return true
+    }
+
+    @Synchronized
+    fun abandonStudentAnnotationResponse(pageToken: String, requestTransferId: String): Boolean {
+        val current = studentPages[pageToken] ?: return false
+        if (current.responseToRequestTransferId != requestTransferId) return false
+        studentPages[pageToken] = current.copy(
+            responseToRequestTransferId = null,
+            outgoingAnnotationTransferId = null,
+            outgoingSourceRevision = 0L,
+            outgoingOriginCursor = 0L,
+            outgoingStateFingerprint = null,
+            outgoingResultLayerSha256 = null,
+            outgoingSentAtEpochMs = null,
+        )
+        persist()
+        return true
+    }
+
+    @Synchronized
+    fun resolveStudentAnnotationAck(
+        syncGeneration: Long,
+        pageToken: String,
+        sourceTransferId: String,
+        sourceRevision: Long,
+        accepted: Boolean,
+    ): Boolean {
+        val current = studentPages[pageToken] ?: return false
+        if (current.syncGeneration != syncGeneration ||
+            current.outgoingAnnotationTransferId != sourceTransferId ||
+            current.outgoingSourceRevision != sourceRevision
+        ) return false
+        var acknowledgedRevision = current.acknowledgedRevision
+        var acknowledgedFingerprint = current.acknowledgedStateFingerprint
+        var acknowledgedOriginCursor = current.acknowledgedOriginCursor
+        if (accepted) {
+            acknowledgedRevision = maxOf(acknowledgedRevision, sourceRevision)
+            acknowledgedFingerprint = current.outgoingStateFingerprint
+            acknowledgedOriginCursor = maxOf(acknowledgedOriginCursor, current.outgoingOriginCursor)
+            if (acknowledgedFingerprint == current.stateFingerprint) {
+                acknowledgedRevision = current.sourceRevision
+                acknowledgedOriginCursor = current.originDeviceHighWater
+            }
+        }
+        studentPages[pageToken] = current.copy(
+            acknowledgedRevision = acknowledgedRevision.coerceAtMost(current.sourceRevision),
+            acknowledgedStateFingerprint = acknowledgedFingerprint,
+            acknowledgedOriginCursor = acknowledgedOriginCursor.coerceAtMost(current.originDeviceHighWater),
+            responseToRequestTransferId = null,
+            outgoingAnnotationTransferId = null,
+            outgoingSourceRevision = 0L,
+            outgoingOriginCursor = 0L,
+            outgoingStateFingerprint = null,
+            outgoingResultLayerSha256 = null,
+            outgoingSentAtEpochMs = null,
+        )
+        persist()
+        return true
+    }
+
+    @Synchronized
+    fun mappedLocalBookId(workbookToken: String, contentSha256: String): String? =
+        workbookMappings[workbookToken]?.takeIf { it.contentSha256 == contentSha256 }?.localBookId
+
+    @Synchronized
+    fun mappedWorkbookToken(localBookId: String, contentSha256: String): String? =
+        workbookMappings.values.asSequence()
+            .filter { it.localBookId == localBookId && it.contentSha256 == contentSha256 }
+            .map(WorkbookMappingRecord::workbookToken)
+            .distinct()
+            .singleOrNull()
+
+    @Synchronized
+    fun requiresExplicitWorkbookMapping(workbookToken: String, contentSha256: String): Boolean =
+        ExplicitWorkbookMappingRequirement(workbookToken, contentSha256) in
+            explicitWorkbookMappingRequirements
+
+    @Synchronized
+    fun unbindMissingTeacherWorkbook(workbookToken: String, contentSha256: String): Boolean {
+        require(workbookToken.isNotBlank() && contentSha256.isNotBlank())
+        val requirement = ExplicitWorkbookMappingRequirement(workbookToken, contentSha256)
+        var changed = explicitWorkbookMappingRequirements.add(requirement)
+        val mapping = workbookMappings[workbookToken]
+            ?.takeIf { it.contentSha256 == contentSha256 }
+        if (mapping != null) {
+            workbookMappings.remove(workbookToken)
+            changed = true
+            teacherPages.values.filter {
+                it.workbookToken == workbookToken && it.contentSha256 == contentSha256 &&
+                    it.localBookId == mapping.localBookId
+            }.forEach { page ->
+                teacherPages[page.pageToken] = page.copy(
+                    workbookLabel = "교재 연결 필요",
+                    localBookId = null,
+                    appliedRevision = 0L,
+                    appliedStudentLayerSha256 = null,
+                    requestTransferId = null,
+                    requestCreatedAtEpochMs = null,
+                    requestTransportAcknowledgedAtEpochMs = null,
+                    requestedSourceRevision = 0L,
+                    requesterRevision = 0L,
+                    forceCheckpoint = false,
+                    lastCompletedRequestTransferId = null,
+                    lastCompletedAnnotationTransferId = null,
+                )
+            }
+        }
+        if (changed) persist()
+        return changed
+    }
+
+    @Synchronized
+    fun rememberWorkbookMapping(workbookToken: String, localBookId: String, contentSha256: String) {
+        if (requiresExplicitWorkbookMapping(workbookToken, contentSha256)) return
+        val next = WorkbookMappingRecord(workbookToken, localBookId, contentSha256)
+        if (workbookMappings[workbookToken] == next) return
+        workbookMappings[workbookToken] = next
+        persist()
+    }
+
+    /** Explicit user confirmation may migrate one local import from an obsolete remote token. */
+    @Synchronized
+    fun rebindTeacherWorkbook(
+        workbookToken: String,
+        localBookId: String,
+        contentSha256: String,
+        workbookLabel: String,
+        localStudentLayerSha256ByPageToken: Map<String, String>,
+    ): List<TeacherPageSyncRecord> {
+        require(workbookToken.isNotBlank() && localBookId.isNotBlank() && contentSha256.isNotBlank())
+        require(!localBookActivelyClaimedByDifferentWorkbook(workbookToken, localBookId, contentSha256)) {
+            "Local workbook is still used by another remote workbook"
+        }
+        // Build every target row first. A missing digest must leave the mapping and its safety
+        // tombstone untouched in this process, not merely on the next journal reload.
+        val targetPages = teacherPages.values.filter {
+            it.workbookToken == workbookToken && it.contentSha256 == contentSha256
+        }
+        require(targetPages.isNotEmpty()) { "Remote workbook is no longer available" }
+        val rebound = targetPages.map { page ->
+            val localLayerSha256 = localStudentLayerSha256ByPageToken[page.pageToken]
+                ?: error("Missing local layer digest for ${page.pageToken}")
+            page.copy(
+                workbookLabel = workbookLabel,
+                localBookId = localBookId,
+                appliedRevision = if (localLayerSha256 == page.studentLayerSha256) {
+                    page.sourceRevision
+                } else {
+                    0L
+                },
+                appliedStudentLayerSha256 = localLayerSha256,
+                requestTransferId = null,
+                requestCreatedAtEpochMs = null,
+                requestTransportAcknowledgedAtEpochMs = null,
+                requestedSourceRevision = 0L,
+                requesterRevision = 0L,
+                forceCheckpoint = localLayerSha256 != page.studentLayerSha256,
+                lastCompletedRequestTransferId = null,
+                lastCompletedAnnotationTransferId = null,
+            )
+        }
+        workbookMappings.entries.removeAll { (_, mapping) ->
+            mapping.workbookToken != workbookToken && mapping.localBookId == localBookId &&
+                mapping.contentSha256 == contentSha256
+        }
+        workbookMappings[workbookToken] = WorkbookMappingRecord(
+            workbookToken,
+            localBookId,
+            contentSha256,
+        )
+        explicitWorkbookMappingRequirements.remove(
+            ExplicitWorkbookMappingRequirement(workbookToken, contentSha256),
+        )
+        teacherPages.values.filter {
+            it.workbookToken != workbookToken && it.localBookId == localBookId &&
+                it.contentSha256 == contentSha256
+        }.forEach { claimed ->
+            teacherPages[claimed.pageToken] = claimed.copy(
+                workbookLabel = "교재 연결 필요",
+                localBookId = null,
+                appliedRevision = 0L,
+                appliedStudentLayerSha256 = null,
+                requestTransferId = null,
+                requestCreatedAtEpochMs = null,
+                requestTransportAcknowledgedAtEpochMs = null,
+                requestedSourceRevision = 0L,
+                requesterRevision = 0L,
+                forceCheckpoint = false,
+                lastCompletedRequestTransferId = null,
+                lastCompletedAnnotationTransferId = null,
+            )
+        }
+        rebound.forEach { teacherPages[it.pageToken] = it }
+        persist()
+        return rebound
+    }
+
+    @Synchronized
+    fun localBookClaimedByDifferentWorkbook(
+        workbookToken: String,
+        localBookId: String,
+        contentSha256: String,
+    ): Boolean = workbookMappings.values.any { mapping ->
+        mapping.localBookId == localBookId && mapping.contentSha256 == contentSha256 &&
+            mapping.workbookToken != workbookToken
+    }
+
+    @Synchronized
+    fun localBookActivelyClaimedByDifferentWorkbook(
+        workbookToken: String,
+        localBookId: String,
+        contentSha256: String,
+    ): Boolean = teacherPages.values.any { page ->
+        page.workbookToken != workbookToken && page.localBookId == localBookId &&
+            page.contentSha256 == contentSha256
+    }
+
+    @Synchronized
+    fun replaceTeacherManifest(
+        syncGeneration: Long,
+        sequence: Long,
+        pages: List<TeacherPageSyncRecord>,
+        cursor: TeacherPageSyncCursorRecord?,
+        inventoryPageCount: Int?,
+    ): TeacherManifestInstallResult {
+        require(syncGeneration > 0L && sequence > 0L)
+        if (syncGeneration == teacherManifestGeneration && sequence == teacherManifestSequence) {
+            return TeacherManifestInstallResult.DUPLICATE
+        }
+        if (isTeacherManifestStale(
+                teacherManifestGeneration,
+                teacherManifestSequence,
+                syncGeneration,
+                sequence,
+            )
+        ) return TeacherManifestInstallResult.STALE
+        if (syncGeneration == teacherManifestGeneration && pages.any { incoming ->
+                val previous = teacherPages[incoming.pageToken] ?: return@any false
+                !hasSameTeacherPageIdentity(previous, incoming) || isTeacherPageRegression(
+                    previous.manifestRevision,
+                    previous.manifestStudentLayerSha256,
+                    incoming.manifestRevision,
+                    incoming.manifestStudentLayerSha256,
+                ) || incoming.sourceRevision == previous.sourceRevision &&
+                    incoming.studentLayerSha256 != previous.studentLayerSha256
+            }
+        ) return TeacherManifestInstallResult.REGRESSION
+
+        val previousPages = if (syncGeneration == teacherManifestGeneration) teacherPages.toMap() else emptyMap()
+        teacherPages.clear()
+        // A bounded manifest is a page upsert batch within one generation. Retaining omitted rows
+        // keeps an in-flight request/correlation alive when another newly changed page pushes it
+        // outside the 512-row transport window. PAGE_UNAVAILABLE explicitly removes a stale row.
+        teacherPages.putAll(previousPages)
+        pages.forEach { incoming ->
+            require(incoming.syncGeneration == syncGeneration)
+            val previous = previousPages[incoming.pageToken]
+            teacherPages[incoming.pageToken] = mergeTeacherPageFromManifest(previous, incoming)
+        }
+        teacherManifestGeneration = syncGeneration
+        teacherManifestSequence = sequence
+        teacherInventoryPageCount = inventoryPageCount
+        teacherCursor = cursor
+        persist()
+        return TeacherManifestInstallResult.APPLIED
+    }
+
+    @Synchronized
+    fun removeTeacherPage(pageToken: String): Boolean {
+        if (teacherPages.remove(pageToken) == null) return false
+        if (teacherCursor?.pageToken == pageToken) teacherCursor = null
+        persist()
+        return true
+    }
+
+    @Synchronized fun teacherManifestGeneration(): Long = teacherManifestGeneration
+    @Synchronized fun teacherManifestSequence(): Long = teacherManifestSequence
+
+    @Synchronized
+    fun teacherInventoryComplete(): Boolean = teacherInventoryPageCount?.let { expected ->
+        teacherPages.size == expected
+    } ?: false
+
+    @Synchronized fun teacherExpectedInventoryPageCount(): Int? = teacherInventoryPageCount
+    @Synchronized fun teacherDiscoveredInventoryPageCount(): Int = teacherPages.size
+
+    /** LAN READY invalidates page ownership but keeps high-waters that reject delayed old manifests. */
+    @Synchronized
+    fun clearTeacherManifestPagesForLan() {
+        if (teacherPages.isEmpty() && teacherCursor == null && teacherInventoryPageCount == null) return
+        teacherPages.clear()
+        teacherCursor = null
+        teacherInventoryPageCount = null
+        persist()
+    }
+
+    @Synchronized
+    fun teacherPages(): List<TeacherPageSyncRecord> = teacherPages.values.sortedWith(
+        compareByDescending<TeacherPageSyncRecord>(TeacherPageSyncRecord::lastChangedAtEpochMs)
+            .thenByDescending(TeacherPageSyncRecord::pageNumber),
+    )
+
+    @Synchronized fun pendingTeacherPages(): List<TeacherPageSyncRecord> = teacherPages().filter { it.pending || it.mappingRequired }
+    @Synchronized fun teacherPage(pageToken: String): TeacherPageSyncRecord? = teacherPages[pageToken]
+    @Synchronized fun teacherCursor(): TeacherPageSyncCursorRecord? = teacherCursor
+
+    @Synchronized
+    fun reserveTeacherRequest(
+        pageToken: String,
+        transferId: String,
+        createdAtEpochMs: Long,
+        requestedSourceRevision: Long,
+        requesterRevision: Long,
+    ): TeacherPageSyncRecord? {
+        val current = teacherPages[pageToken] ?: return null
+        if (current.mappingRequired || current.requestTransferId != null) return current
+        return current.copy(
+            requestTransferId = transferId,
+            requestCreatedAtEpochMs = createdAtEpochMs,
+            requestTransportAcknowledgedAtEpochMs = null,
+            requestedSourceRevision = requestedSourceRevision,
+            requesterRevision = requesterRevision,
+        ).also {
+            teacherPages[pageToken] = it
+            persist()
+        }
+    }
+
+    @Synchronized
+    fun markTeacherRequestTransportAcknowledged(
+        pageToken: String,
+        transferId: String,
+        observedAtEpochMs: Long,
+    ): TeacherPageSyncRecord? {
+        val current = teacherPages[pageToken] ?: return null
+        if (current.requestTransferId != transferId) return null
+        if (current.requestTransportAcknowledgedAtEpochMs != null) return current
+        return current.copy(
+            requestTransportAcknowledgedAtEpochMs = observedAtEpochMs.coerceAtLeast(0L),
+        ).also {
+            teacherPages[pageToken] = it
+            persist()
+        }
+    }
+
+    @Synchronized
+    fun clearTeacherRequest(
+        pageToken: String,
+        transferId: String? = null,
+        forceCheckpoint: Boolean = false,
+    ): Boolean {
+        val current = teacherPages[pageToken] ?: return false
+        if (transferId != null && current.requestTransferId != transferId) return false
+        val next = current.copy(
+            requestTransferId = null,
+            requestCreatedAtEpochMs = null,
+            requestTransportAcknowledgedAtEpochMs = null,
+            requestedSourceRevision = 0L,
+            requesterRevision = 0L,
+            forceCheckpoint = current.forceCheckpoint || forceCheckpoint,
+        )
+        if (next == current) return false
+        teacherPages[pageToken] = next
+        persist()
+        return true
+    }
+
+    @Synchronized
+    fun recordTeacherPageApplied(
+        pageToken: String,
+        sourceRevision: Long,
+        resultLayerSha256: String,
+        observedAttemptNos: List<Int>,
+        requestTransferId: String,
+        annotationTransferId: String,
+    ): Boolean {
+        val current = teacherPages[pageToken] ?: return false
+        require(sourceRevision > 0L)
+        val next = current.copy(
+            sourceRevision = maxOf(current.sourceRevision, sourceRevision),
+            studentLayerSha256 = if (sourceRevision >= current.sourceRevision) resultLayerSha256 else current.studentLayerSha256,
+            attemptNos = (current.attemptNos + observedAttemptNos).distinct().sorted(),
+            appliedRevision = maxOf(current.appliedRevision, sourceRevision),
+            appliedStudentLayerSha256 = resultLayerSha256,
+            requestTransferId = null,
+            requestCreatedAtEpochMs = null,
+            requestTransportAcknowledgedAtEpochMs = null,
+            requestedSourceRevision = 0L,
+            requesterRevision = 0L,
+            forceCheckpoint = false,
+            lastCompletedRequestTransferId = requestTransferId,
+            lastCompletedAnnotationTransferId = annotationTransferId,
+        )
+        if (next == current) return false
+        teacherPages[pageToken] = next
+        persist()
+        return true
+    }
+
+    private fun teacherReviewKey(pageToken: String, attemptNo: Int): String = "$pageToken:$attemptNo"
+    @Synchronized fun appliedTeacherReview(pageToken: String, attemptNo: Int): AppliedTeacherReviewRecord? =
+        appliedTeacherReviews[teacherReviewKey(pageToken, attemptNo)]
+
+    @Synchronized fun appliedTeacherReviewRevision(pageToken: String, attemptNo: Int): Long =
+        appliedTeacherReview(pageToken, attemptNo)?.sourceRevision ?: 0L
+
+    @Synchronized
+    fun recordTeacherReviewApplied(
+        pageToken: String,
+        attemptNo: Int,
+        sourceRevision: Long,
+        payloadSha256: String,
+        resultLayerSha256: String,
+    ): Boolean {
+        val key = teacherReviewKey(pageToken, attemptNo)
+        val current = appliedTeacherReviews[key]
+        if (current != null && sourceRevision <= current.sourceRevision) return false
+        appliedTeacherReviews[key] = AppliedTeacherReviewRecord(
+            sourceRevision,
+            payloadSha256,
+            resultLayerSha256,
+        )
+        persist()
+        return true
+    }
+
+    @Synchronized
+    fun queueTeacherReview(value: PendingTeacherReviewRecord) {
+        if (teacherPublicationCompletionKey(value) in completedTeacherPublications) return
+        val current = pendingTeacherReviews[value.key]
+        if (current?.intentId == value.intentId) {
+            // The periodic journal scan can win the few milliseconds between durable promotion and
+            // the live pair-scoped bus callback. Permit only that one-way provenance upgrade; a
+            // later generic scan can never erase a captured token/deferred binding or alter an
+            // in-flight transfer.
+            val upgradesHeldLivePublication = !current.inFlight &&
+                current.workbookToken == null && !current.deferredWorkbookBinding &&
+                (value.workbookToken != null || value.deferredWorkbookBinding) &&
+                current.bookId == value.bookId && current.contentSha256 == value.contentSha256 &&
+                current.pageNumber == value.pageNumber && current.attemptNo == value.attemptNo
+            if (upgradesHeldLivePublication) {
+                pendingTeacherReviews[value.key] = value
+                persist()
+            }
+            return
+        }
+        pendingTeacherReviews[value.key] = value
+        persist()
+    }
+
+    @Synchronized
+    fun pendingTeacherReviews(): List<PendingTeacherReviewRecord> = pendingTeacherReviews.values.sortedWith(
+        compareByDescending<PendingTeacherReviewRecord>(PendingTeacherReviewRecord::queuedAtEpochMs)
+            .thenByDescending(PendingTeacherReviewRecord::pageNumber),
+    )
+
+    @Synchronized
+    fun bindDeferredTeacherReviewWorkbook(
+        key: String,
+        intentId: String,
+        workbookToken: String,
+    ): PendingTeacherReviewRecord? {
+        require(intentId.isNotBlank() && workbookToken.isNotBlank())
+        val current = pendingTeacherReviews[key] ?: return null
+        if (current.intentId != intentId || current.inFlight || current.workbookToken != null ||
+            !current.deferredWorkbookBinding
+        ) return null
+        return current.copy(
+            workbookToken = workbookToken,
+            deferredWorkbookBinding = false,
+        ).also {
+            pendingTeacherReviews[key] = it
+            persist()
+        }
+    }
+
+    @Synchronized
+    fun reservePendingTeacherReview(
+        key: String,
+        syncGeneration: Long,
+        pageToken: String,
+        transferId: String,
+        sourceRevision: Long,
+        payloadSha256: String,
+        resultLayerSha256: String,
+        sentAtEpochMs: Long,
+    ): PendingTeacherReviewRecord? {
+        val current = pendingTeacherReviews[key] ?: return null
+        if (current.inFlight) return current
+        return current.copy(
+            inFlightSyncGeneration = syncGeneration,
+            inFlightPageToken = pageToken,
+            inFlightTransferId = transferId,
+            inFlightSourceRevision = sourceRevision,
+            inFlightPayloadSha256 = payloadSha256,
+            inFlightResultLayerSha256 = resultLayerSha256,
+            sentAtEpochMs = sentAtEpochMs,
+            transportAcknowledgedAtEpochMs = null,
+        ).also {
+            pendingTeacherReviews[key] = it
+            persist()
+        }
+    }
+
+    @Synchronized
+    fun markPendingTeacherReviewTransportAcknowledged(
+        key: String,
+        transferId: String,
+        observedAtEpochMs: Long,
+    ): PendingTeacherReviewRecord? {
+        val current = pendingTeacherReviews[key] ?: return null
+        if (current.inFlightTransferId != transferId) return null
+        if (current.transportAcknowledgedAtEpochMs != null) return current
+        return current.copy(
+            transportAcknowledgedAtEpochMs = observedAtEpochMs.coerceAtLeast(0L),
+        ).also {
+            pendingTeacherReviews[key] = it
+            persist()
+        }
+    }
+
+    @Synchronized
+    fun resolvePendingTeacherReview(
+        syncGeneration: Long,
+        pageToken: String,
+        sourceTransferId: String,
+        sourceRevision: Long,
+        accepted: Boolean,
+        retryQueuedAtEpochMs: Long,
+    ): Boolean {
+        val current = pendingTeacherReviews.values.firstOrNull {
+            it.inFlightSyncGeneration == syncGeneration && it.inFlightPageToken == pageToken &&
+                it.inFlightTransferId == sourceTransferId && it.inFlightSourceRevision == sourceRevision
+        } ?: return false
+        if (accepted) {
+            completedTeacherPublications[teacherPublicationCompletionKey(current)] = retryQueuedAtEpochMs
+            trimCompletedTeacherPublications()
+            pendingTeacherReviews.remove(current.key)
+        } else {
+            pendingTeacherReviews[current.key] = current.clearedForRetry(retryQueuedAtEpochMs)
+        }
+        persist()
+        return true
+    }
+
+    @Synchronized
+    fun expirePendingTeacherReview(key: String, nowEpochMs: Long): Boolean {
+        val current = pendingTeacherReviews[key] ?: return false
+        if (!current.inFlight) return false
+        pendingTeacherReviews[key] = current.clearedForRetry(nowEpochMs)
+        persist()
+        return true
+    }
+
+    @Synchronized
+    fun removePendingTeacherReview(key: String): Boolean {
+        if (pendingTeacherReviews.remove(key) == null) return false
+        persist()
+        return true
+    }
+
+    @Synchronized
+    fun clearPendingTeacherReviews() {
+        if (pendingTeacherReviews.isEmpty()) return
+        pendingTeacherReviews.clear()
+        persist()
+    }
+
+    @Synchronized
+    fun completeTeacherReviewFromLan(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        publicationId: String,
+        completedAtEpochMs: Long,
+    ): Boolean {
+        require(publicationId.isNotBlank() && completedAtEpochMs >= 0L)
+        val key = "$bookId:$pageNumber:$attemptNo"
+        val pending = pendingTeacherReviews[key]
+        if (pending != null && pending.intentId != publicationId) return false
+        val completionKey = teacherPublicationCompletionKey(bookId, pageNumber, attemptNo, publicationId)
+        val alreadyCompleted = completionKey in completedTeacherPublications
+        if (pending == null && alreadyCompleted) return true
+        completedTeacherPublications[completionKey] = completedAtEpochMs
+        trimCompletedTeacherPublications()
+        if (pending != null) pendingTeacherReviews.remove(key)
+        persist()
+        return true
+    }
+
+    @Synchronized
+    fun isTeacherPublicationCompleted(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        publicationId: String,
+    ): Boolean = teacherPublicationCompletionKey(
+        bookId,
+        pageNumber,
+        attemptNo,
+        publicationId,
+    ) in completedTeacherPublications
+
+    private fun teacherPublicationCompletionKey(value: PendingTeacherReviewRecord): String =
+        teacherPublicationCompletionKey(
+            value.bookId,
+            value.pageNumber,
+            value.attemptNo,
+            value.intentId,
+        )
+
+    private fun teacherPublicationCompletionKey(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        publicationId: String,
+    ): String = MessageDigest.getInstance("SHA-256")
+        .digest(
+            JSONObject()
+                .put("bookId", bookId)
+                .put("pageNumber", pageNumber)
+                .put("attemptNo", attemptNo)
+                .put("publicationId", publicationId)
+                .toString()
+                .toByteArray(Charsets.UTF_8),
+        )
+        .joinToString("") { byte -> (byte.toInt() and 0xff).toString(16).padStart(2, '0') }
+
+    private fun trimCompletedTeacherPublications() {
+        while (completedTeacherPublications.size > MAX_COMPLETED_TEACHER_PUBLICATIONS) {
+            completedTeacherPublications.remove(completedTeacherPublications.keys.first())
+        }
+    }
+
+    private fun PendingTeacherReviewRecord.clearedForRetry(nowEpochMs: Long) = copy(
+        queuedAtEpochMs = maxOf(queuedAtEpochMs, nowEpochMs),
+        retryCount = safeIncrementInt(retryCount),
+        inFlightSyncGeneration = 0L,
+        inFlightPageToken = null,
+        inFlightTransferId = null,
+        inFlightSourceRevision = 0L,
+        inFlightPayloadSha256 = null,
+        inFlightResultLayerSha256 = null,
+        sentAtEpochMs = null,
+        transportAcknowledgedAtEpochMs = null,
+    )
+
+    private fun clearPairState(resetGenerationCounter: Boolean) {
+        if (resetGenerationCounter) studentGenerationCounter = 0L
+        studentOpenGeneration = 0L
+        studentManifestSequence = 0L
+        studentManifestWindowOrdinal = 0L
+        outstandingStudentManifest = null
+        studentPages.clear()
+        teacherManifestGeneration = 0L
+        teacherManifestSequence = 0L
+        teacherInventoryPageCount = null
+        teacherPages.clear()
+        teacherCursor = null
+        workbookMappings.clear()
+        explicitWorkbookMappingRequirements.clear()
+        appliedTeacherReviews.clear()
+        pendingTeacherReviews.clear()
+        completedTeacherPublications.clear()
+    }
+
+    private fun load() {
+        val durableGenerationHighWater = readGenerationHighWater()
+        resetInMemoryState()
+        studentGenerationCounter = durableGenerationHighWater
+        runCatching {
+            val root = JSONObject(atomicFile.openRead().bufferedReader(Charsets.UTF_8).use { it.readText() })
+            val version = root.optInt("version")
+            if (version !in MIN_SUPPORTED_VERSION..VERSION) return@runCatching
+            pairId = root.optNullableString("pairId")
+            val journalGenerationCounter = root.optLong("studentGenerationCounter").coerceAtLeast(0L)
+            studentGenerationCounter = maxOf(durableGenerationHighWater, journalGenerationCounter)
+            studentOpenGeneration = root.optLong("studentOpenGeneration").coerceAtLeast(0L)
+            studentManifestSequence = root.optLong("studentManifestSequence").coerceAtLeast(0L)
+            studentManifestWindowOrdinal = root.optLong("studentManifestWindowOrdinal").coerceAtLeast(0L)
+            outstandingStudentManifest = root.optJSONObject("outstandingStudentManifest")?.let(::decodeManifest)
+            teacherManifestGeneration = root.optLong("teacherManifestGeneration").coerceAtLeast(0L)
+            teacherManifestSequence = root.optLong("teacherManifestSequence").coerceAtLeast(0L)
+            teacherInventoryPageCount = root.optNullableInt("teacherInventoryPageCount")
+            root.optJSONArray("studentPages")?.forEachObject { decodeStudent(it)?.let { row -> studentPages[row.pageToken] = row } }
+            root.optJSONArray("teacherPages")?.forEachObject { decodeTeacher(it)?.let { row -> teacherPages[row.pageToken] = row } }
+            teacherCursor = root.optJSONObject("teacherCursor")?.let(::decodeCursor)
+            root.optJSONArray("workbookMappings")?.forEachObject { decodeMapping(it)?.let { row -> workbookMappings[row.workbookToken] = row } }
+            root.optJSONArray("explicitWorkbookMappingRequirements")?.forEachObject { value ->
+                decodeExplicitMappingRequirement(value)?.let(explicitWorkbookMappingRequirements::add)
+            }
+            root.optJSONObject("appliedTeacherReviewRevisions")?.let { values ->
+                values.keys().forEach { key ->
+                    val raw = values.opt(key)
+                    val record = when (raw) {
+                        is Number -> raw.toLong().takeIf { it >= 0L }?.let {
+                            AppliedTeacherReviewRecord(it, null, null)
+                        }
+                        is JSONObject -> runCatching {
+                            AppliedTeacherReviewRecord(
+                                sourceRevision = raw.getLong("sourceRevision"),
+                                payloadSha256 = raw.optNullableString("payloadSha256"),
+                                resultLayerSha256 = raw.optNullableString("resultLayerSha256"),
+                            )
+                        }.getOrNull()
+                        else -> null
+                    }
+                    record?.let { appliedTeacherReviews[key] = it }
+                }
+            }
+            root.optJSONArray("pendingTeacherReviews")?.forEachObject { decodePendingReview(it)?.let { row -> pendingTeacherReviews[row.key] = row } }
+            root.optJSONObject("completedTeacherPublications")?.takeIf { version >= 3 }?.let { values ->
+                values.keys().forEach { id ->
+                    values.optLong(id, -1L).takeIf { it >= 0L }?.let {
+                        completedTeacherPublications[id] = it
+                    }
+                }
+                trimCompletedTeacherPublications()
+            }
+            if (shouldDiscardRecoveredStudentGeneration(
+                    durableGenerationHighWater,
+                    journalGenerationCounter,
+                    studentOpenGeneration,
+                )
+            ) {
+                // The redundant high-water won a crash race against the main journal. Never reuse
+                // the older open generation/page tokens; the next begin allocates high-water + 1.
+                studentOpenGeneration = 0L
+                studentManifestSequence = 0L
+                studentManifestWindowOrdinal = 0L
+                outstandingStudentManifest = null
+                studentPages.clear()
+            } else if (studentOpenGeneration == 0L) {
+                studentManifestSequence = 0L
+                studentManifestWindowOrdinal = 0L
+                outstandingStudentManifest = null
+                studentPages.clear()
+            } else {
+                studentPages.entries.removeAll { it.value.syncGeneration != studentOpenGeneration }
+                if (outstandingStudentManifest?.syncGeneration != studentOpenGeneration) {
+                    outstandingStudentManifest = null
+                }
+            }
+            if (journalGenerationCounter > durableGenerationHighWater) {
+                runCatching { persistGenerationHighWater(journalGenerationCounter) }
+            }
+        }.onFailure {
+            resetInMemoryState()
+            studentGenerationCounter = durableGenerationHighWater
+        }
+    }
+
+    private fun readGenerationHighWater(): Long = runCatching {
+        generationHighWaterFile.openRead().bufferedReader(Charsets.US_ASCII).use { reader ->
+            reader.readText().trim().toLong().coerceAtLeast(0L)
+        }
+    }.getOrDefault(0L)
+
+    private fun persistGenerationHighWater(value: Long) {
+        require(value >= 0L)
+        val output = generationHighWaterFile.startWrite()
+        try {
+            output.write(value.toString().toByteArray(Charsets.US_ASCII))
+            output.flush()
+            output.fd.sync()
+            generationHighWaterFile.finishWrite(output)
+        } catch (error: Throwable) {
+            runCatching { generationHighWaterFile.failWrite(output) }
+            throw error
+        }
+    }
+
+    private fun persist() {
+        val root = JSONObject()
+            .put("version", VERSION).put("pairId", pairId ?: JSONObject.NULL)
+            .put("studentGenerationCounter", studentGenerationCounter)
+            .put("studentOpenGeneration", studentOpenGeneration)
+            .put("studentManifestSequence", studentManifestSequence)
+            .put("studentManifestWindowOrdinal", studentManifestWindowOrdinal)
+            .put("outstandingStudentManifest", outstandingStudentManifest?.let(::encode) ?: JSONObject.NULL)
+            .put("studentPages", JSONArray().apply { studentPages.values.forEach { put(encode(it)) } })
+            .put("teacherManifestGeneration", teacherManifestGeneration)
+            .put("teacherManifestSequence", teacherManifestSequence)
+            .put("teacherInventoryPageCount", teacherInventoryPageCount ?: JSONObject.NULL)
+            .put("teacherPages", JSONArray().apply { teacherPages.values.forEach { put(encode(it)) } })
+            .put("teacherCursor", teacherCursor?.let(::encode) ?: JSONObject.NULL)
+            .put("workbookMappings", JSONArray().apply { workbookMappings.values.forEach { put(encode(it)) } })
+            .put("explicitWorkbookMappingRequirements", JSONArray().apply {
+                explicitWorkbookMappingRequirements.forEach { requirement ->
+                    put(JSONObject()
+                        .put("workbookToken", requirement.workbookToken)
+                        .put("contentSha256", requirement.contentSha256))
+                }
+            })
+            .put("appliedTeacherReviewRevisions", JSONObject().apply {
+                appliedTeacherReviews.forEach { (key, value) ->
+                    put(key, JSONObject()
+                        .put("sourceRevision", value.sourceRevision)
+                        .put("payloadSha256", value.payloadSha256 ?: JSONObject.NULL)
+                        .put("resultLayerSha256", value.resultLayerSha256 ?: JSONObject.NULL))
+                }
+            })
+            .put("pendingTeacherReviews", JSONArray().apply { pendingTeacherReviews.values.forEach { put(encode(it)) } })
+            .put("completedTeacherPublications", JSONObject().apply {
+                completedTeacherPublications.forEach(::put)
+            })
+        val output = try {
+            beforePersistWrite?.invoke()
+            atomicFile.startWrite()
+        } catch (error: Throwable) {
+            load()
+            throw error
+        }
+        try {
+            output.write(root.toString().toByteArray(Charsets.UTF_8))
+            output.flush()
+            output.fd.sync()
+            atomicFile.finishWrite(output)
+        } catch (error: Throwable) {
+            runCatching { atomicFile.failWrite(output) }
+            load()
+            throw error
+        }
+    }
+
+    /** Restores the exact empty/default state before a durable journal is decoded. */
+    private fun resetInMemoryState() {
+        pairId = null
+        studentGenerationCounter = 0L
+        clearPairState(resetGenerationCounter = false)
+    }
+
+    private fun encode(v: StudentManifestReservation) = JSONObject()
+        .put("generation", v.syncGeneration).put("sequence", v.sequence)
+        .put("transferId", v.transferId).put("createdAt", v.createdAtEpochMs)
+        .put("windowOrdinal", v.windowOrdinal)
+
+    private fun encode(v: StudentPageSyncRecord) = JSONObject()
+        .put("generation", v.syncGeneration).put("pageToken", v.pageToken)
+        .put("workbookToken", v.workbookToken).put("bookId", v.bookId)
+        .put("contentSha256", v.contentSha256).put("studentLayerSha256", v.studentLayerSha256)
+        .put("stateFingerprint", v.stateFingerprint).put("workbookLabel", v.workbookLabel)
+        .put("pageNumber", v.pageNumber).put("attemptNos", v.attemptNos.toJsonArray())
+        .put("submittedAttemptNos", v.submittedAttemptNos.toJsonArray())
+        .put("sourceRevision", v.sourceRevision).put("acknowledgedRevision", v.acknowledgedRevision)
+        .put("acknowledgedStateFingerprint", v.acknowledgedStateFingerprint ?: JSONObject.NULL)
+        .put("originDeviceHighWater", v.originDeviceHighWater)
+        .put("acknowledgedOriginCursor", v.acknowledgedOriginCursor)
+        .put("lastChangedAt", v.lastChangedAtEpochMs).put("approximateBytes", v.approximateBytes)
+        .put("responseToRequestTransferId", v.responseToRequestTransferId ?: JSONObject.NULL)
+        .put("outgoingAnnotationTransferId", v.outgoingAnnotationTransferId ?: JSONObject.NULL)
+        .put("outgoingSourceRevision", v.outgoingSourceRevision)
+        .put("outgoingOriginCursor", v.outgoingOriginCursor)
+        .put("outgoingStateFingerprint", v.outgoingStateFingerprint ?: JSONObject.NULL)
+        .put("outgoingResultLayerSha256", v.outgoingResultLayerSha256 ?: JSONObject.NULL)
+        .put("outgoingSentAt", v.outgoingSentAtEpochMs ?: JSONObject.NULL)
+
+    private fun encode(v: TeacherPageSyncRecord) = JSONObject()
+        .put("generation", v.syncGeneration).put("pageToken", v.pageToken)
+        .put("workbookToken", v.workbookToken).put("contentSha256", v.contentSha256)
+        .put("studentLayerSha256", v.studentLayerSha256).put("workbookLabel", v.workbookLabel)
+        .put("localBookId", v.localBookId ?: JSONObject.NULL).put("pageNumber", v.pageNumber)
+        .put("attemptNos", v.attemptNos.toJsonArray()).put("submittedAttemptNos", v.submittedAttemptNos.toJsonArray())
+        .put("sourceRevision", v.sourceRevision).put("manifestRevision", v.manifestRevision)
+        .put("manifestStudentLayerSha256", v.manifestStudentLayerSha256)
+        .put("appliedRevision", v.appliedRevision)
+        .put("appliedStudentLayerSha256", v.appliedStudentLayerSha256 ?: JSONObject.NULL)
+        .put("lastChangedAt", v.lastChangedAtEpochMs).put("approximateBytes", v.approximateBytes)
+        .put("requestTransferId", v.requestTransferId ?: JSONObject.NULL)
+        .put("requestCreatedAt", v.requestCreatedAtEpochMs ?: JSONObject.NULL)
+        .put("requestTransportAcknowledgedAt", v.requestTransportAcknowledgedAtEpochMs ?: JSONObject.NULL)
+        .put("requestedSourceRevision", v.requestedSourceRevision).put("requesterRevision", v.requesterRevision)
+        .put("forceCheckpoint", v.forceCheckpoint)
+        .put("lastCompletedRequestTransferId", v.lastCompletedRequestTransferId ?: JSONObject.NULL)
+        .put("lastCompletedAnnotationTransferId", v.lastCompletedAnnotationTransferId ?: JSONObject.NULL)
+
+    private fun encode(v: TeacherPageSyncCursorRecord) = JSONObject()
+        .put("generation", v.syncGeneration).put("sequence", v.sequence)
+        .put("pageToken", v.pageToken).put("workbookToken", v.workbookToken)
+        .put("contentSha256", v.contentSha256).put("pageNumber", v.pageNumber)
+        .put("attemptNo", v.attemptNo ?: JSONObject.NULL).put("sourceRevision", v.sourceRevision)
+        .put("updatedAt", v.updatedAtEpochMs)
+
+    private fun encode(v: WorkbookMappingRecord) = JSONObject()
+        .put("workbookToken", v.workbookToken).put("localBookId", v.localBookId)
+        .put("contentSha256", v.contentSha256)
+
+    private fun encode(v: PendingTeacherReviewRecord) = JSONObject()
+        .put("intentId", v.intentId).put("bookId", v.bookId).put("contentSha256", v.contentSha256)
+        .put("workbookToken", v.workbookToken ?: JSONObject.NULL)
+        .put("deferredWorkbookBinding", v.deferredWorkbookBinding)
+        .put("deferredAfterManifestGeneration", v.deferredAfterManifestGeneration)
+        .put("deferredAfterManifestSequence", v.deferredAfterManifestSequence)
+        .put("pageNumber", v.pageNumber).put("attemptNo", v.attemptNo)
+        .put("queuedAt", v.queuedAtEpochMs).put("retryCount", v.retryCount)
+        .put("inFlightGeneration", v.inFlightSyncGeneration)
+        .put("inFlightPageToken", v.inFlightPageToken ?: JSONObject.NULL)
+        .put("inFlightTransferId", v.inFlightTransferId ?: JSONObject.NULL)
+        .put("inFlightSourceRevision", v.inFlightSourceRevision)
+        .put("inFlightPayloadSha256", v.inFlightPayloadSha256 ?: JSONObject.NULL)
+        .put("inFlightResultLayerSha256", v.inFlightResultLayerSha256 ?: JSONObject.NULL)
+        .put("sentAt", v.sentAtEpochMs ?: JSONObject.NULL)
+        .put("transportAcknowledgedAt", v.transportAcknowledgedAtEpochMs ?: JSONObject.NULL)
+
+    private fun decodeManifest(v: JSONObject) = StudentManifestReservation(
+        v.getLong("generation"), v.getLong("sequence"), v.getString("transferId"), v.getLong("createdAt"),
+        v.optLong("windowOrdinal").coerceAtLeast(0L),
+    )
+
+    private fun decodeStudent(v: JSONObject): StudentPageSyncRecord? = runCatching { StudentPageSyncRecord(
+        syncGeneration = v.getLong("generation"), pageToken = v.getString("pageToken"),
+        workbookToken = v.getString("workbookToken"), bookId = v.getString("bookId"),
+        contentSha256 = v.getString("contentSha256"), studentLayerSha256 = v.getString("studentLayerSha256"),
+        stateFingerprint = v.getString("stateFingerprint"), workbookLabel = v.getString("workbookLabel"),
+        pageNumber = v.getInt("pageNumber"), attemptNos = v.optJSONArray("attemptNos").toIntList(),
+        submittedAttemptNos = v.optJSONArray("submittedAttemptNos").toIntList(),
+        sourceRevision = v.getLong("sourceRevision"), acknowledgedRevision = v.optLong("acknowledgedRevision"),
+        acknowledgedStateFingerprint = v.optNullableString("acknowledgedStateFingerprint"),
+        originDeviceHighWater = v.optLong("originDeviceHighWater"), acknowledgedOriginCursor = v.optLong("acknowledgedOriginCursor"),
+        lastChangedAtEpochMs = v.getLong("lastChangedAt"), approximateBytes = v.optLong("approximateBytes"),
+        responseToRequestTransferId = v.optNullableString("responseToRequestTransferId"),
+        outgoingAnnotationTransferId = v.optNullableString("outgoingAnnotationTransferId"),
+        outgoingSourceRevision = v.optLong("outgoingSourceRevision"), outgoingOriginCursor = v.optLong("outgoingOriginCursor"),
+        outgoingStateFingerprint = v.optNullableString("outgoingStateFingerprint"),
+        outgoingResultLayerSha256 = v.optNullableString("outgoingResultLayerSha256"),
+        outgoingSentAtEpochMs = v.optNullableLong("outgoingSentAt"),
+    ) }.getOrNull()
+
+    private fun decodeTeacher(v: JSONObject): TeacherPageSyncRecord? = runCatching { TeacherPageSyncRecord(
+        syncGeneration = v.getLong("generation"), pageToken = v.getString("pageToken"),
+        workbookToken = v.getString("workbookToken"), contentSha256 = v.getString("contentSha256"),
+        studentLayerSha256 = v.getString("studentLayerSha256"), workbookLabel = v.getString("workbookLabel"),
+        localBookId = v.optNullableString("localBookId"), pageNumber = v.getInt("pageNumber"),
+        attemptNos = v.optJSONArray("attemptNos").toIntList(), submittedAttemptNos = v.optJSONArray("submittedAttemptNos").toIntList(),
+        sourceRevision = v.getLong("sourceRevision"),
+        manifestRevision = v.optLong("manifestRevision", v.getLong("sourceRevision")),
+        manifestStudentLayerSha256 = v.optString("manifestStudentLayerSha256", v.getString("studentLayerSha256")),
+        appliedRevision = v.optLong("appliedRevision"),
+        appliedStudentLayerSha256 = v.optNullableString("appliedStudentLayerSha256"),
+        lastChangedAtEpochMs = v.getLong("lastChangedAt"), approximateBytes = v.optLong("approximateBytes"),
+        requestTransferId = v.optNullableString("requestTransferId"), requestCreatedAtEpochMs = v.optNullableLong("requestCreatedAt"),
+        requestTransportAcknowledgedAtEpochMs = v.optNullableLong("requestTransportAcknowledgedAt"),
+        requestedSourceRevision = v.optLong("requestedSourceRevision"), requesterRevision = v.optLong("requesterRevision"),
+        forceCheckpoint = v.optBoolean("forceCheckpoint"),
+        lastCompletedRequestTransferId = v.optNullableString("lastCompletedRequestTransferId"),
+        lastCompletedAnnotationTransferId = v.optNullableString("lastCompletedAnnotationTransferId"),
+    ) }.getOrNull()
+
+    private fun decodeCursor(v: JSONObject): TeacherPageSyncCursorRecord? = runCatching { TeacherPageSyncCursorRecord(
+        v.getLong("generation"), v.getLong("sequence"), v.getString("pageToken"), v.getString("workbookToken"),
+        v.getString("contentSha256"), v.getInt("pageNumber"), if (v.isNull("attemptNo")) null else v.getInt("attemptNo"),
+        v.getLong("sourceRevision"), v.getLong("updatedAt"),
+    ) }.getOrNull()
+
+    private fun decodeMapping(v: JSONObject): WorkbookMappingRecord? = runCatching { WorkbookMappingRecord(
+        v.getString("workbookToken"), v.getString("localBookId"), v.getString("contentSha256"),
+    ) }.getOrNull()
+
+    private fun decodeExplicitMappingRequirement(
+        v: JSONObject,
+    ): ExplicitWorkbookMappingRequirement? = runCatching {
+        ExplicitWorkbookMappingRequirement(
+            v.getString("workbookToken"),
+            v.getString("contentSha256"),
+        ).also {
+            require(it.workbookToken.isNotBlank() && it.contentSha256.isNotBlank())
+        }
+    }.getOrNull()
+
+    private fun decodePendingReview(v: JSONObject): PendingTeacherReviewRecord? = runCatching { PendingTeacherReviewRecord(
+        intentId = v.getString("intentId"), bookId = v.getString("bookId"), contentSha256 = v.getString("contentSha256"),
+        workbookToken = v.optNullableString("workbookToken"),
+        deferredWorkbookBinding = if (v.has("deferredWorkbookBinding")) {
+            v.optBoolean("deferredWorkbookBinding")
+        } else {
+            v.optBoolean("deferredLanWorkbookBinding")
+        },
+        deferredAfterManifestGeneration = v.optLong("deferredAfterManifestGeneration").coerceAtLeast(0L),
+        deferredAfterManifestSequence = v.optLong("deferredAfterManifestSequence").coerceAtLeast(0L),
+        pageNumber = v.getInt("pageNumber"), attemptNo = v.getInt("attemptNo"), queuedAtEpochMs = v.getLong("queuedAt"),
+        retryCount = v.optInt("retryCount"), inFlightSyncGeneration = v.optLong("inFlightGeneration"),
+        inFlightPageToken = v.optNullableString("inFlightPageToken"), inFlightTransferId = v.optNullableString("inFlightTransferId"),
+        inFlightSourceRevision = v.optLong("inFlightSourceRevision"), inFlightPayloadSha256 = v.optNullableString("inFlightPayloadSha256"),
+        inFlightResultLayerSha256 = v.optNullableString("inFlightResultLayerSha256"), sentAtEpochMs = v.optNullableLong("sentAt"),
+        transportAcknowledgedAtEpochMs = v.optNullableLong("transportAcknowledgedAt"),
+    ) }.getOrNull()
+
+    private fun JSONArray?.toIntList(): List<Int> = if (this == null) emptyList() else buildList {
+        for (index in 0 until length()) add(getInt(index))
+    }
+    private fun JSONArray.forEachObject(block: (JSONObject) -> Unit) { for (index in 0 until length()) block(getJSONObject(index)) }
+    private fun List<Int>.toJsonArray() = JSONArray().apply { forEach(::put) }
+    private fun JSONObject.optNullableString(name: String): String? = if (isNull(name)) null else optString(name).takeIf(String::isNotBlank)
+    private fun JSONObject.optNullableLong(name: String): Long? = if (isNull(name)) null else getLong(name)
+    private fun JSONObject.optNullableInt(name: String): Int? = if (isNull(name)) null else getInt(name)
+
+    private companion object {
+        const val MIN_SUPPORTED_VERSION = 2
+        const val VERSION = 4
+        const val MAX_COMPLETED_TEACHER_PUBLICATIONS = 1_024
+    }
+}
+
+internal fun pageStateFingerprint(
+    studentLayerSha256: String,
+    attemptNos: List<Int>,
+    submittedAttemptNos: List<Int>,
+): String {
+    val material = buildString {
+        append(studentLayerSha256).append('|')
+        attemptNos.forEach { append(it).append(',') }
+        append('|')
+        submittedAttemptNos.forEach { append(it).append(',') }
+    }
+    return MessageDigest.getInstance("SHA-256")
+        .digest(material.toByteArray(Charsets.US_ASCII))
+        .joinToString("") { byte -> (byte.toInt() and 0xff).toString(16).padStart(2, '0') }
+}
+
+internal fun nextPageSyncRevision(
+    previousFingerprint: String?,
+    previousRevision: Long,
+    currentFingerprint: String,
+): Long = when {
+    previousFingerprint == null -> 1L
+    previousFingerprint == currentFingerprint -> previousRevision
+    else -> safeIncrement(previousRevision)
+}
+
+internal fun isTeacherManifestStale(
+    currentGeneration: Long,
+    currentSequence: Long,
+    incomingGeneration: Long,
+    incomingSequence: Long,
+): Boolean = incomingGeneration < currentGeneration ||
+    incomingGeneration == currentGeneration && incomingSequence <= currentSequence
+
+internal fun isTeacherPageRegression(
+    previousRevision: Long,
+    previousLayerSha256: String,
+    incomingRevision: Long,
+    incomingLayerSha256: String,
+): Boolean = incomingRevision < previousRevision ||
+    incomingRevision == previousRevision && incomingLayerSha256 != previousLayerSha256
+
+/**
+ * A request response may legitimately observe a revision newer than a manifest that was already in
+ * flight. Keep that applied response as the effective page while advancing the independent
+ * manifest high-water, so the delayed manifest is neither poison nor a state rollback.
+ */
+internal fun mergeTeacherPageFromManifest(
+    previous: TeacherPageSyncRecord?,
+    incoming: TeacherPageSyncRecord,
+): TeacherPageSyncRecord {
+    if (previous == null) return incoming
+    require(hasSameTeacherPageIdentity(previous, incoming))
+    val effectiveSourceRevision = maxOf(incoming.sourceRevision, previous.sourceRevision)
+    val effectiveStudentLayerSha256 = if (previous.sourceRevision > incoming.sourceRevision) {
+        previous.studentLayerSha256
+    } else {
+        incoming.studentLayerSha256
+    }
+    val alreadyHasEffectiveState = incoming.appliedStudentLayerSha256 == effectiveStudentLayerSha256 ||
+        previous.appliedStudentLayerSha256 == effectiveStudentLayerSha256
+    val appliedRevision = if (alreadyHasEffectiveState) effectiveSourceRevision else {
+        maxOf(incoming.appliedRevision, previous.appliedRevision).coerceAtMost(effectiveSourceRevision)
+    }
+    return incoming.copy(
+        studentLayerSha256 = effectiveStudentLayerSha256,
+        attemptNos = (incoming.attemptNos + previous.attemptNos).distinct().sorted(),
+        submittedAttemptNos = (incoming.submittedAttemptNos + previous.submittedAttemptNos).distinct().sorted(),
+        sourceRevision = effectiveSourceRevision,
+        appliedRevision = appliedRevision,
+        appliedStudentLayerSha256 = if (alreadyHasEffectiveState) effectiveStudentLayerSha256 else {
+            incoming.appliedStudentLayerSha256 ?: previous.appliedStudentLayerSha256
+        },
+        requestTransferId = previous.requestTransferId,
+        requestCreatedAtEpochMs = previous.requestCreatedAtEpochMs,
+        requestTransportAcknowledgedAtEpochMs = previous.requestTransportAcknowledgedAtEpochMs,
+        requestedSourceRevision = previous.requestedSourceRevision,
+        requesterRevision = previous.requesterRevision,
+        forceCheckpoint = previous.forceCheckpoint,
+        lastCompletedRequestTransferId = previous.lastCompletedRequestTransferId,
+        lastCompletedAnnotationTransferId = previous.lastCompletedAnnotationTransferId,
+    )
+}
+
+internal fun hasSameTeacherPageIdentity(
+    previous: TeacherPageSyncRecord,
+    incoming: TeacherPageSyncRecord,
+): Boolean = previous.pageToken == incoming.pageToken &&
+    previous.syncGeneration == incoming.syncGeneration &&
+    previous.workbookToken == incoming.workbookToken &&
+    previous.contentSha256 == incoming.contentSha256 &&
+    previous.pageNumber == incoming.pageNumber &&
+    previous.localBookId == incoming.localBookId
+
+internal fun shouldDiscardRecoveredStudentGeneration(
+    durableHighWater: Long,
+    journalGenerationCounter: Long,
+    openGeneration: Long,
+): Boolean {
+    require(durableHighWater >= 0L && journalGenerationCounter >= 0L && openGeneration >= 0L)
+    if (openGeneration == 0L) return false
+    val effectiveCounter = maxOf(durableHighWater, journalGenerationCounter)
+    return openGeneration != journalGenerationCounter || openGeneration != effectiveCounter
+}
+
+private fun safeIncrement(value: Long): Long {
+    check(value < Long.MAX_VALUE) { "Page synchronization counter is exhausted" }
+    return value + 1L
+}
+
+private fun safeIncrementInt(value: Int): Int = if (value == Int.MAX_VALUE) value else value + 1

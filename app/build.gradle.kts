@@ -90,4 +90,5 @@ dependencies {
     androidTestImplementation(project(":library:data"))
     androidTestImplementation(project(":sync:lan"))
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20260814")
 }

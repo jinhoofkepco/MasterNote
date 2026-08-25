@@ -232,6 +232,75 @@ object RemoteReviewDocumentCodec {
                     output.writeInt(envelope.score)
                     output.writeInt(envelope.maximumScore)
                 }
+
+                is PageSyncManifestEnvelope -> {
+                    output.writeLong(envelope.syncGeneration)
+                    output.writeLong(envelope.sequence)
+                    output.writeBoolean(envelope.currentCursor != null)
+                    envelope.currentCursor?.let { cursor ->
+                        output.writeLong(cursor.sequence)
+                        output.writeBoundedString(cursor.pageToken)
+                        output.writeInt(cursor.pageNumber)
+                        output.writeNullablePositiveInt(cursor.currentAttemptNo)
+                        output.writeLong(cursor.revision)
+                    }
+                    output.writeInt(envelope.entries.size)
+                    envelope.entries.forEach { entry ->
+                        output.writeBoundedString(entry.pageToken)
+                        output.writeBoundedString(entry.workbookToken)
+                        output.writeBoundedString(entry.contentSha256)
+                        output.writeBoundedString(entry.studentLayerSha256)
+                        output.writeInt(entry.pageNumber)
+                        output.writeAttemptNos(entry.attemptNos)
+                        output.writeAttemptNos(entry.submittedAttemptNos)
+                        output.writeLong(entry.revision)
+                        output.writeLong(entry.lastChangedEpochMs)
+                        output.writeLong(entry.approxBytes)
+                    }
+                    // Optional trailing field keeps new readers compatible with already queued
+                    // manifest frames that predate bounded inventory pagination.
+                    envelope.inventoryPageCount?.let(output::writeInt)
+                }
+
+                is PageSyncRequestEnvelope -> {
+                    output.writeLong(envelope.syncGeneration)
+                    output.writeBoundedString(envelope.pageToken)
+                    output.writeInt(envelope.pageNumber)
+                    output.writeNullablePositiveInt(envelope.attemptNo)
+                    output.writeLong(envelope.requesterRevision)
+                }
+
+                is PageAnnotationEnvelope -> {
+                    output.writeLong(envelope.syncGeneration)
+                    output.writeByte(envelope.purpose.wireCode())
+                    output.writeNullableString(envelope.responseToTransferId)
+                    output.writeBoundedString(envelope.pageToken)
+                    output.writeInt(envelope.pageNumber)
+                    output.writeAttemptNos(envelope.attemptNos)
+                    output.writeByte(envelope.kind.wireCode())
+                    output.writeLong(envelope.baseRevision)
+                    output.writeLong(envelope.sourceRevision)
+                    output.writeNullableString(envelope.deltaOriginDeviceId)
+                    output.writeLong(envelope.baseOriginCursor)
+                    output.writeLong(envelope.sourceOriginCursor)
+                    output.writeByte(envelope.compression.wireCode())
+                    val annotationPayload = envelope.payloadBytesForCodec()
+                    output.writeInt(annotationPayload.size)
+                    output.write(annotationPayload)
+                    output.writeBoundedString(envelope.payloadSha256)
+                    output.writeBoundedString(envelope.resultLayerSha256)
+                }
+
+                is PageSyncAckEnvelope -> {
+                    output.writeLong(envelope.syncGeneration)
+                    output.writeByte(envelope.sourceType.wireCode())
+                    output.writeBoundedString(envelope.sourceTransferId)
+                    output.writeBoundedString(envelope.pageToken)
+                    output.writeInt(envelope.pageNumber)
+                    output.writeLong(envelope.sourceRevision)
+                    output.writeByte(envelope.disposition.wireCode())
+                    output.writeNullableString(envelope.reasonCode)
+                }
             }
         }
         return bytes.toByteArray()
@@ -375,6 +444,119 @@ object RemoteReviewDocumentCodec {
                 score = input.readInt(),
                 maximumScore = input.readInt(),
             )
+
+            RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST -> {
+                val syncGeneration = input.readLong()
+                val sequence = input.readLong()
+                val currentCursor = when (input.readUnsignedByte()) {
+                    0 -> null
+                    1 -> PageSyncCursor(
+                        sequence = input.readLong(),
+                        pageToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                        pageNumber = input.readInt(),
+                        currentAttemptNo = input.readNullablePositiveInt(),
+                        revision = input.readLong(),
+                    )
+                    else -> fail(RemoteReviewCodecError.MALFORMED_PAYLOAD) {
+                        "Current-cursor marker must be 0 or 1."
+                    }
+                }
+                val entryCount = input.readBoundedCount(
+                    RemoteReviewLimits.MAX_PAGE_SYNC_MANIFEST_ENTRIES,
+                    "page sync manifest entry",
+                )
+                val entries = ArrayList<PageSyncManifestEntry>(entryCount)
+                repeat(entryCount) {
+                    entries += PageSyncManifestEntry(
+                        pageToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                        workbookToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                        contentSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES),
+                        studentLayerSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES),
+                        pageNumber = input.readInt(),
+                        attemptNos = input.readAttemptNos(),
+                        submittedAttemptNos = input.readAttemptNos(),
+                        revision = input.readLong(),
+                        lastChangedEpochMs = input.readLong(),
+                        approxBytes = input.readLong(),
+                    )
+                }
+                val inventoryPageCount = if (input.available() == 0) null else input.readInt()
+                PageSyncManifestEnvelope(
+                    transferId = transferId,
+                    createdAtEpochMs = createdAtEpochMs,
+                    syncGeneration = syncGeneration,
+                    sequence = sequence,
+                    currentCursor = currentCursor,
+                    entries = entries,
+                    inventoryPageCount = inventoryPageCount,
+                )
+            }
+
+            RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST -> PageSyncRequestEnvelope(
+                transferId = transferId,
+                createdAtEpochMs = createdAtEpochMs,
+                syncGeneration = input.readLong(),
+                pageToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                pageNumber = input.readInt(),
+                attemptNo = input.readNullablePositiveInt(),
+                requesterRevision = input.readLong(),
+            )
+
+            RemoteReviewEnvelopeType.PAGE_ANNOTATION -> {
+                val syncGeneration = input.readLong()
+                val purpose = pageAnnotationPurposeFromWire(input.readUnsignedByte())
+                val responseToTransferId = input.readNullableString(
+                    RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES,
+                )
+                val pageToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES)
+                val pageNumber = input.readInt()
+                val attemptNos = input.readAttemptNos()
+                val kind = pageAnnotationKindFromWire(input.readUnsignedByte())
+                val baseRevision = input.readLong()
+                val sourceRevision = input.readLong()
+                val deltaOriginDeviceId = input.readNullableString(
+                    RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES,
+                )
+                val baseOriginCursor = input.readLong()
+                val sourceOriginCursor = input.readLong()
+                val compression = pageAnnotationCompressionFromWire(input.readUnsignedByte())
+                val annotationPayload = input.readBoundedBytes(kind.maxPayloadBytes())
+                val payloadSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES)
+                val resultLayerSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES)
+                PageAnnotationEnvelope(
+                    transferId = transferId,
+                    createdAtEpochMs = createdAtEpochMs,
+                    syncGeneration = syncGeneration,
+                    purpose = purpose,
+                    responseToTransferId = responseToTransferId,
+                    pageToken = pageToken,
+                    pageNumber = pageNumber,
+                    attemptNos = attemptNos,
+                    kind = kind,
+                    baseRevision = baseRevision,
+                    sourceRevision = sourceRevision,
+                    deltaOriginDeviceId = deltaOriginDeviceId,
+                    baseOriginCursor = baseOriginCursor,
+                    sourceOriginCursor = sourceOriginCursor,
+                    compression = compression,
+                    payloadBytes = annotationPayload,
+                    payloadSha256 = payloadSha256,
+                    resultLayerSha256 = resultLayerSha256,
+                )
+            }
+
+            RemoteReviewEnvelopeType.PAGE_SYNC_ACK -> PageSyncAckEnvelope(
+                transferId = transferId,
+                createdAtEpochMs = createdAtEpochMs,
+                syncGeneration = input.readLong(),
+                sourceType = pageSyncAckSourceTypeFromWire(input.readUnsignedByte()),
+                sourceTransferId = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                pageToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                pageNumber = input.readInt(),
+                sourceRevision = input.readLong(),
+                disposition = pageSyncAckDispositionFromWire(input.readUnsignedByte()),
+                reasonCode = input.readNullableString(MAX_DETAIL_CODE_BYTES),
+            )
         }
         if (input.available() != 0) {
             fail(RemoteReviewCodecError.INVALID_LENGTH) {
@@ -422,6 +604,11 @@ object RemoteReviewDocumentCodec {
     private fun DataOutputStream.writeNullablePositiveInt(value: Int?) {
         writeBoolean(value != null)
         if (value != null) writeInt(value)
+    }
+
+    private fun DataOutputStream.writeAttemptNos(attemptNos: List<Int>) {
+        writeInt(attemptNos.size)
+        attemptNos.forEach(::writeInt)
     }
 
     private fun DataInputStream.readBoundedString(maxBytes: Int): String {
@@ -476,12 +663,24 @@ object RemoteReviewDocumentCodec {
         return count
     }
 
+    private fun DataInputStream.readAttemptNos(): List<Int> {
+        val count = readBoundedCount(
+            RemoteReviewLimits.MAX_PAGE_SYNC_ATTEMPTS_PER_PAGE,
+            "attempt",
+        )
+        return List(count) { readInt() }
+    }
+
     private fun RemoteReviewEnvelopeType.wireCode(): Int = when (this) {
         RemoteReviewEnvelopeType.PAGE_SNAPSHOT -> 1
         RemoteReviewEnvelopeType.TEACHER_FEEDBACK -> 2
         RemoteReviewEnvelopeType.ACK -> 3
         RemoteReviewEnvelopeType.CHAT_MESSAGE -> 4
         RemoteReviewEnvelopeType.REMOTE_GRADE -> 5
+        RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST -> 6
+        RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST -> 7
+        RemoteReviewEnvelopeType.PAGE_ANNOTATION -> 8
+        RemoteReviewEnvelopeType.PAGE_SYNC_ACK -> 9
     }
 
     private fun envelopeTypeFromWire(code: Int): RemoteReviewEnvelopeType = when (code) {
@@ -490,7 +689,78 @@ object RemoteReviewDocumentCodec {
         3 -> RemoteReviewEnvelopeType.ACK
         4 -> RemoteReviewEnvelopeType.CHAT_MESSAGE
         5 -> RemoteReviewEnvelopeType.REMOTE_GRADE
+        6 -> RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST
+        7 -> RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST
+        8 -> RemoteReviewEnvelopeType.PAGE_ANNOTATION
+        9 -> RemoteReviewEnvelopeType.PAGE_SYNC_ACK
         else -> fail(RemoteReviewCodecError.UNKNOWN_TYPE) { "Unknown envelope type $code." }
+    }
+
+    private fun PageAnnotationKind.wireCode(): Int = when (this) {
+        PageAnnotationKind.DELTA -> 1
+        PageAnnotationKind.CHECKPOINT -> 2
+    }
+
+    private fun pageAnnotationKindFromWire(code: Int): PageAnnotationKind = when (code) {
+        1 -> PageAnnotationKind.DELTA
+        2 -> PageAnnotationKind.CHECKPOINT
+        else -> fail(RemoteReviewCodecError.MALFORMED_PAYLOAD) {
+            "Unknown page annotation kind $code."
+        }
+    }
+
+    private fun PageAnnotationPurpose.wireCode(): Int = when (this) {
+        PageAnnotationPurpose.STUDENT_PAGE -> 1
+        PageAnnotationPurpose.TEACHER_REVIEW -> 2
+    }
+
+    private fun pageAnnotationPurposeFromWire(code: Int): PageAnnotationPurpose = when (code) {
+        1 -> PageAnnotationPurpose.STUDENT_PAGE
+        2 -> PageAnnotationPurpose.TEACHER_REVIEW
+        else -> fail(RemoteReviewCodecError.MALFORMED_PAYLOAD) {
+            "Unknown page annotation purpose $code."
+        }
+    }
+
+    private fun PageAnnotationCompression.wireCode(): Int = when (this) {
+        PageAnnotationCompression.NONE -> 1
+        PageAnnotationCompression.GZIP -> 2
+    }
+
+    private fun pageAnnotationCompressionFromWire(code: Int): PageAnnotationCompression = when (code) {
+        1 -> PageAnnotationCompression.NONE
+        2 -> PageAnnotationCompression.GZIP
+        else -> fail(RemoteReviewCodecError.MALFORMED_PAYLOAD) {
+            "Unknown page annotation compression $code."
+        }
+    }
+
+    private fun PageSyncAckDisposition.wireCode(): Int = when (this) {
+        PageSyncAckDisposition.APPLIED -> 1
+        PageSyncAckDisposition.DUPLICATE -> 2
+        PageSyncAckDisposition.REJECTED -> 3
+    }
+
+    private fun pageSyncAckDispositionFromWire(code: Int): PageSyncAckDisposition = when (code) {
+        1 -> PageSyncAckDisposition.APPLIED
+        2 -> PageSyncAckDisposition.DUPLICATE
+        3 -> PageSyncAckDisposition.REJECTED
+        else -> fail(RemoteReviewCodecError.MALFORMED_PAYLOAD) {
+            "Unknown page sync ACK disposition $code."
+        }
+    }
+
+    private fun PageSyncAckSourceType.wireCode(): Int = when (this) {
+        PageSyncAckSourceType.REQUEST -> 1
+        PageSyncAckSourceType.ANNOTATION -> 2
+    }
+
+    private fun pageSyncAckSourceTypeFromWire(code: Int): PageSyncAckSourceType = when (code) {
+        1 -> PageSyncAckSourceType.REQUEST
+        2 -> PageSyncAckSourceType.ANNOTATION
+        else -> fail(RemoteReviewCodecError.MALFORMED_PAYLOAD) {
+            "Unknown page sync ACK source type $code."
+        }
     }
 
     private fun SnapshotImageFormat.wireCode(): Int = when (this) {

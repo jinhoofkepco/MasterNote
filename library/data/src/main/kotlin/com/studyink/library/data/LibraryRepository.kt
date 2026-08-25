@@ -207,6 +207,19 @@ class LibraryRepository private constructor(private val context: Context) {
     fun book(bookId: String): Book = catalog.books.firstOrNull { it.id == bookId }
         ?: error("교재를 찾을 수 없습니다.")
 
+    /**
+     * Resolves a transport workbook fingerprint without trusting a remote title or local UUID.
+     * Callers must require exactly one result; duplicate imports are deliberately not guessed.
+     */
+    @Synchronized
+    fun booksByContentSha256(contentSha256: String): List<Book> {
+        val normalized = contentSha256.trim().lowercase()
+        if (normalized.length != 64 || normalized.any { it !in "0123456789abcdef" }) return emptyList()
+        return catalog.books.filter {
+            it.hiddenAtEpochMillis == null && it.contentSha256.lowercase() == normalized
+        }
+    }
+
     fun pdfFile(book: Book): File = File(booksDirectory, book.pdfRelativePath).also {
         require(it.isFile) { "교재 PDF 사본이 없습니다." }
     }
@@ -344,6 +357,106 @@ class LibraryRepository private constructor(private val context: Context) {
         return updated
     }
 
+    /**
+     * Durably commits one teacher-grade draft without duplicating a replayed draft mutation.
+     *
+     * A changed group advances its sync revision exactly once and emits one local mark event only
+     * after the catalog write succeeds. Replaying an already materialized state performs neither
+     * a catalog write nor an event emission.
+     */
+    @Synchronized
+    fun commitTeacherGradeDraft(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        groupId: String,
+        anchor: PagePoint,
+        color: MarkColor,
+        hidden: Boolean,
+        appendMark: Boolean,
+        createdAtEpochMillis: Long,
+        updatedAtEpochMillis: Long,
+    ): MarkGroup = commitTeacherGradeDrafts(
+        listOf(
+            TeacherGradeDraftCommitInput(
+                bookId,
+                pageNumber,
+                attemptNo,
+                groupId,
+                anchor,
+                color,
+                hidden,
+                appendMark,
+                createdAtEpochMillis,
+                updatedAtEpochMillis,
+            ),
+        ),
+    ).single()
+
+    /** Validates and folds the entire publish batch before one catalog write and any bus event. */
+    @Synchronized
+    fun previewTeacherGradeDrafts(
+        drafts: List<TeacherGradeDraftCommitInput>,
+    ): List<MarkGroup> = foldTeacherGradeDrafts(drafts).markGroups
+
+    /** Validates and folds the entire publish batch before one catalog write and any bus event. */
+    @Synchronized
+    fun commitTeacherGradeDrafts(
+        drafts: List<TeacherGradeDraftCommitInput>,
+    ): List<MarkGroup> {
+        if (drafts.isEmpty()) return emptyList()
+        val previousCatalog = catalog
+        val folded = foldTeacherGradeDrafts(drafts)
+        if (folded.markGroups == previousCatalog.markGroups) return folded.committed
+        catalog = previousCatalog.copy(markGroups = folded.markGroups)
+        try {
+            persist()
+        } catch (error: Throwable) {
+            catalog = previousCatalog
+            throw error
+        }
+        folded.changedById.values.forEach(LibraryMarkGroupBus::markGroupChanged)
+        return folded.committed
+    }
+
+    private fun foldTeacherGradeDrafts(
+        drafts: List<TeacherGradeDraftCommitInput>,
+    ): TeacherGradeDraftBatchFold {
+        var workingGroups = catalog.markGroups
+        val committed = ArrayList<MarkGroup>(drafts.size)
+        val changedById = linkedMapOf<String, MarkGroup>()
+        drafts.forEach { draft ->
+            val targetBook = catalog.books.firstOrNull { it.id == draft.bookId }
+                ?: error("교재를 찾을 수 없습니다.")
+            val result = mergeTeacherGradeDraftCommit(
+                markGroups = workingGroups,
+                attempts = catalog.attempts,
+                bookId = draft.bookId,
+                pageNumber = draft.pageNumber,
+                pageCount = targetBook.pageCount,
+                attemptNo = draft.attemptNo,
+                groupId = draft.groupId,
+                anchor = draft.anchor,
+                color = draft.color,
+                hidden = draft.hidden,
+                appendMark = draft.appendMark,
+                createdAtEpochMillis = draft.createdAtEpochMillis,
+                updatedAtEpochMillis = draft.updatedAtEpochMillis,
+                deviceId = deviceId,
+            )
+            workingGroups = result.markGroups
+            committed += result.committedGroup
+            if (result.changed) changedById[result.committedGroup.id] = result.committedGroup
+        }
+        return TeacherGradeDraftBatchFold(workingGroups, committed, changedById)
+    }
+
+    private data class TeacherGradeDraftBatchFold(
+        val markGroups: List<MarkGroup>,
+        val committed: List<MarkGroup>,
+        val changedById: Map<String, MarkGroup>,
+    )
+
     @Synchronized
     fun changeLatestMarkColor(groupId: String, attemptNo: Int, color: MarkColor) {
         val existing = catalog.markGroups.firstOrNull { it.id == groupId } ?: return
@@ -424,6 +537,61 @@ class LibraryRepository private constructor(private val context: Context) {
         catalog = catalog.copy(markGroups = result.markGroups)
         persist()
         return true
+    }
+
+    /**
+     * Applies only one student-attempt slice from a remote teacher review.
+     *
+     * Telegram review envelopes version the selected attempt independently from the group's
+     * full-state LAN revision. Consequently, an older full-group revision may still contain the
+     * newest review for [attemptNo]. Other attempts are retained verbatim, while group-level
+     * metadata follows the normal deterministic sync ordering. This received-data path does not
+     * notify [LibraryMarkGroupBus], preventing a review from echoing back to its sender.
+     */
+    @Synchronized
+    fun upsertMarkGroupAttemptFromSync(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        incoming: MarkGroup,
+    ): Boolean = upsertMarkGroupAttemptsFromSync(
+        bookId = bookId,
+        pageNumber = pageNumber,
+        attemptNo = attemptNo,
+        incoming = listOf(incoming),
+    )
+
+    /**
+     * Atomically applies every exact-attempt group carried by one teacher-review envelope.
+     *
+     * The entire batch is validated and folded before the catalog is installed. A changed batch
+     * produces one durable catalog write and no [LibraryMarkGroupBus] event; an invalid group,
+     * identity collision, or persistence failure leaves the in-memory catalog unchanged.
+     */
+    @Synchronized
+    fun upsertMarkGroupAttemptsFromSync(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        incoming: List<MarkGroup>,
+    ): Boolean {
+        val targetBook = book(bookId)
+        val result = mergeRemoteMarkGroupAttempts(
+            markGroups = catalog.markGroups,
+            bookId = bookId,
+            pageNumber = pageNumber,
+            pageCount = targetBook.pageCount,
+            attempts = catalog.attempts,
+            attemptNo = attemptNo,
+            incoming = incoming,
+        )
+        val previousCatalog = catalog
+        return applyRemoteMarkGroupAttemptBatch(
+            result = result,
+            install = { markGroups -> catalog = previousCatalog.copy(markGroups = markGroups) },
+            rollback = { catalog = previousCatalog },
+            persist = ::persist,
+        )
     }
 
     /** Idempotent peer upsert. Received attempts are not emitted back onto [LibraryAttemptBus]. */
@@ -649,6 +817,187 @@ internal fun mergeRemoteMarkGroup(
     )
 }
 
+/** Executes the batch's only durable side effect; received groups are deliberately not emitted. */
+internal fun applyRemoteMarkGroupAttemptBatch(
+    result: MarkGroupUpsertResult,
+    install: (List<MarkGroup>) -> Unit,
+    rollback: () -> Unit,
+    persist: () -> Unit,
+): Boolean {
+    if (!result.changed) return false
+    install(result.markGroups)
+    try {
+        persist()
+    } catch (error: Throwable) {
+        rollback()
+        throw error
+    }
+    return true
+}
+
+/**
+ * Pure preflight and fold for one exact-attempt teacher-review envelope.
+ *
+ * Every payload is checked against the original catalog before any fold result is returned. IDs
+ * must also be unique within the envelope, so input order can never decide an identity collision.
+ */
+internal fun mergeRemoteMarkGroupAttempts(
+    markGroups: List<MarkGroup>,
+    bookId: String,
+    pageNumber: Int,
+    pageCount: Int,
+    attempts: List<Attempt>,
+    attemptNo: Int,
+    incoming: List<MarkGroup>,
+): MarkGroupUpsertResult {
+    require(pageNumber in 0 until pageCount) { "채점 대상 페이지가 교재 범위를 벗어납니다." }
+    require(attemptNo > TEACHER_PAGE_REVIEW_ATTEMPT_NO) { "학생 풀이 회차 번호가 올바르지 않습니다." }
+    require(isValidMarkAttemptTarget(bookId, pageNumber, attemptNo, attempts)) {
+        "채점 대상 풀이 회차가 없습니다."
+    }
+    val incomingIds = HashSet<String>()
+    require(incoming.all { incomingIds.add(it.id) }) {
+        "한 번의 채점 동기화에 같은 표시 ID가 중복되어 있습니다."
+    }
+
+    incoming.forEach { group ->
+        mergeRemoteMarkGroupAttempt(
+            markGroups = markGroups,
+            bookId = bookId,
+            pageNumber = pageNumber,
+            pageCount = pageCount,
+            attempts = attempts,
+            attemptNo = attemptNo,
+            incoming = group,
+        )
+    }
+
+    var folded = MarkGroupUpsertResult(markGroups = markGroups, changed = false)
+    incoming.forEach { group ->
+        val next = mergeRemoteMarkGroupAttempt(
+            markGroups = folded.markGroups,
+            bookId = bookId,
+            pageNumber = pageNumber,
+            pageCount = pageCount,
+            attempts = attempts,
+            attemptNo = attemptNo,
+            incoming = group,
+        )
+        folded = MarkGroupUpsertResult(
+            markGroups = next.markGroups,
+            changed = folded.changed || next.changed,
+        )
+    }
+    return folded
+}
+
+/**
+ * Pure exact-attempt merge for delayed teacher reviews.
+ *
+ * The envelope that carries this payload owns ordering for [attemptNo], so its marks are applied
+ * even when [incoming]'s full-group sync revision is older. The full-group ordering is consulted
+ * only for anchor/visibility/creator metadata. This keeps independently delivered attempt reviews
+ * from deleting one another.
+ */
+internal fun mergeRemoteMarkGroupAttempt(
+    markGroups: List<MarkGroup>,
+    bookId: String,
+    pageNumber: Int,
+    pageCount: Int,
+    attempts: List<Attempt>,
+    attemptNo: Int,
+    incoming: MarkGroup,
+): MarkGroupUpsertResult {
+    require(pageNumber in 0 until pageCount) { "채점 대상 페이지가 교재 범위를 벗어납니다." }
+    require(attemptNo > TEACHER_PAGE_REVIEW_ATTEMPT_NO) { "학생 풀이 회차 번호가 올바르지 않습니다." }
+    require(isValidMarkAttemptTarget(bookId, pageNumber, attemptNo, attempts)) {
+        "채점 대상 풀이 회차가 없습니다."
+    }
+    require(incoming.bookId == bookId && incoming.pageNumber == pageNumber) {
+        "다른 교재 또는 페이지의 채점 표시를 동기화할 수 없습니다."
+    }
+    require(incoming.id.isNotBlank() && incoming.id.length <= 256) { "채점 표시 ID가 올바르지 않습니다." }
+    require(incoming.createdAtEpochMillis >= 0L && (incoming.hiddenAtEpochMillis ?: 0L) >= 0L) {
+        "채점 표시 시간이 올바르지 않습니다."
+    }
+    require(incoming.syncRevision >= 0L && incoming.lastModifiedByDeviceId.length <= 256) {
+        "채점 표시 변경 정보가 올바르지 않습니다."
+    }
+    require(incoming.syncRevision == 0L || incoming.lastModifiedByDeviceId.isNotBlank()) {
+        "채점 표시 변경 기기가 비어 있습니다."
+    }
+    require(
+        incoming.anchor.x.isFinite() && incoming.anchor.x in 0f..1000f &&
+            incoming.anchor.y.isFinite() && incoming.anchor.y in 0f..1_000_000f &&
+            incoming.anchor.pressure.isFinite() && incoming.anchor.pressure >= 0f
+    ) { "채점 표시 위치가 올바르지 않습니다." }
+    require(incoming.marks.isNotEmpty() && incoming.marks.size <= 4_096) {
+        "채점 표시 이력이 올바르지 않습니다."
+    }
+    require(incoming.marks.all { mark ->
+        mark.attemptNo == attemptNo && mark.gradedAtEpochMillis >= 0L &&
+            (mark.hiddenAtEpochMillis ?: 0L) >= 0L
+    }) { "선택한 풀이 회차의 채점 표시만 동기화할 수 있습니다." }
+
+    val existing = markGroups.firstOrNull { it.id == incoming.id }
+    require(existing == null || existing.bookId == bookId && existing.pageNumber == pageNumber) {
+        "같은 ID의 채점 표시가 다른 교재 또는 페이지에 있습니다."
+    }
+    require(existing == null || isCompatibleMarkGroupTarget(existing, attemptNo)) {
+        "페이지 표시와 학생 풀이 채점을 같은 표시 묶음에 섞을 수 없습니다."
+    }
+
+    if (existing == null) {
+        return MarkGroupUpsertResult(markGroups + incoming, changed = true)
+    }
+
+    val mergedMarks = replaceAttemptSlice(
+        existing = existing.marks,
+        attemptNo = attemptNo,
+        replacement = incoming.marks,
+    )
+    require(mergedMarks.size <= 4_096) { "채점 표시 이력이 너무 큽니다." }
+    val metadataSource = if (incoming.compareGlobalSyncOrder(existing) > 0) incoming else existing
+    val merged = metadataSource.copy(
+        marks = mergedMarks,
+        syncRevision = maxOf(existing.syncRevision, incoming.syncRevision),
+    )
+    if (merged == existing) return MarkGroupUpsertResult(markGroups, changed = false)
+    return MarkGroupUpsertResult(
+        markGroups = markGroups.map { if (it.id == existing.id) merged else it },
+        changed = true,
+    )
+}
+
+private fun replaceAttemptSlice(
+    existing: List<Mark>,
+    attemptNo: Int,
+    replacement: List<Mark>,
+): List<Mark> {
+    val insertionIndex = existing.indexOfFirst { it.attemptNo == attemptNo }
+    if (insertionIndex < 0) return existing + replacement
+    return buildList(existing.size - existing.count { it.attemptNo == attemptNo } + replacement.size) {
+        existing.forEachIndexed { index, mark ->
+            if (index == insertionIndex) addAll(replacement)
+            if (mark.attemptNo != attemptNo) add(mark)
+        }
+    }
+}
+
+private fun MarkGroup.compareGlobalSyncOrder(other: MarkGroup): Int {
+    syncRevision.compareTo(other.syncRevision).takeIf { it != 0 }?.let { return it }
+    lastModifiedByDeviceId.compareTo(other.lastModifiedByDeviceId).takeIf { it != 0 }?.let { return it }
+    return globalSyncStateKey().compareTo(other.globalSyncStateKey())
+}
+
+private fun MarkGroup.globalSyncStateKey(): String = buildString {
+    append(createdAtEpochMillis).append('|')
+    append(hiddenAtEpochMillis ?: -1L).append('|')
+    append(anchor.x.toRawBits()).append(',')
+    append(anchor.y.toRawBits()).append(',')
+    append(anchor.pressure.toRawBits())
+}
+
 private fun MarkGroup.compareSyncOrder(other: MarkGroup): Int {
     syncRevision.compareTo(other.syncRevision).takeIf { it != 0 }?.let { return it }
     lastModifiedByDeviceId.compareTo(other.lastModifiedByDeviceId).takeIf { it != 0 }?.let { return it }
@@ -674,7 +1023,7 @@ private fun encodeCatalog(catalog: LibraryCatalog): JSONObject {
         .put("students", JSONArray().apply { catalog.students.forEach { put(it.toJson()) } })
         .put("books", JSONArray().apply { catalog.books.forEach { put(it.toJson()) } })
         .put("attempts", JSONArray().apply { catalog.attempts.forEach { put(it.toJson()) } })
-        .put("markGroups", JSONArray().apply { catalog.markGroups.forEach { put(it.toJson()) } })
+        .put("markGroups", JSONArray().apply { catalog.markGroups.forEach { put(it.toCatalogJson()) } })
 }
 
 private fun Student.toJson() = JSONObject().put("id", id).put("displayName", displayName)
@@ -687,8 +1036,9 @@ private fun Book.toJson() = JSONObject().put("id", id).put("studentId", studentI
 private fun Attempt.toJson() = JSONObject().put("bookId", bookId).put("page", pageNumber)
     .put("attemptNo", attemptNo).put("locked", locked).put("startedAt", startedAtEpochMillis)
     .put("lockedAt", lockedAtEpochMillis ?: JSONObject.NULL)
-private fun MarkGroup.toJson() = JSONObject().put("id", id).put("bookId", bookId).put("page", pageNumber)
-    .put("anchor", JSONArray().put(anchor.x).put(anchor.y)).put("createdAt", createdAtEpochMillis)
+internal fun MarkGroup.toCatalogJson() = JSONObject().put("id", id).put("bookId", bookId).put("page", pageNumber)
+    .put("anchor", JSONArray().put(anchor.x).put(anchor.y).put(anchor.pressure))
+    .put("createdAt", createdAtEpochMillis)
     .put("hiddenAt", hiddenAtEpochMillis ?: JSONObject.NULL)
     .put("syncRevision", syncRevision)
     .put("lastModifiedByDeviceId", lastModifiedByDeviceId)
@@ -715,22 +1065,28 @@ private fun decodeCatalog(root: JSONObject): LibraryCatalog {
         locked = getBoolean("locked"), startedAtEpochMillis = getLong("startedAt"),
         lockedAtEpochMillis = nullableLong("lockedAt"),
     ) }
-    val groups = root.getJSONArray("markGroups").objects {
-        val group = this
-        val anchor = getJSONArray("anchor")
-        MarkGroup(
-            id = getString("id"), bookId = getString("bookId"), pageNumber = getInt("page"),
-            anchor = PagePoint(anchor.getDouble(0).toFloat(), anchor.getDouble(1).toFloat()),
-            marks = getJSONArray("marks").objects { Mark(
-                attemptNo = getInt("attemptNo"), color = MarkColor.valueOf(getString("color")),
-                gradedAtEpochMillis = getLong("gradedAt"), hiddenAtEpochMillis = nullableLong("hiddenAt"),
-            ) },
-            createdAtEpochMillis = group.getLong("createdAt"), hiddenAtEpochMillis = group.nullableLong("hiddenAt"),
-            syncRevision = group.optLong("syncRevision", 0L),
-            lastModifiedByDeviceId = group.optString("lastModifiedByDeviceId", ""),
-        )
-    }
+    val groups = root.getJSONArray("markGroups").objects(JSONObject::toCatalogMarkGroup)
     return LibraryCatalog(students, root.getString("selectedStudentId"), books, attempts, groups)
+}
+
+internal fun JSONObject.toCatalogMarkGroup(): MarkGroup {
+    val group = this
+    val anchor = getJSONArray("anchor")
+    return MarkGroup(
+        id = getString("id"), bookId = getString("bookId"), pageNumber = getInt("page"),
+        anchor = PagePoint(
+            x = anchor.getDouble(0).toFloat(),
+            y = anchor.getDouble(1).toFloat(),
+            pressure = if (anchor.length() >= 3) anchor.getDouble(2).toFloat() else 1f,
+        ),
+        marks = getJSONArray("marks").objects { Mark(
+            attemptNo = getInt("attemptNo"), color = MarkColor.valueOf(getString("color")),
+            gradedAtEpochMillis = getLong("gradedAt"), hiddenAtEpochMillis = nullableLong("hiddenAt"),
+        ) },
+        createdAtEpochMillis = group.getLong("createdAt"), hiddenAtEpochMillis = group.nullableLong("hiddenAt"),
+        syncRevision = group.optLong("syncRevision", 0L),
+        lastModifiedByDeviceId = group.optString("lastModifiedByDeviceId", ""),
+    )
 }
 
 private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }

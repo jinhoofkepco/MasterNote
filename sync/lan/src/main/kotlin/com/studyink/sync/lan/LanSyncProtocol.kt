@@ -2,6 +2,12 @@ package com.studyink.sync.lan
 
 import android.net.Uri
 import org.json.JSONObject
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.security.SecureRandom
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 enum class LanPeerRole { STUDENT_SERVER, TEACHER_CLIENT }
 
@@ -12,6 +18,7 @@ data class PairingPayload(
     val token: String,
 ) {
     fun toUri(): Uri = Uri.Builder().scheme("masternote").authority("pair")
+        .appendQueryParameter("v", LAN_AUTH_VERSION.toString())
         .appendQueryParameter("host", host)
         .appendQueryParameter("port", port.toString())
         .appendQueryParameter("book", bookId)
@@ -21,6 +28,9 @@ data class PairingPayload(
     companion object {
         fun parse(uri: Uri): PairingPayload {
             require(uri.scheme == "masternote" && uri.host == "pair")
+            require(uri.getQueryParameter("v")?.toIntOrNull() == LAN_AUTH_VERSION) {
+                "Unsupported LAN pairing payload"
+            }
             return PairingPayload(
                 host = requireNotNull(uri.getQueryParameter("host")),
                 port = requireNotNull(uri.getQueryParameter("port")).toInt(),
@@ -32,7 +42,7 @@ data class PairingPayload(
 }
 
 internal object LanWire {
-    const val PROTOCOL_VERSION = 1
+    const val PROTOCOL_VERSION = 2
     const val MAX_LINE_CHARS = 800_000
 
     fun message(type: String, configure: JSONObject.() -> Unit = {}): String = JSONObject()
@@ -130,6 +140,106 @@ enum class LanSessionPhase {
     DISCONNECTED,
 }
 
+internal const val LAN_AUTH_VERSION = 2
+private val LAN_SHA256_HEX = Regex("[0-9a-f]{64}")
+
+internal fun isValidLanSha256(value: String): Boolean = LAN_SHA256_HEX.matches(value)
+
+internal fun newLanSecretHex(): String = ByteArray(32).also(SecureRandom()::nextBytes).toHex()
+
+/** Public greeting by construction: the shared secret is not an input and cannot leak on the wire. */
+internal fun lanHelloMessage(
+    deviceId: String,
+    role: LanPeerRole,
+    bookId: String,
+    documentSha256: String,
+    nonceHex: String,
+): String = LanWire.message("HELLO") {
+    lanHelloPublicFields(deviceId, role, bookId, documentSha256, nonceHex).forEach { (key, value) ->
+        put(key, value)
+    }
+}
+
+internal fun lanHelloPublicFields(
+    deviceId: String,
+    role: LanPeerRole,
+    bookId: String,
+    documentSha256: String,
+    nonceHex: String,
+): Map<String, Any> {
+    require(deviceId.isNotBlank() && deviceId.length <= 512)
+    require(bookId.isNotBlank() && bookId.length <= 512)
+    require(isValidLanSha256(documentSha256) && isValidLanSha256(nonceHex))
+    return linkedMapOf(
+        "authVersion" to LAN_AUTH_VERSION,
+        "deviceId" to deviceId,
+        "role" to role.name,
+        "bookId" to bookId,
+        "documentHash" to documentSha256,
+        "nonce" to nonceHex,
+    )
+}
+
+/**
+ * Mutual-authentication proof over both socket nonces and both endpoint identities.
+ * Length-prefixing every field makes the transcript unambiguous; sender role separation prevents
+ * reflecting one side's proof back as the other side's proof.
+ */
+internal fun lanAuthProofHex(
+    secretHex: String,
+    senderNonceHex: String,
+    receiverNonceHex: String,
+    senderDeviceId: String,
+    receiverDeviceId: String,
+    senderRole: LanPeerRole,
+    receiverRole: LanPeerRole,
+    senderBookId: String,
+    receiverBookId: String,
+    documentSha256: String,
+): String {
+    require(isValidLanSha256(secretHex)) { "LAN shared secret is invalid" }
+    require(isValidLanSha256(senderNonceHex) && isValidLanSha256(receiverNonceHex)) {
+        "LAN authentication nonce is invalid"
+    }
+    require(isValidLanSha256(documentSha256)) { "LAN document digest is invalid" }
+    val fields = listOf(
+        "masternote-lan-auth-v$LAN_AUTH_VERSION",
+        "${senderRole.name.lowercase()}-proof",
+        senderNonceHex,
+        receiverNonceHex,
+        senderDeviceId,
+        receiverDeviceId,
+        senderRole.name,
+        receiverRole.name,
+        senderBookId,
+        receiverBookId,
+        documentSha256,
+    )
+    require(fields.drop(2).dropLast(1).all { it.isNotBlank() && it.length <= 512 }) {
+        "LAN authentication identity is invalid"
+    }
+    val mac = Mac.getInstance("HmacSHA256")
+    mac.init(SecretKeySpec(secretHex.hexToBytes(), "HmacSHA256"))
+    fields.forEach { field ->
+        val bytes = field.toByteArray(StandardCharsets.UTF_8)
+        mac.update(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(bytes.size).array())
+        mac.update(bytes)
+    }
+    return mac.doFinal().toHex()
+}
+
+internal fun lanAuthProofMatches(expectedHex: String, receivedHex: String): Boolean =
+    isValidLanSha256(expectedHex) && isValidLanSha256(receivedHex) &&
+        MessageDigest.isEqual(expectedHex.hexToBytes(), receivedHex.hexToBytes())
+
+private fun String.hexToBytes(): ByteArray = ByteArray(length / 2) { index ->
+    substring(index * 2, index * 2 + 2).toInt(16).toByte()
+}
+
+private fun ByteArray.toHex(): String = joinToString("") { byte ->
+    (byte.toInt() and 0xff).toString(16).padStart(2, '0')
+}
+
 /** One lock-consistent view used by transport arbitration immediately before durable enqueue. */
 data class LanSessionSnapshot(
     val connectionState: LanConnectionState,
@@ -148,6 +258,18 @@ data class LanActiveSessionSnapshot(
     val session: LanSessionSnapshot,
 )
 
+data class LanTeacherReviewPublication(
+    val bookId: String,
+    val pageNumber: Int,
+    val attemptNo: Int,
+    val publicationId: String,
+) {
+    init {
+        require(bookId.isNotBlank() && pageNumber >= 0 && attemptNo > 0)
+        require(publicationId.matches(Regex("[0-9a-f]{64}")))
+    }
+}
+
 object LanSyncBus {
     interface Listener {
         fun onConnectionStateChanged(bookId: String, state: LanConnectionState) {}
@@ -164,6 +286,8 @@ object LanSyncBus {
         fun onRemoteStudentLocationChanged(location: StudentLocation) {
             onRemotePageChanged(location.bookId, location.pageNumber)
         }
+        fun onLocalTeacherReviewPublished(publication: LanTeacherReviewPublication) {}
+        fun onTeacherReviewAcknowledged(publication: LanTeacherReviewPublication) {}
         fun onPairingReady(bookId: String, pairingUri: String) {}
         fun onSessionIssue(message: String) {}
     }
@@ -208,8 +332,25 @@ object LanSyncBus {
 
     /** The service's active book and state, read under the same monitor as both state maps. */
     fun activeSessionSnapshot(): LanActiveSessionSnapshot? = synchronized(this) {
-        val bookId = activeSessionBookId ?: return@synchronized null
-        LanActiveSessionSnapshot(
+        activeSessionSnapshotLocked()
+    }
+
+    /**
+     * Runs one application-data ownership decision while holding the same monitor used by LAN
+     * connection and session-phase transitions. This is deliberately a narrow lease rather than
+     * a cached boolean: if [block] observes no active LAN owner, a socket cannot become visible to
+     * the application until the guarded Telegram mutation has finished.
+     *
+     * Keep [block] bounded and never wait for another thread from it. Listener callbacks are
+     * dispatched after this monitor is released, so re-reading bus state on the current thread is
+     * safe and re-entrant.
+     */
+    fun <T> withActiveSessionLease(block: (LanActiveSessionSnapshot?) -> T): T =
+        synchronized(this) { block(activeSessionSnapshotLocked()) }
+
+    private fun activeSessionSnapshotLocked(): LanActiveSessionSnapshot? {
+        val bookId = activeSessionBookId ?: return null
+        return LanActiveSessionSnapshot(
             bookId = bookId,
             session = sessionSnapshotLocked(bookId),
         )
@@ -272,6 +413,13 @@ object LanSyncBus {
     fun operationWritten(bookId: String, pageNumber: Int) = listenerSnapshot().forEach {
         it.onLocalOperation(bookId, pageNumber)
     }
+
+    fun teacherReviewPublished(publication: LanTeacherReviewPublication) = listenerSnapshot().forEach {
+        it.onLocalTeacherReviewPublished(publication)
+    }
+
+    internal fun teacherReviewAcknowledged(publication: LanTeacherReviewPublication) =
+        listenerSnapshot().forEach { it.onTeacherReviewAcknowledged(publication) }
 
     fun pageChanged(
         bookId: String,

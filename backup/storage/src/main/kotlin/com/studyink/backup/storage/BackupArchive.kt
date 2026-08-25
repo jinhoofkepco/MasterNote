@@ -214,6 +214,9 @@ internal object BackupArchive {
                     } finally {
                         zip.closeEntry()
                     }
+                    if (destination != null && entry.time >= 0L) {
+                        destination.setLastModified(entry.time)
+                    }
                     if (entry.size >= 0L && entry.size != entryBytes) invalid("ZIP 크기 정보가 일치하지 않습니다: $path")
                     when (path) {
                         MANIFEST_PATH -> manifestBytes = capture!!.toByteArray()

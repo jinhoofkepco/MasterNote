@@ -9,7 +9,11 @@ import com.studyink.core.model.StrokeTool
 import com.studyink.monitor.core.NormalizedTeacherPoint
 import com.studyink.monitor.core.NormalizedTeacherStroke
 import com.studyink.monitor.core.NormalizedGradeAnchor
+import com.studyink.monitor.core.HybridLinkDecision
+import com.studyink.monitor.core.HybridLinkHealth
+import com.studyink.monitor.core.HybridLinkLabel
 import com.studyink.monitor.core.HybridLinkMode
+import com.studyink.monitor.core.HybridLinkTransport
 import com.studyink.monitor.core.PageSnapshotEnvelope
 import com.studyink.monitor.core.RemoteGradeEnvelope
 import com.studyink.monitor.core.RemoteReviewDocumentCodec
@@ -21,6 +25,8 @@ import com.studyink.monitor.core.StudentWorkKind
 import com.studyink.monitor.core.TeacherFeedbackEnvelope
 import com.studyink.monitor.core.TeacherInkTool
 import com.studyink.sync.lan.LanConnectionState
+import com.studyink.sync.lan.LanSessionPhase
+import com.studyink.sync.lan.LanSessionSnapshot
 import java.io.File
 import kotlin.io.path.createTempDirectory
 import org.junit.Assert.assertEquals
@@ -78,23 +84,70 @@ class MasterNoteRemoteReviewCoordinatorTest {
         )
     }
 
-    @Test fun telegramOnlyTeacherCanSendWithoutEverOpeningALanSession() {
-        assertTrue(shouldAllowTelegramUserAction(hasActiveLanSession = false, hybridMode = null))
-        // A decision retained from a closed LAN session must not suppress Telegram-only actions.
-        assertTrue(
-            shouldAllowTelegramUserAction(
-                hasActiveLanSession = false,
-                hybridMode = HybridLinkMode.LAN_LIVE,
+    @Test fun readyLanSessionOwnsGlobalPageSyncEvenWhenReaderShowsAnotherBook() {
+        assertEquals(
+            GlobalPageSyncTransportRoute.LAN_OWNS,
+            globalPageSyncTransportRoute(
+                LanSessionSnapshot(LanConnectionState.CONNECTED, LanSessionPhase.READY),
             ),
         )
     }
 
-    @Test fun activeLanSessionRequiresAnExplicitTelegramOwningMode() {
-        assertFalse(shouldAllowTelegramUserAction(true, null))
-        assertFalse(shouldAllowTelegramUserAction(true, HybridLinkMode.LAN_LIVE))
-        assertFalse(shouldAllowTelegramUserAction(true, HybridLinkMode.LAN_GRACE))
-        assertTrue(shouldAllowTelegramUserAction(true, HybridLinkMode.TELEGRAM_FALLBACK))
-        assertTrue(shouldAllowTelegramUserAction(true, HybridLinkMode.OFFLINE_QUEUEING))
+    @Test fun globalLanOwnershipAlsoOverridesTheBookScopedTelegramDisplay() {
+        val bookScopedTelegram = HybridLinkDecision(
+            mode = HybridLinkMode.TELEGRAM_FALLBACK,
+            label = HybridLinkLabel.TELEGRAM,
+            health = HybridLinkHealth.READY,
+            activeTransport = HybridLinkTransport.TELEGRAM,
+            enteredTelegramFallback = true,
+        )
+
+        val displayed = globalHybridDisplayDecision(
+            GlobalPageSyncTransportRoute.LAN_OWNS,
+            bookScopedTelegram,
+        )
+
+        assertEquals(HybridLinkMode.LAN_LIVE, displayed.mode)
+        assertEquals(HybridLinkLabel.LAN, displayed.label)
+        assertEquals(HybridLinkHealth.READY, displayed.health)
+        assertEquals(HybridLinkTransport.LAN, displayed.activeTransport)
+    }
+
+    @Test fun connectedLanCatchUpRetainsGlobalTelegramPageDocuments() {
+        val staleTelegramDecision = HybridLinkDecision(
+            mode = HybridLinkMode.TELEGRAM_FALLBACK,
+            label = HybridLinkLabel.TELEGRAM,
+            health = HybridLinkHealth.READY,
+            activeTransport = HybridLinkTransport.TELEGRAM,
+            enteredTelegramFallback = true,
+        )
+        listOf(
+            LanSessionPhase.SOCKET_CONNECTED,
+            LanSessionPhase.HANDSHAKE_COMPLETE,
+            LanSessionPhase.PAGE_CATCHING_UP,
+        ).forEach { phase ->
+            assertEquals(
+                GlobalPageSyncTransportRoute.LAN_GRACE,
+                globalPageSyncTransportRoute(
+                    LanSessionSnapshot(LanConnectionState.CONNECTED, phase),
+                    staleTelegramDecision,
+                ),
+            )
+        }
+    }
+
+    @Test fun absentOrDisconnectedLanSessionAllowsGlobalTelegramFallback() {
+        assertEquals(GlobalPageSyncTransportRoute.TELEGRAM, globalPageSyncTransportRoute(null))
+        listOf(
+            LanConnectionState.IDLE,
+            LanConnectionState.CONNECTING,
+            LanConnectionState.DISCONNECTED,
+        ).forEach { connection ->
+            assertEquals(
+                GlobalPageSyncTransportRoute.TELEGRAM,
+                globalPageSyncTransportRoute(LanSessionSnapshot(connection, LanSessionPhase.READY)),
+            )
+        }
     }
 
     @Test fun onlyConnectedLanTransportMayUseCatchUpGrace() {
@@ -102,6 +155,14 @@ class MasterNoteRemoteReviewCoordinatorTest {
         assertTrue(isLanTransportDefinitelyDisconnected(LanConnectionState.IDLE))
         assertTrue(isLanTransportDefinitelyDisconnected(LanConnectionState.CONNECTING))
         assertTrue(isLanTransportDefinitelyDisconnected(LanConnectionState.DISCONNECTED))
+    }
+
+    @Test fun peerReceiptOnlyBecomesTerminalAtGatewayRetentionBoundary() {
+        val dayMs = 24L * 60L * 60L * 1_000L
+        assertFalse(isUnacknowledgedPeerReceiptExpired(100L, 100L + dayMs - 1L))
+        assertTrue(isUnacknowledgedPeerReceiptExpired(100L, 100L + dayMs))
+        assertFalse(isUnacknowledgedPeerReceiptExpired(-1L, dayMs))
+        assertFalse(isUnacknowledgedPeerReceiptExpired(dayMs, dayMs - 1L))
     }
 
     @Test fun enteringTelegramFallbackForcesTheCurrentPageImmediately() {
@@ -465,6 +526,25 @@ class MasterNoteRemoteReviewCoordinatorTest {
                 maximumJournalBytes = 1_000_000L,
             )
             assertEquals(2L, restarted.reserve(PAGE_TOKEN, "feedback_transfer_9999", 1L))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun teacherRevisionJournalCutsCrashTornTailBeforeAppendingNextReservation() {
+        val root = createTempDirectory("remote-review-revision-torn-tail").toFile()
+        val file = File(root, "revisions")
+        try {
+            val first = RemoteReviewTeacherRevisionStore(file)
+            assertEquals(1L, first.reserve(PAGE_TOKEN, "feedback_transfer_0001", 1L))
+            file.appendText("RRT1\tbroken-partial-record", Charsets.UTF_8)
+
+            val repaired = RemoteReviewTeacherRevisionStore(file)
+            assertEquals(2L, repaired.reserve(PAGE_TOKEN, "feedback_transfer_0002", 1L))
+
+            val restarted = RemoteReviewTeacherRevisionStore(file)
+            assertEquals(2L, restarted.latestRevision(PAGE_TOKEN))
+            assertEquals(2L, restarted.reserve(PAGE_TOKEN, "feedback_transfer_0002", 1L))
         } finally {
             root.deleteRecursively()
         }

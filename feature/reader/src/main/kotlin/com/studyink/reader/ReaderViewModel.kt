@@ -7,8 +7,10 @@ import com.studyink.annotation.engine.AnnotationChange
 import com.studyink.annotation.engine.AnnotationDocument
 import com.studyink.annotation.storage.CorruptAnnotationDataException
 import com.studyink.annotation.storage.PageOperationLogStore
+import com.studyink.annotation.storage.TeacherReviewPublishIntent
 import com.studyink.core.model.AnnotationSnapshot
 import com.studyink.core.model.Attempt
+import com.studyink.core.model.Mark
 import com.studyink.core.model.MarkColor
 import com.studyink.core.model.MarkGroup
 import com.studyink.core.model.PagePoint
@@ -18,16 +20,27 @@ import com.studyink.core.model.summariseActivity
 import com.studyink.core.model.trimmedTo
 import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.library.data.LibraryRepository
+import com.studyink.library.data.TeacherGradeDraftCommitInput
 import com.studyink.monitor.core.RemoteReviewFeedbackBus
 import com.studyink.monitor.core.RemoteTeacherFeedbackApplied
 import com.studyink.monitor.core.HybridLinkDecision
+import com.studyink.monitor.core.HybridLinkMode
 import com.studyink.monitor.core.HybridLinkStatusBus
 import com.studyink.monitor.core.RemoteGradeAppliedBus
 import com.studyink.monitor.core.RemotePeerChatStateBus
+import com.studyink.monitor.core.RemoteStudentCursor
+import com.studyink.monitor.core.RemoteStudentCursorBus
+import com.studyink.monitor.core.RemoteStudentCursorTransport
+import com.studyink.monitor.core.RemoteStudentPageAppliedBus
+import com.studyink.monitor.core.TeacherReviewPublished
+import com.studyink.monitor.core.TeacherReviewPublishedBus
+import com.studyink.monitor.core.TeacherReviewPublicationProvenanceBus
 import com.studyink.monitor.telegram.RemoteMonitorGateway
 import com.studyink.monitor.telegram.RemoteReviewPeerStatus
 import com.studyink.sync.lan.LanConnectionState
+import com.studyink.sync.lan.LanSessionPhase
 import com.studyink.sync.lan.LanSyncBus
+import com.studyink.sync.lan.LanTeacherReviewPublication
 import com.studyink.sync.lan.StudentLocation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -164,8 +177,13 @@ data class ReaderUiState(
     val canRedo: Boolean = false,
     val dataError: String? = null,
     val storageAvailable: Boolean = true,
+    /** Exact local workbook represented by the latest remote student cursor. */
+    val studentBookId: String? = null,
+    val studentBookTitle: String? = null,
     val studentPageNumber: Int? = null,
     val studentAttemptNo: Int? = null,
+    /** Telegram exposes the cursor before a requested page necessarily reaches durable storage. */
+    val studentPageReady: Boolean = true,
     /**
      * Whether the visible page is currently owned by the student's remote cursor. LIVE_MONITOR is
      * still active while this is false; only automatic page following is paused for local browsing.
@@ -214,8 +232,6 @@ data class ReaderUiState(
     val canPublishTeacherInkNow: Boolean
         get() = documentReady && storageAvailable && capabilities.canPublishTeacherInk
 
-    val shouldForceSyncTeacherUndoRedo: Boolean
-        get() = role != ReaderRole.STUDENT && !isTeacherPageTarget
 }
 
 internal data class ReaderAnnotationTarget(
@@ -239,6 +255,59 @@ internal data class PendingMarkMove(
 
 internal fun ReaderUiState.annotationTarget() = ReaderAnnotationTarget(bookId, pageNumber, attemptNo)
 
+internal fun ReaderUiState.gradeDraftTargetOrNull(): TeacherGradeDraftTarget? =
+    if (
+        role == ReaderRole.TEACHER_PHONE &&
+        workflow == ReaderWorkflow.LIVE_MONITOR &&
+        attemptNo > TEACHER_PAGE_REVIEW_ATTEMPT_NO
+    ) {
+        TeacherGradeDraftTarget(bookId, pageNumber, attemptNo)
+    } else {
+        null
+    }
+
+internal fun mergeTeacherGradeDraftMarks(
+    committed: List<MarkGroup>,
+    drafts: List<TeacherGradeDraft>,
+): List<MarkGroup> {
+    if (drafts.isEmpty()) return committed
+    val merged = committed.associateByTo(linkedMapOf(), MarkGroup::id)
+    drafts.forEach { draft ->
+        val existing = merged[draft.groupId]
+        val next = when {
+            existing == null -> draft.toMarkGroup()
+            draft.hidden -> existing.copy(
+                anchor = draft.anchor,
+                hiddenAtEpochMillis = draft.updatedAtEpochMillis,
+            )
+            else -> {
+                val draftMark = Mark(
+                    attemptNo = draft.target.attemptNo,
+                    color = draft.color,
+                    gradedAtEpochMillis = draft.updatedAtEpochMillis,
+                )
+                val marks = if (draft.appendOnCommit) {
+                    existing.marks + draftMark
+                } else {
+                    val latestIndex = existing.marks.indexOfLast { mark ->
+                        mark.attemptNo == draft.target.attemptNo && mark.hiddenAtEpochMillis == null
+                    }
+                    if (latestIndex < 0) {
+                        existing.marks + draftMark
+                    } else {
+                        existing.marks.mapIndexed { index, mark ->
+                            if (index == latestIndex) draftMark else mark
+                        }
+                    }
+                }
+                existing.copy(anchor = draft.anchor, marks = marks, hiddenAtEpochMillis = null)
+            }
+        }
+        merged[draft.groupId] = next
+    }
+    return merged.values.sortedBy { it.anchor.y }
+}
+
 internal fun ReaderUiState.canMutateStudentAttempt(writableAttemptNo: Int?): Boolean =
     role != ReaderRole.STUDENT ||
         currentAttemptWritable && writableAttemptNo != null && writableAttemptNo == attemptNo
@@ -254,14 +323,36 @@ internal fun ReaderUiState.shouldFollowRemoteStudentPage(
     pageNumber: Int,
     attemptNo: Int?,
 ): Boolean =
-    this.bookId == bookId &&
-        capabilities.showsStudentLocation &&
+    capabilities.showsStudentLocation &&
         isFollowingStudent &&
-        (this.pageNumber != pageNumber || attemptNo != null && this.attemptNo != attemptNo)
+        (this.bookId != bookId || this.pageNumber != pageNumber ||
+            attemptNo != null && this.attemptNo != attemptNo)
 
 internal data class LiveMonitorTarget(
     val pageNumber: Int,
     val attemptNo: Int?,
+)
+
+private data class RetainedStudentCursor(
+    val location: StudentLocation,
+    val pageReady: Boolean,
+)
+
+private fun retainedStudentCursor(bookId: String): RetainedStudentCursor? {
+    val mode = HybridLinkStatusBus.current()?.decision?.mode
+    if (mode == HybridLinkMode.TELEGRAM_FALLBACK || mode == HybridLinkMode.OFFLINE_QUEUEING) {
+        return RemoteStudentCursorBus.current(bookId)
+            ?.takeIf { it.transport == RemoteStudentCursorTransport.TELEGRAM }
+            ?.let { RetainedStudentCursor(it.toLanLocation(), it.pageReady) }
+    }
+    return LanSyncBus.remoteStudentLocation(bookId)?.let { RetainedStudentCursor(it, true) }
+}
+
+private fun RemoteStudentCursor.toLanLocation(): StudentLocation = StudentLocation(
+    bookId = bookId,
+    pageNumber = pageNumber,
+    attemptNo = attemptNo,
+    revision = sourceRevision,
 )
 
 /**
@@ -296,6 +387,7 @@ internal fun AnnotationSnapshot.studentAttemptNos(): Set<Int> = assets.values.as
 class ReaderViewModel(application: Application) : AndroidViewModel(application) {
     private val store = PageOperationLogStore.get(application)
     private val library = LibraryRepository.get(application)
+    private val gradeDrafts = TeacherGradeDraftStore.get(application)
     private val remoteMonitorGateway = RemoteMonitorGateway.get(application)
     private val mutationMutex = Mutex()
     private val pendingDocumentMutations = AtomicInteger(0)
@@ -307,6 +399,29 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     private var lastSampledClock = 0L
     private val _uiState = MutableStateFlow(ReaderUiState())
     val uiState: StateFlow<ReaderUiState> = _uiState.asStateFlow()
+
+    private fun readerMarks(
+        bookId: String,
+        pageNumber: Int,
+        role: ReaderRole,
+        workflow: ReaderWorkflow,
+        attemptNo: Int,
+    ): List<MarkGroup> {
+        val committed = library.markGroups(bookId, pageNumber)
+        if (role != ReaderRole.TEACHER_PHONE || workflow != ReaderWorkflow.LIVE_MONITOR) {
+            return committed
+        }
+        val target = TeacherGradeDraftTarget(bookId, pageNumber, attemptNo)
+        return mergeTeacherGradeDraftMarks(committed, gradeDrafts.list(target))
+    }
+
+    private fun readerMarks(state: ReaderUiState): List<MarkGroup> = readerMarks(
+        state.bookId,
+        state.pageNumber,
+        state.role,
+        state.workflow,
+        state.attemptNo,
+    )
     private val _remoteFeedbackArrivals = MutableSharedFlow<RemoteTeacherFeedbackApplied>(
         extraBufferCapacity = 4,
     )
@@ -326,15 +441,19 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     private val hybridLinkSubscription = HybridLinkStatusBus.subscribe { status ->
         viewModelScope.launch(Dispatchers.Main.immediate) {
             val latest = _uiState.value
-            if (latest.bookId != status.bookId) return@launch
             _uiState.value = latest.copy(hybridLink = status.decision)
+            if (status.decision.mode == HybridLinkMode.TELEGRAM_FALLBACK ||
+                status.decision.mode == HybridLinkMode.OFFLINE_QUEUEING
+            ) {
+                RemoteStudentCursorBus.current(status.bookId)?.let(::handleTelegramStudentCursor)
+            }
         }
     }
     private val remoteGradeSubscription = RemoteGradeAppliedBus.subscribe { event ->
         viewModelScope.launch(Dispatchers.Main.immediate) {
             val latest = _uiState.value
             if (latest.bookId != event.bookId || latest.pageNumber != event.pageNumber) return@launch
-            _uiState.value = latest.copy(marks = library.markGroups(event.bookId, event.pageNumber))
+            _uiState.value = latest.copy(marks = readerMarks(latest))
         }
     }
     private val peerChatSubscription = RemotePeerChatStateBus.subscribe { chatState ->
@@ -343,6 +462,19 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 ?: return@launch
             if (chatState.scope.pairId != peer.pairId) return@launch
             _uiState.update { latest -> latest.copy(telegramUnreadCount = chatState.unreadCount) }
+        }
+    }
+    private val remoteStudentCursorSubscription = RemoteStudentCursorBus.subscribe { cursor ->
+        if (cursor.transport != RemoteStudentCursorTransport.TELEGRAM) return@subscribe
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            handleTelegramStudentCursor(cursor)
+        }
+    }
+    private val remoteStudentPageSubscription = RemoteStudentPageAppliedBus.subscribe { event ->
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            val latest = _uiState.value
+            if (!latest.matchesRemotePage(event.bookId, event.pageNumber)) return@launch
+            refreshCurrentPage(event.bookId, event.pageNumber, latest.studentAttemptNo)
         }
     }
     private val syncListener = object : LanSyncBus.Listener {
@@ -379,7 +511,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 if (latest.matchesRemotePage(bookId, pageNumber)) {
                     // markGroups is an in-memory catalog read. Keeping the read and state copy in
                     // this non-suspending main-thread block preserves LAN callback ordering.
-                    _uiState.value = latest.copy(marks = library.markGroups(bookId, pageNumber))
+                    _uiState.value = latest.copy(marks = readerMarks(latest))
                 }
             }
         }
@@ -387,27 +519,28 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         override fun onRemoteStudentLocationChanged(location: StudentLocation) {
             viewModelScope.launch(Dispatchers.Main.immediate) {
                 val latest = _uiState.value
-                if (
-                    latest.bookId != location.bookId ||
-                    !latest.capabilities.showsStudentLocation
-                ) return@launch
+                if (!latest.capabilities.showsStudentLocation) return@launch
+                val remoteBook = runCatching { library.book(location.bookId) }.getOrNull() ?: return@launch
                 val shouldFollow = latest.shouldFollowRemoteStudentPage(
                     location.bookId,
                     location.pageNumber,
                     location.attemptNo,
                 )
                 _uiState.value = latest.copy(
+                    studentBookId = location.bookId,
+                    studentBookTitle = remoteBook.title,
                     studentPageNumber = location.pageNumber,
                     studentAttemptNo = location.attemptNo,
+                    studentPageReady = true,
                 )
                 if (!shouldFollow) return@launch
-                if (latest.pageNumber != location.pageNumber) {
+                if (latest.bookId != location.bookId || latest.pageNumber != location.pageNumber) {
                     openBook(
                         bookId = location.bookId,
                         pageNumber = location.pageNumber,
                         role = latest.role,
                         selectedAttemptNo = null,
-                        confirmedPageCount = latest.pageCount.takeIf { it > 0 },
+                        confirmedPageCount = remoteBook.pageCount,
                         workflow = ReaderWorkflow.LIVE_MONITOR,
                         liveStudentAttemptNo = location.attemptNo,
                         followRemoteStudent = true,
@@ -431,6 +564,8 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         hybridLinkSubscription.close()
         remoteGradeSubscription.close()
         peerChatSubscription.close()
+        remoteStudentCursorSubscription.close()
+        remoteStudentPageSubscription.close()
         LanSyncBus.removeListener(syncListener)
         val state = _uiState.value
         if (state.bookId.isNotBlank() && state.storageAvailable) {
@@ -460,13 +595,14 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         val shouldFollowStudent = role != ReaderRole.STUDENT &&
             resolvedWorkflow == ReaderWorkflow.LIVE_MONITOR &&
             followRemoteStudent
-        val stickyStudentLocation = if (
+        val retainedAtOpen = if (
             role != ReaderRole.STUDENT && resolvedWorkflow == ReaderWorkflow.LIVE_MONITOR
         ) {
-            LanSyncBus.remoteStudentLocation(bookId)
+            retainedStudentCursor(bookId)
         } else {
             null
         }
+        val stickyStudentLocation = retainedAtOpen?.location.takeIf { retainedAtOpen?.pageReady == true }
         val liveTarget = resolveLiveMonitorTarget(
             requestedPageNumber = pageNumber,
             liveStudentAttemptNo = liveStudentAttemptNo,
@@ -516,13 +652,14 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     // A PAGE_STATE can arrive while a manually selected page is loading. The
                     // visible target stays manual, but the location badge must retain the newest
                     // cursor rather than the one captured before the disk read began.
-                    val retainedStudentLocation = if (
+                    val retainedCursor = if (
                         resolvedWorkflow == ReaderWorkflow.LIVE_MONITOR
                     ) {
-                        LanSyncBus.remoteStudentLocation(book.id) ?: stickyStudentLocation
+                        retainedStudentCursor(book.id) ?: retainedAtOpen
                     } else {
                         null
                     }
+                    val retainedStudentLocation = retainedCursor?.location
                     document = AnnotationDocument(
                         initial = snapshot,
                         operationClockHighWater = loaded.operationClockHighWater,
@@ -546,9 +683,21 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                         role = role,
                         workflow = resolvedWorkflow,
                         capabilities = ReaderCapabilities.forSession(role, resolvedWorkflow, attemptNo),
-                        marks = library.markGroups(book.id, target),
+                        marks = readerMarks(book.id, target, role, resolvedWorkflow, attemptNo),
                         studentPageNumber = if (resolvedWorkflow == ReaderWorkflow.LIVE_MONITOR) {
                             retainedStudentLocation?.pageNumber ?: _uiState.value.studentPageNumber
+                        } else {
+                            null
+                        },
+                        studentBookId = if (resolvedWorkflow == ReaderWorkflow.LIVE_MONITOR) {
+                            retainedStudentLocation?.bookId ?: _uiState.value.studentBookId
+                        } else {
+                            null
+                        },
+                        studentBookTitle = if (resolvedWorkflow == ReaderWorkflow.LIVE_MONITOR) {
+                            retainedStudentLocation?.bookId?.let { remoteBookId ->
+                                runCatching { library.book(remoteBookId).title }.getOrNull()
+                            } ?: _uiState.value.studentBookTitle
                         } else {
                             null
                         },
@@ -557,6 +706,8 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                         } else {
                             null
                         },
+                        studentPageReady = retainedCursor?.pageReady
+                            ?: _uiState.value.studentPageReady,
                         isFollowingStudent = shouldFollowStudent,
                         currentAttemptWritable = role == ReaderRole.STUDENT &&
                             attempts.any { it.attemptNo == attemptNo && !it.locked },
@@ -566,7 +717,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                         submissionInProgress = submissionGate.get(),
                         attemptPinned = pinAttempt && attemptNo == selectedAttemptNo,
                         liveConnection = LanSyncBus.connectionState(book.id),
-                        hybridLink = HybridLinkStatusBus.current(book.id)?.decision,
+                        hybridLink = HybridLinkStatusBus.current()?.decision,
                         telegramUnreadCount = _uiState.value.telegramUnreadCount,
                         pageAttemptNos = attempts.map { it.attemptNo },
                     )
@@ -678,7 +829,13 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     snapshot = if (snapshotChanged) loaded else latest.snapshot,
                     attemptNo = attemptNo,
                     capabilities = ReaderCapabilities.forSession(latest.role, latest.workflow, attemptNo),
-                    marks = library.markGroups(bookId, pageNumber),
+                    marks = readerMarks(
+                        bookId,
+                        pageNumber,
+                        latest.role,
+                        latest.workflow,
+                        attemptNo,
+                    ),
                     studentAttemptNo = if (latest.workflow == ReaderWorkflow.LIVE_MONITOR) {
                         liveStudentAttemptNo ?: latest.studentAttemptNo
                     } else {
@@ -749,8 +906,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         wholeStroke: Boolean,
         onComplete: (() -> Unit)? = null,
     ) {
-        val forceTeacherSync = _uiState.value.role != ReaderRole.STUDENT
-        mutate(onComplete, forceSync = forceTeacherSync) { state ->
+        mutate(onComplete) { state ->
             // The target is captured when the S Pen first touches down. A live teacher can be
             // moved to another page/attempt while the eraser is still travelling, so committing
             // against whatever happens to be current on ACTION_UP would erase the wrong layer.
@@ -777,7 +933,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun undo() = mutate(syncTeacherAttempt = true) { state ->
+    fun undo() = mutate { state ->
         val writable = if (state.role == ReaderRole.STUDENT) {
             library.writableAttempt(state.bookId, state.pageNumber, create = false)?.attemptNo
         } else {
@@ -787,7 +943,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         document.undo(library.deviceId)
     }
 
-    fun redo() = mutate(syncTeacherAttempt = true) { state ->
+    fun redo() = mutate { state ->
         val writable = if (state.role == ReaderRole.STUDENT) {
             library.writableAttempt(state.bookId, state.pageNumber, create = false)?.attemptNo
         } else {
@@ -865,20 +1021,62 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         val state = _uiState.value
         if (
             !state.capabilities.showsStudentLocation ||
-            state.bookId.isBlank() ||
-            state.pageCount <= 0
+            state.bookId.isBlank()
         ) return
-        val stickyStudentLocation = LanSyncBus.remoteStudentLocation(state.bookId)
+        val activeLan = LanSyncBus.activeSessionSnapshot()?.takeIf { active ->
+            active.session.connectionState == LanConnectionState.CONNECTED &&
+                active.session.phase == LanSessionPhase.READY
+        }
+        val liveLanLocation = activeLan?.let { LanSyncBus.remoteStudentLocation(it.bookId) }
+        val telegramCursor = RemoteStudentCursorBus.current()
+            ?.takeIf { it.transport == RemoteStudentCursorTransport.TELEGRAM }
+        val stickyStudentLocation = liveLanLocation ?: telegramCursor?.toLanLocation() ?: return
+        val targetBook = runCatching { library.book(stickyStudentLocation.bookId) }.getOrNull() ?: return
         openBook(
-            bookId = state.bookId,
-            pageNumber = stickyStudentLocation?.pageNumber ?: state.pageNumber,
+            bookId = targetBook.id,
+            pageNumber = stickyStudentLocation.pageNumber,
             role = state.role,
             selectedAttemptNo = null,
-            confirmedPageCount = state.pageCount,
+            confirmedPageCount = targetBook.pageCount,
             workflow = ReaderWorkflow.LIVE_MONITOR,
-            liveStudentAttemptNo = stickyStudentLocation?.attemptNo,
+            liveStudentAttemptNo = stickyStudentLocation.attemptNo,
             followRemoteStudent = true,
         )
+    }
+
+    private fun handleTelegramStudentCursor(cursor: RemoteStudentCursor) {
+        // Delivery to Main may lag behind a LAN takeover which cleared the sticky Telegram cursor.
+        if (RemoteStudentCursorBus.current() != cursor) return
+        val latest = _uiState.value
+        if (!latest.capabilities.showsStudentLocation) return
+        val remoteBook = runCatching { library.book(cursor.bookId) }.getOrNull() ?: return
+        val shouldFollow = cursor.pageReady && latest.shouldFollowRemoteStudentPage(
+            cursor.bookId,
+            cursor.pageNumber,
+            cursor.attemptNo,
+        )
+        _uiState.value = latest.copy(
+            studentBookId = cursor.bookId,
+            studentBookTitle = remoteBook.title,
+            studentPageNumber = cursor.pageNumber,
+            studentAttemptNo = cursor.attemptNo,
+            studentPageReady = cursor.pageReady,
+        )
+        if (!shouldFollow) return
+        if (latest.bookId != cursor.bookId || latest.pageNumber != cursor.pageNumber) {
+            openBook(
+                bookId = cursor.bookId,
+                pageNumber = cursor.pageNumber,
+                role = latest.role,
+                selectedAttemptNo = null,
+                confirmedPageCount = remoteBook.pageCount,
+                workflow = ReaderWorkflow.LIVE_MONITOR,
+                liveStudentAttemptNo = cursor.attemptNo,
+                followRemoteStudent = true,
+            )
+        } else {
+            refreshCurrentPage(cursor.bookId, cursor.pageNumber, cursor.attemptNo)
+        }
     }
 
     fun addGrade(anchor: PagePoint, color: MarkColor, groupId: String? = null) {
@@ -888,6 +1086,29 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             state.snapshot.activeStrokes.any {
                 it.authorId == "student" && it.attemptNo == state.attemptNo
             }
+        val draftTarget = state.gradeDraftTargetOrNull()
+        if (draftTarget != null) {
+            val attemptKnown = observedStudentAttempt || library.attempts(state.bookId, state.pageNumber)
+                .any { it.attemptNo == state.attemptNo }
+            if (!attemptKnown) {
+                _uiState.value = state.copy(dataError = "채점할 학생 풀이 회차를 아직 불러오지 못했습니다.")
+                return
+            }
+            runCatching {
+                gradeDrafts.add(
+                    target = draftTarget,
+                    anchor = anchor,
+                    color = color,
+                    groupId = groupId,
+                    appendOnCommit = true,
+                )
+            }.onSuccess {
+                _uiState.value = state.copy(marks = readerMarks(state))
+            }.onFailure {
+                _uiState.value = state.copy(dataError = "채점 임시본을 저장하지 못했습니다.")
+            }
+            return
+        }
         runCatching {
             library.addMark(
                 bookId = state.bookId,
@@ -899,7 +1120,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 allowObservedStudentAttempt = observedStudentAttempt,
             )
         }.onSuccess {
-            _uiState.value = state.copy(marks = library.markGroups(state.bookId, state.pageNumber))
+            _uiState.value = state.copy(marks = readerMarks(state))
         }.onFailure {
             _uiState.value = state.copy(dataError = "채점할 학생 풀이 회차를 아직 불러오지 못했습니다.")
         }
@@ -908,20 +1129,45 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     fun changeGrade(groupId: String, color: MarkColor) {
         val state = _uiState.value
         if (!state.capabilities.canGrade) return
+        state.gradeDraftTargetOrNull()?.let { target ->
+            if (ensureGradeDraft(target, groupId) != null) {
+                gradeDrafts.changeColor(target, groupId, color)
+                _uiState.value = state.copy(marks = readerMarks(state))
+            }
+            return
+        }
         library.changeLatestMarkColor(groupId, state.attemptNo, color)
-        _uiState.value = state.copy(marks = library.markGroups(state.bookId, state.pageNumber))
+        _uiState.value = state.copy(marks = readerMarks(state))
     }
 
     fun hideMarkGroup(groupId: String) {
         val state = _uiState.value
         if (!state.capabilities.canGrade) return
+        state.gradeDraftTargetOrNull()?.let { target ->
+            if (ensureGradeDraft(target, groupId) != null) {
+                gradeDrafts.hide(target, groupId)
+                _uiState.value = state.copy(marks = readerMarks(state))
+            }
+            return
+        }
         library.hideMarkGroup(groupId)
-        _uiState.value = state.copy(marks = library.markGroups(state.bookId, state.pageNumber))
+        _uiState.value = state.copy(marks = readerMarks(state))
     }
 
     internal fun moveMarkGroup(move: PendingMarkMove, anchor: PagePoint) {
         val state = _uiState.value
         if (!state.capabilities.canGrade || !move.canApply(state)) return
+        val draftTarget = state.gradeDraftTargetOrNull()
+        if (draftTarget != null) {
+            if (ensureGradeDraft(draftTarget, move.groupId) != null) {
+                gradeDrafts.move(draftTarget, move.groupId, anchor)
+                val latest = _uiState.value
+                if (move.target.matches(latest)) {
+                    _uiState.value = latest.copy(marks = readerMarks(latest))
+                }
+            }
+            return
+        }
         val targetGroup = library.markGroups(move.target.bookId, move.target.pageNumber)
             .firstOrNull { group ->
                 group.id == move.groupId && group.marks.any { mark ->
@@ -932,23 +1178,206 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         val latest = _uiState.value
         if (move.target.matches(latest)) {
             _uiState.value = latest.copy(
-                marks = library.markGroups(move.target.bookId, move.target.pageNumber),
+                marks = readerMarks(latest),
             )
         }
     }
 
+    private fun ensureGradeDraft(
+        target: TeacherGradeDraftTarget,
+        groupId: String,
+    ): TeacherGradeDraft? {
+        gradeDrafts.list(target).firstOrNull { it.groupId == groupId }?.let { return it }
+        val group = library.markGroups(target.bookId, target.pageNumber)
+            .firstOrNull { it.id == groupId } ?: return null
+        val latest = group.marks.lastOrNull { mark ->
+            mark.attemptNo == target.attemptNo && mark.hiddenAtEpochMillis == null
+        } ?: return null
+        return gradeDrafts.add(
+            target = target,
+            anchor = group.anchor,
+            color = latest.color,
+            groupId = group.id,
+            appendOnCommit = false,
+        )
+    }
+
     fun publishTeacherInk(onComplete: (() -> Unit)? = null) {
-        if (!_uiState.value.canPublishTeacherInkNow) return
-        mutate(onComplete, forceSync = true) { state ->
-            if (!state.canPublishTeacherInkNow) return@mutate null
-            document.publishTeacherDrafts(state.attemptNo, library.deviceId)
+        val requested = _uiState.value
+        val requestedTarget = requested.gradeDraftTargetOrNull()
+        if (!requested.canPublishTeacherInkNow || requestedTarget == null) return
+        val pending = pendingDocumentMutations.incrementAndGet()
+        _uiState.update { latest -> latest.copy(pendingDocumentMutations = pending) }
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                mutationMutex.withLock {
+                    val before = _uiState.value
+                    if (
+                        !before.canPublishTeacherInkNow ||
+                        before.gradeDraftTargetOrNull() != requestedTarget
+                    ) return@withLock
+                    val drafts = gradeDrafts.list(requestedTarget)
+                    val beforeSnapshot = document.snapshot()
+                    val beforeClock = document.operationClockHighWater
+                    try {
+                        var publicationId: String? = null
+                        val draftInputs = drafts.map { draft ->
+                            TeacherGradeDraftCommitInput(
+                                bookId = draft.target.bookId,
+                                pageNumber = draft.target.pageNumber,
+                                attemptNo = draft.target.attemptNo,
+                                groupId = draft.groupId,
+                                anchor = draft.anchor,
+                                color = draft.color,
+                                hidden = draft.hidden,
+                                appendMark = draft.appendOnCommit,
+                                createdAtEpochMillis = draft.createdAtEpochMillis,
+                                updatedAtEpochMillis = draft.updatedAtEpochMillis,
+                            )
+                        }
+                        val change = document.publishTeacherDrafts(before.attemptNo, library.deviceId)
+                        val plannedExactGroups = withContext(Dispatchers.IO) {
+                            library.previewTeacherGradeDrafts(draftInputs)
+                                .asSequence()
+                                .filter { it.bookId == before.bookId && it.pageNumber == before.pageNumber }
+                                .mapNotNull { group ->
+                                    val exact = group.marks.filter { it.attemptNo == before.attemptNo }
+                                    exact.takeIf(List<*>::isNotEmpty)?.let { group.copy(marks = exact) }
+                                }
+                                .toList()
+                        }
+                        // Freeze the exact intended final bundle before either annotation or grade
+                        // storage is changed. The older ready publication remains intact until the
+                        // new preparation is proven to match both durable stores.
+                        val prepared = withContext(Dispatchers.IO) {
+                            val remoteProvenance = TeacherReviewPublicationProvenanceBus.resolve(
+                                before.bookId,
+                                before.pageNumber,
+                                before.attemptNo,
+                            )
+                            store.prepareTeacherReviewPublication(
+                                intent = TeacherReviewPublishIntent(
+                                    bookId = before.bookId,
+                                    pageNumber = before.pageNumber,
+                                    attemptNo = before.attemptNo,
+                                    updatedAtEpochMillis = System.currentTimeMillis(),
+                                    remotePairId = remoteProvenance?.pairId,
+                                    remoteWorkbookToken = remoteProvenance?.workbookToken,
+                                    remoteManifestGeneration =
+                                        remoteProvenance?.manifestGeneration ?: 0L,
+                                    remoteManifestSequence =
+                                        remoteProvenance?.manifestSequence ?: 0L,
+                                ),
+                                publishedSnapshot = change?.snapshot ?: beforeSnapshot,
+                                publishedMarkGroups = plannedExactGroups,
+                            )
+                        }
+                        val persisted = change?.let { publication ->
+                            withContext(Dispatchers.IO) { store.append(publication) }
+                        }
+                        val mergedConcurrentOperation = change != null &&
+                            persisted?.appliedOperationIds != change.snapshot.appliedOperationIds
+                        val mergedPage = if (mergedConcurrentOperation) {
+                            withContext(Dispatchers.IO) {
+                                store.loadPageState(before.bookId, before.pageNumber)
+                            }
+                        } else {
+                            null
+                        }
+                        val persistedSnapshot = mergedPage?.snapshot ?: persisted ?: before.snapshot
+                        if (mergedPage != null) {
+                            document = AnnotationDocument(
+                                initial = mergedPage.snapshot,
+                                operationClockHighWater = mergedPage.operationClockHighWater,
+                            )
+                        }
+                        withContext(Dispatchers.IO) {
+                            library.commitTeacherGradeDrafts(draftInputs)
+                            val exactPublishedGroups = library.markGroupsForSync(before.bookId)
+                                .asSequence()
+                                .filter { it.pageNumber == before.pageNumber }
+                                .mapNotNull { group ->
+                                    val exact = group.marks.filter { it.attemptNo == before.attemptNo }
+                                    exact.takeIf(List<*>::isNotEmpty)?.let { group.copy(marks = exact) }
+                                }
+                                .toList()
+                            publicationId = requireNotNull(
+                                store.promotePreparedTeacherReviewPublication(
+                                    bookId = before.bookId,
+                                    pageNumber = before.pageNumber,
+                                    attemptNo = before.attemptNo,
+                                    publicationId = prepared.publicationId,
+                                    currentMarkGroups = exactPublishedGroups,
+                                ),
+                            ) { "첨삭 발행 준비 상태와 저장된 결과가 일치하지 않습니다." }.publicationId
+                            gradeDrafts.clearCommittedIds(drafts.mapTo(linkedSetOf()) { it.draftId })
+                        }
+                        // The publish button is a hard history boundary even when there was no
+                        // draft stroke conversion (erase-only or grade-only publication).
+                        document.commitBoundary()
+                        val latest = _uiState.value
+                        if (
+                            latest.bookId == before.bookId &&
+                            latest.pageNumber == before.pageNumber &&
+                            latest.attemptNo == before.attemptNo
+                        ) {
+                            _uiState.value = latest.copy(
+                                snapshot = persistedSnapshot,
+                                marks = readerMarks(latest),
+                                canUndo = if (mergedConcurrentOperation) false else document.canUndo,
+                                canRedo = if (mergedConcurrentOperation) false else document.canRedo,
+                            )
+                        }
+                        // Both LAN and Telegram observe this only after ink and grade commits have
+                        // succeeded for the exact immutable page/attempt target.
+                        val exactPublicationId = requireNotNull(publicationId)
+                        LanSyncBus.teacherReviewPublished(
+                            LanTeacherReviewPublication(
+                                before.bookId,
+                                before.pageNumber,
+                                before.attemptNo,
+                                exactPublicationId,
+                            ),
+                        )
+                        TeacherReviewPublishedBus.publish(
+                            TeacherReviewPublished(
+                                bookId = before.bookId,
+                                pageNumber = before.pageNumber,
+                                attemptNo = before.attemptNo,
+                                publicationId = exactPublicationId,
+                            ),
+                        )
+                    } catch (_: Throwable) {
+                        val durable = runCatching {
+                            withContext(Dispatchers.IO) {
+                                store.loadPageState(before.bookId, before.pageNumber)
+                            }
+                        }.getOrNull()
+                        document = if (durable != null) {
+                            AnnotationDocument(durable.snapshot, durable.operationClockHighWater)
+                        } else {
+                            AnnotationDocument(beforeSnapshot, beforeClock)
+                        }
+                        val latest = _uiState.value
+                        if (latest.bookId == before.bookId && latest.pageNumber == before.pageNumber) {
+                            _uiState.value = latest.copy(
+                                snapshot = durable?.snapshot ?: beforeSnapshot,
+                                marks = readerMarks(latest),
+                                dataError = "첨삭 발행을 완료하지 못했습니다. 임시 채점은 유지되며 다시 누르면 이어서 처리합니다.",
+                            )
+                        }
+                    }
+                }
+            } finally {
+                val remaining = pendingDocumentMutations.decrementAndGet().coerceAtLeast(0)
+                _uiState.update { latest -> latest.copy(pendingDocumentMutations = remaining) }
+                withContext(Dispatchers.Main.immediate) { onComplete?.invoke() }
+            }
         }
     }
 
     private fun mutate(
         onComplete: (() -> Unit)? = null,
-        forceSync: Boolean = false,
-        syncTeacherAttempt: Boolean = false,
         /** Read after [block] has run, when the change decided its own attempt number. */
         attemptNoAfterChange: (() -> Int?)? = null,
         block: (ReaderUiState) -> AnnotationChange?,
@@ -1014,11 +1443,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                             canRedo = if (mergedConcurrentOperation) false else document.canRedo,
                         )
                     }
-                    if (
-                        before.role == ReaderRole.STUDENT ||
-                        forceSync ||
-                        (syncTeacherAttempt && before.shouldForceSyncTeacherUndoRedo)
-                    ) {
+                    if (before.role == ReaderRole.STUDENT) {
                         LanSyncBus.operationWritten(before.bookId, before.pageNumber)
                     }
                     if (before.role == ReaderRole.STUDENT && attemptNo != before.attemptNo) {

@@ -64,6 +64,28 @@ class HybridLinkStateMachineTest {
     }
 
     @Test
+    fun definitiveDisconnectDuringGraceEndsGraceImmediately() {
+        val machine = HybridLinkStateMachine()
+        machine.update(signals(now = 0L, lanReady = true, telegramReady = true))
+        assertEquals(
+            HybridLinkMode.LAN_GRACE,
+            machine.update(signals(now = 100L, lanReady = false, telegramReady = true)).mode,
+        )
+
+        val disconnected = machine.update(
+            signals(
+                now = 101L,
+                lanReady = false,
+                telegramReady = true,
+                lanDefinitelyDisconnected = true,
+            ),
+        )
+
+        assertEquals(HybridLinkMode.TELEGRAM_FALLBACK, disconnected.mode)
+        assertTrue(disconnected.enteredTelegramFallback)
+    }
+
+    @Test
     fun recoveringDuringGraceCancelsFallbackAndNextLossGetsANewGracePeriod() {
         val machine = HybridLinkStateMachine()
         machine.update(signals(now = 0L, lanReady = true, telegramReady = true))

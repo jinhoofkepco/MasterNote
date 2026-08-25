@@ -90,6 +90,9 @@ enum class RemoteReviewIncomingAction {
     APPLY_TEACHER_FEEDBACK,
     APPLY_CHAT_MESSAGE,
     APPLY_REMOTE_GRADE,
+    APPLY_PAGE_SYNC_MANIFEST,
+    APPLY_PAGE_SYNC_REQUEST,
+    APPLY_PAGE_ANNOTATION,
     COMPLETE_OUTBOX,
     IGNORE_DUPLICATE,
     IGNORE_SUPERSEDED,
@@ -116,6 +119,32 @@ data class RemoteReviewAckDirective(
         )
 }
 
+/** A semantic page ACK to enqueue only after the referenced annotation is durably applied. */
+data class PageSyncAckDirective(
+    val syncGeneration: Long,
+    val sourceType: PageSyncAckSourceType,
+    val sourceTransferId: String,
+    val pageToken: String,
+    val pageNumber: Int,
+    val sourceRevision: Long,
+    val disposition: PageSyncAckDisposition,
+    val reasonCode: String? = null,
+) {
+    fun toEnvelope(transferId: String, createdAtEpochMs: Long): PageSyncAckEnvelope =
+        PageSyncAckEnvelope(
+            transferId = transferId,
+            createdAtEpochMs = createdAtEpochMs,
+            syncGeneration = syncGeneration,
+            sourceType = sourceType,
+            sourceTransferId = sourceTransferId,
+            pageToken = pageToken,
+            pageNumber = pageNumber,
+            sourceRevision = sourceRevision,
+            disposition = disposition,
+            reasonCode = reasonCode,
+        )
+}
+
 sealed interface RemoteReviewStateMutation {
     data class RecordCommittedTransfer(val transferId: String) : RemoteReviewStateMutation
     data class SetLatestSnapshot(val cursor: RemoteSnapshotCursor) : RemoteReviewStateMutation
@@ -137,6 +166,8 @@ data class RemoteReviewIncomingPlan(
     val ackAfterCommit: RemoteReviewAckDirective? = null,
     /** Feedback is still applicable, but its student background is no longer the latest one. */
     val feedbackUsesOlderSnapshot: Boolean = false,
+    /** Used instead of [ackAfterCommit] for PAGE_ANNOTATION exact-page semantic settlement. */
+    val pageSyncAckAfterCommit: PageSyncAckDirective? = null,
 )
 
 enum class RemoteReviewOutboxStatus {
@@ -198,6 +229,26 @@ object RemoteReviewExchangeStateMachine {
                 action = RemoteReviewIncomingAction.APPLY_CHAT_MESSAGE,
             )
             is RemoteGradeEnvelope -> planGrade(envelope, state)
+            is PageSyncManifestEnvelope -> planPeerArtifact(
+                envelope = envelope,
+                action = RemoteReviewIncomingAction.APPLY_PAGE_SYNC_MANIFEST,
+            )
+            is PageSyncRequestEnvelope -> planPeerArtifact(
+                envelope = envelope,
+                action = RemoteReviewIncomingAction.APPLY_PAGE_SYNC_REQUEST,
+            )
+            is PageAnnotationEnvelope -> planPageAnnotation(envelope)
+            is PageSyncAckEnvelope -> RemoteReviewIncomingPlan(
+                action = RemoteReviewIncomingAction.COMPLETE_OUTBOX,
+                commitMutations = listOf(
+                    RemoteReviewStateMutation.RecordCommittedTransfer(envelope.transferId),
+                    RemoteReviewStateMutation.SettleOutboxTransfer(
+                        transferId = envelope.sourceTransferId,
+                        disposition = envelope.disposition.asRemoteReviewDisposition(),
+                        detailCode = envelope.reasonCode,
+                    ),
+                ),
+            )
         }
     }
 
@@ -209,6 +260,10 @@ object RemoteReviewExchangeStateMachine {
         is ChatMessageEnvelope -> null
         is RemoteGradeEnvelope -> "GRADE:${envelope.sourceSnapshot.pageToken}:" +
             "${envelope.attemptNo}:${envelope.gradeGroupId}"
+        is PageSyncManifestEnvelope -> null
+        is PageSyncRequestEnvelope -> null
+        is PageAnnotationEnvelope -> null
+        is PageSyncAckEnvelope -> null
     }
 
     /**
@@ -379,6 +434,18 @@ object RemoteReviewExchangeStateMachine {
         ),
     )
 
+    private fun planPageAnnotation(
+        annotation: PageAnnotationEnvelope,
+    ): RemoteReviewIncomingPlan = RemoteReviewIncomingPlan(
+        action = RemoteReviewIncomingAction.APPLY_PAGE_ANNOTATION,
+        commitMutations = listOf(
+            RemoteReviewStateMutation.RecordCommittedTransfer(annotation.transferId),
+        ),
+        pageSyncAckAfterCommit = annotation.pageSyncAckDirective(
+            PageSyncAckDisposition.APPLIED,
+        ),
+    )
+
     private fun planGrade(
         grade: RemoteGradeEnvelope,
         state: RemoteReviewStateView,
@@ -475,7 +542,11 @@ object RemoteReviewExchangeStateMachine {
     private fun duplicatePlan(envelope: RemoteReviewEnvelope): RemoteReviewIncomingPlan =
         RemoteReviewIncomingPlan(
             action = RemoteReviewIncomingAction.IGNORE_DUPLICATE,
-            ackAfterCommit = if (envelope is RemoteReviewAckEnvelope) {
+            ackAfterCommit = if (
+                envelope is RemoteReviewAckEnvelope ||
+                envelope is PageSyncAckEnvelope ||
+                envelope is PageAnnotationEnvelope
+            ) {
                 null
             } else {
                 RemoteReviewAckDirective(
@@ -483,7 +554,29 @@ object RemoteReviewExchangeStateMachine {
                     disposition = RemoteReviewAckDisposition.DUPLICATE,
                 )
             },
+            pageSyncAckAfterCommit = (envelope as? PageAnnotationEnvelope)?.pageSyncAckDirective(
+                PageSyncAckDisposition.DUPLICATE,
+            ),
         )
+
+    private fun PageAnnotationEnvelope.pageSyncAckDirective(
+        disposition: PageSyncAckDisposition,
+    ): PageSyncAckDirective = PageSyncAckDirective(
+        syncGeneration = syncGeneration,
+        sourceType = PageSyncAckSourceType.ANNOTATION,
+        sourceTransferId = transferId,
+        pageToken = pageToken,
+        pageNumber = pageNumber,
+        sourceRevision = sourceRevision,
+        disposition = disposition,
+    )
+
+    private fun PageSyncAckDisposition.asRemoteReviewDisposition(): RemoteReviewAckDisposition =
+        when (this) {
+            PageSyncAckDisposition.APPLIED -> RemoteReviewAckDisposition.APPLIED
+            PageSyncAckDisposition.DUPLICATE -> RemoteReviewAckDisposition.DUPLICATE
+            PageSyncAckDisposition.REJECTED -> RemoteReviewAckDisposition.REJECTED
+        }
 }
 
 private val GRADE_DIGEST = Regex("[0-9a-f]{${RemoteReviewLimits.SHA256_HEX_BYTES}}")

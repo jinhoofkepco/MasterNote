@@ -9,6 +9,7 @@ import android.os.storage.StorageManager
 import android.provider.MediaStore
 import android.provider.Settings
 import com.studyink.annotation.storage.PageOperationLogStore
+import com.studyink.core.model.MasterNoteDataRootBus
 import com.studyink.library.data.LibraryRepository
 import java.io.File
 import java.io.FileInputStream
@@ -195,6 +196,7 @@ class MasterNoteBackupManager private constructor(context: Context) {
                         // are released. New callers will therefore open the newly installed root.
                         PageOperationLogStore.resetForRestore()
                         LibraryRepository.resetForRestore()
+                        MasterNoteDataRootBus.dataRootReplaced()
                     } catch (error: Throwable) {
                         if (newRootInstalled && liveRoot.exists()) deleteTreeChecked(liveRoot, context.filesDir)
                         if (oldRootMoved && rollbackRoot.exists()) {
@@ -203,6 +205,7 @@ class MasterNoteBackupManager private constructor(context: Context) {
                         restorePreviousDeviceId(preferences, previousDeviceId)
                         PageOperationLogStore.resetForRestore()
                         LibraryRepository.resetForRestore()
+                        MasterNoteDataRootBus.dataRootReplaced()
                         throw error
                     }
                 }
@@ -346,6 +349,7 @@ class MasterNoteBackupManager private constructor(context: Context) {
                     output.fd.sync()
                 }
             }
+            if (source.lastModified() > 0L) destination.setLastModified(source.lastModified())
         }
     }
 
@@ -394,6 +398,7 @@ class MasterNoteBackupManager private constructor(context: Context) {
             }
             PageOperationLogStore.resetForRestore()
             LibraryRepository.resetForRestore()
+            MasterNoteDataRootBus.dataRootReplaced()
             return
         }
 
@@ -409,6 +414,7 @@ class MasterNoteBackupManager private constructor(context: Context) {
                 runCatching { deleteTreeChecked(stage, filesRoot) }
                 PageOperationLogStore.resetForRestore()
                 LibraryRepository.resetForRestore()
+                MasterNoteDataRootBus.dataRootReplaced()
             }
         }
         // A stage without a rollback never crossed the destructive rename boundary.

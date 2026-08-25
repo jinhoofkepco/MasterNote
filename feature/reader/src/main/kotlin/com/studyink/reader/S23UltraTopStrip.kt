@@ -347,6 +347,15 @@ internal fun S23UltraTopStrip(
                         forceHovered = previewHoveredDescription == "학생 화면 다시 따라가기" ||
                             previewHoveredDescription == "전송 상태",
                     )
+                    S23StudentPageOrActivityCell(
+                        state = state,
+                        onResumeStudentFollow = onResumeStudentFollow,
+                        onShowStudentActivity = onShowStudentActivity,
+                        role = state.role,
+                        cellWidth = cellWidth,
+                        forceHovered = previewHoveredDescription == "학생 필기량 보기" ||
+                            previewHoveredDescription?.startsWith("학생 현재 페이지") == true,
+                    )
                     if (markHistoryContent != null) {
                         Box(
                             modifier = Modifier
@@ -364,16 +373,6 @@ internal fun S23UltraTopStrip(
                             onNextAttempt = onNextAttempt,
                             onSelectAttempt = onSelectAttempt,
                         )
-                    }
-                    S23StripButton(
-                        description = "학생 필기량 보기",
-                        onAction = onShowStudentActivity,
-                        enabled = state.capabilities.showsStudentLocation,
-                        role = state.role,
-                        cellWidth = cellWidth,
-                        forceHovered = previewHoveredDescription == "학생 필기량 보기",
-                    ) {
-                        S23ActivityBars(color = tokens.paletteBlue)
                     }
                     S23StripIconButton(
                         description = "첨삭 발행",
@@ -412,6 +411,72 @@ internal fun S23UltraTopStrip(
                     )
                 },
             )
+        }
+    }
+}
+
+internal fun ReaderUiState.showsStudentPageShortcut(): Boolean {
+    val remotePage = studentPageNumber ?: return false
+    val remoteBook = studentBookId ?: bookId
+    return capabilities.showsStudentLocation &&
+        (bookId != remoteBook || pageNumber != remotePage ||
+            studentAttemptNo != null && attemptNo != studentAttemptNo)
+}
+
+@Composable
+private fun S23StudentPageOrActivityCell(
+    state: ReaderUiState,
+    onResumeStudentFollow: () -> Unit,
+    onShowStudentActivity: () -> Unit,
+    role: ReaderRole,
+    cellWidth: Dp,
+    forceHovered: Boolean,
+) {
+    val tokens = readerChromeTokens(role)
+    val remotePage = state.studentPageNumber
+    if (state.showsStudentPageShortcut() && remotePage != null) {
+        val pageLabel = remotePage + 1
+        val bookLabel = state.studentBookTitle?.takeIf { state.studentBookId != state.bookId }
+        val attemptLabel = state.studentAttemptNo?.let { "${it}회" }
+        S23StripButton(
+            description = buildString {
+                append("학생 현재 페이지 ").append(pageLabel).append("쪽")
+                attemptLabel?.let { append(" ").append(it) }
+                if (!state.studentPageReady) append(", 필기 동기화 대기 중")
+            },
+            onAction = onResumeStudentFollow,
+            enabled = state.capabilities.showsStudentLocation,
+            role = role,
+            cellWidth = cellWidth,
+            forceHovered = forceHovered,
+        ) {
+            Text(
+                text = bookLabel?.let { "${it.take(3)}·$pageLabel" } ?: pageLabel.toString(),
+                color = if (state.studentPageReady) tokens.paletteGreen else tokens.statusForeground,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Black,
+            )
+            attemptLabel?.let { label ->
+                Text(
+                    text = label,
+                    modifier = Modifier.align(Alignment.TopEnd).padding(top = 3.dp, end = 2.dp),
+                    color = tokens.statusForeground,
+                    fontSize = 7.sp,
+                    lineHeight = 8.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
+    } else {
+        S23StripButton(
+            description = "학생 필기량 보기",
+            onAction = onShowStudentActivity,
+            enabled = state.capabilities.showsStudentLocation,
+            role = role,
+            cellWidth = cellWidth,
+            forceHovered = forceHovered,
+        ) {
+            S23ActivityBars(color = tokens.paletteBlue)
         }
     }
 }

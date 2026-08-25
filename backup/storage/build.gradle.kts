@@ -19,6 +19,7 @@ android {
 kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
 
 dependencies {
+    implementation(project(":core:model"))
     implementation(project(":library:data"))
     implementation(project(":annotation:storage"))
 

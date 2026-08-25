@@ -1,5 +1,7 @@
 package com.studyink.monitor.core
 
+import com.studyink.core.model.TeacherReviewPublicationLimits
+
 /** Wire and allocation limits for the deliberately small remote-review exchange. */
 object RemoteReviewLimits {
     /** Normal writers must stay below this size, including the protocol frame. */
@@ -24,6 +26,23 @@ object RemoteReviewLimits {
     const val MAX_STUDENT_LABEL_UTF8_BYTES: Int = 80
     const val SHA256_HEX_BYTES: Int = 64
     const val MAX_GRADE_SCORE: Int = 1_000_000
+
+    /** A normal delta writer should split before this size. Readers accept recovery batches below. */
+    const val PAGE_ANNOTATION_DELTA_TARGET_BYTES: Int = 512 * 1024
+
+    /** Hard decoded and encoded payload limit for one delta. */
+    const val MAX_PAGE_ANNOTATION_DELTA_BYTES: Int = 1024 * 1024
+
+    /** Leaves the same frame/metadata headroom as a rendered page snapshot. */
+    const val MAX_PAGE_ANNOTATION_CHECKPOINT_BYTES: Int =
+        TeacherReviewPublicationLimits.MAX_WIRE_PAYLOAD_BYTES
+
+    const val MAX_PAGE_SYNC_MANIFEST_ENTRIES: Int = 4_096
+    const val MAX_PAGE_SYNC_INVENTORY_PAGES: Int = 100_000
+    // Checkpoints contain the complete active student layer, so silently truncating this list can
+    // never be safe. 4,096 keeps the manifest bounded while covering years of repeated work.
+    const val MAX_PAGE_SYNC_ATTEMPTS_PER_PAGE: Int = 4_096
+    const val MAX_PAGE_SYNC_APPROX_BYTES: Long = 64L * 1024L * 1024L
 }
 
 class RemoteReviewValidationException(
@@ -37,6 +56,10 @@ enum class RemoteReviewEnvelopeType {
     ACK,
     CHAT_MESSAGE,
     REMOTE_GRADE,
+    PAGE_SYNC_MANIFEST,
+    PAGE_SYNC_REQUEST,
+    PAGE_ANNOTATION,
+    PAGE_SYNC_ACK,
 }
 
 sealed interface RemoteReviewEnvelope {

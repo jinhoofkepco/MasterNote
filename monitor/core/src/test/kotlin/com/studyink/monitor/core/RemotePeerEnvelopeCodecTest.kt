@@ -211,7 +211,7 @@ class RemotePeerEnvelopeCodecTest {
 
     @Test fun unknownNewerWireTypeIsStillRejectedInsteadOfGuessed() {
         val bytes = RemoteReviewDocumentCodec.encode(chat()).copyBytes()
-        bytes[WIRE_TYPE_OFFSET] = 6
+        bytes[WIRE_TYPE_OFFSET] = 10
 
         val failure = assertThrows(RemoteReviewCodecException::class.java) {
             RemoteReviewDocumentCodec.decode(bytes)

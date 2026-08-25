@@ -150,9 +150,15 @@ class AnnotationDocument(
         appliedOperationIds += operation.id
         revision++
         // Publishing is a boundary, not a student/editor undoable gesture.
+        commitBoundary()
+        return AnnotationChange(snapshot(), operation, replacements)
+    }
+
+    /** Clears gesture history after a successful ink, erase-only, or grade-only publication. */
+    @Synchronized
+    fun commitBoundary() {
         undo.clear()
         redo.clear()
-        return AnnotationChange(snapshot(), operation, replacements)
     }
 
     @Synchronized

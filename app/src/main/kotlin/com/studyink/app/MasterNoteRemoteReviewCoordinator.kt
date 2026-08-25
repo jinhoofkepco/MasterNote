@@ -21,14 +21,21 @@ import com.studyink.monitor.core.NormalizedTeacherPoint
 import com.studyink.monitor.core.NormalizedTeacherStroke
 import com.studyink.monitor.core.NormalizedGradeAnchor
 import com.studyink.monitor.core.HybridLinkDecision
+import com.studyink.monitor.core.HybridLinkHealth
+import com.studyink.monitor.core.HybridLinkLabel
 import com.studyink.monitor.core.HybridLinkMode
 import com.studyink.monitor.core.HybridLinkSignals
 import com.studyink.monitor.core.HybridLinkStateMachine
 import com.studyink.monitor.core.HybridLinkStatus
 import com.studyink.monitor.core.HybridLinkStatusBus
+import com.studyink.monitor.core.HybridLinkTransport
 import com.studyink.monitor.core.ChatMessageEnvelope
 import com.studyink.monitor.core.DecodedRemoteReviewDocument
 import com.studyink.monitor.core.PageSnapshotEnvelope
+import com.studyink.monitor.core.PageAnnotationEnvelope
+import com.studyink.monitor.core.PageSyncAckEnvelope
+import com.studyink.monitor.core.PageSyncManifestEnvelope
+import com.studyink.monitor.core.PageSyncRequestEnvelope
 import com.studyink.monitor.core.RemoteReviewDocumentCodec
 import com.studyink.monitor.core.RemoteReviewEnvelopeType
 import com.studyink.monitor.core.RemoteReviewFeedbackBus
@@ -50,6 +57,8 @@ import com.studyink.monitor.core.StudentWorkHeartbeatBus
 import com.studyink.monitor.core.StudentWorkKind
 import com.studyink.monitor.core.TeacherFeedbackEnvelope
 import com.studyink.monitor.core.TeacherInkTool
+import com.studyink.monitor.core.TeacherReviewPublishedBus
+import com.studyink.monitor.core.TeacherReviewPublicationProvenanceBus
 import com.studyink.monitor.render.MasterNotePageRenderer
 import com.studyink.monitor.render.PageRenderImageFormat
 import com.studyink.monitor.render.PageRenderLimits
@@ -71,6 +80,7 @@ import com.studyink.sync.lan.LanSessionSnapshot
 import com.studyink.sync.lan.LanSyncBus
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -154,6 +164,28 @@ object MasterNoteRemoteReviewCoordinator {
     /** Durably clears the unread badge for the exact current pairing. */
     fun markRemotePeerChatRead(): RemotePeerChatState? = runtime?.markRemotePeerChatRead()
 
+    /** Page-level Telegram backlog shown below the encrypted peer conversation. */
+    fun pageSyncUiState(): RemotePageSyncUiState =
+        runtime?.pageSyncUiState() ?: RemotePageSyncUiState()
+
+    fun addPageSyncListener(listener: (RemotePageSyncUiState) -> Unit): AutoCloseable =
+        runtime?.addPageSyncListener(listener) ?: AutoCloseable { }
+
+    /** Starts latest-first manual recovery for pages outside the automatic recent-three set. */
+    fun startPendingPageSync(intervalSeconds: Int) {
+        runtime?.startPendingPageSync(intervalSeconds)
+    }
+
+    fun pausePendingPageSync() {
+        runtime?.pausePendingPageSync()
+    }
+
+    fun workbookMappingCandidates(pageToken: String): List<RemoteWorkbookMappingCandidate> =
+        runtime?.workbookMappingCandidates(pageToken).orEmpty()
+
+    fun bindWorkbookMapping(pageToken: String, localBookId: String): Boolean =
+        runtime?.bindWorkbookMapping(pageToken, localBookId) == true
+
     /**
      * Stops accepting review work and waits until every operation that could touch rendered pages,
      * annotations, or the review ledger has left the coordinator's serial boundary.
@@ -217,6 +249,9 @@ private class RemoteReviewRuntime(
     private val peerChat = RemotePeerChatStore(
         File(application.noBackupFilesDir, "remote-review/peer-chat"),
     )
+    private val pageSyncStore = RemotePageSyncStore(
+        File(application.noBackupFilesDir, "remote-review/page-sync-metadata.v1.json"),
+    )
     private val stagingDirectory = File(application.noBackupFilesDir, "remote-review/staging").apply {
         check(mkdirs() || isDirectory) { "Cannot create remote-review staging directory" }
         listFiles().orEmpty().filter(File::isFile).forEach(File::delete)
@@ -244,20 +279,56 @@ private class RemoteReviewRuntime(
     private val worker = Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "MasterNote-remote-review").apply { isDaemon = true }
     }
+    private val pageSync = RemotePageSyncController(
+        library = library,
+        annotationStore = annotationStore,
+        store = pageSyncStore,
+        pageToken = tokenFactory::pageSyncPageToken,
+        workbookToken = tokenFactory::pageSyncWorkbookToken,
+        reserveTeacherReviewRevision = { pageToken, transferId ->
+            teacherRevisions.reserve(pageToken, transferId, requestedRevision = 1L)
+        },
+        outboundState = { payloadType, transferId ->
+            val receipt = gateway.peerDeliveryReceipt(transferId)
+            when {
+                receipt?.acknowledgedAtEpochMs != null ->
+                    RemotePageSyncOutboundState.ACKNOWLEDGED
+                gateway.pendingPeerDocumentTransfers(setOf(payloadType)).any {
+                    it.transferId == transferId
+                } -> RemotePageSyncOutboundState.PENDING
+                gateway.deadLetters().any { it.entry.peerTransferId == transferId } ->
+                    RemotePageSyncOutboundState.FAILED
+                receipt != null && isUnacknowledgedPeerReceiptExpired(
+                    receipt.sentAtEpochMs,
+                    System.currentTimeMillis(),
+                ) -> RemotePageSyncOutboundState.FAILED
+                receipt != null -> RemotePageSyncOutboundState.SENT
+                else -> RemotePageSyncOutboundState.NONE
+            }
+        },
+        sendEnvelope =(::enqueuePageSyncEnvelope),
+    )
     private val operationLock = Any()
     private val captureState = RemoteReviewCaptureState()
     private var hybridStateMachine = HybridLinkStateMachine()
     private var hybridBookId: String? = null
     private var hybridDecision: HybridLinkDecision? = null
+    private var pageSyncTransportRoute = GlobalPageSyncTransportRoute.TELEGRAM
     private var telegramStatus: RemoteMonitorStatus = gateway.status()
     private var observedSession: ConnectedRemoteReviewSession? = null
     private var presenceSubscription: AutoCloseable? = null
     private var heartbeatSubscription: AutoCloseable? = null
     private var peerDocumentSubscription: AutoCloseable? = null
     private var telegramStatusSubscription: AutoCloseable? = null
+    private var teacherReviewSubscription: AutoCloseable? = null
+    private var teacherReviewProvenanceSubscription: AutoCloseable? = null
     /** Decode failures are retried after process/session restart, but skipped within this runtime. */
     private val retainedUndecodableUpdateIds = linkedSetOf<Long>()
     private val lanListener = object : LanSyncBus.Listener {
+        override fun onLocalOperation(bookId: String, pageNumber: Int) {
+            execute { pageSync.onLocalOperation(bookId, pageNumber) }
+        }
+
         override fun onConnectionStateChanged(bookId: String, state: LanConnectionState) {
             execute { updateHybridLink(bookId) }
         }
@@ -268,6 +339,12 @@ private class RemoteReviewRuntime(
 
         override fun onPagePresenceChanged(presence: com.studyink.sync.lan.PagePresence) {
             execute { updateHybridLink(presence.bookId) }
+        }
+
+        override fun onTeacherReviewAcknowledged(
+            publication: com.studyink.sync.lan.LanTeacherReviewPublication,
+        ) {
+            execute { pageSync.onLanTeacherReviewAcknowledged(publication) }
         }
     }
 
@@ -281,11 +358,26 @@ private class RemoteReviewRuntime(
 
     fun start() {
         LanSyncBus.addListener(lanListener)
+        teacherReviewProvenanceSubscription = TeacherReviewPublicationProvenanceBus.install { target ->
+            synchronized(operationLock) {
+                if (closed || pausedForMaintenance) null else {
+                    refreshSession()
+                    pageSync.teacherReviewPublicationProvenance(
+                        target.bookId,
+                        target.pageNumber,
+                        target.attemptNo,
+                    )
+                }
+            }
+        }
         presenceSubscription = StudentStudyPresenceBus.subscribe { presence ->
             execute { handlePresence(presence) }
         }
         heartbeatSubscription = StudentWorkHeartbeatBus.subscribe { heartbeat ->
             execute { handleHeartbeat(heartbeat) }
+        }
+        teacherReviewSubscription = TeacherReviewPublishedBus.subscribe { event ->
+            execute { pageSync.onTeacherReviewPublished(event) }
         }
         peerDocumentSubscription = gateway.subscribePeerDocuments { pending ->
             execute { processIncoming(pending) }
@@ -294,6 +386,8 @@ private class RemoteReviewRuntime(
             execute {
                 telegramStatus = status
                 hybridBookId?.let(::updateHybridLink)
+                refreshPageSyncTransportState()
+                pageSync.tick()
             }
         }
         // The LAN service can already be running before this application coordinator starts.
@@ -384,6 +478,40 @@ private class RemoteReviewRuntime(
             peerChat.markRead(scope, readAtEpochMs = System.currentTimeMillis()).also {
                 RemotePeerChatStateBus.publish(it)
             }
+        }
+    }
+
+    fun pageSyncUiState(): RemotePageSyncUiState = pageSync.uiState()
+
+    fun addPageSyncListener(listener: (RemotePageSyncUiState) -> Unit): AutoCloseable =
+        pageSync.addUiListener(listener)
+
+    fun startPendingPageSync(intervalSeconds: Int) {
+        if (closed || pausedForMaintenance) return
+        synchronized(operationLock) {
+            if (closed || pausedForMaintenance) return
+            refreshSession()
+            refreshPageSyncTransportState()
+            pageSync.startPendingSync(intervalSeconds)
+        }
+    }
+
+    fun pausePendingPageSync() {
+        if (closed || pausedForMaintenance) return
+        synchronized(operationLock) { pageSync.pausePendingSync() }
+    }
+
+    fun workbookMappingCandidates(pageToken: String): List<RemoteWorkbookMappingCandidate> =
+        if (closed || pausedForMaintenance) emptyList() else synchronized(operationLock) {
+            pageSync.workbookMappingCandidates(pageToken)
+        }
+
+    fun bindWorkbookMapping(pageToken: String, localBookId: String): Boolean {
+        if (closed || pausedForMaintenance) return false
+        return synchronized(operationLock) {
+            if (closed || pausedForMaintenance) return@synchronized false
+            refreshSession()
+            pageSync.bindWorkbookMapping(pageToken, localBookId)
         }
     }
 
@@ -602,9 +730,16 @@ private class RemoteReviewRuntime(
             check(pausedForMaintenance) { "Remote review resumed during data replacement" }
             workGeneration.incrementAndGet()
             captureState.reset()
+            pageSync.onDataRootReplaced()
             observedSession = null
             gateway.cancelPendingPeerDocumentTransfers(
-                setOf(RemoteReviewEnvelopeType.PAGE_SNAPSHOT.name),
+                setOf(
+                    RemoteReviewEnvelopeType.PAGE_SNAPSHOT.name,
+                    RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST.name,
+                    RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST.name,
+                    RemoteReviewEnvelopeType.PAGE_ANNOTATION.name,
+                    RemoteReviewEnvelopeType.PAGE_SYNC_ACK.name,
+                ),
             )
             ledger.clearStudentExchangeState()
             stagingDirectory.listFiles().orEmpty().filter(File::isFile).forEach(File::delete)
@@ -627,24 +762,28 @@ private class RemoteReviewRuntime(
         if (session?.role != RemoteReviewRole.STUDENT) return
         val target = presence.toCaptureTarget()
         target?.bookId?.let(::updateHybridLink)
-        val observedRevision = target?.let {
-            runCatching { annotationStore.loadPage(it.bookId, it.pageNumber).revision }.getOrNull()
-        }
-        captureState.onPresence(target, observedRevision, SystemClock.elapsedRealtime())
-        drainOneDueCapture(session)
+        refreshPageSyncTransportState()
+        pageSync.onStudentPresence(presence)
+        pageSync.tick()
     }
 
     private fun handleHeartbeat(heartbeat: StudentWorkHeartbeat) {
         val session = refreshSession()
         if (session?.role != RemoteReviewRole.STUDENT) return
-        captureState.onHeartbeat(heartbeat, SystemClock.elapsedRealtime())
-        drainOneDueCapture(session)
+        pageSync.onStudentHeartbeat(heartbeat)
+        pageSync.tick()
     }
 
     private fun tick() {
         if (closed) return
-        val session = refreshSession() ?: return
-        hybridBookId?.let(::updateHybridLink)
+        refreshSession() ?: return
+        val activeLan = LanSyncBus.activeSessionSnapshot()
+        if (activeLan != null) {
+            updateHybridLink(activeLan.bookId, activeLan.session)
+        } else {
+            hybridBookId?.let(::updateHybridLink)
+        }
+        refreshPageSyncTransportState()
         val pending = gateway.pendingPeerDocuments()
         val pendingIds = pending.mapTo(linkedSetOf(), PendingTelegramPeerDocument::updateId)
         retainedUndecodableUpdateIds.retainAll(pendingIds)
@@ -656,7 +795,7 @@ private class RemoteReviewRuntime(
         ).forEach { updateId ->
             pendingById[updateId]?.let(::processIncoming)
         }
-        if (session.role == RemoteReviewRole.STUDENT) drainOneDueCapture(session)
+        pageSync.tick()
     }
 
     private fun updateHybridLink(bookId: String) {
@@ -664,6 +803,11 @@ private class RemoteReviewRuntime(
     }
 
     private fun updateHybridLink(bookId: String, lanSnapshot: LanSessionSnapshot) {
+        evaluateHybridLink(bookId, lanSnapshot)
+        refreshPageSyncTransportState()
+    }
+
+    private fun evaluateHybridLink(bookId: String, lanSnapshot: LanSessionSnapshot) {
         if (bookId.isBlank()) return
         if (hybridBookId != bookId) {
             hybridBookId = bookId
@@ -698,36 +842,69 @@ private class RemoteReviewRuntime(
                 lanDefinitelyDisconnected = isLanTransportDefinitelyDisconnected(connection),
             ),
         )
-        val previousDecision = hybridDecision
         hybridDecision = decision
-        HybridLinkStatusBus.publish(
-            HybridLinkStatus(
-                bookId = bookId,
-                decision = decision,
-                updatedAtElapsedMs = SystemClock.elapsedRealtime(),
-            ),
+    }
+
+    private fun refreshPageSyncTransportState() {
+        val activeLan = LanSyncBus.activeSessionSnapshot()
+        // The LAN service owns one process-wide session. Always arbitrate against that exact book,
+        // even when a Reader for another workbook happens to be the last UI source that emitted a
+        // presence update. Re-evaluating here also lets the four-second loss grace expire on the
+        // coordinator's one-second tick without requiring another socket callback.
+        activeLan?.let { evaluateHybridLink(it.bookId, it.session) }
+        val route = globalPageSyncTransportRoute(activeLan?.session, hybridDecision)
+        val previousRoute = pageSyncTransportRoute
+        pageSyncTransportRoute = route
+        val fallbackDecision = hybridDecision
+        val statusBookId = when (route) {
+            GlobalPageSyncTransportRoute.TELEGRAM -> hybridBookId
+            GlobalPageSyncTransportRoute.LAN_GRACE,
+            GlobalPageSyncTransportRoute.LAN_OWNS,
+            -> activeLan?.bookId
+        }
+        if (fallbackDecision != null && !statusBookId.isNullOrBlank()) {
+            HybridLinkStatusBus.publish(
+                HybridLinkStatus(
+                    bookId = statusBookId,
+                    decision = globalHybridDisplayDecision(route, fallbackDecision),
+                    updatedAtElapsedMs = SystemClock.elapsedRealtime(),
+                ),
+            )
+        }
+        pageSync.setTransportState(
+            active = route == GlobalPageSyncTransportRoute.TELEGRAM,
+            online = telegramStatus is RemoteMonitorStatus.Connected,
+            lanOwnsData = route == GlobalPageSyncTransportRoute.LAN_OWNS,
         )
-        if (decision.mode == HybridLinkMode.LAN_LIVE && previousDecision?.mode != HybridLinkMode.LAN_LIVE) {
+        if (route == GlobalPageSyncTransportRoute.LAN_OWNS && previousRoute != route) {
             suspendTelegramPageCaptureWhileLanIsReady()
-        } else if (decision.enteredTelegramFallback) {
-            captureState.forceCurrent(SystemClock.elapsedRealtime())
         }
     }
 
     private fun allowsTelegramUserActionNow(): Boolean {
         val activeLanSession = LanSyncBus.activeSessionSnapshot()
         activeLanSession?.let { updateHybridLink(it.bookId, it.session) }
-        return shouldAllowTelegramUserAction(
-            hasActiveLanSession = activeLanSession != null,
-            hybridMode = hybridDecision?.mode,
-        )
+        return globalPageSyncTransportRoute(
+            activeLanSession?.session,
+            hybridDecision,
+        ) == GlobalPageSyncTransportRoute.TELEGRAM
     }
 
     private fun suspendTelegramPageCaptureWhileLanIsReady() {
-        if (connectedSession()?.role != RemoteReviewRole.STUDENT) return
         gateway.cancelPendingPeerDocumentTransfers(
-            setOf(RemoteReviewEnvelopeType.PAGE_SNAPSHOT.name),
+            setOf(
+                RemoteReviewEnvelopeType.PAGE_SNAPSHOT.name,
+                RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST.name,
+                RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST.name,
+                RemoteReviewEnvelopeType.PAGE_ANNOTATION.name,
+            ),
         )
+        pageSync.setTransportState(
+            active = false,
+            online = telegramStatus is RemoteMonitorStatus.Connected,
+            lanOwnsData = true,
+        )
+        if (connectedSession()?.role != RemoteReviewRole.STUDENT) return
         // Cancellation makes prior transfer ids terminal in the transport journal. Rehydrate only
         // the sticky current page so a later fallback can immediately force one fresh full image.
         captureState.reset()
@@ -741,6 +918,7 @@ private class RemoteReviewRuntime(
     private fun refreshSession(): ConnectedRemoteReviewSession? {
         val current = connectedSession()
         if (current == observedSession) return current
+        pageSync.bindSession(current?.let { RemotePageSyncSession(it.role, it.pairId) })
         observedSession = current
         captureState.reset()
         retainedUndecodableUpdateIds.clear()
@@ -748,14 +926,9 @@ private class RemoteReviewRuntime(
             chatScope(session)?.let { scope -> RemotePeerChatStateBus.publish(peerChat.state(scope)) }
         }
         if (current?.role == RemoteReviewRole.STUDENT) {
-            val target = StudentStudyPresenceBus.current()?.toCaptureTarget()
-            val revision = target?.let {
-                runCatching { annotationStore.loadPage(it.bookId, it.pageNumber).revision }.getOrNull()
-            }
-            val now = SystemClock.elapsedRealtime()
-            captureState.onPresence(target, revision, now)
-            restoreOutstandingPageTransfers(now)
+            StudentStudyPresenceBus.current()?.let(pageSync::onStudentPresence)
         }
+        refreshPageSyncTransportState()
         return current
     }
 
@@ -787,7 +960,9 @@ private class RemoteReviewRuntime(
 
     private fun drainOneDueCapture(session: ConnectedRemoteReviewSession) {
         if (connectedSession() != session) return
-        if (hybridDecision?.telegramActive != true) return
+        if (pageSyncTransportRoute != GlobalPageSyncTransportRoute.TELEGRAM ||
+            hybridDecision?.telegramActive != true
+        ) return
         val deadTransfers = gateway.deadLetters().mapNotNull { it.entry.peerTransferId }.toSet()
         val ticket = captureState.nextDue(
             nowElapsedMs = SystemClock.elapsedRealtime(),
@@ -832,7 +1007,9 @@ private class RemoteReviewRuntime(
             // sticky lower-layer state while the coordinator lock is still held and abort before
             // creating any new Telegram outbox entry if live has reclaimed the page.
             updateHybridLink(ticket.target.bookId)
-            if (hybridDecision?.telegramActive != true) return
+            if (pageSyncTransportRoute != GlobalPageSyncTransportRoute.TELEGRAM ||
+                hybridDecision?.telegramActive != true
+            ) return
             val pairScopedPageToken = tokenFactory.pageToken(session.pairId, ticket.target)
             val randomSuffix = UUID.randomUUID().toString().replace("-", "")
             // Keep the stable ink fingerprint inside the encrypted document. Telegram captions
@@ -944,6 +1121,26 @@ private class RemoteReviewRuntime(
         }
     }
 
+    private fun enqueuePageSyncEnvelope(
+        envelope: com.studyink.monitor.core.RemoteReviewEnvelope,
+    ): TelegramEnqueueResult {
+        if (!allowsTelegramUserActionNow()) return TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
+        val document = writeProtocolDocument(envelope)
+        return try {
+            if (!allowsTelegramUserActionNow()) {
+                TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
+            } else {
+                gateway.enqueuePeerDocument(
+                    transferId = envelope.transferId,
+                    payloadType = envelope.type.name,
+                    plaintext = document,
+                )
+            }
+        } finally {
+            document.delete()
+        }
+    }
+
     private fun processIncoming(pending: PendingTelegramPeerDocument) {
         val session = refreshSession() ?: return
         if (pending.senderBotId != session.peerBotId) {
@@ -974,6 +1171,34 @@ private class RemoteReviewRuntime(
         }
 
         when (val envelope = decoded.envelope) {
+            is PageSyncManifestEnvelope -> {
+                if (pending.payloadType != RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST.name) {
+                    dropIncoming(pending)
+                } else {
+                    processPageSyncIncoming(pending) { pageSync.receiveManifest(envelope) }
+                }
+            }
+            is PageSyncRequestEnvelope -> {
+                if (pending.payloadType != RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST.name) {
+                    dropIncoming(pending)
+                } else {
+                    processPageSyncIncoming(pending) { pageSync.receiveRequest(envelope) }
+                }
+            }
+            is PageAnnotationEnvelope -> {
+                if (pending.payloadType != RemoteReviewEnvelopeType.PAGE_ANNOTATION.name) {
+                    dropIncoming(pending)
+                } else {
+                    processPageSyncIncoming(pending) { pageSync.receiveAnnotation(envelope) }
+                }
+            }
+            is PageSyncAckEnvelope -> {
+                if (pending.payloadType != RemoteReviewEnvelopeType.PAGE_SYNC_ACK.name) {
+                    dropIncoming(pending)
+                } else {
+                    processPageSyncIncoming(pending) { pageSync.receiveAck(envelope) }
+                }
+            }
             is PageSnapshotEnvelope -> {
                 if (session.role != RemoteReviewRole.TEACHER ||
                     pending.payloadType != RemoteReviewEnvelopeType.PAGE_SNAPSHOT.name
@@ -981,7 +1206,9 @@ private class RemoteReviewRuntime(
                     dropIncoming(pending)
                     return
                 }
-                receivePageSnapshot(pending, envelope, session)
+                processTelegramPageDataIncoming(pending) {
+                    receivePageSnapshot(pending, envelope, session)
+                }
             }
             is TeacherFeedbackEnvelope -> {
                 if (session.role != RemoteReviewRole.STUDENT ||
@@ -990,7 +1217,9 @@ private class RemoteReviewRuntime(
                     dropIncoming(pending)
                     return
                 }
-                receiveTeacherFeedback(pending, envelope, session)
+                processTelegramPageDataIncoming(pending) {
+                    receiveTeacherFeedback(pending, envelope, session)
+                }
             }
             is RemoteGradeEnvelope -> {
                 if (session.role != RemoteReviewRole.STUDENT ||
@@ -999,7 +1228,9 @@ private class RemoteReviewRuntime(
                     dropIncoming(pending)
                     return
                 }
-                receiveRemoteGrade(pending, envelope, session)
+                processTelegramPageDataIncoming(pending) {
+                    receiveRemoteGrade(pending, envelope, session)
+                }
             }
             is ChatMessageEnvelope -> {
                 if (pending.payloadType != RemoteReviewEnvelopeType.CHAT_MESSAGE.name) {
@@ -1009,6 +1240,68 @@ private class RemoteReviewRuntime(
                 receivePeerChat(pending, envelope, session)
             }
             else -> dropIncoming(pending) // Semantic ACK envelopes are not used by this path.
+        }
+    }
+
+    private fun settlePageSyncIncoming(
+        pending: PendingTelegramPeerDocument,
+        result: RemotePageSyncIncomingResult,
+    ) {
+        when (result) {
+            RemotePageSyncIncomingResult.ACKNOWLEDGE,
+            RemotePageSyncIncomingResult.DROP,
+            -> gateway.acknowledgePeerDocument(pending.updateId)
+            RemotePageSyncIncomingResult.RETAIN -> Unit
+        }
+    }
+
+    /**
+     * A delayed Telegram page document must never mutate a page while LAN owns or is catching up
+     * the same application data. READY documents are obsolete and can be transport-ACKed; grace
+     * documents remain in the encrypted inbox until one transport has actually won.
+     */
+    private inline fun processPageSyncIncoming(
+        pending: PendingTelegramPeerDocument,
+        crossinline apply: () -> RemotePageSyncIncomingResult,
+    ) {
+        val (route, result) = LanSyncBus.withActiveSessionLease { activeLan ->
+            val currentRoute = globalPageSyncTransportRoute(activeLan?.session, hybridDecision)
+            currentRoute to if (currentRoute == GlobalPageSyncTransportRoute.TELEGRAM) {
+                apply()
+            } else {
+                null
+            }
+        }
+        when (route) {
+            GlobalPageSyncTransportRoute.LAN_OWNS -> dropIncoming(pending)
+            GlobalPageSyncTransportRoute.LAN_GRACE -> Unit
+            GlobalPageSyncTransportRoute.TELEGRAM -> settlePageSyncIncoming(
+                pending,
+                requireNotNull(result),
+            )
+        }
+    }
+
+    /**
+     * Legacy rendered-page feedback and the delta protocol share the same transport ownership.
+     * Holding the LAN bus lease through [apply] closes the check/apply race without introducing a
+     * second generation journal or allowing two writers. The transport ACK may happen inside the
+     * guarded operation, but no LAN session transition can begin until its durable mutation ends.
+     */
+    private inline fun processTelegramPageDataIncoming(
+        pending: PendingTelegramPeerDocument,
+        crossinline apply: () -> Unit,
+    ) {
+        val route = LanSyncBus.withActiveSessionLease { activeLan ->
+            globalPageSyncTransportRoute(activeLan?.session, hybridDecision).also { currentRoute ->
+                if (currentRoute == GlobalPageSyncTransportRoute.TELEGRAM) apply()
+            }
+        }
+        when (route) {
+            GlobalPageSyncTransportRoute.LAN_OWNS -> dropIncoming(pending)
+            GlobalPageSyncTransportRoute.LAN_GRACE,
+            GlobalPageSyncTransportRoute.TELEGRAM,
+            -> Unit
         }
     }
 
@@ -1146,7 +1439,10 @@ private class RemoteReviewRuntime(
             // still the active route. No mark is written in this branch.
             gateway.acknowledgePeerDocument(pending.updateId)
             captureState.forceCurrent(SystemClock.elapsedRealtime())
-            drainOneDueCapture(session)
+            // Rendering is intentionally outside the LAN ownership lease. The queued drain
+            // rechecks the route before it creates an outbox entry, while the stale grade itself
+            // is already durably settled under the lease.
+            execute { drainOneDueCapture(session) }
             return
         }
 
@@ -1241,13 +1537,17 @@ private class RemoteReviewRuntime(
         heartbeatSubscription?.close()
         peerDocumentSubscription?.close()
         telegramStatusSubscription?.close()
+        teacherReviewSubscription?.close()
+        teacherReviewProvenanceSubscription?.close()
         worker.shutdownNow()
         runCatching { worker.awaitTermination(2, TimeUnit.SECONDS) }
         synchronized(operationLock) {
             captureState.reset()
+            pageSync.close()
             observedSession = null
             hybridBookId = null
             hybridDecision = null
+            pageSyncTransportRoute = GlobalPageSyncTransportRoute.TELEGRAM
             HybridLinkStatusBus.clear()
             stagingDirectory.listFiles().orEmpty().filter(File::isFile).forEach(File::delete)
         }
@@ -1259,25 +1559,53 @@ private class RemoteReviewRuntime(
     }
 }
 
-internal fun shouldAllowTelegramUserAction(
-    hasActiveLanSession: Boolean,
-    hybridMode: HybridLinkMode?,
-): Boolean {
-    if (!hasActiveLanSession) return true
-    return when (hybridMode) {
-        HybridLinkMode.TELEGRAM_FALLBACK,
-        HybridLinkMode.OFFLINE_QUEUEING,
-        -> true
+internal enum class GlobalPageSyncTransportRoute { TELEGRAM, LAN_GRACE, LAN_OWNS }
 
-        HybridLinkMode.LAN_LIVE,
-        HybridLinkMode.LAN_GRACE,
-        null,
-        -> false
-    }
+internal fun globalHybridDisplayDecision(
+    route: GlobalPageSyncTransportRoute,
+    telegramDecision: HybridLinkDecision,
+): HybridLinkDecision = when (route) {
+    GlobalPageSyncTransportRoute.TELEGRAM -> telegramDecision
+    GlobalPageSyncTransportRoute.LAN_GRACE -> HybridLinkDecision(
+        mode = HybridLinkMode.LAN_GRACE,
+        label = HybridLinkLabel.LAN,
+        health = HybridLinkHealth.TRANSITIONING,
+        activeTransport = null,
+        enteredTelegramFallback = false,
+    )
+    GlobalPageSyncTransportRoute.LAN_OWNS -> HybridLinkDecision(
+        mode = HybridLinkMode.LAN_LIVE,
+        label = HybridLinkLabel.LAN,
+        health = HybridLinkHealth.READY,
+        activeTransport = HybridLinkTransport.LAN,
+        enteredTelegramFallback = false,
+    )
+}
+
+/**
+ * Page deltas are application-global, while the Reader's hybrid indicator is book-scoped. Route
+ * from the LAN service's one real session so opening another book cannot accidentally enable both
+ * transports. A connected session retains Telegram input until READY; a definitively disconnected
+ * record immediately hands ownership back to Telegram.
+ */
+internal fun globalPageSyncTransportRoute(
+    activeLanSession: LanSessionSnapshot?,
+    @Suppress("UNUSED_PARAMETER")
+    hybridDecision: HybridLinkDecision? = null,
+): GlobalPageSyncTransportRoute = when {
+    activeLanSession == null || isLanTransportDefinitelyDisconnected(activeLanSession.connectionState) ->
+        GlobalPageSyncTransportRoute.TELEGRAM
+    activeLanSession.phase == LanSessionPhase.READY -> GlobalPageSyncTransportRoute.LAN_OWNS
+    else -> GlobalPageSyncTransportRoute.LAN_GRACE
 }
 
 internal fun isLanTransportDefinitelyDisconnected(connectionState: LanConnectionState): Boolean =
     connectionState != LanConnectionState.CONNECTED
+
+/** Mirrors the gateway's 24-hour peer-document retention after bounded dead-letter eviction. */
+internal fun isUnacknowledgedPeerReceiptExpired(sentAtEpochMs: Long, nowEpochMs: Long): Boolean =
+    sentAtEpochMs >= 0L && nowEpochMs >= sentAtEpochMs &&
+        nowEpochMs - sentAtEpochMs >= 24L * 60L * 60L * 1_000L
 
 internal data class RemoteReviewCaptureTarget(
     val bookId: String,
@@ -1893,6 +2221,7 @@ internal class RemoteReviewTeacherRevisionStore(
         require(maxReservations > 0 && compactAfterRecords > 0 && maximumJournalBytes > 0L)
         require(file.parentFile?.mkdirs() == true || file.parentFile?.isDirectory == true)
         File(file.parentFile, "${file.name}.compact").delete()
+        repairTrailingJournalTail()
         if (file.isFile) {
             file.forEachLine(StandardCharsets.UTF_8) { line ->
                 journalRecordCount++
@@ -1915,6 +2244,18 @@ internal class RemoteReviewTeacherRevisionStore(
         }
         trim()
         compactIfNeeded()
+    }
+
+    /** Remove a crash-torn final record before a later append can fuse with it permanently. */
+    private fun repairTrailingJournalTail() {
+        if (!file.isFile || file.length() == 0L) return
+        val bytes = file.readBytes()
+        if (bytes.last() == '\n'.code.toByte()) return
+        val lastCompleteEnd = bytes.indexOfLast { it == '\n'.code.toByte() } + 1
+        RandomAccessFile(file, "rw").use { journal ->
+            journal.setLength(lastCompleteEnd.toLong())
+            journal.fd.sync()
+        }
     }
 
     @Synchronized
@@ -2128,11 +2469,31 @@ private class RemoteReviewPageTokenFactory(private val keyFile: File) {
     private val key: ByteArray = loadOrCreateKey()
 
     fun pageToken(pairId: String, target: RemoteReviewCaptureTarget): String {
+        return token("snapshot", pairId, target.bookId, target.pageNumber, target.attemptNo ?: 0, 0L, "page")
+    }
+
+    fun pageSyncWorkbookToken(pairId: String, bookId: String): String =
+        token("page-sync-workbook", pairId, bookId, 0, 0, 0L, "workbook")
+
+    fun pageSyncPageToken(pairId: String, bookId: String, pageNumber: Int, generation: Long): String {
+        require(pageNumber >= 0 && generation > 0L)
+        return token("page-sync-page", pairId, bookId, pageNumber, 0, generation, "page")
+    }
+
+    private fun token(
+        domain: String,
+        pairId: String,
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        generation: Long,
+        prefix: String,
+    ): String {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(key, "HmacSHA256"))
-        val material = "$pairId\u0000${target.bookId}\u0000${target.pageNumber}\u0000${target.attemptNo ?: 0}"
+        val material = "$domain\u0000$pairId\u0000$bookId\u0000$pageNumber\u0000$attemptNo\u0000$generation"
         val digest = mac.doFinal(material.toByteArray(StandardCharsets.UTF_8))
-        return "page_${Base64.getUrlEncoder().withoutPadding().encodeToString(digest)}"
+        return "${prefix}_${Base64.getUrlEncoder().withoutPadding().encodeToString(digest)}"
     }
 
     private fun loadOrCreateKey(): ByteArray {

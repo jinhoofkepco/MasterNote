@@ -1,5 +1,6 @@
 package com.studyink.app
 
+import android.app.AlertDialog
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -46,13 +47,23 @@ class RemotePeerChatActivity : ComponentActivity() {
     private lateinit var input: EditText
     private lateinit var sendButton: Button
     private lateinit var pageButton: Button
+    private lateinit var pageSyncPanel: RemotePageSyncPanelView
     private var stateSubscription: AutoCloseable? = null
+    private var pageSyncSubscription: AutoCloseable? = null
     private var renderedRevision = Long.MIN_VALUE
     private var sendBusy = false
+    private var pageSyncCommandBusy = false
+    private var selectedPageSyncIntervalSeconds = DEFAULT_REMOTE_PAGE_SYNC_INTERVAL_SECONDS
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        selectedPageSyncIntervalSeconds = normalizeRemotePageSyncInterval(
+            savedInstanceState?.getInt(
+                STATE_PAGE_SYNC_INTERVAL_SECONDS,
+                DEFAULT_REMOTE_PAGE_SYNC_INTERVAL_SECONDS,
+            ) ?: DEFAULT_REMOTE_PAGE_SYNC_INTERVAL_SECONDS,
+        )
         gateway = RemoteMonitorGateway.get(this)
         setContentView(buildContent())
     }
@@ -63,23 +74,39 @@ class RemotePeerChatActivity : ComponentActivity() {
         stateSubscription = RemotePeerChatStateBus.subscribe { state ->
             runOnUiThread { renderIfCurrent(state) }
         }
+        pageSyncSubscription?.close()
+        pageSyncSubscription = MasterNoteRemoteReviewCoordinator.addPageSyncListener { state ->
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) renderPageSyncState(state)
+            }
+        }
         refreshCurrentState()
+        refreshPageSyncState()
     }
 
     override fun onResume() {
         super.onResume()
         // Pairing can change in the setup activity without producing a chat-state event.
         refreshCurrentState()
+        refreshPageSyncState()
     }
 
     override fun onStop() {
         stateSubscription?.close()
         stateSubscription = null
+        pageSyncSubscription?.close()
+        pageSyncSubscription = null
         super.onStop()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt(STATE_PAGE_SYNC_INTERVAL_SECONDS, selectedPageSyncIntervalSeconds)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onDestroy() {
         stateSubscription?.close()
+        pageSyncSubscription?.close()
         worker.shutdownNow()
         super.onDestroy()
     }
@@ -127,6 +154,25 @@ class RemotePeerChatActivity : ComponentActivity() {
             addView(messageList, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
         root.addView(scrollView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        pageSyncPanel = RemotePageSyncPanelView(this).apply {
+            selectedIntervalSeconds = selectedPageSyncIntervalSeconds
+            onStartRequested = { intervalSeconds -> startPendingPageSync(intervalSeconds) }
+            onPauseRequested =(::pausePendingPageSync)
+            onWorkbookMappingRequested =(::chooseWorkbookMapping)
+        }
+        root.addView(
+            pageSyncPanel,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                marginStart = dp(8)
+                marginEnd = dp(8)
+                topMargin = dp(5)
+                bottomMargin = dp(5)
+            },
+        )
 
         val composer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -202,6 +248,19 @@ class RemotePeerChatActivity : ComponentActivity() {
             return
         }
         renderIfCurrent(state, force = true)
+    }
+
+    private fun refreshPageSyncState() {
+        renderPageSyncState(MasterNoteRemoteReviewCoordinator.pageSyncUiState())
+    }
+
+    private fun renderPageSyncState(state: RemotePageSyncUiState) {
+        if (state.running) {
+            selectedPageSyncIntervalSeconds = normalizeRemotePageSyncInterval(state.intervalSeconds)
+        }
+        pageSyncPanel.selectedIntervalSeconds = selectedPageSyncIntervalSeconds
+        pageSyncPanel.commandInProgress = pageSyncCommandBusy
+        pageSyncPanel.render(state)
     }
 
     private fun renderIfCurrent(state: RemotePeerChatState, force: Boolean = false) {
@@ -310,6 +369,93 @@ class RemotePeerChatActivity : ComponentActivity() {
         }
     }
 
+    private fun startPendingPageSync(intervalSeconds: Int) {
+        if (pageSyncCommandBusy) return
+        selectedPageSyncIntervalSeconds = normalizeRemotePageSyncInterval(intervalSeconds)
+        pageSyncCommandBusy = true
+        pageSyncPanel.commandInProgress = true
+        worker.execute {
+            runCatching {
+                MasterNoteRemoteReviewCoordinator.startPendingPageSync(selectedPageSyncIntervalSeconds)
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                pageSyncCommandBusy = false
+                pageSyncPanel.commandInProgress = false
+                refreshPageSyncState()
+            }
+        }
+    }
+
+    private fun pausePendingPageSync() {
+        if (pageSyncCommandBusy) return
+        pageSyncCommandBusy = true
+        pageSyncPanel.commandInProgress = true
+        worker.execute {
+            runCatching { MasterNoteRemoteReviewCoordinator.pausePendingPageSync() }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                pageSyncCommandBusy = false
+                pageSyncPanel.commandInProgress = false
+                refreshPageSyncState()
+            }
+        }
+    }
+
+    private fun chooseWorkbookMapping(pageToken: String) {
+        if (pageSyncCommandBusy || pageToken.isBlank()) return
+        pageSyncCommandBusy = true
+        pageSyncPanel.commandInProgress = true
+        worker.execute {
+            val candidates = runCatching {
+                MasterNoteRemoteReviewCoordinator.workbookMappingCandidates(pageToken)
+            }.getOrDefault(emptyList())
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                pageSyncCommandBusy = false
+                pageSyncPanel.commandInProgress = false
+                if (candidates.isEmpty()) {
+                    Toast.makeText(
+                        this,
+                        "현재 학생에게서 같은 PDF 교재를 찾지 못했습니다.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    return@runOnUiThread
+                }
+                val labels = candidates.map { "${it.title} · ${it.pageCount}쪽" }.toTypedArray()
+                AlertDialog.Builder(this)
+                    .setTitle("연결할 교재 선택")
+                    .setItems(labels) { _, index ->
+                        bindWorkbookMapping(pageToken, candidates[index].localBookId)
+                    }
+                    .setNegativeButton("취소", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun bindWorkbookMapping(pageToken: String, localBookId: String) {
+        if (pageSyncCommandBusy) return
+        pageSyncCommandBusy = true
+        pageSyncPanel.commandInProgress = true
+        worker.execute {
+            val bound = runCatching {
+                MasterNoteRemoteReviewCoordinator.bindWorkbookMapping(pageToken, localBookId)
+            }.getOrDefault(false)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                pageSyncCommandBusy = false
+                pageSyncPanel.commandInProgress = false
+                Toast.makeText(
+                    this,
+                    if (bound) "교재를 연결했습니다." else "교재 연결 상태가 바뀌었습니다. 다시 선택해주세요.",
+                    if (bound) Toast.LENGTH_SHORT else Toast.LENGTH_LONG,
+                ).show()
+                refreshPageSyncState()
+            }
+        }
+    }
+
     private fun TelegramEnqueueResult.accepted(): Boolean =
         this == TelegramEnqueueResult.ENQUEUED ||
             this == TelegramEnqueueResult.ALREADY_PENDING ||
@@ -335,6 +481,7 @@ class RemotePeerChatActivity : ComponentActivity() {
     private fun dp(value: Float): Int = (value * resources.displayMetrics.density).toInt()
 
     private companion object {
+        const val STATE_PAGE_SYNC_INTERVAL_SECONDS = "remote_page_sync_interval_seconds"
         const val MAX_INPUT_CHARS = 1_000
         const val COLOR_BACKGROUND = 0xFFF2F0EA.toInt()
         const val COLOR_HEADER = 0xFFFDFBF6.toInt()

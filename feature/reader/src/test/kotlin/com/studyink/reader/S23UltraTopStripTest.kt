@@ -10,6 +10,71 @@ import org.junit.Test
 
 class S23UltraTopStripTest {
     @Test
+    fun studentPageShortcutShowsForAnotherPage() {
+        val state = studentShortcutState(
+            pageNumber = 3,
+            attemptNo = 2,
+            studentPageNumber = 4,
+            studentAttemptNo = 2,
+        )
+
+        assertTrue(state.showsStudentPageShortcut())
+    }
+
+    @Test
+    fun studentPageShortcutShowsForAnotherAttemptOnTheSamePage() {
+        val state = studentShortcutState(
+            pageNumber = 3,
+            attemptNo = 2,
+            studentPageNumber = 3,
+            studentAttemptNo = 3,
+        )
+
+        assertTrue(state.showsStudentPageShortcut())
+    }
+
+    @Test
+    fun studentPageShortcutShowsForAnotherWorkbookEvenAtTheSamePageAndAttempt() {
+        val state = studentShortcutState(
+            pageNumber = 3,
+            attemptNo = 2,
+            studentPageNumber = 3,
+            studentAttemptNo = 2,
+        ).copy(bookId = "teacher-book", studentBookId = "student-book", studentBookTitle = "수학")
+
+        assertTrue(state.showsStudentPageShortcut())
+        assertTrue(state.copy(isFollowingStudent = true).shouldFollowRemoteStudentPage("student-book", 3, 2))
+    }
+
+    @Test
+    fun studentPageShortcutHidesForTheExactVisibleTargetOrMissingRemotePage() {
+        val exactTarget = studentShortcutState(
+            pageNumber = 3,
+            attemptNo = 2,
+            studentPageNumber = 3,
+            studentAttemptNo = 2,
+        )
+        val missingRemotePage = exactTarget.copy(studentPageNumber = null)
+
+        assertFalse(exactTarget.showsStudentPageShortcut())
+        assertFalse(missingRemotePage.showsStudentPageShortcut())
+    }
+
+    @Test
+    fun pageReadinessDoesNotChangeStudentPageShortcutVisibility() {
+        val waitingForPage = studentShortcutState(
+            pageNumber = 3,
+            attemptNo = 2,
+            studentPageNumber = 4,
+            studentAttemptNo = 2,
+            studentPageReady = false,
+        )
+
+        assertTrue(waitingForPage.showsStudentPageShortcut())
+        assertTrue(waitingForPage.copy(studentPageReady = true).showsStudentPageShortcut())
+    }
+
+    @Test
     fun attemptCellDirectTapBelongsToFingerNotStylus() {
         assertTrue(s23AttemptCellHandlesDirectPointer(PointerType.Touch))
         assertFalse(s23AttemptCellHandlesDirectPointer(PointerType.Stylus))
@@ -162,4 +227,21 @@ class S23UltraTopStripTest {
         assertEquals("9+", s23UnreadBadgeLabel(10))
         assertEquals("9+", s23UnreadBadgeLabel(999))
     }
+
+    private fun studentShortcutState(
+        pageNumber: Int,
+        attemptNo: Int,
+        studentPageNumber: Int?,
+        studentAttemptNo: Int?,
+        studentPageReady: Boolean = true,
+    ): ReaderUiState = ReaderUiState(
+        pageNumber = pageNumber,
+        attemptNo = attemptNo,
+        role = ReaderRole.TEACHER_PHONE,
+        workflow = ReaderWorkflow.LIVE_MONITOR,
+        capabilities = ReaderCapabilities.forRole(ReaderRole.TEACHER_PHONE),
+        studentPageNumber = studentPageNumber,
+        studentAttemptNo = studentAttemptNo,
+        studentPageReady = studentPageReady,
+    )
 }

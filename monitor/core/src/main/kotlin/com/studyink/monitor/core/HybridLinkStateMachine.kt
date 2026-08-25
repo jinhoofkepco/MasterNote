@@ -101,7 +101,9 @@ class HybridLinkStateMachine(
                 graceStartedAtElapsedMs = signals.nowElapsedMs
                 HybridLinkMode.LAN_GRACE
             }
-            previousMode == HybridLinkMode.LAN_GRACE && withinGrace(signals.nowElapsedMs) ->
+            previousMode == HybridLinkMode.LAN_GRACE &&
+                !signals.lanDefinitelyDisconnected &&
+                withinGrace(signals.nowElapsedMs) ->
                 HybridLinkMode.LAN_GRACE
             signals.telegramReady -> HybridLinkMode.TELEGRAM_FALLBACK
             else -> HybridLinkMode.OFFLINE_QUEUEING

@@ -142,19 +142,6 @@ class ReaderWorkflowTest {
     }
 
     @Test
-    fun teacherUndoRedoSyncsActualAttemptsButNotPrivatePageLevelWork() {
-        val actualAttempt = ReaderUiState(
-            attemptNo = 1,
-            role = ReaderRole.TEACHER_PHONE,
-            workflow = ReaderWorkflow.LIVE_MONITOR,
-        )
-        val pageLevel = actualAttempt.copy(attemptNo = TEACHER_PAGE_REVIEW_ATTEMPT_NO)
-
-        assertTrue(actualAttempt.shouldForceSyncTeacherUndoRedo)
-        assertFalse(pageLevel.shouldForceSyncTeacherUndoRedo)
-    }
-
-    @Test
     fun remotePageCallbackMustMatchTheLatestBookAndPage() {
         val state = ReaderUiState(bookId = "book-a", pageNumber = 3)
 
@@ -164,7 +151,7 @@ class ReaderWorkflowTest {
     }
 
     @Test
-    fun liveMonitorFollowsOnlyAnotherPageInTheSameBook() {
+    fun liveMonitorFollowsAnotherPageOrWorkbookWhileFollowing() {
         val live = ReaderUiState(
             bookId = "book-a",
             pageNumber = 3,
@@ -181,7 +168,7 @@ class ReaderWorkflowTest {
         assertTrue(live.shouldFollowRemoteStudentPage("book-a", 4, 1))
         assertFalse(live.shouldFollowRemoteStudentPage("book-a", 3, 1))
         assertTrue(live.shouldFollowRemoteStudentPage("book-a", 3, 2))
-        assertFalse(live.shouldFollowRemoteStudentPage("book-b", 4, 1))
+        assertTrue(live.shouldFollowRemoteStudentPage("book-b", 4, 1))
         assertFalse(
             live.copy(isFollowingStudent = false)
                 .shouldFollowRemoteStudentPage("book-a", 4, 1)

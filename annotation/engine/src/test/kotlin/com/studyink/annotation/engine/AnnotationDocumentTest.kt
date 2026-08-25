@@ -98,6 +98,22 @@ class AnnotationDocumentTest {
         assertEquals(3L, next.operation.logicalClock)
     }
 
+    @Test
+    fun commitBoundaryPreventsUndoAcrossAnEraseOnlyOrGradeOnlyPublish() {
+        val document = AnnotationDocument(AnnotationSnapshot.empty("book", 0))
+        val added = document.addStroke(stroke("teacher"))
+        assertTrue(document.canUndo)
+
+        // Reader invokes this only after the complete review bundle is durably promoted. It must
+        // also seal history when that bundle contains no new ink (erase-only or grade-only).
+        document.commitBoundary()
+
+        assertFalse(document.canUndo)
+        assertFalse(document.canRedo)
+        assertEquals(null, document.undo("teacher-device"))
+        assertTrue(document.snapshot().activeStrokeIds.contains(added.addedAssets.single().id))
+    }
+
     private fun stroke(author: String) = StrokeAsset(
         pageNumber = 0,
         tool = StrokeTool.PEN,

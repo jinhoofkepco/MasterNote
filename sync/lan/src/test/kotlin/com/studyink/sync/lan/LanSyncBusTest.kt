@@ -1,15 +1,217 @@
 package com.studyink.sync.lan
 
+import com.studyink.core.model.Mark
+import com.studyink.core.model.MarkColor
+import com.studyink.core.model.MarkGroup
+import com.studyink.core.model.PagePoint
+import java.io.BufferedReader
+import java.io.StringReader
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LanSyncBusTest {
+
+    @Test
+    fun mutualAuthProofBindsBothPeersRolesBooksDigestAndNonces() {
+        val secret = "11".repeat(32)
+        val studentNonce = "22".repeat(32)
+        val teacherNonce = "33".repeat(32)
+        val documentHash = "44".repeat(32)
+        val studentProof = lanAuthProofHex(
+            secret,
+            studentNonce,
+            teacherNonce,
+            "student-device",
+            "teacher-device",
+            LanPeerRole.STUDENT_SERVER,
+            LanPeerRole.TEACHER_CLIENT,
+            "student-book",
+            "teacher-book",
+            documentHash,
+        )
+        val teacherProof = lanAuthProofHex(
+            secret,
+            teacherNonce,
+            studentNonce,
+            "teacher-device",
+            "student-device",
+            LanPeerRole.TEACHER_CLIENT,
+            LanPeerRole.STUDENT_SERVER,
+            "teacher-book",
+            "student-book",
+            documentHash,
+        )
+
+        assertTrue(isValidLanSha256(studentProof))
+        assertTrue(lanAuthProofMatches(studentProof, studentProof))
+        assertFalse(lanAuthProofMatches(studentProof, teacherProof))
+        assertFalse(
+            lanAuthProofMatches(
+                studentProof,
+                lanAuthProofHex(
+                    secret,
+                    studentNonce,
+                    teacherNonce,
+                    "student-device",
+                    "teacher-device",
+                    LanPeerRole.STUDENT_SERVER,
+                    LanPeerRole.TEACHER_CLIENT,
+                    "another-student-book",
+                    "teacher-book",
+                    documentHash,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun lanSecretsAndDocumentDigestsAreFullSha256Values() {
+        assertTrue(isValidLanSha256(newLanSecretHex()))
+        assertTrue(isValidLanSha256("ab".repeat(32)))
+        assertFalse(isValidLanSha256("ab".repeat(16)))
+        assertFalse(isValidLanSha256(""))
+        assertFalse(isValidLanSha256("AB".repeat(32)))
+    }
+
+    @Test
+    fun publicHelloContainsNonceAndIdentityButNeverTheSharedSecret() {
+        val secret = "55".repeat(32)
+        val nonce = "66".repeat(32)
+        val hello = lanHelloPublicFields(
+            deviceId = "student-device",
+            role = LanPeerRole.STUDENT_SERVER,
+            bookId = "student-book",
+            documentSha256 = "77".repeat(32),
+            nonceHex = nonce,
+        )
+
+        assertEquals(LAN_AUTH_VERSION, hello["authVersion"])
+        assertEquals(nonce, hello["nonce"])
+        assertFalse("token" in hello)
+        assertFalse("secret" in hello)
+        assertFalse(hello.toString().contains(secret))
+    }
+
+    @Test
+    fun boundedLanLineNeverAllocatesPastTheFrameLimit() {
+        fun reader(value: String) = BufferedReader(StringReader(value))
+        assertEquals("hello", readBoundedLanLine(reader("hello\r\nnext"), 5))
+        assertEquals("exact", readBoundedLanLine(reader("exact\n"), 5))
+        assertNull(readBoundedLanLine(reader(""), 5))
+        assertThrows(IllegalArgumentException::class.java) {
+            readBoundedLanLine(reader("123456"), 5)
+        }
+    }
+
+    @Test
+    fun pageCatchUpDeadlineIgnoresHeartbeatTrafficAndEventuallyExpires() {
+        assertFalse(isLanPageCatchUpExpired(0L, 100L))
+        assertFalse(isLanPageCatchUpExpired(130L, 129L))
+        assertTrue(isLanPageCatchUpExpired(130L, 130L))
+        assertTrue(isLanPageCatchUpExpired(130L, 999L))
+    }
+
+    @Test
+    fun invalidOperationClosesBeforeAFollowingPageSyncedCanClaimReady() {
+        assertTrue(mustCloseLanConnectionAfterFailure("OPERATION", authenticated = true))
+        assertTrue(mustCloseLanConnectionAfterFailure("PAGE_SYNCED", authenticated = true))
+        assertTrue(mustCloseLanConnectionAfterFailure("PING", authenticated = false))
+        assertFalse(mustCloseLanConnectionAfterFailure("PING", authenticated = true))
+    }
+
+    @Test
+    fun connectionEpochCannotBeReusedWithinOneServiceLifetime() {
+        val epoch = MonotonicLanConnectionEpoch()
+
+        val first = epoch.advance()
+        val second = epoch.advance()
+
+        assertEquals(1L, first)
+        assertEquals(2L, second)
+        assertEquals(second, epoch.current)
+    }
+
+    @Test
+    fun activeSessionLeaseSerializesTelegramMutationBeforeLanTakeover() {
+        val bookId = "lease-${System.nanoTime()}"
+        val leaseEntered = CountDownLatch(1)
+        val releaseLease = CountDownLatch(1)
+        val takeoverAttempting = CountDownLatch(1)
+        val takeoverCompleted = CountDownLatch(1)
+        val mutationCompleted = AtomicBoolean(false)
+        val executor = Executors.newFixedThreadPool(2)
+        LanSyncBus.clearConnectionState(bookId)
+
+        val mutation = executor.submit {
+            LanSyncBus.withActiveSessionLease { active ->
+                assertNull(active)
+                leaseEntered.countDown()
+                assertTrue(releaseLease.await(2, TimeUnit.SECONDS))
+                mutationCompleted.set(true)
+            }
+        }
+        val takeover = executor.submit {
+            assertTrue(leaseEntered.await(2, TimeUnit.SECONDS))
+            takeoverAttempting.countDown()
+            LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTED)
+            assertTrue(
+                "LAN takeover completed before the Telegram mutation",
+                mutationCompleted.get(),
+            )
+            takeoverCompleted.countDown()
+        }
+
+        try {
+            assertTrue(leaseEntered.await(2, TimeUnit.SECONDS))
+            assertTrue(takeoverAttempting.await(2, TimeUnit.SECONDS))
+            assertFalse(
+                "LAN takeover crossed the active Telegram mutation",
+                takeoverCompleted.await(150, TimeUnit.MILLISECONDS),
+            )
+            releaseLease.countDown()
+            assertTrue(takeoverCompleted.await(2, TimeUnit.SECONDS))
+            mutation.get(2, TimeUnit.SECONDS)
+            takeover.get(2, TimeUnit.SECONDS)
+            assertTrue(mutationCompleted.get())
+            assertEquals(
+                LanConnectionState.CONNECTED,
+                LanSyncBus.activeSessionSnapshot()?.session?.connectionState,
+            )
+        } finally {
+            releaseLease.countDown()
+            executor.shutdownNow()
+            executor.awaitTermination(2, TimeUnit.SECONDS)
+            LanSyncBus.clearConnectionState(bookId)
+        }
+    }
+
+    @Test
+    fun legacyMarkSyncNeverLeaksAttemptGradesOutsideAtomicReviewBundle() {
+        val pageLevel = MarkGroup(
+            bookId = "book",
+            pageNumber = 3,
+            anchor = PagePoint(1f, 2f),
+            marks = listOf(Mark(attemptNo = 0, color = MarkColor.BLUE)),
+        )
+        val attemptGrade = pageLevel.copy(
+            id = "attempt-grade",
+            marks = listOf(Mark(attemptNo = 2, color = MarkColor.RED)),
+        )
+
+        assertTrue(isLegacyLanMarkGroup(pageLevel))
+        assertTrue(!isLegacyLanMarkGroup(attemptGrade))
+        assertTrue(!isLegacyLanMarkGroup(pageLevel.copy(marks = pageLevel.marks + attemptGrade.marks)))
+    }
+
     @Test
     fun activeSessionSnapshotTracksTheServiceSessionAndClearsAfterBothStatesAreIdle() {
         val bookId = "active-book-${UUID.randomUUID()}"
