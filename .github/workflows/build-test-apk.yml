@@ -86,8 +86,9 @@ jobs:
         run: |
           APK_PATH="app/build/outputs/apk/release/app-release.apk"
           ACTUAL_CERT_SHA256="$("$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$APK_PATH" | awk -F': ' '/SHA-256 digest/ {print $2; exit}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]:')"
-          ACTUAL_PACKAGE="$("$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK_PATH" | awk -F\"'\" '/^package:/ {print $2; exit}')"
-          ACTUAL_VERSION_CODE="$("$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK_PATH" | awk -F\"'\" '/^package:/ {print $4; exit}')"
+          APK_BADGING="$("$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK_PATH")"
+          ACTUAL_PACKAGE="$(printf '%s\n' "$APK_BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)"
+          ACTUAL_VERSION_CODE="$(printf '%s\n' "$APK_BADGING" | sed -n "s/^package:.*versionCode='\([0-9][0-9]*\)'.*/\1/p" | head -n 1)"
           echo "Signing certificate SHA-256: $ACTUAL_CERT_SHA256"
           test "$ACTUAL_CERT_SHA256" = "$EXPECTED_CERT_SHA256"
           test "$ACTUAL_PACKAGE" = "com.studyink.app"
