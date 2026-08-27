@@ -113,6 +113,27 @@ class LanSyncBusTest {
     }
 
     @Test
+    fun teacherReviewPayloadChunkingPreservesEmptyExactBoundaryAndTailBytes() {
+        assertTrue(splitLanTeacherReviewPayload(byteArrayOf(), 4).isEmpty())
+
+        val exact = byteArrayOf(0, 1, 2, 3)
+        val exactChunks = splitLanTeacherReviewPayload(exact, 4)
+        assertEquals(1, exactChunks.size)
+        assertTrue(exact.contentEquals(exactChunks.single()))
+
+        val payload = ByteArray(10) { it.toByte() }
+        val chunks = splitLanTeacherReviewPayload(payload, 4)
+        assertEquals(listOf(4, 4, 2), chunks.map(ByteArray::size))
+        assertTrue(payload.contentEquals(chunks.fold(ByteArray(0)) { all, chunk -> all + chunk }))
+
+        payload[0] = 99
+        assertEquals(0, chunks.first().first().toInt())
+        assertThrows(IllegalArgumentException::class.java) {
+            splitLanTeacherReviewPayload(byteArrayOf(1), 0)
+        }
+    }
+
+    @Test
     fun pageCatchUpDeadlineIgnoresHeartbeatTrafficAndEventuallyExpires() {
         assertFalse(isLanPageCatchUpExpired(0L, 100L))
         assertFalse(isLanPageCatchUpExpired(130L, 129L))

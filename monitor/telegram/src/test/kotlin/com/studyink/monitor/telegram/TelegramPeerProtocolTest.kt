@@ -75,4 +75,95 @@ class TelegramPeerProtocolTest {
         val parsed = TelegramPeerProtocol.parseControl(ack, key)
         assertEquals("transfer_123", (parsed as TelegramPeerProtocol.PeerControl.Received).transferId)
     }
+
+    @Test fun lightweightConnectionControlsRoundTripWithSignedCorrelationFields() {
+        val key = TelegramPeerProtocol.newSharedKey()
+        val sentAt = 1_000_000L
+        val expiresAt = sentAt + TelegramPeerProtocol.DEFAULT_CONTROL_REQUEST_LIFETIME_MS
+
+        assertEquals(
+            TelegramPeerProtocol.PeerControl.ConnectRequest("request_123", sentAt, expiresAt),
+            TelegramPeerProtocol.parseControl(
+                TelegramPeerProtocol.connectRequest("request_123", sentAt, expiresAt, key),
+                key,
+            ),
+        )
+        assertEquals(
+            TelegramPeerProtocol.PeerControl.ConnectAccept("request_123", sentAt + 1L),
+            TelegramPeerProtocol.parseControl(
+                TelegramPeerProtocol.connectAccept("request_123", sentAt + 1L, key),
+                key,
+            ),
+        )
+        assertEquals(
+            TelegramPeerProtocol.PeerControl.Ping("session_123", "nonce_123", sentAt, expiresAt),
+            TelegramPeerProtocol.parseControl(
+                TelegramPeerProtocol.ping("session_123", "nonce_123", sentAt, expiresAt, key),
+                key,
+            ),
+        )
+        assertEquals(
+            TelegramPeerProtocol.PeerControl.Pong("session_123", "nonce_123", sentAt + 2L),
+            TelegramPeerProtocol.parseControl(
+                TelegramPeerProtocol.pong("session_123", "nonce_123", sentAt + 2L, key),
+                key,
+            ),
+        )
+    }
+
+    @Test fun lightweightControlsRejectTamperingWrongKeysAndMalformedWindows() {
+        val key = TelegramPeerProtocol.newSharedKey()
+        val otherKey = TelegramPeerProtocol.newSharedKey()
+        val sentAt = 2_000_000L
+        val expiresAt = sentAt + 30_000L
+        val request = TelegramPeerProtocol.connectRequest("request_123", sentAt, expiresAt, key)
+        val ping = TelegramPeerProtocol.ping("session_123", "nonce_123", sentAt, expiresAt, key)
+
+        assertNull(TelegramPeerProtocol.parseControl(request.replace("request_123", "request_124"), key))
+        assertNull(TelegramPeerProtocol.parseControl(ping.replace("nonce_123", "nonce_124"), key))
+        assertNull(TelegramPeerProtocol.parseControl(request, otherKey))
+        assertNull(TelegramPeerProtocol.parseControl(ping, otherKey))
+        assertNull(TelegramPeerProtocol.parseControl("MNTP1 CONNECT_ACCEPT bad/id 100 signature", key))
+
+        try {
+            TelegramPeerProtocol.connectRequest(
+                "request_123",
+                sentAt,
+                sentAt - 1L,
+                key,
+            )
+            fail("A control message cannot expire before it was sent")
+        } catch (_: IllegalArgumentException) {
+            // Expected.
+        }
+    }
+
+    @Test fun parserPreservesSignedExpiryForGatewayFreshnessPolicy() {
+        val key = TelegramPeerProtocol.newSharedKey()
+        val alreadyOldSentAt = 10_000L
+        val alreadyOldExpiry = 20_000L
+
+        val request = TelegramPeerProtocol.parseControl(
+            TelegramPeerProtocol.connectRequest(
+                "request_old",
+                alreadyOldSentAt,
+                alreadyOldExpiry,
+                key,
+            ),
+            key,
+        ) as TelegramPeerProtocol.PeerControl.ConnectRequest
+        val ping = TelegramPeerProtocol.parseControl(
+            TelegramPeerProtocol.ping(
+                "session_old",
+                "nonce_old",
+                alreadyOldSentAt,
+                alreadyOldExpiry,
+                key,
+            ),
+            key,
+        ) as TelegramPeerProtocol.PeerControl.Ping
+
+        assertEquals(alreadyOldExpiry, request.expiresAtEpochMs)
+        assertEquals(alreadyOldExpiry, ping.expiresAtEpochMs)
+    }
 }

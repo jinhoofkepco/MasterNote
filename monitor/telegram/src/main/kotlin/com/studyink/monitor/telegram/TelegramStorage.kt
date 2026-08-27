@@ -21,6 +21,7 @@ class TelegramStoragePaths private constructor(val root: File) {
     val peerInboxJournal = root.resolve("peer-inbox-journal.v1")
     val peerReceiptJournal = root.resolve("peer-receipts.v1")
     val peerHandshakeFile = root.resolve("peer-handshake.v1")
+    val peerLinkStateFile = root.resolve("peer-link-state.v1")
     val peerInboxDirectory = root.resolve("peer-inbox")
     val mediaDirectory = root.resolve("media")
     val voiceDirectory = mediaDirectory.resolve("voice")

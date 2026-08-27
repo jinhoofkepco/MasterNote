@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.os.SystemClock
+import android.util.Log
 import com.studyink.library.data.LibraryRepository
 import com.studyink.library.ui.LibraryActivity
 import com.studyink.monitor.core.HourlyActivityReport
@@ -19,8 +20,10 @@ import com.studyink.monitor.core.StudentStudyPresence
 import com.studyink.monitor.core.StudentStudyPresenceBus
 import com.studyink.monitor.core.StudentWorkHeartbeatBus
 import com.studyink.monitor.telegram.RemoteMonitorGateway
+import com.studyink.monitor.telegram.RemoteMonitorStatus
 import com.studyink.monitor.telegram.RemoteReviewPeerStatus
 import com.studyink.monitor.telegram.RemoteReviewRole
+import com.studyink.monitor.telegram.TelegramPeerLinkHealth
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -42,9 +45,14 @@ class RemoteMonitorService : Service() {
     private var presenceSubscription: AutoCloseable? = null
     private var heartbeatSubscription: AutoCloseable? = null
     private var preferencesSubscription: AutoCloseable? = null
+    private var peerLinkSubscription: AutoCloseable? = null
     private var reportClock: ScheduledFuture<*>? = null
     private var remoteReviewWatchdog: ScheduledFuture<*>? = null
     @Volatile private var activityReportingStarted = false
+    @Volatile private var parentTrafficBlockedForRole = false
+    private val workerRetryLock = Any()
+    private var consecutiveWorkerRestartFailures = 0
+    private var nextWorkerRestartElapsedMs = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -55,13 +63,20 @@ class RemoteMonitorService : Service() {
         // Reader presence gets a chance to prove that the student has resumed work.
         gateway.cancelCoalesced(IDLE_COALESCE_KEY)
         gateway.cancelCoalesced(HOURLY_REPORT_COALESCE_KEY)
+        // Disable the legacy human-parent path before opening the shared Telegram poller. This
+        // closes the startup window in which a teacher bot could replay a parent TEXT command.
+        if (teacherRemoteReview()) reconcileParentMonitorRole(restartWorkersAfterPreferenceChange = false)
         val canRun = gateway.preferences().monitoringEnabled || remoteReviewConfigured()
         if (!canRun || !gateway.start()) {
             stopSelf()
             return
         }
+        gateway.maintainPeerLink()
+        peerLinkSubscription = gateway.subscribePeerLinkState(emitCurrent = false) {
+            scheduleLifecycleReconciliation()
+        }
         remoteReviewWatchdog = scheduler.scheduleWithFixedDelay(
-            ::stopIfNothingConfigured,
+            ::maintainRemoteReviewWorkers,
             REMOTE_REVIEW_WATCHDOG_SECONDS,
             REMOTE_REVIEW_WATCHDOG_SECONDS,
             TimeUnit.SECONDS,
@@ -72,13 +87,22 @@ class RemoteMonitorService : Service() {
 
     private fun startActivityReportingIfNeeded() {
         if (activityReportingStarted) return
-        if (!gateway.preferences().monitoringEnabled || teacherRemoteReview()) return
+        if (
+            !parentActivityReportingAllowed(
+                monitoringEnabled = gateway.preferences().monitoringEnabled,
+                peerStatus = gateway.remoteReviewPeerStatus(),
+            )
+        ) return
         activityReportingStarted = true
         synchronized(idleLock) {
             realtimeActivityEnabled = gateway.preferences().realtimeActivityEnabled
             if (!realtimeActivityEnabled) hourly.start(SystemClock.elapsedRealtime())
         }
         preferencesSubscription = gateway.subscribePreferences(emitCurrent = false) { preferences ->
+            if (!parentActivityReportingAllowed(preferences.monitoringEnabled, gateway.remoteReviewPeerStatus())) {
+                scheduleLifecycleReconciliation()
+                return@subscribePreferences
+            }
             switchActivityReportingMode(preferences.realtimeActivityEnabled)
         }
         // Close the narrow read-to-subscribe race if a Telegram command arrived during startup.
@@ -134,6 +158,7 @@ class RemoteMonitorService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
+                resetWorkerRestartBackoff()
                 gateway.cancelCoalesced(IDLE_COALESCE_KEY)
                 gateway.cancelCoalesced(HOURLY_REPORT_COALESCE_KEY)
                 gateway.updatePreferences { it.copy(monitoringEnabled = false) }
@@ -143,12 +168,12 @@ class RemoteMonitorService : Service() {
                 }
                 stopActivityReporting()
                 gateway.start()
+                scheduleLifecycleReconciliation()
                 updateNotification()
             }
             ACTION_REFRESH -> {
-                if (gateway.preferences().monitoringEnabled || remoteReviewConfigured()) gateway.start()
-                startActivityReportingIfNeeded()
-                updateNotification()
+                resetWorkerRestartBackoff()
+                scheduleLifecycleReconciliation(runWorkerMaintenance = true)
             }
         }
         return START_STICKY
@@ -159,6 +184,8 @@ class RemoteMonitorService : Service() {
     override fun onDestroy() {
         remoteReviewWatchdog?.cancel(false)
         remoteReviewWatchdog = null
+        peerLinkSubscription?.close()
+        peerLinkSubscription = null
         stopActivityReporting()
         scheduler.shutdownNow()
         synchronized(idleLock) {
@@ -192,8 +219,107 @@ class RemoteMonitorService : Service() {
     private fun remoteReviewConfigured(): Boolean =
         gateway.remoteReviewPeerStatus() !is RemoteReviewPeerStatus.Unconfigured
 
-    private fun stopIfNothingConfigured() {
-        if (!gateway.preferences().monitoringEnabled && !remoteReviewConfigured()) stopSelf()
+    private fun maintainRemoteReviewWorkers() {
+        try {
+            if (!gateway.preferences().monitoringEnabled && !remoteReviewConfigured()) {
+                stopSelf()
+                return
+            }
+            reconcileParentMonitorRole()
+            val nowElapsedMs = SystemClock.elapsedRealtime()
+            val statusBefore = gateway.status()
+            if (statusBefore is RemoteMonitorStatus.Connected) resetWorkerRestartBackoff()
+            if (statusBefore is RemoteMonitorStatus.Error && !workerRestartDue(nowElapsedMs)) {
+                gateway.maintainPeerLink()
+                updateNotification()
+                return
+            }
+            // start() is idempotent while both workers are alive. When Error is sticky it gets a
+            // capped exponential retry so a permanent token/4xx failure cannot churn every 30 s.
+            val recoveringFromError = statusBefore is RemoteMonitorStatus.Error
+            val started = gateway.start()
+            if (!started || recoveringFromError) {
+                recordWorkerRestartFailure(nowElapsedMs)
+            } else if (gateway.status() is RemoteMonitorStatus.Connected) {
+                resetWorkerRestartBackoff()
+            }
+            gateway.maintainPeerLink()
+            updateNotification()
+        } catch (error: Throwable) {
+            // ScheduledExecutor suppresses all later invocations when one fixed-delay tick throws.
+            // Keep the watchdog alive after transient storage/network failures and back off.
+            recordWorkerRestartFailure(SystemClock.elapsedRealtime())
+            Log.w(TAG, "Remote-review watchdog tick failed", error)
+            runCatching { updateNotification() }
+        }
+    }
+
+    /** Applies the mutually-exclusive parent/teacher policy without closing peer-link observers. */
+    private fun reconcileParentMonitorRole(restartWorkersAfterPreferenceChange: Boolean = true) {
+        val blocked = !parentMonitorRoleGate(gateway.remoteReviewPeerStatus()).allowsRendering
+        if (!blocked) {
+            parentTrafficBlockedForRole = false
+            startActivityReportingIfNeeded()
+            return
+        }
+
+        val preferenceChanged = gateway.preferences().monitoringEnabled
+        if (preferenceChanged) {
+            // handleInbound uses this durable switch as its precondition, so turning it off also
+            // blocks future parent TEXT and /화면 commands. Stopping the shared workers first also
+            // keeps an already-queued idle/report item from racing the cancellation below.
+            gateway.updatePreferences { it.copy(monitoringEnabled = false) }
+        }
+        stopActivityReporting()
+        gateway.pendingParentMessage()?.let { gateway.acknowledgeParentMessage(it.updateId) }
+        gateway.pendingScreenRequests().forEach { gateway.acknowledgeScreenRequest(it.updateId) }
+        if (!parentTrafficBlockedForRole) {
+            gateway.cancelParentRenderTrafficForRemoteTeacher()
+            parentTrafficBlockedForRole = true
+        }
+        if (preferenceChanged && restartWorkersAfterPreferenceChange && remoteReviewConfigured()) {
+            gateway.start()
+        }
+    }
+
+    private fun scheduleLifecycleReconciliation(runWorkerMaintenance: Boolean = false) {
+        try {
+            scheduler.execute {
+                if (runWorkerMaintenance) {
+                    maintainRemoteReviewWorkers()
+                } else {
+                    try {
+                        reconcileParentMonitorRole()
+                        updateNotification()
+                    } catch (error: Throwable) {
+                        Log.w(TAG, "Remote-monitor lifecycle reconciliation failed", error)
+                    }
+                }
+            }
+        } catch (_: RuntimeException) {
+            // The only expected case is a late transport callback after onDestroy shut down the
+            // scheduler. peerLinkSubscription is still owned by the service and closed there.
+        }
+    }
+
+    private fun workerRestartDue(nowElapsedMs: Long): Boolean = synchronized(workerRetryLock) {
+        nowElapsedMs >= nextWorkerRestartElapsedMs
+    }
+
+    private fun recordWorkerRestartFailure(nowElapsedMs: Long) = synchronized(workerRetryLock) {
+        consecutiveWorkerRestartFailures = (consecutiveWorkerRestartFailures + 1)
+            .coerceAtMost(MAX_TRACKED_WORKER_FAILURES)
+        val delay = remoteMonitorWorkerRetryDelayMillis(consecutiveWorkerRestartFailures)
+        nextWorkerRestartElapsedMs = if (nowElapsedMs > Long.MAX_VALUE - delay) {
+            Long.MAX_VALUE
+        } else {
+            nowElapsedMs + delay
+        }
+    }
+
+    private fun resetWorkerRestartBackoff() = synchronized(workerRetryLock) {
+        consecutiveWorkerRestartFailures = 0
+        nextWorkerRestartElapsedMs = 0L
     }
 
     private fun teacherRemoteReview(): Boolean = when (val status = gateway.remoteReviewPeerStatus()) {
@@ -203,6 +329,15 @@ class RemoteMonitorService : Service() {
     }
 
     private fun switchActivityReportingMode(realtime: Boolean) {
+        if (
+            !parentActivityReportingAllowed(
+                gateway.preferences().monitoringEnabled,
+                gateway.remoteReviewPeerStatus(),
+            )
+        ) {
+            scheduleLifecycleReconciliation()
+            return
+        }
         val changed = synchronized(idleLock) {
             if (realtimeActivityEnabled == realtime) {
                 false
@@ -227,6 +362,15 @@ class RemoteMonitorService : Service() {
     }
 
     private fun pollActivityReporting() {
+        if (
+            !parentActivityReportingAllowed(
+                gateway.preferences().monitoringEnabled,
+                gateway.remoteReviewPeerStatus(),
+            )
+        ) {
+            scheduleLifecycleReconciliation()
+            return
+        }
         val decision = synchronized(idleLock) {
             val now = SystemClock.elapsedRealtime()
             if (realtimeActivityEnabled) {
@@ -244,6 +388,12 @@ class RemoteMonitorService : Service() {
     }
 
     private fun sendRealtimeIdle(presence: StudentStudyPresence, alert: IdleAlert) {
+        if (
+            !parentActivityReportingAllowed(
+                gateway.preferences().monitoringEnabled,
+                gateway.remoteReviewPeerStatus(),
+            )
+        ) return
         val repository = runCatching { LibraryRepository.get(applicationContext) }.getOrNull()
         val book = presence.bookId?.let { id -> runCatching { repository?.book(id) }.getOrNull() }
         val student = book?.studentId?.let { id ->
@@ -263,6 +413,12 @@ class RemoteMonitorService : Service() {
         presence: StudentStudyPresence?,
         report: HourlyActivityReport,
     ) {
+        if (
+            !parentActivityReportingAllowed(
+                gateway.preferences().monitoringEnabled,
+                gateway.remoteReviewPeerStatus(),
+            )
+        ) return
         val activePresence = presence?.takeIf(StudentStudyPresence::active)
         val repository = runCatching { LibraryRepository.get(applicationContext) }.getOrNull()
         val book = activePresence?.bookId?.let { id ->
@@ -292,16 +448,28 @@ class RemoteMonitorService : Service() {
 
     private fun updateNotification() {
         if (teacherRemoteReview()) {
+            val connection = when (gateway.peerLinkState().health) {
+                TelegramPeerLinkHealth.CONNECTED -> "학생 기기 연결 확인 · 페이지 수신 대기"
+                TelegramPeerLinkHealth.CHECKING -> "학생 기기 응답 확인 중"
+                TelegramPeerLinkHealth.STALE -> "학생 기기 응답 없음 · 연결 요청 가능"
+                TelegramPeerLinkHealth.UNAVAILABLE -> "원격 첨삭 연결 설정 필요"
+            }
             getSystemService(NotificationManager::class.java).notify(
                 NOTIFICATION_ID,
-                notification("원격 첨삭 페이지 수신 대기"),
+                notification(connection),
             )
             return
         }
         if (!gateway.preferences().monitoringEnabled && remoteReviewConfigured()) {
+            val connection = when (gateway.peerLinkState().health) {
+                TelegramPeerLinkHealth.CONNECTED -> "선생 기기 연결 확인 · 페이지 전송 대기"
+                TelegramPeerLinkHealth.CHECKING -> "선생 기기 응답 확인 중"
+                TelegramPeerLinkHealth.STALE -> "선생 기기 응답 없음 · 안전하게 대기 중"
+                TelegramPeerLinkHealth.UNAVAILABLE -> "원격 첨삭 연결 설정 필요"
+            }
             getSystemService(NotificationManager::class.java).notify(
                 NOTIFICATION_ID,
-                notification("원격 첨삭 페이지 전송 대기"),
+                notification(connection),
             )
             return
         }
@@ -362,6 +530,7 @@ class RemoteMonitorService : Service() {
         private const val ACTION_STOP = "com.studyink.app.remote.STOP"
         private const val ACTION_REFRESH = "com.studyink.app.remote.REFRESH"
         private const val REMOTE_REVIEW_WATCHDOG_SECONDS = 30L
+        private const val TAG = "RemoteMonitorService"
 
         fun startIfEnabled(context: Context) {
             val gateway = RemoteMonitorGateway.get(context)
@@ -390,6 +559,25 @@ class RemoteMonitorService : Service() {
             }
         }
     }
+}
+
+private const val REMOTE_WORKER_BASE_RETRY_MILLIS = 30_000L
+private const val REMOTE_WORKER_MAX_RETRY_MILLIS = 15L * 60L * 1_000L
+private const val MAX_TRACKED_WORKER_FAILURES = 31
+
+internal fun parentActivityReportingAllowed(
+    monitoringEnabled: Boolean,
+    peerStatus: RemoteReviewPeerStatus,
+): Boolean = monitoringEnabled && parentMonitorRoleGate(peerStatus).allowsRendering
+
+/** Pure/capped so restart timing can be regression-tested without constructing an Android Service. */
+internal fun remoteMonitorWorkerRetryDelayMillis(consecutiveFailures: Int): Long {
+    require(consecutiveFailures > 0)
+    var delay = REMOTE_WORKER_BASE_RETRY_MILLIS
+    repeat((consecutiveFailures - 1).coerceAtMost(MAX_TRACKED_WORKER_FAILURES - 1)) {
+        delay = (delay * 2L).coerceAtMost(REMOTE_WORKER_MAX_RETRY_MILLIS)
+    }
+    return delay
 }
 
 private sealed interface ActivityReportDecision {

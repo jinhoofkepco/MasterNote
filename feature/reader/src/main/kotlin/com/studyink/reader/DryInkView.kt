@@ -116,7 +116,6 @@ class DryInkView(context: Context) : View(context) {
         val active = visibleReaderStrokes(
             strokes = cachedPageStrokes[activePage].orEmpty(),
             visibleAttemptNo = visibleAttemptNo,
-            showLatestRemoteFeedbackAcrossAttempts = !showTeacherDrafts,
         ).filter { stroke -> isOnScreen(adapter, stroke, visibleBounds) }
         active.forEach { drawStroke(canvas, adapter, it, false) }
 
@@ -401,43 +400,8 @@ class DryInkView(context: Context) : View(context) {
     )
 }
 
-/**
- * Students must see the newest Telegram correction even if they opened the next writable attempt
- * before it arrived. Only the specially tagged remote layer crosses the attempt boundary; student
- * ink, ordinary teacher/LAN ink, and teacher review screens retain exact-attempt isolation.
- */
+/** Keeps every ink source, including Telegram teacher feedback, on its exact student attempt. */
 internal fun visibleReaderStrokes(
     strokes: List<StrokeAsset>,
     visibleAttemptNo: Int,
-    showLatestRemoteFeedbackAcrossAttempts: Boolean,
-): List<StrokeAsset> {
-    val latestRemoteLayer = if (showLatestRemoteFeedbackAcrossAttempts) {
-        strokes.asSequence()
-            .filter(StrokeAsset::isPublishedTelegramRemoteFeedback)
-            .maxWithOrNull(
-                compareBy<StrokeAsset>(StrokeAsset::logicalClock)
-                    .thenBy { it.publishedAtEpochMillis ?: Long.MIN_VALUE }
-                    .thenBy { it.itemId.orEmpty() }
-                    .thenBy(StrokeAsset::deviceId),
-            )
-            ?.remoteFeedbackLayerKey()
-    } else {
-        null
-    }
-    return strokes.filter { stroke ->
-        if (stroke.isPublishedTelegramRemoteFeedback() && showLatestRemoteFeedbackAcrossAttempts) {
-            stroke.remoteFeedbackLayerKey() == latestRemoteLayer
-        } else {
-            stroke.attemptNo == visibleAttemptNo
-        }
-    }
-}
-
-private fun StrokeAsset.isPublishedTelegramRemoteFeedback(): Boolean =
-    authorId == "teacher" &&
-        publishedAtEpochMillis != null &&
-        deviceId.startsWith("telegram-teacher-") &&
-        itemId?.startsWith("remote-review:") == true
-
-private fun StrokeAsset.remoteFeedbackLayerKey(): String =
-    "$deviceId\u0000$attemptNo\u0000$itemId\u0000$publishedAtEpochMillis\u0000$logicalClock"
+): List<StrokeAsset> = strokes.filter { stroke -> stroke.attemptNo == visibleAttemptNo }

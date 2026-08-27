@@ -195,6 +195,46 @@ class PageSyncProtocolCodecTest {
         assertEquals(pageAnnotationSha256Hex(canonical), decoded.payloadSha256)
     }
 
+    @Test fun studentCheckpointFragmentRoundTripsGroupOrderAndBothDigests() {
+        val whole = "first-fragment|second-fragment".toByteArray()
+        val fragment = "second-fragment".toByteArray()
+        val original = PageAnnotationEnvelope.fromDecodedPayload(
+            transferId = "checkpoint_chunk_transfer_0002",
+            createdAtEpochMs = 20_000L,
+            syncGeneration = 7L,
+            purpose = PageAnnotationPurpose.STUDENT_PAGE,
+            responseToTransferId = REQUEST_TRANSFER_ID,
+            pageToken = PAGE_TOKEN,
+            pageNumber = 37,
+            attemptNos = listOf(1, 2),
+            kind = PageAnnotationKind.CHECKPOINT,
+            baseRevision = 0L,
+            sourceRevision = 92L,
+            deltaOriginDeviceId = null,
+            baseOriginCursor = 0L,
+            sourceOriginCursor = 0L,
+            compression = PageAnnotationCompression.GZIP,
+            decodedPayloadBytes = fragment,
+            resultLayerSha256 = RESULT_LAYER_SHA,
+            chunkGroupId = "checkpoint_group_transfer_0001",
+            chunkIndex = 1,
+            chunkCount = 2,
+            assembledPayloadSizeBytes = whole.size,
+            assembledPayloadSha256 = pageAnnotationSha256Hex(whole),
+        )
+
+        val decoded = roundTrip(original) as PageAnnotationEnvelope
+
+        assertTrue(decoded.chunked)
+        assertEquals("checkpoint_group_transfer_0001", decoded.chunkGroupId)
+        assertEquals(1, decoded.chunkIndex)
+        assertEquals(2, decoded.chunkCount)
+        assertEquals(whole.size, decoded.assembledPayloadSizeBytes)
+        assertEquals(pageAnnotationSha256Hex(whole), decoded.payloadSha256)
+        assertEquals(pageAnnotationSha256Hex(fragment), decoded.chunkSha256)
+        assertArrayEquals(fragment, decoded.copyDecodedPayloadBytes())
+    }
+
     @Test fun pageSyncAckRoundTripsGenerationSourceTypeExactPageRevisionAndReason() {
         val annotationApplied = ack()
         val requestRejected = ack(

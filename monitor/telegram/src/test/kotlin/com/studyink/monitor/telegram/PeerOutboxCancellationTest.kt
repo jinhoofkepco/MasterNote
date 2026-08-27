@@ -86,6 +86,32 @@ class PeerOutboxCancellationTest {
     }
 
     @Test
+    fun uploaderStartupGateDurablyRetiresAllLegacyReviewDocumentsBeforeSending() {
+        val root = temporary.newFolder("startup-retirement")
+        val owned = root.resolve("peer-outbox").apply { mkdirs() }
+        val journal = root.resolve("outbox.v1")
+        val outbox = TelegramOutbox(journal)
+        val legacy = listOf(
+            peerDocument(owned, "snapshot_0001", "PAGE_SNAPSHOT", createdAt = 10L),
+            peerDocument(owned, "feedback_0001", "TEACHER_FEEDBACK", createdAt = 11L),
+            peerDocument(owned, "grade_0001", "REMOTE_GRADE", createdAt = 12L),
+        )
+        val pageDelta = peerDocument(owned, "delta_0001", "PAGE_ANNOTATION", createdAt = 13L)
+        val chat = peerDocument(owned, "chat_0001", "CHAT_MESSAGE", createdAt = 14L)
+        val control = peerText("ack_transport_0001", createdAt = 15L)
+        val parent = parentDocument(owned, "parent_0001", createdAt = 16L)
+        (legacy + pageDelta + chat + control + parent).forEach(outbox::enqueue)
+
+        assertTrue(retireLegacyPeerDocumentsBeforeWorkerStart(outbox, owned, nowEpochMs = 20L))
+        assertTrue(legacy.all { requireNotNull(it.file).exists().not() })
+        assertEquals(
+            setOf(pageDelta.idempotencyKey, chat.idempotencyKey, control.idempotencyKey, parent.idempotencyKey),
+            TelegramOutbox(journal).pendingSnapshot()
+                .mapTo(linkedSetOf(), TelegramOutboxEntry::idempotencyKey),
+        )
+    }
+
+    @Test
     fun malformedOrMismatchedCaptionCannotCancelAnUnrelatedDocument() {
         val root = temporary.newFolder("mismatch")
         val owned = root.resolve("peer-outbox").apply { mkdirs() }
@@ -116,6 +142,30 @@ class PeerOutboxCancellationTest {
         assertThrows(IllegalArgumentException::class.java) {
             inspectPendingPeerDocumentTransfers(outbox.pendingSnapshot(), setOf("page_snapshot"))
         }
+    }
+
+    @Test
+    fun expiringLinkControlCancellationIsDurableAndDoesNotTouchDocumentsOrOtherControls() {
+        val root = temporary.newFolder("link-controls")
+        val journal = root.resolve("outbox.v1")
+        val outbox = TelegramOutbox(journal)
+        val expiredPing = peerText("ping_nonce_identifier", createdAt = 10L)
+        val liveAck = peerText("ack_transport_0001", createdAt = 11L)
+        val document = peerDocument(root, "snapshot_0001", "PAGE_SNAPSHOT", createdAt = 12L)
+        listOf(expiredPing, liveAck, document).forEach(outbox::enqueue)
+
+        assertEquals(
+            listOf(expiredPing),
+            outbox.cancelPeerTextTransfers(setOf("ping_nonce_identifier"), 20L),
+        )
+        assertEquals(
+            setOf(liveAck.idempotencyKey, document.idempotencyKey),
+            TelegramOutbox(journal).pendingSnapshot().mapTo(linkedSetOf(), TelegramOutboxEntry::idempotencyKey),
+        )
+        assertEquals(
+            TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED,
+            TelegramOutbox(journal).enqueue(expiredPing),
+        )
     }
 
     private fun peerDocument(

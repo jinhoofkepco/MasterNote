@@ -12,6 +12,7 @@ import java.util.Base64
 class TelegramOutbox(
     private val journal: File,
     private val maxPendingEntries: Int = DEFAULT_MAX_PENDING,
+    private val reservedPeerTextEntries: Int = DEFAULT_RESERVED_PEER_TEXT_ENTRIES,
 ) {
     private val pending = linkedMapOf<String, TelegramOutboxEntry>()
     private val delivered = linkedMapOf<String, Long>()
@@ -22,6 +23,7 @@ class TelegramOutbox(
 
     init {
         require(maxPendingEntries > 0)
+        require(reservedPeerTextEntries >= 0)
         require(journal.parentFile?.mkdirs() == true || journal.parentFile?.isDirectory == true)
         replay()
     }
@@ -29,11 +31,47 @@ class TelegramOutbox(
     @Synchronized
     fun enqueue(entry: TelegramOutboxEntry): TelegramEnqueueResult {
         validate(entry)
-        if (entry.idempotencyKey in pending) return TelegramEnqueueResult.ALREADY_PENDING
-        if (entry.idempotencyKey in delivered) return TelegramEnqueueResult.ALREADY_DELIVERED
-        if (entry.idempotencyKey in dead) return TelegramEnqueueResult.PREVIOUSLY_DEAD
-        if (entry.idempotencyKey in superseded) return TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
-        if (pending.size >= maxPendingEntries) return TelegramEnqueueResult.QUEUE_FULL
+        priorResult(entry.idempotencyKey)?.let { return it }
+        if (!hasCapacityFor(entry)) return TelegramEnqueueResult.QUEUE_FULL
+        append(encodePut(entry))
+        pending[entry.idempotencyKey] = entry
+        compactIfNeeded()
+        return TelegramEnqueueResult.ENQUEUED
+    }
+
+    /**
+     * Link controls must still fit when a long-offline device has filled the ordinary data queue.
+     * If the small reserved lane itself is full, the oldest non-in-flight liveness probe is durably
+     * superseded. Delivery acknowledgements and CONNECT_ACCEPT/PONG responses are never displaced:
+     * when only essential responses remain, the inbound poller must retry its current update after
+     * one of them is sent.
+     */
+    @Synchronized
+    fun enqueuePeerLinkControl(entry: TelegramOutboxEntry): TelegramEnqueueResult {
+        validate(entry)
+        require(isReservedPeerText(entry))
+        priorResult(entry.idempotencyKey)?.let { return it }
+        if (reservedPeerTextEntries == 0) return TelegramEnqueueResult.QUEUE_FULL
+        if (reservedPeerTextCount() >= reservedPeerTextEntries) {
+            val replaceable = pending.values.asSequence()
+                .filter(::isReservedPeerText)
+                .filter { it.idempotencyKey !in inFlight }
+                .filter(::isReplaceablePeerProbe)
+                .minWithOrNull(
+                    compareBy<TelegramOutboxEntry>(
+                        ::peerTextReplacementPriority,
+                        TelegramOutboxEntry::createdAtEpochMs,
+                    ),
+                ) ?: return TelegramEnqueueResult.QUEUE_FULL
+            append(encodeSuperseded(replaceable.idempotencyKey, entry.createdAtEpochMs))
+            pending.remove(replaceable.idempotencyKey)
+            rememberBounded(
+                superseded,
+                replaceable.idempotencyKey,
+                entry.createdAtEpochMs,
+                MAX_SUPERSEDED_KEYS,
+            )
+        }
         append(encodePut(entry))
         pending[entry.idempotencyKey] = entry
         compactIfNeeded()
@@ -49,14 +87,13 @@ class TelegramOutbox(
         validate(entry)
         require(entry.kind == TelegramOutboxKind.TEXT)
         require(!entry.coalesceKey.isNullOrBlank())
-        if (entry.idempotencyKey in pending) return TelegramEnqueueResult.ALREADY_PENDING
-        if (entry.idempotencyKey in delivered) return TelegramEnqueueResult.ALREADY_DELIVERED
-        if (entry.idempotencyKey in dead) return TelegramEnqueueResult.PREVIOUSLY_DEAD
-        if (entry.idempotencyKey in superseded) return TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
+        priorResult(entry.idempotencyKey)?.let { return it }
         val replaceable = pending.values.filter {
             it.coalesceKey == entry.coalesceKey && it.idempotencyKey !in inFlight
         }
-        if (pending.size - replaceable.size >= maxPendingEntries) return TelegramEnqueueResult.QUEUE_FULL
+        if (regularPendingCount() - replaceable.size >= maxPendingEntries) {
+            return TelegramEnqueueResult.QUEUE_FULL
+        }
         append(encodeLatest(entry))
         replaceable.forEach {
             pending.remove(it.idempotencyKey)
@@ -141,6 +178,49 @@ class TelegramOutbox(
         return cancelled
     }
 
+    /**
+     * Supersedes only lightweight peer controls. A liveness probe has a short semantic lifetime;
+     * keeping an expired probe in the durable retry queue would manufacture a false reconnect much
+     * later and could let offline time accumulate hundreds of tiny messages.
+     */
+    @Synchronized
+    fun cancelPeerTextTransfers(
+        transferIds: Set<String>,
+        cancelledAtEpochMs: Long,
+    ): List<TelegramOutboxEntry> {
+        require(cancelledAtEpochMs >= 0L)
+        require(transferIds.all(PEER_IDENTIFIER::matches))
+        if (transferIds.isEmpty()) return emptyList()
+        val cancelled = pending.values.filter { entry ->
+            entry.route == TelegramOutboxRoute.PEER &&
+                entry.kind == TelegramOutboxKind.TEXT &&
+                entry.peerTransferId in transferIds
+        }
+        cancelled.forEach { entry ->
+            append(encodeSuperseded(entry.idempotencyKey, cancelledAtEpochMs))
+            pending.remove(entry.idempotencyKey)
+            inFlight.remove(entry.idempotencyKey)
+            rememberBounded(superseded, entry.idempotencyKey, cancelledAtEpochMs, MAX_SUPERSEDED_KEYS)
+        }
+        compactIfNeeded()
+        return cancelled
+    }
+
+    /** Cancels every human-parent route entry when this installation becomes the remote teacher. */
+    @Synchronized
+    fun cancelParentEntries(cancelledAtEpochMs: Long): List<TelegramOutboxEntry> {
+        require(cancelledAtEpochMs >= 0L)
+        val cancelled = pending.values.filter { it.route == TelegramOutboxRoute.PARENT }
+        cancelled.forEach { entry ->
+            append(encodeSuperseded(entry.idempotencyKey, cancelledAtEpochMs))
+            pending.remove(entry.idempotencyKey)
+            inFlight.remove(entry.idempotencyKey)
+            rememberBounded(superseded, entry.idempotencyKey, cancelledAtEpochMs, MAX_SUPERSEDED_KEYS)
+        }
+        compactIfNeeded()
+        return cancelled
+    }
+
     @Synchronized
     fun due(nowEpochMs: Long): TelegramOutboxEntry? = pending.values
         .asSequence()
@@ -158,6 +238,10 @@ class TelegramOutbox(
         inFlight += entry.idempotencyKey
         return entry
     }
+
+    /** Releases only the process-local claim; the durable pending record remains unchanged. */
+    @Synchronized
+    internal fun releaseClaim(idempotencyKey: String): Boolean = inFlight.remove(idempotencyKey)
 
     @Synchronized
     fun nextWakeEpochMs(): Long? = pending.values.minOfOrNull(TelegramOutboxEntry::nextAttemptEpochMs)
@@ -185,6 +269,30 @@ class TelegramOutbox(
         val updated = entry.copy(
             attempts = entry.attempts + 1,
             nextAttemptEpochMs = safeAdd(nowEpochMs, delayMs.coerceAtLeast(0L)),
+            lastError = reason.take(MAX_REASON_CHARS),
+        )
+        append(encodePut(updated))
+        inFlight.remove(idempotencyKey)
+        pending[idempotencyKey] = updated
+        compactIfNeeded()
+        return updated
+    }
+
+    /**
+     * Releases an in-flight entry without counting a transport retry. Used after Telegram has
+     * accepted a peer document: the entry remains only as ACK-retention bookkeeping and is made
+     * due once, at its terminal retention deadline.
+     */
+    @Synchronized
+    fun deferUntil(
+        idempotencyKey: String,
+        nextAttemptEpochMs: Long,
+        reason: String,
+    ): TelegramOutboxEntry? {
+        require(nextAttemptEpochMs >= 0L)
+        val entry = pending[idempotencyKey] ?: return null
+        val updated = entry.copy(
+            nextAttemptEpochMs = nextAttemptEpochMs,
             lastError = reason.take(MAX_REASON_CHARS),
         )
         append(encodePut(updated))
@@ -331,6 +439,41 @@ class TelegramOutbox(
             }
         }
     }
+
+    private fun priorResult(idempotencyKey: String): TelegramEnqueueResult? = when {
+        idempotencyKey in pending -> TelegramEnqueueResult.ALREADY_PENDING
+        idempotencyKey in delivered -> TelegramEnqueueResult.ALREADY_DELIVERED
+        idempotencyKey in dead -> TelegramEnqueueResult.PREVIOUSLY_DEAD
+        idempotencyKey in superseded -> TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
+        else -> null
+    }
+
+    private fun hasCapacityFor(entry: TelegramOutboxEntry): Boolean = if (isReservedPeerText(entry)) {
+        reservedPeerTextCount() < reservedPeerTextEntries
+    } else {
+        regularPendingCount() < maxPendingEntries
+    }
+
+    private fun regularPendingCount(): Int = pending.values.count { !isReservedPeerText(it) }
+
+    private fun reservedPeerTextCount(): Int = pending.values.count(::isReservedPeerText)
+
+    private fun isReservedPeerText(entry: TelegramOutboxEntry): Boolean =
+        entry.route == TelegramOutboxRoute.PEER && entry.kind == TelegramOutboxKind.TEXT &&
+            (entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_PREFIX) ||
+                entry.idempotencyKey.startsWith(PEER_DELIVERY_ACK_PREFIX))
+
+    private fun peerTextReplacementPriority(entry: TelegramOutboxEntry): Int = when {
+        entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_PREFIX) &&
+            (":ping:" in entry.idempotencyKey || ":connect:" in entry.idempotencyKey) -> 0
+        entry.idempotencyKey.startsWith(PEER_DELIVERY_ACK_PREFIX) -> 1
+        entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_PREFIX) -> 2
+        else -> 3
+    }
+
+    private fun isReplaceablePeerProbe(entry: TelegramOutboxEntry): Boolean =
+        entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_PREFIX) &&
+            (":ping:" in entry.idempotencyKey || ":connect:" in entry.idempotencyKey)
 
     private fun append(line: String) {
         FileOutputStream(journal, true).use { output ->
@@ -504,11 +647,14 @@ class TelegramOutbox(
         const val LEGACY_PUT_FIELD_COUNT = 15
         const val PUT_FIELD_COUNT = 18
         const val DEFAULT_MAX_PENDING = 512
+        const val DEFAULT_RESERVED_PEER_TEXT_ENTRIES = 4
         const val MAX_DELIVERED_KEYS = 10_000
         const val MAX_DEAD_LETTERS = 512
         const val MAX_SUPERSEDED_KEYS = 10_000
         const val MAX_REASON_CHARS = 240
         const val MAX_COALESCE_KEY_CHARS = 120
         const val COMPACT_AFTER_RECORDS = 256
+        const val PEER_LINK_CONTROL_PREFIX = "telegram-peer-control:"
+        const val PEER_DELIVERY_ACK_PREFIX = "telegram-peer-received:"
     }
 }

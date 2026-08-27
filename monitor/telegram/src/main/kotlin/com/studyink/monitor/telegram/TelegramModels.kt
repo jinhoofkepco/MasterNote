@@ -186,6 +186,8 @@ data class TelegramDeliveryReceipt(
     val outboxKey: String,
     val telegramMessageId: Long?,
     val sentAtEpochMs: Long,
+    /** Telegram accepted this upload; absence of a peer ACK must never trigger another upload. */
+    val serverAcceptedAtEpochMs: Long? = null,
     val acknowledgedAtEpochMs: Long? = null,
     val acknowledgementMessageId: Long? = null,
 )

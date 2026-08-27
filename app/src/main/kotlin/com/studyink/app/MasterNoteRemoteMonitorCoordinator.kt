@@ -10,6 +10,8 @@ import com.studyink.monitor.render.MasterNotePageRenderer
 import com.studyink.monitor.render.PageRenderRequest
 import com.studyink.monitor.telegram.PendingScreenRequest
 import com.studyink.monitor.telegram.RemoteMonitorGateway
+import com.studyink.monitor.telegram.RemoteReviewPeerStatus
+import com.studyink.monitor.telegram.RemoteReviewRole
 import com.studyink.monitor.telegram.TelegramEnqueueResult
 import java.io.File
 import java.util.concurrent.CompletableFuture
@@ -52,6 +54,9 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
     private var maintenanceSubscription: AutoCloseable? = null
     private var baselineStore: SubmissionBaselineStore? = null
     private val monitoringEnabled = AtomicBoolean(false)
+    /** Prevents repeated worker interruption while the same teacher-role gate stays active. */
+    private val remoteTeacherGateActive = AtomicBoolean(false)
+    private val remoteTeacherCleanupScheduled = AtomicBoolean(false)
     private val maintenanceLock = Any()
     private var pausedForMaintenance = false
 
@@ -62,6 +67,7 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
         renderer = MasterNotePageRenderer.get(app)
         monitoringEnabled.set(gateway.preferences().monitoringEnabled)
         baselineStore = SubmissionBaselineStore(File(app.noBackupFilesDir, "remote-monitor-submission-baseline"))
+        enforceRemoteTeacherParentGate()
         LibraryAttemptBus.addListener(this)
         commandSubscription = gateway.subscribePendingScreenRequests(listener = ::queueCurrentPage)
         maintenanceSubscription = RemoteMonitorMaintenanceBus.install(
@@ -88,6 +94,7 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
             },
         )
         preferenceSubscription = gateway.subscribePreferences { preferences ->
+            if (enforceRemoteTeacherParentGate()) return@subscribePreferences
             if (preferences.monitoringEnabled) {
                 if (!monitoringEnabled.getAndSet(true)) {
                     // Enabling again begins a new parent-facing session. Submissions made while
@@ -109,6 +116,7 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
     }
 
     override fun onLocalAttemptChanged(attempt: Attempt) {
+        if (enforceRemoteTeacherParentGate()) return
         val lockedAt = attempt.lockedAtEpochMillis ?: return
         val session = currentRenderSession() ?: return
         if (!attempt.locked || lockedAt < session.baselineEpochMillis) return
@@ -137,6 +145,7 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
             pausedForMaintenance = false
             advanceWorkGeneration()
         }
+        if (enforceRemoteTeacherParentGate()) return
         if (gateway.preferences().monitoringEnabled) {
             gateway.pendingScreenRequests().forEach(::queueCurrentPage)
             scanMissedSubmissions()
@@ -149,7 +158,12 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
     }
 
     private fun queueCurrentPage(command: PendingScreenRequest) {
-        val session = currentRenderSession() ?: return
+        if (consumeScreenRequestForRemoteTeacher(command)) return
+        val session = currentRenderSession() ?: run {
+            // The remote-review role can change between the first policy read and session lookup.
+            consumeScreenRequestForRemoteTeacher(command)
+            return
+        }
         if (command.chatId != session.chatId) return
         val scheduledKey = "${session.generation}:${command.requestId}"
         if (screenRequestAccountedFor(command) || !scheduledKeys.add(scheduledKey)) {
@@ -160,7 +174,10 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
         }
         val accepted = schedule(PRIORITY_CURRENT_PAGE) {
             try {
-                if (!isRenderSessionCurrent(session)) return@schedule
+                if (!isRenderSessionCurrent(session)) {
+                    consumeScreenRequestForRemoteTeacher(command)
+                    return@schedule
+                }
                 if (screenRequestAccountedFor(command)) {
                     gateway.acknowledgeScreenRequest(command.updateId)
                     return@schedule
@@ -191,6 +208,8 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
                 }
                 if (screenRequestAccountedFor(command)) {
                     gateway.acknowledgeScreenRequest(command.updateId)
+                } else if (consumeScreenRequestForRemoteTeacher(command)) {
+                    Unit
                 } else if (result == TelegramEnqueueResult.QUEUE_FULL) {
                     scheduleScreenRetry(session)
                 }
@@ -199,6 +218,49 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
             }
         }
         if (!accepted) scheduledKeys.remove(scheduledKey)
+    }
+
+    /** Teacher-side bot-to-bot mode must never retain or execute human-parent `/화면` work. */
+    private fun consumeScreenRequestForRemoteTeacher(command: PendingScreenRequest): Boolean {
+        if (!enforceRemoteTeacherParentGate()) return false
+        gateway.acknowledgeScreenRequest(command.updateId)
+        return true
+    }
+
+    /**
+     * Parent monitoring and teacher remote review share one durable Telegram outbox. Entering the
+     * teacher role invalidates queued render work and consumes replayable parent commands exactly
+     * once; every hot-path render check below still re-evaluates the role for race safety.
+     */
+    private fun enforceRemoteTeacherParentGate(): Boolean {
+        val gate = parentMonitorRoleGate(gateway.remoteReviewPeerStatus())
+        if (gate.allowsRendering) {
+            if (remoteTeacherGateActive.getAndSet(false)) {
+                // Never disclose attempts made while this installation was acting as the teacher
+                // if parent monitoring is explicitly enabled again after a role change.
+                baselineStore?.reset(System.currentTimeMillis())
+                advanceWorkGeneration()
+            }
+            remoteTeacherCleanupScheduled.set(false)
+            return false
+        }
+        if (remoteTeacherGateActive.compareAndSet(false, true)) {
+            advanceWorkGeneration()
+            baselineStore?.reset(System.currentTimeMillis())
+            gateway.pendingParentMessage()?.let { gateway.acknowledgeParentMessage(it.updateId) }
+            gateway.pendingScreenRequests().forEach { gateway.acknowledgeScreenRequest(it.updateId) }
+        }
+        scheduleRemoteTeacherCleanup()
+        return true
+    }
+
+    /** Outbox cancellation can stop/join transport workers, so never perform it on a UI callback. */
+    private fun scheduleRemoteTeacherCleanup() {
+        if (!remoteTeacherCleanupScheduled.compareAndSet(false, true)) return
+        retryScheduler.execute {
+            runCatching { gateway.cancelParentRenderTrafficForRemoteTeacher() }
+                .onFailure { remoteTeacherCleanupScheduled.set(false) }
+        }
     }
 
     private fun screenRequestAccountedFor(command: PendingScreenRequest): Boolean =
@@ -391,6 +453,7 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
         repeat(3) {
             val generationBefore = workGeneration.get()
             if (!monitoringEnabled.get() || !gateway.preferences().monitoringEnabled) return null
+            if (enforceRemoteTeacherParentGate()) return null
             if (synchronized(maintenanceLock) { pausedForMaintenance }) return null
             val chatId = gateway.configuredChatId() ?: return null
             val baseline = baselineStore?.baseline() ?: return null
@@ -405,6 +468,7 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
         session.generation == workGeneration.get() &&
             monitoringEnabled.get() &&
             gateway.preferences().monitoringEnabled &&
+            parentMonitorRoleGate(gateway.remoteReviewPeerStatus()).allowsRendering &&
             gateway.configuredChatId() == session.chatId &&
             baselineStore?.baseline() == session.baselineEpochMillis &&
             !synchronized(maintenanceLock) { pausedForMaintenance }
@@ -422,6 +486,29 @@ object MasterNoteRemoteMonitorCoordinator : LibraryAttemptBus.Listener {
     private const val PRIORITY_SUBMISSION = 20
     private const val QUEUE_FULL_RETRY_MILLIS = 30_000L
     private const val MAX_QUEUED_SUBMISSIONS = 8
+}
+
+internal enum class ParentMonitorRoleGate(
+    val allowsRendering: Boolean,
+    val consumePendingScreenRequests: Boolean,
+) {
+    ALLOW(allowsRendering = true, consumePendingScreenRequests = false),
+    BLOCK_REMOTE_TEACHER(allowsRendering = false, consumePendingScreenRequests = true),
+}
+
+/**
+ * Parent monitoring and bot-to-bot teacher review share one Telegram gateway, but only the student
+ * device may produce parent-facing submission/screen renders. WaitingForStudentAck is also a
+ * teacher-owned state, so work is blocked before the pairing handshake finishes.
+ */
+internal fun parentMonitorRoleGate(status: RemoteReviewPeerStatus): ParentMonitorRoleGate = when (status) {
+    is RemoteReviewPeerStatus.WaitingForStudentAck -> ParentMonitorRoleGate.BLOCK_REMOTE_TEACHER
+    is RemoteReviewPeerStatus.Connected -> if (status.role == RemoteReviewRole.TEACHER) {
+        ParentMonitorRoleGate.BLOCK_REMOTE_TEACHER
+    } else {
+        ParentMonitorRoleGate.ALLOW
+    }
+    else -> ParentMonitorRoleGate.ALLOW
 }
 
 private data class RenderSession(

@@ -2,10 +2,15 @@ package com.studyink.monitor.telegram
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class TelegramOutboxProcessorTest {
     @get:Rule val temporary = TemporaryFolder()
@@ -39,7 +44,123 @@ class TelegramOutboxProcessorTest {
         assertEquals(listOf("hello"), fixture.api.sentTexts)
     }
 
-    @Test fun peerDocumentIsKeptUntilAuthenticatedPeerAcknowledgement() {
+    @Test fun preTransportFailureReleasesTheClaimForTheSameProcessorToRetry() {
+        val root = temporary.newFolder()
+        val outbox = TelegramOutbox(root.resolve("outbox"))
+        val api = FakeApi(null)
+        val active = TelegramCredentials("123456:${"a".repeat(24)}", 7L, "parent")
+        var failPreflight = true
+        val processor = TelegramOutboxProcessor(
+            active,
+            api,
+            outbox,
+            TelegramRetryGate(root.resolve("gate")),
+            TelegramConnectionTracker(TelegramConnectionStateStore(root.resolve("connection"))) {},
+            root,
+            TelegramJitterSource { 0.0 },
+            credentialsProvider = {
+                if (failPreflight) {
+                    failPreflight = false
+                    error("credential read failed")
+                }
+                active
+            },
+        )
+        outbox.enqueue(textEntry("preflight-retry"))
+
+        assertThrows(IllegalStateException::class.java) { processor.processOne(1_000L) }
+        assertEquals(
+            OutboxProcessResult.Sent("preflight-retry"),
+            processor.processOne(1_000L),
+        )
+        assertEquals(listOf("hello"), api.sentTexts)
+    }
+
+    @Test fun closeReleasesOnlyAClaimThatHasNotStartedTransport() {
+        val root = temporary.newFolder()
+        val outbox = TelegramOutbox(root.resolve("outbox"))
+        val firstApi = FakeApi(null)
+        val active = TelegramCredentials("123456:${"a".repeat(24)}", 7L, "parent")
+        val enteredPreflight = CountDownLatch(1)
+        val releasePreflight = CountDownLatch(1)
+        val processor = TelegramOutboxProcessor(
+            active,
+            firstApi,
+            outbox,
+            TelegramRetryGate(root.resolve("gate")),
+            TelegramConnectionTracker(TelegramConnectionStateStore(root.resolve("connection"))) {},
+            root,
+            TelegramJitterSource { 0.0 },
+            credentialsProvider = {
+                enteredPreflight.countDown()
+                releasePreflight.await(5L, TimeUnit.SECONDS)
+                active
+            },
+        )
+        outbox.enqueue(textEntry("close-preflight"))
+        val failure = AtomicReference<Throwable?>()
+        val executor = Executors.newSingleThreadExecutor()
+        val task = executor.submit {
+            runCatching { processor.processOne(1_000L) }.exceptionOrNull().let(failure::set)
+        }
+
+        assertTrue(enteredPreflight.await(1L, TimeUnit.SECONDS))
+        processor.close()
+        releasePreflight.countDown()
+        task.get(2L, TimeUnit.SECONDS)
+        executor.shutdownNow()
+        assertTrue(failure.get() is IllegalStateException)
+        assertTrue(firstApi.sentTexts.isEmpty())
+
+        val secondApi = FakeApi(null)
+        val recovered = TelegramOutboxProcessor(
+            active,
+            secondApi,
+            outbox,
+            TelegramRetryGate(root.resolve("gate-2")),
+            TelegramConnectionTracker(TelegramConnectionStateStore(root.resolve("connection-2"))) {},
+            root,
+            TelegramJitterSource { 0.0 },
+        )
+        assertEquals(
+            OutboxProcessResult.Sent("close-preflight"),
+            recovered.processOne(1_000L),
+        )
+        assertEquals(listOf("hello"), secondApi.sentTexts)
+    }
+
+    @Test fun teacherRoleNeverFlushesARecoveredParentOutboxEntry() {
+        val root = temporary.newFolder()
+        val outbox = TelegramOutbox(root.resolve("outbox"))
+        val api = FakeApi(null)
+        val teacher = TelegramCredentials(
+            botToken = "123456:${"a".repeat(24)}",
+            allowedPrivateChatId = 7L,
+            chatLabel = "parent",
+            remoteReviewRole = RemoteReviewRole.TEACHER,
+            peerPairId = "pair_identifier_123",
+            peerSharedKeyBase64 = TelegramPeerProtocol.encodeKey(ByteArray(32) { 1 }),
+            peerPairingExpiresAtEpochMs = 100_000L,
+        )
+        val processor = TelegramOutboxProcessor(
+            teacher,
+            api,
+            outbox,
+            TelegramRetryGate(root.resolve("gate")),
+            TelegramConnectionTracker(TelegramConnectionStateStore(root.resolve("connection"))) {},
+            root,
+            TelegramJitterSource { 0.0 },
+        )
+        outbox.enqueue(textEntry("stale-parent"))
+
+        assertEquals(
+            OutboxProcessResult.Dead("stale-parent"),
+            processor.processOne(1_000L),
+        )
+        assertTrue(api.sentTexts.isEmpty())
+    }
+
+    @Test fun peerDocumentIsUploadedOnceAndBookkeepingRemainsUntilAuthenticatedAcknowledgement() {
         val root = temporary.newFolder()
         val payload = root.resolve("payload.mne").apply { writeText("encrypted") }
         val outbox = TelegramOutbox(root.resolve("outbox"))
@@ -64,11 +185,16 @@ class TelegramOutboxProcessorTest {
         )
         outbox.enqueue(peerEntry("peer:1", "transfer_123", payload))
 
-        assertEquals(OutboxProcessResult.Retried("peer:1", 61_000L), processor.processOne(1_000L))
-        assertEquals(null, receiptStore.receipt("transfer_123")?.telegramMessageId)
+        val acknowledgementDeadline = 1_000L + PEER_ACK_RETENTION_MS
+        assertEquals(
+            OutboxProcessResult.Retried("peer:1", acknowledgementDeadline),
+            processor.processOne(1_000L),
+        )
+        assertEquals(91L, receiptStore.receipt("transfer_123")?.telegramMessageId)
+        assertEquals(1_000L, receiptStore.receipt("transfer_123")?.serverAcceptedAtEpochMs)
         assertEquals(null, receiptStore.receipt("transfer_123")?.acknowledgedAtEpochMs)
         assertEquals(1, api.sentPeerDocuments)
-        assertTrue(payload.isFile)
+        assertTrue(!payload.exists())
         assertEquals(1, outbox.size())
 
         assertTrue(receiptStore.recordAcknowledged("transfer_123", 92L, 2_000L))
@@ -79,7 +205,7 @@ class TelegramOutboxProcessorTest {
         assertTrue(!payload.exists())
     }
 
-    @Test fun missingPeerAcknowledgementRetriesSameTransferWithBoundedBackoff() {
+    @Test fun missingPeerAcknowledgementNeverUploadsSameTransferAgain() {
         val root = temporary.newFolder()
         val payload = root.resolve("payload.mne").apply { writeText("encrypted") }
         val outbox = TelegramOutbox(root.resolve("outbox"))
@@ -104,14 +230,129 @@ class TelegramOutboxProcessorTest {
         )
         outbox.enqueue(peerEntry("peer:1", "transfer_123", payload))
 
-        assertEquals(OutboxProcessResult.Retried("peer:1", 61_000L), processor.processOne(1_000L))
-        assertEquals(OutboxProcessResult.Retried("peer:1", 181_000L), processor.processOne(61_000L))
-        assertEquals(2, api.sentPeerDocuments)
-        assertEquals(2, outbox.pendingSnapshot().single().attempts)
-        assertEquals(8L * 60_000L, peerAcknowledgementRetryDelayMs(3))
-        assertEquals(180L * 60_000L, peerAcknowledgementRetryDelayMs(20))
+        val deadline = 1_000L + PEER_ACK_RETENTION_MS
+        assertEquals(
+            OutboxProcessResult.Retried("peer:1", deadline),
+            processor.processOne(1_000L),
+        )
+        assertEquals(1, api.sentPeerDocuments)
+        assertEquals(0, outbox.pendingSnapshot().single().attempts)
+        assertTrue(!payload.exists())
+        val replayedOutbox = TelegramOutbox(root.resolve("outbox"))
+        val replayedReceipts = TelegramPeerReceiptStore(root.resolve("receipts"))
+        val replayedApi = FakeApi(null)
+        val replayedProcessor = TelegramOutboxProcessor(
+            credentials,
+            replayedApi,
+            replayedOutbox,
+            TelegramRetryGate(root.resolve("replayed-gate")),
+            TelegramConnectionTracker(TelegramConnectionStateStore(root.resolve("replayed-connection"))) {},
+            root,
+            TelegramJitterSource { 0.0 },
+            peerReceipts = replayedReceipts,
+        )
+        assertEquals(
+            OutboxProcessResult.Waiting(deadline),
+            replayedProcessor.processOne(61_000L),
+        )
+        assertEquals(0, replayedApi.sentPeerDocuments)
         assertTrue(!peerAcknowledgementExpired(1_000L, 1_000L + 86_399_999L))
         assertTrue(peerAcknowledgementExpired(1_000L, 1_000L + 86_400_000L))
+
+        assertEquals(OutboxProcessResult.Dead("peer:1"), replayedProcessor.processOne(deadline))
+        assertEquals(0, replayedApi.sentPeerDocuments)
+        assertEquals(0, replayedOutbox.size())
+    }
+
+    @Test fun legacySuccessfulUploadMarkerIsMigratedWithoutAnotherTelegramUpload() {
+        val root = temporary.newFolder()
+        val payload = root.resolve("payload.mne").apply { writeText("encrypted") }
+        val outbox = TelegramOutbox(root.resolve("outbox"))
+        val receiptStore = TelegramPeerReceiptStore(root.resolve("receipts"))
+        val entry = peerEntry("peer:legacy", "transfer_legacy", payload)
+        outbox.enqueue(entry)
+        receiptStore.recordSent("transfer_legacy", entry.idempotencyKey, null, 1_000L)
+        outbox.retry(entry.idempotencyKey, 1_000L, 1L, "원격 기기 수신 확인 대기")
+        val api = FakeApi(null)
+        val processor = TelegramOutboxProcessor(
+            peerCredentials(),
+            api,
+            outbox,
+            TelegramRetryGate(root.resolve("gate")),
+            TelegramConnectionTracker(TelegramConnectionStateStore(root.resolve("connection"))) {},
+            root,
+            TelegramJitterSource { 0.0 },
+            peerReceipts = receiptStore,
+        )
+
+        assertEquals(
+            OutboxProcessResult.Retried("peer:legacy", 1_000L + PEER_ACK_RETENTION_MS),
+            processor.processOne(1_001L),
+        )
+        assertEquals(0, api.sentPeerDocuments)
+        assertEquals(1_000L, receiptStore.receipt("transfer_legacy")?.serverAcceptedAtEpochMs)
+        assertTrue(!payload.exists())
+    }
+
+    @Test fun legacySuccessMarkerPreventsReuploadEvenIfReceiptJournalWasLost() {
+        val root = temporary.newFolder()
+        val payload = root.resolve("payload.mne").apply { writeText("encrypted") }
+        val outbox = TelegramOutbox(root.resolve("outbox"))
+        val entry = peerEntry("peer:legacy-lost", "transfer_legacy_lost", payload)
+        outbox.enqueue(entry)
+        outbox.retry(entry.idempotencyKey, 1_000L, 1L, "원격 기기 수신 확인 대기")
+        val receipts = TelegramPeerReceiptStore(root.resolve("receipts"))
+        val api = FakeApi(null)
+        val processor = TelegramOutboxProcessor(
+            peerCredentials(),
+            api,
+            outbox,
+            TelegramRetryGate(root.resolve("gate")),
+            TelegramConnectionTracker(TelegramConnectionStateStore(root.resolve("connection"))) {},
+            root,
+            TelegramJitterSource { 0.0 },
+            peerReceipts = receipts,
+        )
+
+        assertEquals(
+            OutboxProcessResult.Retried("peer:legacy-lost", PEER_ACK_RETENTION_MS),
+            processor.processOne(1_001L),
+        )
+        assertEquals(0, api.sentPeerDocuments)
+        assertEquals(0L, receipts.receipt("transfer_legacy_lost")?.serverAcceptedAtEpochMs)
+        assertTrue(!payload.exists())
+    }
+
+    @Test fun aConfirmedNetworkFailureCanRetryUntilTelegramFirstAcceptsTheUpload() {
+        val root = temporary.newFolder()
+        val payload = root.resolve("payload.mne").apply { writeText("encrypted") }
+        val outbox = TelegramOutbox(root.resolve("outbox"))
+        val receipts = TelegramPeerReceiptStore(root.resolve("receipts"))
+        val api = FakeApi(TelegramApiException(500, "temporary"))
+        val processor = TelegramOutboxProcessor(
+            peerCredentials(),
+            api,
+            outbox,
+            TelegramRetryGate(root.resolve("gate")),
+            TelegramConnectionTracker(TelegramConnectionStateStore(root.resolve("connection"))) {},
+            root,
+            TelegramJitterSource { 0.0 },
+            peerReceipts = receipts,
+        )
+        outbox.enqueue(peerEntry("peer:retry", "transfer_retry", payload))
+
+        assertEquals(
+            OutboxProcessResult.Retried("peer:retry", 3_000L),
+            processor.processOne(1_000L),
+        )
+        assertEquals(null, receipts.receipt("transfer_retry")?.serverAcceptedAtEpochMs)
+        api.failure = null
+        assertEquals(
+            OutboxProcessResult.Retried("peer:retry", 3_000L + PEER_ACK_RETENTION_MS),
+            processor.processOne(3_000L),
+        )
+        assertEquals(3_000L, receipts.receipt("transfer_retry")?.serverAcceptedAtEpochMs)
+        assertEquals(1, api.sentPeerDocuments)
     }
 
     @Test fun peerDocumentWithoutAcknowledgementExpiresAndDeletesOwnedPayload() {
@@ -205,6 +446,14 @@ class TelegramOutboxProcessorTest {
         )
     }
 
+    private fun peerCredentials() = TelegramCredentials(
+        "123456:${"a".repeat(24)}",
+        7L,
+        "parent",
+        peerBotId = 202L,
+        peerBotUsername = "teacher_bot",
+    )
+
     private fun textEntry(key: String) = TelegramOutboxEntry(
         idempotencyKey = key,
         destinationChatId = 7L,
@@ -243,7 +492,7 @@ class TelegramOutboxProcessorTest {
         val processor: TelegramOutboxProcessor,
     )
 
-    private class FakeApi(private val failure: Throwable?) : TelegramBotApi {
+    private class FakeApi(var failure: Throwable?) : TelegramBotApi {
         val sentTexts = mutableListOf<String>()
         var sentPeerDocuments = 0
         override fun getMe() = error("unused")

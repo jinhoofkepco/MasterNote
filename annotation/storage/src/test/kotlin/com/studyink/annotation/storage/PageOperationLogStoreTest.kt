@@ -18,6 +18,102 @@ import org.junit.Test
 
 class PageOperationLogStoreTest {
     @Test
+    fun boundedDeltaCopiesOnlyThePrefixThatFitsItsWireBudget() {
+        val root = Files.createTempDirectory("masternote-bounded-delta").toFile()
+        try {
+            val store = PageOperationLogStore(root, checkpointInterval = 10_000)
+            var snapshot = AnnotationSnapshot.empty(BOOK_ID, PAGE)
+            repeat(3) {
+                snapshot = store.append(AnnotationDocument(snapshot).addStroke(stroke("student-device")))
+            }
+            val all = store.encodedOperationsAfter(BOOK_ID, PAGE, "student-device", 0L)
+            val oneFrameBudget = 8 + 4 + all.first().size
+
+            val bounded = store.encodedOperationsAfterBounded(
+                BOOK_ID,
+                PAGE,
+                "student-device",
+                0L,
+                maxFramedBytes = oneFrameBudget,
+                fixedFrameBytes = 8,
+                perOperationFrameBytes = 4,
+            )
+
+            assertFalse(bounded.complete)
+            assertEquals(oneFrameBudget, bounded.framedByteCount)
+            assertEquals(1, bounded.operations.size)
+            assertArrayEquals(all.first(), bounded.operations.single())
+            assertEquals(store.operationCursor(all.first()).logicalClock, bounded.lastLogicalClock)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun vmErrorEscapesCorruptionBoundaryWithoutRunningQuarantineHandler() {
+        var quarantined = false
+        val fatal = OutOfMemoryError("simulated")
+
+        val thrown = assertThrows(OutOfMemoryError::class.java) {
+            readAnnotationDataOrHandleCorruption<Unit>(
+                read = { throw fatal },
+                onCorruption = {
+                    quarantined = true
+                },
+            )
+        }
+
+        assertTrue(thrown === fatal)
+        assertFalse(quarantined)
+    }
+
+    @Test
+    fun durableAppendSurvivesReloadWithoutAForcedCheckpoint() {
+        val root = Files.createTempDirectory("masternote-submit-without-checkpoint").toFile()
+        try {
+            val store = PageOperationLogStore(root, checkpointInterval = 10_000)
+            val added = AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE))
+                .addStroke(stroke("student-device"))
+
+            store.append(added)
+
+            assertFalse(root.resolve("$BOOK_ID/pages/$PAGE/checkpoint.json").exists())
+            val reloaded = PageOperationLogStore(root, checkpointInterval = 10_000)
+                .loadPage(BOOK_ID, PAGE)
+            assertEquals(1L, reloaded.revision)
+            assertEquals(added.addedAssets.map(StrokeAsset::id).toSet(), reloaded.activeStrokeIds)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun pageIndexCacheIsBoundedAndAnEvictedPageRebuildsFromDurableLog() {
+        val root = Files.createTempDirectory("masternote-page-index-lru").toFile()
+        try {
+            val store = PageOperationLogStore(root, checkpointInterval = 10_000)
+            val firstPage = 0
+            val added = AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, firstPage))
+                .addStroke(stroke("student-device").copy(pageNumber = firstPage))
+            store.append(added)
+
+            (1..PageOperationLogStore.MAX_CACHED_PAGE_INDEXES).forEach { page ->
+                store.loadPage(BOOK_ID, page)
+            }
+
+            assertEquals(PageOperationLogStore.MAX_CACHED_PAGE_INDEXES, store.cachedPageIndexCount())
+            assertFalse(store.isPageIndexCached(BOOK_ID, firstPage))
+            val rebuilt = store.loadPage(BOOK_ID, firstPage)
+            assertEquals(1L, rebuilt.revision)
+            assertEquals(added.addedAssets.map(StrokeAsset::id).toSet(), rebuilt.activeStrokeIds)
+            assertEquals(PageOperationLogStore.MAX_CACHED_PAGE_INDEXES, store.cachedPageIndexCount())
+            assertTrue(store.isPageIndexCached(BOOK_ID, firstPage))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun localAppendSignalsExactlyOnceAfterItIsReadableFromTheStableRoot() {
         val root = Files.createTempDirectory("masternote-commit-local").toFile()
         try {
@@ -143,6 +239,89 @@ class PageOperationLogStoreTest {
     }
 
     @Test
+    fun syntheticCheckpointPreservesClockRevisionAndLaterLocalHistoryAcrossRestart() {
+        val sourceRoot = Files.createTempDirectory("masternote-synthetic-clock-source").toFile()
+        val targetRoot = Files.createTempDirectory("masternote-synthetic-clock-target").toFile()
+        try {
+            val source = PageOperationLogStore(sourceRoot)
+            val sourceDocument = AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE))
+            val sourceAdd = sourceDocument.addStroke(stroke("remote-student"))
+            source.append(sourceAdd)
+            val sourceErase = requireNotNull(
+                sourceDocument.erase(
+                    page = PAGE,
+                    path = sourceAdd.addedAssets.single().points,
+                    radius = 20f,
+                    wholeStroke = true,
+                    authorId = "student",
+                    attemptNo = 1,
+                    deviceId = "remote-student",
+                ),
+            )
+            assertTrue(sourceErase.addedAssets.isEmpty())
+            source.append(sourceErase)
+            val exported = source.exportStudentLayerCheckpoint(BOOK_ID, PAGE, "remote-student")
+            assertEquals(2L, exported.originDeviceHighWater)
+
+            val target = PageOperationLogStore(targetRoot, checkpointInterval = 10_000)
+            val targetDocument = AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE))
+            target.append(targetDocument.addStroke(stroke("local-device")))
+            val logBytesBeforeCheckpoint = target.operationLogFile(BOOK_ID, PAGE).length()
+
+            val applied = target.applyStudentLayerCheckpoint(
+                localBookId = BOOK_ID,
+                pageNumber = PAGE,
+                checkpointBytes = exported.copyCheckpointBytes(),
+                expectedResultLayerSha256 = exported.layerSha256,
+            )
+            assertEquals(2L, applied.snapshot.revision)
+            assertEquals(logBytesBeforeCheckpoint, target.operationLogFile(BOOK_ID, PAGE).length())
+            assertEquals(2L, target.loadPageState(BOOK_ID, PAGE).operationClockHighWater)
+            assertEquals(2L, target.maxOperationClock(BOOK_ID, PAGE, "student-layer-checkpoint"))
+
+            val restarted = PageOperationLogStore(targetRoot, checkpointInterval = 10_000)
+            val durable = restarted.loadPageState(BOOK_ID, PAGE)
+            assertEquals(applied.snapshot.revision, durable.snapshot.revision)
+            assertEquals(applied.snapshot.assets, durable.snapshot.assets)
+            assertEquals(applied.snapshot.activeStrokeIds, durable.snapshot.activeStrokeIds)
+            assertEquals(applied.snapshot.appliedOperationIds, durable.snapshot.appliedOperationIds)
+            assertEquals(2L, durable.operationClockHighWater)
+            assertEquals(2L, restarted.maxOperationClock(BOOK_ID, PAGE, "student-layer-checkpoint"))
+
+            val localDocument = AnnotationDocument(durable.snapshot, durable.operationClockHighWater)
+            val localAdd = localDocument.addStroke(
+                stroke("local-device").copy(authorId = "teacher", publishedAtEpochMillis = 100L),
+            )
+            assertEquals(3L, localAdd.operation.logicalClock)
+            restarted.append(localAdd)
+            val localUndo = requireNotNull(localDocument.undo("local-device"))
+            assertEquals(4L, localUndo.operation.logicalClock)
+            val afterUndo = restarted.append(localUndo)
+            assertEquals(4L, afterUndo.revision)
+
+            val localDelta = restarted.encodedOperationsAfter(
+                BOOK_ID,
+                PAGE,
+                "local-device",
+                1L,
+            )
+            assertEquals(listOf(3L, 4L), localDelta.map { restarted.operationCursor(it).logicalClock })
+
+            val secondRestart = PageOperationLogStore(targetRoot, checkpointInterval = 10_000)
+            val finalPage = secondRestart.loadPageState(BOOK_ID, PAGE)
+            assertEquals(afterUndo.revision, finalPage.snapshot.revision)
+            assertEquals(afterUndo.assets, finalPage.snapshot.assets)
+            assertEquals(afterUndo.activeStrokeIds, finalPage.snapshot.activeStrokeIds)
+            assertEquals(afterUndo.appliedOperationIds, finalPage.snapshot.appliedOperationIds)
+            assertEquals(4L, finalPage.operationClockHighWater)
+            assertEquals(4L, finalPage.snapshot.revision)
+        } finally {
+            sourceRoot.deleteRecursively()
+            targetRoot.deleteRecursively()
+        }
+    }
+
+    @Test
     fun redoOfUnpublishedTeacherDraftIsNotEligibleForSync() {
         val root = Files.createTempDirectory("masternote-draft-redo").toFile()
         try {
@@ -206,6 +385,7 @@ class PageOperationLogStoreTest {
             )
             target.append(oldStudent)
             target.append(teacher)
+            val logBytesBeforeRemoteCheckpoint = target.operationLogFile(localBookId, PAGE).length()
 
             val applied = target.applyStudentLayerCheckpoint(localBookId, PAGE, stableEncoding)
             val expectedStudentIds = setOf(
@@ -219,6 +399,12 @@ class PageOperationLogStoreTest {
             assertTrue(oldStudent.addedAssets.single().id !in applied.snapshot.activeStrokeIds)
             assertTrue(teacher.addedAssets.single().id in applied.snapshot.activeStrokeIds)
             assertEquals(teacher.addedAssets.single(), applied.snapshot.assets[teacher.addedAssets.single().id])
+            assertEquals(
+                "Remote full-layer payload must not be duplicated into operations.log",
+                logBytesBeforeRemoteCheckpoint,
+                target.operationLogFile(localBookId, PAGE).length(),
+            )
+            assertTrue(targetRoot.resolve("$localBookId/pages/$PAGE/checkpoint.json").isFile)
 
             val duplicate = target.applyStudentLayerCheckpoint(localBookId, PAGE, stableEncoding)
             assertFalse(duplicate.changed)
@@ -1023,6 +1209,8 @@ class PageOperationLogStoreTest {
                 .filter { it.authorId == "student" }
                 .mapTo(hashSetOf(), StrokeAsset::id))
             assertTrue(teacher.addedAssets.single().id in applied.snapshot.activeStrokeIds)
+            assertEquals(3L, target.loadPageState(BOOK_ID, PAGE).operationClockHighWater)
+            assertEquals(3L, target.maxOperationClock(BOOK_ID, PAGE, "student-layer-delta"))
 
             val replay = target.applyEncodedStudentDelta(
                 localBookId = BOOK_ID,
@@ -1040,6 +1228,8 @@ class PageOperationLogStoreTest {
             val reloaded = PageOperationLogStore(targetRoot)
             assertEquals(expectedDigest, reloaded.studentLayerSha256(BOOK_ID, PAGE))
             assertTrue(teacher.addedAssets.single().id in reloaded.loadPage(BOOK_ID, PAGE).activeStrokeIds)
+            assertEquals(3L, reloaded.loadPageState(BOOK_ID, PAGE).operationClockHighWater)
+            assertEquals(3L, reloaded.maxOperationClock(BOOK_ID, PAGE, "student-layer-delta"))
         } finally {
             sourceRoot.deleteRecursively()
             targetRoot.deleteRecursively()

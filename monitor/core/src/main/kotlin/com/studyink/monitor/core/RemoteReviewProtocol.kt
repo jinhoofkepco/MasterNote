@@ -37,6 +37,14 @@ object RemoteReviewLimits {
     const val MAX_PAGE_ANNOTATION_CHECKPOINT_BYTES: Int =
         TeacherReviewPublicationLimits.MAX_WIRE_PAYLOAD_BYTES
 
+    /**
+     * A complete student-page checkpoint may span several ordinary Telegram documents. Each
+     * fragment still obeys [MAX_PAGE_ANNOTATION_CHECKPOINT_BYTES], so no individual decode or
+     * transport allocation grows with a long-offline page.
+     */
+    const val MAX_PAGE_ANNOTATION_ASSEMBLED_BYTES: Int = 8 * 1024 * 1024
+    const val MAX_PAGE_ANNOTATION_CHUNKS: Int = 8
+
     const val MAX_PAGE_SYNC_MANIFEST_ENTRIES: Int = 4_096
     const val MAX_PAGE_SYNC_INVENTORY_PAGES: Int = 100_000
     // Checkpoints contain the complete active student layer, so silently truncating this list can

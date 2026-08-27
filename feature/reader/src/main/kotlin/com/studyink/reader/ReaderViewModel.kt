@@ -316,7 +316,10 @@ internal fun ReaderUiState.matchesRemotePage(bookId: String, pageNumber: Int): B
     this.bookId == bookId && this.pageNumber == pageNumber
 
 internal fun ReaderUiState.acceptsRemoteTeacherFeedback(event: RemoteTeacherFeedbackApplied): Boolean =
-    role == ReaderRole.STUDENT && matchesRemotePage(event.bookId, event.pageNumber)
+    role == ReaderRole.STUDENT &&
+        event.attemptNo != null &&
+        attemptNo == event.attemptNo &&
+        matchesRemotePage(event.bookId, event.pageNumber)
 
 internal fun ReaderUiState.shouldFollowRemoteStudentPage(
     bookId: String,
@@ -977,7 +980,10 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     if (!current.canMutateStudentAttempt(attempt.attemptNo)) return@withLock
                     val snapshot = document.snapshot()
                     if (snapshot.bookId != state.bookId || snapshot.pageNumber != state.pageNumber) return@withLock
-                    store.writeCheckpoint(snapshot)
+                    // Every accepted mutation was already appended and fsynced before it reached
+                    // this state. A checkpoint only accelerates a later load, so forcing a large
+                    // JSON checkpoint here can delay submission or exhaust the tablet heap without
+                    // adding durability.
                     library.lockAttempt(state.bookId, state.pageNumber, attempt.attemptNo)
                     submitted = true
                     val next = (state.pageNumber + 1).coerceAtMost(state.pageCount - 1)

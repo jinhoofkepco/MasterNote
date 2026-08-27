@@ -16,14 +16,24 @@ import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeId
 import com.studyink.core.model.StrokeTool
 import com.studyink.core.model.TeacherReviewPublicationLimits
+import com.google.gson.stream.JsonReader
+import com.google.gson.stream.JsonToken
+import com.google.gson.stream.JsonWriter
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedWriter
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.UUID
 
@@ -32,6 +42,16 @@ class CorruptAnnotationDataException(
     val quarantinedFile: File,
     cause: Throwable,
 ) : IOException(message, cause)
+
+/** Corruption is recoverable; VM failures must escape without moving otherwise valid user data. */
+internal inline fun <T> readAnnotationDataOrHandleCorruption(
+    read: () -> T,
+    onCorruption: (Exception) -> T,
+): T = try {
+    read()
+} catch (error: Exception) {
+    onCorruption(error)
+}
 
 data class OperationCursor(val deviceId: String, val logicalClock: Long)
 
@@ -42,6 +62,14 @@ data class PageOperationSyncStats(
     val originDeviceHighWater: Long,
     /** Includes erase-only mutations, which leave no active stroke timestamp behind. */
     val lastMutationEpochMillis: Long = 0L,
+)
+
+/** A defensive-copy operation batch which proves whether every matching record fit the budget. */
+data class BoundedEncodedOperationBatch(
+    val operations: List<ByteArray>,
+    val framedByteCount: Int,
+    val complete: Boolean,
+    val lastLogicalClock: Long?,
 )
 
 data class StudentLayerCheckpointApplyResult(
@@ -186,6 +214,11 @@ private data class PortableLayer(
     val sha256: String,
 )
 
+private data class DecodedPageCheckpoint(
+    val snapshot: AnnotationSnapshot,
+    val maximumClockByDevice: Map<String, Long>,
+)
+
 private data class FrozenTeacherReviewPublication(
     val intent: TeacherReviewPublishIntent,
     val checkpointBytes: ByteArray,
@@ -210,7 +243,20 @@ class PageOperationLogStore(
     checkpointInterval: Int = DEFAULT_CHECKPOINT_INTERVAL,
 ) {
     private val checkpointInterval = checkpointInterval.coerceAtLeast(1)
-    private val pageIndexes = mutableMapOf<PageKey, PageIndex>()
+    /**
+     * Page indexes contain the decoded checkpoint, every retained operation, and encoded copies
+     * used by delta sync. Keeping one for every page visited by a Telegram manifest can therefore
+     * retain hundreds of megabytes even though the durable files are already on disk.
+     *
+     * Access order keeps the pages used most recently hot. Eviction is safe because append and
+     * remote-apply paths fsync their operation before mutating the index; a miss rebuilds the same
+     * state from the checkpoint plus append log while this store's monitor is held.
+     */
+    private val pageIndexes = LinkedHashMap<PageKey, PageIndex>(
+        MAX_CACHED_PAGE_INDEXES + 1,
+        0.75f,
+        true,
+    )
     private val teacherReviewPublishIntents = linkedMapOf<TeacherReviewIntentKey, TeacherReviewPublishIntent>()
     /**
      * Bridges the tiny in-process race where the coordinator promotes and LAN acknowledges an
@@ -254,27 +300,40 @@ class PageOperationLogStore(
     private fun readPageIndex(bookId: String, pageNumber: Int): PageIndex {
         val directory = pageDirectory(bookId, pageNumber)
         val checkpointFile = File(directory, CHECKPOINT_FILE)
-        var snapshot = if (checkpointFile.exists()) {
-            decodeSafely(checkpointFile) { decodeSnapshot(JSONObject(it)) }
+        val checkpoint = if (checkpointFile.exists()) {
+            readCheckpointSafely(checkpointFile)
         } else {
-            AnnotationSnapshot.empty(bookId, pageNumber)
+            DecodedPageCheckpoint(
+                snapshot = AnnotationSnapshot.empty(bookId, pageNumber),
+                maximumClockByDevice = emptyMap(),
+            )
         }
+        var snapshot = checkpoint.snapshot
         validatePartition(snapshot, bookId, pageNumber)
 
         val records = mutableListOf<IndexedOperation>()
         val byDevice = mutableMapOf<String, MutableList<IndexedOperation>>()
-        val maximumClocks = mutableMapOf<String, Long>()
+        val maximumClocks = checkpoint.maximumClockByDevice.toMutableMap()
+        // Legacy checkpoints did not carry operation-only clocks. Asset clocks are still a safe
+        // lower bound and avoid needless replay when their original append log is unavailable.
+        snapshot.assets.values.forEach { asset ->
+            maximumClocks[asset.deviceId] = maxOf(
+                maximumClocks[asset.deviceId] ?: 0L,
+                asset.logicalClock,
+            )
+        }
         val logFile = File(directory, LOG_FILE)
         if (!logFile.exists()) return PageIndex(snapshot, records, byDevice, maximumClocks)
         try {
             logFile.bufferedReader(Charsets.UTF_8).useLines { lines ->
                 lines.forEachIndexed { index, line ->
                     if (line.isBlank()) return@forEachIndexed
-                    val record = try {
-                        decodeRecord(JSONObject(line))
-                    } catch (error: Throwable) {
-                        throw IOException("Invalid operation at line ${index + 1}", error)
-                    }
+                    val record = readAnnotationDataOrHandleCorruption(
+                        read = { decodeRecord(JSONObject(line)) },
+                        onCorruption = { error ->
+                            throw IOException("Invalid operation at line ${index + 1}", error)
+                        },
+                    )
                     require(record.bookId == bookId && record.pageNumber == pageNumber) {
                         "Operation partition identity mismatch"
                     }
@@ -291,9 +350,7 @@ class PageOperationLogStore(
                     }
                 }
             }
-        } catch (error: Throwable) {
-            quarantineAndThrow(logFile, error)
-        }
+        } catch (error: Exception) { quarantineAndThrow(logFile, error) }
         byDevice.values.forEach { operations -> operations.sortBy { it.record.operation.logicalClock } }
         validatePartition(snapshot, bookId, pageNumber)
         return PageIndex(snapshot, records, byDevice, maximumClocks)
@@ -336,7 +393,20 @@ class PageOperationLogStore(
     @Synchronized
     fun writeCheckpoint(snapshot: AnnotationSnapshot) {
         val directory = pageDirectory(snapshot.bookId, snapshot.pageNumber)
-        atomicWrite(File(directory, CHECKPOINT_FILE), encodeSnapshot(snapshot).toString())
+        val cached = pageIndexes[PageKey(snapshot.bookId, snapshot.pageNumber)]
+            ?.takeIf { it.snapshot === snapshot }
+        val maximumClocks = cached?.maximumClockByDevice.orEmpty().toMutableMap()
+        snapshot.assets.values.forEach { asset ->
+            maximumClocks[asset.deviceId] = maxOf(
+                maximumClocks[asset.deviceId] ?: 0L,
+                asset.logicalClock,
+            )
+        }
+        atomicWriteCheckpoint(
+            File(directory, CHECKPOINT_FILE),
+            snapshot,
+            maximumClocks,
+        )
     }
 
     /**
@@ -380,6 +450,45 @@ class PageOperationLogStore(
             .filter { includeTeacherDrafts || it.record.isPublishable(index.snapshot) }
             .map { it.encoded.copyOf() }
             .toList()
+    }
+
+    /**
+     * Copies at most one wire-sized prefix and stops at the first matching record that would exceed
+     * the caller's frame budget. Unlike [encodedOperationsAfter], a multi-megabyte offline log is
+     * never duplicated in full merely to discover that it cannot fit one delta document.
+     */
+    @Synchronized
+    fun encodedOperationsAfterBounded(
+        bookId: String,
+        pageNumber: Int,
+        originDeviceId: String,
+        logicalClock: Long,
+        maxFramedBytes: Int,
+        fixedFrameBytes: Int = 0,
+        perOperationFrameBytes: Int = 0,
+        includeTeacherDrafts: Boolean = true,
+    ): BoundedEncodedOperationBatch {
+        require(originDeviceId.isNotBlank()) { "Origin device id cannot be blank" }
+        require(logicalClock >= 0L) { "Operation clock cannot be negative" }
+        require(maxFramedBytes > 0 && fixedFrameBytes in 0..maxFramedBytes)
+        require(perOperationFrameBytes >= 0)
+        val index = pageIndex(bookId, pageNumber)
+        val records = index.byDevice[originDeviceId].orEmpty()
+        val start = records.firstIndexAfterClock(logicalClock)
+        val copied = ArrayList<ByteArray>()
+        var framedBytes = fixedFrameBytes
+        var lastClock: Long? = null
+        for (pending in records.subList(start, records.size)) {
+            if (!includeTeacherDrafts && !pending.record.isPublishable(index.snapshot)) continue
+            val nextSize = perOperationFrameBytes.toLong() + pending.encoded.size.toLong()
+            if (framedBytes.toLong() + nextSize > maxFramedBytes.toLong()) {
+                return BoundedEncodedOperationBatch(copied, framedBytes, false, lastClock)
+            }
+            copied += pending.encoded.copyOf()
+            framedBytes += nextSize.toInt()
+            lastClock = pending.record.operation.logicalClock
+        }
+        return BoundedEncodedOperationBatch(copied, framedBytes, true, lastClock)
     }
 
     /** Operations accepted by [appendEncodedStudentOperation], regardless of this device's old role. */
@@ -505,7 +614,7 @@ class PageOperationLogStore(
         expectedResultLayerSha256: String? = null,
         allowedAttemptNos: Collection<Int>? = null,
     ): StudentLayerCheckpointApplyResult {
-        val decoded = decodeStudentLayerCheckpoint(checkpointBytes.copyOf())
+        val decoded = decodeStudentLayerCheckpoint(checkpointBytes)
         require(decoded.sourcePageNumber == pageNumber) { "Student layer checkpoint page mismatch" }
         val index = pageIndex(localBookId, pageNumber)
         val current = index.snapshot
@@ -560,7 +669,10 @@ class PageOperationLogStore(
             operation = operation,
             addedAssets = decoded.assets,
         )
-        val updated = appendSyntheticRecord(index, record)
+        // The checkpoint is the atomic durable commit. Keeping a multi-MiB replacement as one
+        // operations.log row would duplicate it on disk and in every PageIndex reload; older rows
+        // remain untouched for delta history.
+        val updated = commitSyntheticCheckpoint(index, record)
         check(portableStudentLayer(updated).sha256 == incomingLayer.sha256) {
             "Student checkpoint replacement produced a different layer"
         }
@@ -868,7 +980,7 @@ class PageOperationLogStore(
             ),
             addedAssets = resultLayer.assets,
         )
-        val updated = appendSyntheticRecord(index, record)
+        val updated = commitSyntheticCheckpoint(index, record)
         check(portableStudentLayer(updated).sha256 == resultLayer.sha256) {
             "Student delta replacement produced a different layer"
         }
@@ -1211,7 +1323,13 @@ class PageOperationLogStore(
         originDeviceId: String?,
     ): StudentLayerCheckpointExport {
         val layer = portableStudentLayer(index.snapshot)
-        val highWater = layer.assets.maxOfOrNull(StrokeAsset::logicalClock) ?: 0L
+        val originHighWater = originDeviceId?.let { index.maximumClockByDevice[it] } ?: 0L
+        // Erase and undo operations may advance the origin clock without leaving an asset that can
+        // carry it. The exported checkpoint must still advance a receiver past that causal point.
+        val highWater = maxOf(
+            originHighWater,
+            layer.assets.maxOfOrNull(StrokeAsset::logicalClock) ?: 0L,
+        )
         require(highWater in 0 until Long.MAX_VALUE) { "Student layer checkpoint clock is invalid" }
         val body = encodeStudentLayerCheckpointBody(
             sourcePageNumber = pageNumber,
@@ -1220,8 +1338,7 @@ class PageOperationLogStore(
             activeStrokeIds = layer.activeStrokeIds,
         )
         val checkpointId = sha256(body.toString().toByteArray(StandardCharsets.UTF_8))
-        val encoded = JSONObject(body.toString())
-            .put("checkpointId", checkpointId)
+        val encoded = body.put("checkpointId", checkpointId)
             .toString()
             .toByteArray(StandardCharsets.UTF_8)
         require(encoded.size <= MAX_STUDENT_LAYER_CHECKPOINT_BYTES) {
@@ -1230,7 +1347,7 @@ class PageOperationLogStore(
         return StudentLayerCheckpointExport(
             checkpointBytes = encoded,
             layerSha256 = layer.sha256,
-            originDeviceHighWater = originDeviceId?.let { index.maximumClockByDevice[it] } ?: 0L,
+            originDeviceHighWater = originHighWater,
         )
     }
 
@@ -1340,6 +1457,37 @@ class PageOperationLogStore(
         index.add(record, encoded, updated)
         MasterNoteDataCommitBus.recordDurableCommit()
         if (updated.revision % checkpointInterval == 0L) writeCheckpoint(updated)
+        return updated
+    }
+
+    /**
+     * Commits a materialized remote-layer replacement without retaining its full assets a second
+     * time as an encoded operation. The checkpoint rename is atomic and fsynced; pre-existing log
+     * rows remain available for local-origin delta history and are ignored on reload because their
+     * revisions are at or below this snapshot.
+     */
+    private fun commitSyntheticCheckpoint(index: PageIndex, record: StoredOperationRecord): AnnotationSnapshot {
+        val current = index.snapshot
+        require(record.revision == current.revision + 1L) { "Synthetic operation revision is stale" }
+        val updated = apply(current, record)
+        val maximumClocks = index.maximumClockByDevice.toMutableMap().apply {
+            this[record.operation.deviceId] = maxOf(
+                this[record.operation.deviceId] ?: 0L,
+                record.operation.logicalClock,
+            )
+            updated.assets.values.forEach { asset ->
+                this[asset.deviceId] = maxOf(this[asset.deviceId] ?: 0L, asset.logicalClock)
+            }
+        }
+        atomicWriteCheckpoint(
+            File(pageDirectory(record.bookId, record.pageNumber), CHECKPOINT_FILE),
+            updated,
+            maximumClocks,
+        )
+        index.maximumClockByDevice.clear()
+        index.maximumClockByDevice.putAll(maximumClocks)
+        index.snapshot = updated
+        MasterNoteDataCommitBus.recordDurableCommit()
         return updated
     }
 
@@ -1820,8 +1968,29 @@ class PageOperationLogStore(
         file.renameTo(quarantined)
     }
 
-    private fun pageIndex(bookId: String, pageNumber: Int): PageIndex =
-        pageIndexes.getOrPut(PageKey(bookId, pageNumber)) { readPageIndex(bookId, pageNumber) }
+    @Synchronized
+    private fun pageIndex(bookId: String, pageNumber: Int): PageIndex {
+        val key = PageKey(bookId, pageNumber)
+        pageIndexes[key]?.let { return it }
+        // Drop the cold index before decoding another large page so the transient peak is bounded
+        // too; waiting until after the read would briefly retain one extra full page.
+        while (pageIndexes.size >= MAX_CACHED_PAGE_INDEXES) {
+            val eldest = pageIndexes.entries.iterator()
+            if (!eldest.hasNext()) break
+            eldest.next()
+            eldest.remove()
+        }
+        return readPageIndex(bookId, pageNumber).also { loaded ->
+            pageIndexes[key] = loaded
+        }
+    }
+
+    @Synchronized
+    internal fun cachedPageIndexCount(): Int = pageIndexes.size
+
+    @Synchronized
+    internal fun isPageIndexCached(bookId: String, pageNumber: Int): Boolean =
+        PageKey(bookId, pageNumber) in pageIndexes
 
     private fun pageDirectory(bookId: String, pageNumber: Int): File {
         require(pageNumber >= 0) { "Page number cannot be negative" }
@@ -2219,9 +2388,19 @@ class PageOperationLogStore(
         .decode(ByteBuffer.wrap(bytes))
         .toString()
 
-    private fun decodeSafely(file: File, decode: (String) -> AnnotationSnapshot): AnnotationSnapshot = try {
-        decode(file.readText(Charsets.UTF_8))
-    } catch (error: Throwable) {
+    private fun readCheckpointSafely(file: File): DecodedPageCheckpoint = try {
+        FileInputStream(file).use { input ->
+            JsonReader(InputStreamReader(input, StandardCharsets.UTF_8)).use { reader ->
+                readSnapshotJson(reader).also {
+                    require(reader.peek() == JsonToken.END_DOCUMENT) {
+                        "Unexpected data after annotation checkpoint"
+                    }
+                }
+            }
+        }
+    } catch (error: Exception) {
+        // A valid checkpoint must never be quarantined merely because the process exhausted its
+        // heap. Parse/IO failures are durable corruption; VM failures are not.
         quarantineAndThrow(file, error)
     }
 
@@ -2237,15 +2416,40 @@ class PageOperationLogStore(
         throw CorruptAnnotationDataException("손상된 필기 데이터를 격리했습니다.", quarantined, error)
     }
 
-    private fun atomicWrite(target: File, text: String) {
+    private fun atomicWriteCheckpoint(
+        target: File,
+        snapshot: AnnotationSnapshot,
+        maximumClockByDevice: Map<String, Long>,
+    ) {
         val temporary = File(target.parentFile, "${target.name}.tmp")
-        FileOutputStream(temporary, false).use { output ->
-            output.write(text.toByteArray(Charsets.UTF_8))
-            output.flush()
-            output.fd.sync()
+        try {
+            FileOutputStream(temporary, false).use { output ->
+                val buffered = BufferedWriter(OutputStreamWriter(output, StandardCharsets.UTF_8))
+                JsonWriter(buffered).use { writer ->
+                    writer.setSerializeNulls(true)
+                    writeSnapshotJson(writer, snapshot, maximumClockByDevice)
+                    writer.flush()
+                    output.fd.sync()
+                }
+            }
+            try {
+                Files.move(
+                    temporary.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(
+                    temporary.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+        } catch (error: Throwable) {
+            runCatching { Files.deleteIfExists(temporary.toPath()) }
+            throw error
         }
-        if (target.exists() && !target.delete()) throw IOException("Cannot replace checkpoint")
-        if (!temporary.renameTo(target)) throw IOException("Cannot commit checkpoint")
     }
 
     private data class StoredOperationRecord(
@@ -2375,27 +2579,286 @@ class PageOperationLogStore(
     private fun JSONObject.optionalString(name: String): String? =
         if (!has(name) || isNull(name)) null else getString(name)
 
-    private fun encodeSnapshot(snapshot: AnnotationSnapshot) = JSONObject()
-        .put("formatVersion", ANNOTATION_FORMAT_VERSION)
-        .put("bookId", snapshot.bookId)
-        .put("pageNumber", snapshot.pageNumber)
-        .put("revision", snapshot.revision)
-        .put("assets", JSONArray().apply { snapshot.assets.values.forEach { put(it.toJson()) } })
-        .put("activeStrokeIds", JSONArray().apply { snapshot.activeStrokeIds.forEach { put(it.value) } })
-        .put("appliedOperationIds", JSONArray().apply { snapshot.appliedOperationIds.forEach { put(it.value) } })
+    private fun writeSnapshotJson(
+        writer: JsonWriter,
+        snapshot: AnnotationSnapshot,
+        maximumClockByDevice: Map<String, Long>,
+    ) {
+        require(maximumClockByDevice.size <= MAX_CHECKPOINT_CLOCK_DEVICES) {
+            "Checkpoint contains too many operation clock origins"
+        }
+        writer.beginObject()
+        writer.name("formatVersion").value(ANNOTATION_FORMAT_VERSION.toLong())
+        writer.name("bookId").value(snapshot.bookId)
+        writer.name("pageNumber").value(snapshot.pageNumber.toLong())
+        writer.name("revision").value(snapshot.revision)
+        writer.name("operationClockHighWaterByDevice").beginObject()
+        maximumClockByDevice.toSortedMap().forEach { (deviceId, logicalClock) ->
+            require(deviceId.isNotBlank() && deviceId.length <= MAX_CHECKPOINT_IDENTIFIER_CHARS) {
+                "Checkpoint operation clock device id is invalid"
+            }
+            require(logicalClock in 0 until Long.MAX_VALUE) {
+                "Checkpoint operation clock is invalid"
+            }
+            writer.name(deviceId).value(logicalClock)
+        }
+        writer.endObject()
+        writer.name("assets").beginArray()
+        snapshot.assets.values.forEach { asset -> writeStrokeAssetJson(writer, asset) }
+        writer.endArray()
+        writer.name("activeStrokeIds").beginArray()
+        snapshot.activeStrokeIds.forEach { id -> writer.value(id.value) }
+        writer.endArray()
+        writer.name("appliedOperationIds").beginArray()
+        snapshot.appliedOperationIds.forEach { id -> writer.value(id.value) }
+        writer.endArray()
+        writer.endObject()
+    }
 
-    private fun decodeSnapshot(root: JSONObject): AnnotationSnapshot {
-        root.requireFormatVersion()
-        val assets = root.getJSONArray("assets").toStrokeAssets().associateBy { it.id }
-        return AnnotationSnapshot(
-            bookId = root.getString("bookId"),
-            pageNumber = root.getInt("pageNumber"),
-            revision = root.getLong("revision"),
-            assets = assets,
-            activeStrokeIds = root.getJSONArray("activeStrokeIds").toStrokeIds(),
-            appliedOperationIds = root.getJSONArray("appliedOperationIds").toOperationIds(),
+    private fun writeStrokeAssetJson(writer: JsonWriter, asset: StrokeAsset) {
+        writer.beginObject()
+        writer.name("id").value(asset.id.value)
+        writer.name("pageNumber").value(asset.pageNumber.toLong())
+        writer.name("tool").value(asset.tool.name)
+        writer.name("colorArgb").value(asset.colorArgb.toLong())
+        writer.name("width").value(asset.width.toDouble())
+        writer.name("authorId").value(asset.authorId)
+        writer.name("attemptNo").value(asset.attemptNo.toLong())
+        writer.name("logicalClock").value(asset.logicalClock)
+        writer.name("deviceId").value(asset.deviceId)
+        writer.name("itemId")
+        asset.itemId?.let(writer::value) ?: writer.nullValue()
+        writer.name("publishedAt")
+        asset.publishedAtEpochMillis?.let(writer::value) ?: writer.nullValue()
+        writer.name("points").beginArray()
+        asset.points.forEach { point ->
+            writer.beginArray()
+            writer.value(point.x.toDouble())
+            writer.value(point.y.toDouble())
+            writer.value(point.pressure.toDouble())
+            writer.endArray()
+        }
+        writer.endArray()
+        writer.name("bounds").beginArray()
+        writer.value(asset.bounds.left.toDouble())
+        writer.value(asset.bounds.top.toDouble())
+        writer.value(asset.bounds.right.toDouble())
+        writer.value(asset.bounds.bottom.toDouble())
+        writer.endArray()
+        writer.name("createdAtEpochMillis").value(asset.createdAtEpochMillis)
+        writer.name("parentStrokeId")
+        asset.parentStrokeId?.let { parent -> writer.value(parent.value) } ?: writer.nullValue()
+        writer.name("formatVersion").value(asset.formatVersion.toLong())
+        writer.endObject()
+    }
+
+    private fun readSnapshotJson(reader: JsonReader): DecodedPageCheckpoint {
+        var formatVersion: Int? = null
+        var bookId: String? = null
+        var pageNumber: Int? = null
+        var revision: Long? = null
+        var maximumClockByDevice: Map<String, Long> = emptyMap()
+        var assets: Map<StrokeId, StrokeAsset>? = null
+        var activeStrokeIds: Set<StrokeId>? = null
+        var appliedOperationIds: Set<OperationId>? = null
+
+        reader.beginObject()
+        while (reader.hasNext()) {
+            when (reader.nextName()) {
+                "formatVersion" -> formatVersion = reader.nextInt()
+                "bookId" -> bookId = reader.nextString()
+                "pageNumber" -> pageNumber = reader.nextInt()
+                "revision" -> revision = reader.nextLong()
+                "operationClockHighWaterByDevice" -> {
+                    maximumClockByDevice = readOperationClockHighWaterByDevice(reader)
+                }
+                "assets" -> assets = readStrokeAssetMap(reader)
+                "activeStrokeIds" -> activeStrokeIds = readStrokeIdSet(reader)
+                "appliedOperationIds" -> appliedOperationIds = readOperationIdSet(reader)
+                else -> reader.skipValue()
+            }
+        }
+        reader.endObject()
+
+        val version = requireNotNull(formatVersion) { "Checkpoint formatVersion is missing" }
+        require(version == ANNOTATION_FORMAT_VERSION) {
+            "Unsupported annotation format $version"
+        }
+        return DecodedPageCheckpoint(
+            snapshot = AnnotationSnapshot(
+                bookId = requireNotNull(bookId) { "Checkpoint bookId is missing" },
+                pageNumber = requireNotNull(pageNumber) { "Checkpoint pageNumber is missing" },
+                revision = requireNotNull(revision) { "Checkpoint revision is missing" },
+                assets = requireNotNull(assets) { "Checkpoint assets are missing" },
+                activeStrokeIds = requireNotNull(activeStrokeIds) {
+                    "Checkpoint activeStrokeIds are missing"
+                },
+                appliedOperationIds = requireNotNull(appliedOperationIds) {
+                    "Checkpoint appliedOperationIds are missing"
+                },
+            ),
+            maximumClockByDevice = maximumClockByDevice,
         )
     }
+
+    private fun readOperationClockHighWaterByDevice(reader: JsonReader): Map<String, Long> =
+        linkedMapOf<String, Long>().apply {
+            reader.beginObject()
+            while (reader.hasNext()) {
+                require(size < MAX_CHECKPOINT_CLOCK_DEVICES) {
+                    "Checkpoint contains too many operation clock origins"
+                }
+                val deviceId = reader.nextName()
+                require(deviceId.isNotBlank() && deviceId.length <= MAX_CHECKPOINT_IDENTIFIER_CHARS) {
+                    "Checkpoint operation clock device id is invalid"
+                }
+                val logicalClock = reader.nextLong()
+                require(logicalClock in 0 until Long.MAX_VALUE) {
+                    "Checkpoint operation clock is invalid"
+                }
+                require(put(deviceId, logicalClock) == null) {
+                    "Checkpoint contains duplicate operation clock origins"
+                }
+            }
+            reader.endObject()
+        }
+
+    private fun readStrokeAssetMap(reader: JsonReader): Map<StrokeId, StrokeAsset> =
+        linkedMapOf<StrokeId, StrokeAsset>().apply {
+            reader.beginArray()
+            while (reader.hasNext()) {
+                val asset = readStrokeAssetJson(reader)
+                put(asset.id, asset)
+            }
+            reader.endArray()
+        }
+
+    private fun readStrokeAssetJson(reader: JsonReader): StrokeAsset {
+        var id: String? = null
+        var pageNumber: Int? = null
+        var tool: String? = null
+        var colorArgb: Int? = null
+        var width: Float? = null
+        var points: List<PagePoint>? = null
+        var authorId: String? = null
+        var attemptNo: Int? = null
+        var logicalClock: Long? = null
+        var deviceId: String? = null
+        var itemId: String? = null
+        var publishedAtEpochMillis: Long? = null
+        var bounds: PageBounds? = null
+        var createdAtEpochMillis: Long? = null
+        var parentStrokeId: String? = null
+        var formatVersion: Int? = null
+
+        reader.beginObject()
+        while (reader.hasNext()) {
+            when (reader.nextName()) {
+                "id" -> id = reader.nextString()
+                "pageNumber" -> pageNumber = reader.nextInt()
+                "tool" -> tool = reader.nextString()
+                "colorArgb" -> colorArgb = reader.nextInt()
+                "width" -> width = reader.nextDouble().toFloat()
+                "points" -> points = readPagePoints(reader)
+                "authorId" -> authorId = reader.nextString()
+                "attemptNo" -> attemptNo = reader.nextInt()
+                "logicalClock" -> logicalClock = reader.nextLong()
+                "deviceId" -> deviceId = reader.nextString()
+                "itemId" -> itemId = reader.nextNullableString()
+                "publishedAt" -> publishedAtEpochMillis = reader.nextNullableLong()
+                "bounds" -> bounds = readPageBounds(reader)
+                "createdAtEpochMillis" -> createdAtEpochMillis = reader.nextLong()
+                "parentStrokeId" -> parentStrokeId = reader.nextNullableString()
+                "formatVersion" -> formatVersion = reader.nextInt()
+                else -> reader.skipValue()
+            }
+        }
+        reader.endObject()
+
+        val version = requireNotNull(formatVersion) { "Stroke formatVersion is missing" }
+        require(version == ANNOTATION_FORMAT_VERSION) { "Unsupported stroke format" }
+        return StrokeAsset(
+            id = StrokeId(requireNotNull(id) { "Stroke id is missing" }),
+            pageNumber = requireNotNull(pageNumber) { "Stroke pageNumber is missing" },
+            tool = StrokeTool.valueOf(requireNotNull(tool) { "Stroke tool is missing" }),
+            colorArgb = requireNotNull(colorArgb) { "Stroke colorArgb is missing" },
+            width = requireNotNull(width) { "Stroke width is missing" },
+            points = requireNotNull(points) { "Stroke points are missing" },
+            authorId = requireNotNull(authorId) { "Stroke authorId is missing" },
+            attemptNo = requireNotNull(attemptNo) { "Stroke attemptNo is missing" },
+            logicalClock = requireNotNull(logicalClock) { "Stroke logicalClock is missing" },
+            deviceId = requireNotNull(deviceId) { "Stroke deviceId is missing" },
+            itemId = itemId?.takeIf { it.isNotBlank() && it != "null" },
+            publishedAtEpochMillis = publishedAtEpochMillis,
+            bounds = requireNotNull(bounds) { "Stroke bounds are missing" },
+            createdAtEpochMillis = requireNotNull(createdAtEpochMillis) {
+                "Stroke createdAtEpochMillis is missing"
+            },
+            parentStrokeId = parentStrokeId
+                ?.takeIf { it.isNotBlank() && it != "null" }
+                ?.let(::StrokeId),
+            formatVersion = version,
+        )
+    }
+
+    private fun readPagePoints(reader: JsonReader): List<PagePoint> = buildList {
+        reader.beginArray()
+        while (reader.hasNext()) {
+            reader.beginArray()
+            require(reader.hasNext()) { "Stroke point x is missing" }
+            val x = reader.nextDouble().toFloat()
+            require(reader.hasNext()) { "Stroke point y is missing" }
+            val y = reader.nextDouble().toFloat()
+            val pressure = if (reader.hasNext()) reader.nextDouble().toFloat() else 1f
+            while (reader.hasNext()) reader.skipValue()
+            reader.endArray()
+            add(PagePoint(x, y, pressure))
+        }
+        reader.endArray()
+    }
+
+    private fun readPageBounds(reader: JsonReader): PageBounds {
+        reader.beginArray()
+        require(reader.hasNext()) { "Stroke bound left is missing" }
+        val left = reader.nextDouble().toFloat()
+        require(reader.hasNext()) { "Stroke bound top is missing" }
+        val top = reader.nextDouble().toFloat()
+        require(reader.hasNext()) { "Stroke bound right is missing" }
+        val right = reader.nextDouble().toFloat()
+        require(reader.hasNext()) { "Stroke bound bottom is missing" }
+        val bottom = reader.nextDouble().toFloat()
+        while (reader.hasNext()) reader.skipValue()
+        reader.endArray()
+        return PageBounds(left, top, right, bottom)
+    }
+
+    private fun readStrokeIdSet(reader: JsonReader): Set<StrokeId> = buildSet {
+        reader.beginArray()
+        while (reader.hasNext()) add(StrokeId(reader.nextString()))
+        reader.endArray()
+    }
+
+    private fun readOperationIdSet(reader: JsonReader): Set<OperationId> = buildSet {
+        reader.beginArray()
+        while (reader.hasNext()) add(OperationId(reader.nextString()))
+        reader.endArray()
+    }
+
+    private fun JsonReader.nextNullableString(): String? =
+        if (peek() == JsonToken.NULL) {
+            nextNull()
+            null
+        } else {
+            nextString()
+        }
+
+    private fun JsonReader.nextNullableLong(): Long? =
+        if (peek() == JsonToken.NULL) {
+            nextNull()
+            null
+        } else {
+            nextLong()
+        }
 
     private fun JSONObject.requireFormatVersion() {
         val version = getInt("formatVersion")
@@ -2494,7 +2957,8 @@ class PageOperationLogStore(
     }
 
     companion object {
-        const val MAX_STUDENT_LAYER_CHECKPOINT_BYTES = 2 * 1024 * 1024 - 32 * 1024
+        /** Complete checkpoints are fragmented into ordinary <=2 MiB transport documents. */
+        const val MAX_STUDENT_LAYER_CHECKPOINT_BYTES = 8 * 1024 * 1024
         const val MAX_PUBLISHED_TEACHER_LAYER_CHECKPOINT_BYTES = 2 * 1024 * 1024 - 32 * 1024
         const val MAX_TEACHER_REVIEW_MARK_GROUP_BYTES = 512 * 1024
 
@@ -2532,6 +2996,7 @@ class PageOperationLogStore(
         }
 
         private const val DEFAULT_CHECKPOINT_INTERVAL = 64
+        internal const val MAX_CACHED_PAGE_INDEXES = 3
         private const val CHECKPOINT_FILE = "checkpoint.json"
         private const val LOG_FILE = "operations.log"
         private const val MAX_ENCODED_OPERATION_BYTES = 512 * 1024
@@ -2557,9 +3022,10 @@ class PageOperationLogStore(
         private const val MAX_PUBLISHED_TEACHER_LAYER_CHECKPOINT_TOTAL_POINTS = 120_000L
         private const val MAX_CHECKPOINT_IDENTIFIER_CHARS = 256
         private const val MAX_CHECKPOINT_ITEM_ID_CHARS = 1_024
+        private const val MAX_CHECKPOINT_CLOCK_DEVICES = 4_096
         private const val MAX_STUDENT_DELTA_OPERATIONS = 8_192
         private const val MAX_STUDENT_DELTA_ATTEMPTS = 512
-        private const val MAX_ATOMIC_STUDENT_DELTA_BYTES = MAX_STUDENT_LAYER_CHECKPOINT_BYTES
+        private const val MAX_ATOMIC_STUDENT_DELTA_BYTES = 2 * 1024 * 1024 - 32 * 1024
         private const val TEACHER_REVIEW_PUBLISH_INTENTS_FILE = "teacher-review-publish-intents.json"
         private const val TEACHER_REVIEW_PUBLISH_INTENT_JOURNAL_VERSION = 3
         private const val TEACHER_REVIEW_PUBLICATION_ARTIFACTS_DIRECTORY =

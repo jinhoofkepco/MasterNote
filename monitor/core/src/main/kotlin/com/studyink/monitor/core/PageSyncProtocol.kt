@@ -211,13 +211,22 @@ class PageAnnotationEnvelope(
     payloadBytes: ByteArray,
     val payloadSha256: String,
     val resultLayerSha256: String,
+    chunkGroupId: String? = null,
+    val chunkIndex: Int = 0,
+    val chunkCount: Int = 1,
+    assembledPayloadSizeBytes: Int? = null,
+    chunkSha256: String? = null,
 ) : RemoteReviewEnvelope {
     override val type: RemoteReviewEnvelopeType = RemoteReviewEnvelopeType.PAGE_ANNOTATION
 
     val attemptNos: List<Int> = immutableListCopy(attemptNos)
     private val immutablePayloadBytes: ByteArray = payloadBytes.copyOf()
+    val chunkGroupId: String = chunkGroupId ?: transferId
+    val assembledPayloadSizeBytes: Int
+    val chunkSha256: String = chunkSha256 ?: payloadSha256
 
     val payloadSizeBytes: Int get() = immutablePayloadBytes.size
+    val chunked: Boolean get() = chunkCount > 1
 
     fun copyPayloadBytes(): ByteArray = immutablePayloadBytes.copyOf()
 
@@ -294,6 +303,20 @@ class PageAnnotationEnvelope(
         }
         validateSha256Hex(payloadSha256, "payloadSha256")
         validateSha256Hex(resultLayerSha256, "resultLayerSha256")
+        validateOpaqueToken(this.chunkGroupId, "chunkGroupId")
+        checkProtocol(chunkCount in 1..RemoteReviewLimits.MAX_PAGE_ANNOTATION_CHUNKS, "chunkCount") {
+            "must be between 1 and ${RemoteReviewLimits.MAX_PAGE_ANNOTATION_CHUNKS}"
+        }
+        checkProtocol(chunkIndex in 0 until chunkCount, "chunkIndex") {
+            "must address one fragment in chunkCount"
+        }
+        checkProtocol(!chunked || purpose == PageAnnotationPurpose.STUDENT_PAGE, "chunkCount") {
+            "teacher review checkpoints cannot be fragmented"
+        }
+        checkProtocol(!chunked || kind == PageAnnotationKind.CHECKPOINT, "kind") {
+            "only checkpoints may be fragmented"
+        }
+        validateSha256Hex(this.chunkSha256, "chunkSha256")
 
         val decodedPayload = decodePageAnnotationPayload(
             compression = compression,
@@ -303,13 +326,36 @@ class PageAnnotationEnvelope(
         checkProtocol(decodedPayload.isNotEmpty(), "payloadBytes") {
             "decoded payload must not be empty"
         }
+        val resolvedAssembledSize = assembledPayloadSizeBytes ?: decodedPayload.size
+        this.assembledPayloadSizeBytes = resolvedAssembledSize
+        checkProtocol(
+            resolvedAssembledSize in decodedPayload.size..RemoteReviewLimits.MAX_PAGE_ANNOTATION_ASSEMBLED_BYTES,
+            "assembledPayloadSizeBytes",
+        ) {
+            "must contain this fragment and not exceed " +
+                "${RemoteReviewLimits.MAX_PAGE_ANNOTATION_ASSEMBLED_BYTES} bytes"
+        }
+        checkProtocol(!chunked || resolvedAssembledSize > decodedPayload.size, "assembledPayloadSizeBytes") {
+            "a fragmented payload must be larger than one fragment"
+        }
         checkProtocol(
             MessageDigest.isEqual(
-                payloadSha256.toByteArray(Charsets.US_ASCII),
+                this.chunkSha256.toByteArray(Charsets.US_ASCII),
                 pageAnnotationSha256Hex(decodedPayload).toByteArray(Charsets.US_ASCII),
             ),
-            "payloadSha256",
-        ) { "does not match the decoded payload" }
+            if (chunked) "chunkSha256" else "payloadSha256",
+        ) { "does not match the decoded fragment" }
+        if (!chunked) {
+            checkProtocol(this.chunkGroupId == transferId, "chunkGroupId") {
+                "must equal transferId for an unfragmented annotation"
+            }
+            checkProtocol(resolvedAssembledSize == decodedPayload.size, "assembledPayloadSizeBytes") {
+                "must equal the decoded payload size for an unfragmented annotation"
+            }
+            checkProtocol(payloadSha256 == this.chunkSha256, "payloadSha256") {
+                "must equal chunkSha256 for an unfragmented annotation"
+            }
+        }
     }
 
     companion object {
@@ -332,6 +378,11 @@ class PageAnnotationEnvelope(
             compression: PageAnnotationCompression,
             decodedPayloadBytes: ByteArray,
             resultLayerSha256: String,
+            chunkGroupId: String = transferId,
+            chunkIndex: Int = 0,
+            chunkCount: Int = 1,
+            assembledPayloadSizeBytes: Int = decodedPayloadBytes.size,
+            assembledPayloadSha256: String = pageAnnotationSha256Hex(decodedPayloadBytes),
         ): PageAnnotationEnvelope {
             checkProtocol(decodedPayloadBytes.isNotEmpty(), "payloadBytes") { "must not be empty" }
             checkProtocol(decodedPayloadBytes.size <= kind.maxPayloadBytes(), "payloadBytes") {
@@ -360,8 +411,13 @@ class PageAnnotationEnvelope(
                 sourceOriginCursor = sourceOriginCursor,
                 compression = compression,
                 payloadBytes = wirePayload,
-                payloadSha256 = pageAnnotationSha256Hex(canonicalPayload),
+                payloadSha256 = assembledPayloadSha256,
                 resultLayerSha256 = resultLayerSha256,
+                chunkGroupId = chunkGroupId,
+                chunkIndex = chunkIndex,
+                chunkCount = chunkCount,
+                assembledPayloadSizeBytes = assembledPayloadSizeBytes,
+                chunkSha256 = pageAnnotationSha256Hex(canonicalPayload),
             )
         }
     }

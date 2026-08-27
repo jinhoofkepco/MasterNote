@@ -19,6 +19,9 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.studyink.document.pdf.PdfViewportAdapter
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import kotlin.math.max
 
 internal object RemoteFeedbackPainter {
@@ -88,6 +91,10 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
     private var maxGestureTravelPixels = 0f
     private val gesturePoints = mutableListOf<RemoteNormalizedPoint>()
     private val gradeTapSlopPixels = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+    private var eraseExecutor: ExecutorService? = null
+    private var eraseFuture: Future<*>? = null
+    private var eraseWorkGeneration = 0L
+    private var eraseInProgress = false
 
     var selectedTool: RemoteReviewTool = RemoteReviewTool.PEN
         set(value) { field = value; invalidate() }
@@ -118,6 +125,10 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
     ): RemoteSnapshotOpenResult {
         val result = editor.openSnapshot(snapshot, initialFeedback, discardUnpublishedChanges)
         if (result == RemoteSnapshotOpenResult.OPENED || result == RemoteSnapshotOpenResult.ALREADY_OPEN) {
+            if (result == RemoteSnapshotOpenResult.OPENED) {
+                invalidatePendingErase()
+                cancelGesture()
+            }
             pageBitmap = bitmap
             invalidate()
             publishState()
@@ -128,6 +139,7 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
     fun clearSnapshot(discardUnpublishedChanges: Boolean = false): Boolean {
         val cleared = editor.clearSnapshot(discardUnpublishedChanges)
         if (cleared) {
+            invalidatePendingErase()
             cancelGesture()
             pageBitmap = null
             invalidate()
@@ -136,10 +148,13 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
         return cleared
     }
 
-    fun undo(): Boolean = editor.undo().also { changed ->
-        if (changed) {
-            invalidate()
-            publishState()
+    fun undo(): Boolean {
+        invalidatePendingErase()
+        return editor.undo().also { changed ->
+            if (changed) {
+                invalidate()
+                publishState()
+            }
         }
     }
 
@@ -164,6 +179,8 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (!isEnabled || editor.state.snapshot == null) return false
+        // A second gesture cannot race a whole-trace erase computed from the preceding revision.
+        if (eraseInProgress) return true
         val actionIndex = event.actionIndex.coerceIn(0, event.pointerCount - 1)
         val stylus = event.getToolType(actionIndex) == MotionEvent.TOOL_TYPE_STYLUS ||
             event.getToolType(actionIndex) == MotionEvent.TOOL_TYPE_ERASER
@@ -184,7 +201,7 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
                 maxGestureTravelPixels = 0f
                 gesturePoints.clear()
                 gesturePoints += point.copy(pressure = event.pressure.coerceIn(0f, 1f))
-                parent.requestDisallowInterceptTouchEvent(true)
+                parent?.requestDisallowInterceptTouchEvent(true)
                 invalidate()
                 return true
             }
@@ -260,6 +277,11 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
         } else {
             null
         }
+        val erasePlan = if (completedTool == RemoteReviewTool.ERASER) {
+            editor.prepareErase(gesturePoints, eraserRadiusFraction)
+        } else {
+            null
+        }
         when (completedTool) {
             RemoteReviewTool.PEN -> editor.addStroke(
                 tool = RemoteFeedbackStrokeTool.PEN,
@@ -273,14 +295,75 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
                 widthFraction = highlighterWidthFraction,
                 points = gesturePoints,
             )
-            // Erase calculation deliberately runs once, only after ACTION_UP.
-            RemoteReviewTool.ERASER -> editor.erase(gesturePoints, eraserRadiusFraction)
+            // Erase calculation is scheduled below, only after ACTION_UP and preview cleanup.
+            RemoteReviewTool.ERASER -> Unit
             // Grade selection is a host action, never an edit to the correction stroke layer.
             RemoteReviewTool.GRADE -> Unit
         }
         cancelGesture()
-        if (completedTool != RemoteReviewTool.GRADE) publishState()
+        if (erasePlan != null) {
+            scheduleErase(erasePlan)
+        } else if (completedTool != RemoteReviewTool.GRADE) {
+            publishState()
+        }
         gradeTap?.let(onGradeTap)
+    }
+
+    private fun scheduleErase(plan: RemoteReviewErasePlan) {
+        invalidatePendingErase()
+        eraseInProgress = true
+        val generation = eraseWorkGeneration
+        try {
+            eraseFuture = eraseExecutor().submit {
+                val resolution = resolveRemoteEraseWork(resolve = { editor.resolveErase(plan) })
+                post complete@{
+                    if (
+                        generation != eraseWorkGeneration ||
+                        !eraseInProgress
+                    ) return@complete
+                    eraseFuture = null
+                    eraseInProgress = false
+                    if (!isAttachedToWindow) return@complete
+                    val candidates = (resolution as? RemoteEraseResolution.Success)
+                        ?.candidateStrokeIds
+                        ?: return@complete
+                    val removed = editor.commitErase(plan, candidates)
+                    invalidate()
+                    if (removed.isNotEmpty()) publishState()
+                }
+            }
+        } catch (_: Throwable) {
+            // submit/executor creation can itself fail (including resource/OOM failures). This
+            // path is already on the main thread, so release only this generation's busy state.
+            if (generation == eraseWorkGeneration) {
+                eraseFuture = null
+                eraseInProgress = false
+                invalidate()
+            }
+        }
+    }
+
+    private fun eraseExecutor(): ExecutorService {
+        val existing = eraseExecutor
+        if (existing != null && !existing.isShutdown) return existing
+        return Executors.newSingleThreadExecutor { task ->
+            Thread(task, ERASER_THREAD_NAME).apply {
+                isDaemon = true
+                priority = (Thread.NORM_PRIORITY - 1).coerceAtLeast(Thread.MIN_PRIORITY)
+            }
+        }.also { eraseExecutor = it }
+    }
+
+    /** Cancels queued work and makes any already-posted completion stale. */
+    private fun invalidatePendingErase(shutdownExecutor: Boolean = false) {
+        eraseWorkGeneration = if (eraseWorkGeneration == Long.MAX_VALUE) 1L else eraseWorkGeneration + 1L
+        eraseFuture?.cancel(true)
+        eraseFuture = null
+        eraseInProgress = false
+        if (shutdownExecutor) {
+            eraseExecutor?.shutdownNow()
+            eraseExecutor = null
+        }
     }
 
     private fun cancelGesture() {
@@ -288,7 +371,7 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
         activeGestureSnapshot = null
         maxGestureTravelPixels = 0f
         gesturePoints.clear()
-        parent.requestDisallowInterceptTouchEvent(false)
+        parent?.requestDisallowInterceptTouchEvent(false)
         invalidate()
     }
 
@@ -341,11 +424,38 @@ class RemoteReviewCanvasView @JvmOverloads constructor(
 
     private fun publishState() = onStateChanged(editor.state)
 
+    override fun onDetachedFromWindow() {
+        invalidatePendingErase(shutdownExecutor = true)
+        cancelGesture()
+        super.onDetachedFromWindow()
+    }
+
     private companion object {
         const val NO_POINTER = -1
         const val POINT_EPSILON = 0.00005f
+        const val ERASER_THREAD_NAME = "remote-review-eraser"
         const val DEFAULT_TEACHER_PEN_COLOR = 0xFFD94747.toInt()
         const val DEFAULT_HIGHLIGHTER_COLOR = 0x66FFE45C
+    }
+}
+
+internal sealed interface RemoteEraseResolution {
+    data class Success(val candidateStrokeIds: Set<String>) : RemoteEraseResolution
+    data object Failed : RemoteEraseResolution
+}
+
+/** Contains worker failures/interrupts so every accepted erase can post a main-thread cleanup. */
+internal fun resolveRemoteEraseWork(
+    resolve: () -> Set<String>,
+    isInterrupted: () -> Boolean = { Thread.currentThread().isInterrupted },
+): RemoteEraseResolution {
+    if (isInterrupted()) return RemoteEraseResolution.Failed
+    return try {
+        val candidates = resolve()
+        if (isInterrupted()) RemoteEraseResolution.Failed
+        else RemoteEraseResolution.Success(candidates)
+    } catch (_: Throwable) {
+        RemoteEraseResolution.Failed
     }
 }
 

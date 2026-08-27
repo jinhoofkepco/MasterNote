@@ -24,20 +24,27 @@ class TelegramPeerDocumentInbox(
         cleanupOrphans()
     }
 
-    @Synchronized
     fun offer(entry: PendingTelegramPeerDocument): Boolean {
-        validate(entry)
-        if (entry.updateId in pending || entry.transferId in completedTransfers ||
-            pending.values.any { it.transferId == entry.transferId }
-        ) {
-            deleteOwned(entry.file)
-            return false
+        val subscribers: List<(PendingTelegramPeerDocument) -> Unit>
+        synchronized(this) {
+            validate(entry)
+            if (entry.updateId in pending || entry.transferId in completedTransfers ||
+                pending.values.any { it.transferId == entry.transferId }
+            ) {
+                deleteOwned(entry.file)
+                return false
+            }
+            check(pending.size < maxPendingEntries) { "Remote-review inbox is full." }
+            append(encodePut(entry))
+            pending[entry.updateId] = entry
+            // PUT is already fsynced. Compaction is only bounded-journal maintenance and a failure
+            // here must not make the caller delete the payload referenced by that durable PUT.
+            runCatching { compactIfNeeded() }
+            subscribers = listeners.toList()
         }
-        check(pending.size < maxPendingEntries) { "Remote-review inbox is full." }
-        append(encodePut(entry))
-        pending[entry.updateId] = entry
-        compactIfNeeded()
-        listeners.toList().forEach { it(entry) }
+        // A UI/controller listener is not part of the storage transaction. Notify outside the
+        // monitor and isolate failures so a healthy subscriber can still observe the same entry.
+        subscribers.forEach { listener -> runCatching { listener(entry) } }
         return true
     }
 
@@ -225,6 +232,38 @@ class TelegramPeerReceiptStore(private val journal: File) {
         return receipt
     }
 
+    /**
+     * Durably separates "upload accepted by Telegram" from the later authenticated peer ACK.
+     * Once this marker exists the outbox processor may retain bookkeeping for 24 hours, but it
+     * must never upload the same transfer again.
+     */
+    @Synchronized
+    fun recordServerAccepted(
+        transferId: String,
+        telegramMessageId: Long?,
+        acceptedAtEpochMs: Long,
+    ): TelegramDeliveryReceipt? {
+        require(acceptedAtEpochMs >= 0L)
+        val current = receipts[transferId] ?: return null
+        if (current.serverAcceptedAtEpochMs != null) return current
+        append(
+            listOf(
+                VERSION,
+                "ACCEPTED",
+                encode(transferId),
+                telegramMessageId?.toString().orEmpty(),
+                acceptedAtEpochMs.toString(),
+            ).joinToString("\t"),
+        )
+        val accepted = current.copy(
+            telegramMessageId = telegramMessageId ?: current.telegramMessageId,
+            serverAcceptedAtEpochMs = acceptedAtEpochMs,
+        )
+        receipts[transferId] = accepted
+        compactIfNeeded()
+        return accepted
+    }
+
     @Synchronized
     fun recordAcknowledged(transferId: String, messageId: Long?, acknowledgedAtEpochMs: Long): Boolean {
         val current = receipts[transferId] ?: return false
@@ -253,6 +292,17 @@ class TelegramPeerReceiptStore(private val journal: File) {
                         receipts[transfer] = TelegramDeliveryReceipt(
                             transfer, decode(f[3]), f[4].takeIf(String::isNotBlank)?.toLong(), f[5].toLong(),
                         )
+                    }
+                    "ACCEPTED" -> if (f.size == 5) {
+                        val transfer = decode(f[2])
+                        val acceptedAt = f[4].toLong().also { require(it >= 0L) }
+                        receipts[transfer]?.let { current ->
+                            receipts[transfer] = current.copy(
+                                telegramMessageId = f[3].takeIf(String::isNotBlank)?.toLong()
+                                    ?: current.telegramMessageId,
+                                serverAcceptedAtEpochMs = acceptedAt,
+                            )
+                        }
                     }
                     "ACK" -> if (f.size == 5) {
                         val transfer = decode(f[2])
@@ -293,6 +343,17 @@ class TelegramPeerReceiptStore(private val journal: File) {
                         receipt.sentAtEpochMs.toString(),
                     ).joinToString("\t"),
                 ).append('\n')
+                receipt.serverAcceptedAtEpochMs?.let { at ->
+                    append(
+                        listOf(
+                            VERSION,
+                            "ACCEPTED",
+                            encode(receipt.transferId),
+                            receipt.telegramMessageId?.toString().orEmpty(),
+                            at.toString(),
+                        ).joinToString("\t"),
+                    ).append('\n')
+                }
                 receipt.acknowledgedAtEpochMs?.let { at ->
                     append(
                         listOf(
@@ -307,7 +368,9 @@ class TelegramPeerReceiptStore(private val journal: File) {
             }
         }
         AtomicDiskFile.writeText(journal, text)
-        appendedRecords = receipts.size + receipts.values.count { it.acknowledgedAtEpochMs != null }
+        appendedRecords = receipts.size +
+            receipts.values.count { it.serverAcceptedAtEpochMs != null } +
+            receipts.values.count { it.acknowledgedAtEpochMs != null }
     }
     private fun encode(value: String) = Base64.getUrlEncoder().withoutPadding().encodeToString(value.toByteArray())
     private fun decode(value: String) = Base64.getUrlDecoder().decode(value).toString(StandardCharsets.UTF_8)

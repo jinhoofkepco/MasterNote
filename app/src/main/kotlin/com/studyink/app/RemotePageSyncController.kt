@@ -54,6 +54,33 @@ internal enum class RemotePageSyncIncomingResult {
 /** Durable transport state as seen through the Telegram gateway journals. */
 internal enum class RemotePageSyncOutboundState { NONE, PENDING, SENT, ACKNOWLEDGED, FAILED }
 
+internal data class StudentAnnotationResponse(
+    /** Semantic identity acknowledged only after every fragment was durably assembled and applied. */
+    val groupTransferId: String,
+    val envelopes: List<PageAnnotationEnvelope>,
+) {
+    init {
+        require(envelopes.isNotEmpty() && envelopes.all { it.chunkGroupId == groupTransferId })
+    }
+}
+
+private data class StudentInventoryPage(
+    val pairId: String,
+    val syncGeneration: Long,
+    val bookId: String,
+    val pageNumber: Int,
+) {
+    val key: String get() = "$syncGeneration:$bookId:$pageNumber"
+}
+
+private data class StudentInventoryBook(
+    val pairId: String,
+    val syncGeneration: Long,
+    val bookId: String,
+) {
+    val key: String get() = "$syncGeneration:$bookId"
+}
+
 /**
  * Serial, page-scoped slow-live synchronization. It intentionally allows only one student-page
  * request at a time; current/recent pages are automatic and every older page is explicit UI work.
@@ -80,7 +107,18 @@ internal class RemotePageSyncController(
     private var lastManifestSentAtElapsedMs: Long? = null
     /** Remaining bounded manifest windows in the current inventory advertisement cycle. */
     private var manifestBatchesRemaining = 0
+    /** Inventory/page state changed after the currently outstanding manifest was frozen. */
+    private var manifestChangedSinceReservation = false
     private val seededStudentBooks = linkedSetOf<String>()
+    private val discoveredStudentBooks = linkedSetOf<String>()
+    private val expectedStudentInventoryPages = linkedMapOf<String, LinkedHashSet<Int>>()
+    private val queuedStudentInventoryBooks = ArrayDeque<StudentInventoryBook>()
+    private val queuedStudentInventoryBookKeys = linkedSetOf<String>()
+    private val failedStudentInventoryBooks = linkedMapOf<String, Long>()
+    private val queuedStudentInventoryPages = ArrayDeque<StudentInventoryPage>()
+    private val queuedStudentInventoryKeys = linkedSetOf<String>()
+    private val failedStudentInventoryPages = linkedMapOf<String, Long>()
+    private val failedStudentInventoryPageTargets = linkedMapOf<String, StudentInventoryPage>()
     private var manualRunning = false
     private var intervalSeconds = DEFAULT_REMOTE_PAGE_SYNC_INTERVAL_SECONDS
     private var requestCooldownUntilElapsedMs = 0L
@@ -107,7 +145,8 @@ internal class RemotePageSyncController(
         manifestDueAtElapsedMs = Long.MAX_VALUE
         lastManifestSentAtElapsedMs = null
         manifestBatchesRemaining = 0
-        seededStudentBooks.clear()
+        manifestChangedSinceReservation = false
+        clearStudentInventoryScan()
         manualRunning = false
         requestCooldownUntilElapsedMs = 0L
         lastRequestedPageToken = null
@@ -116,9 +155,9 @@ internal class RemotePageSyncController(
         failedTeacherReviewKeys.clear()
         nextTeacherReviewSendAtElapsedMs = 0L
         if (next?.role == RemoteReviewRole.STUDENT && telegramActive) {
-            seedAllStudentBooks()
+            scheduleAllStudentBooks()
             manifestDueAtElapsedMs = nowElapsedMs()
-            manifestBatchesRemaining = requiredManifestBatchCount(store.studentPages().size)
+            manifestBatchesRemaining = requiredManifestBatchCount(expectedStudentInventoryPageCount())
         }
         RemoteStudentCursorBus.clear(RemoteStudentCursorTransport.TELEGRAM)
         notifyUiChanged()
@@ -135,18 +174,19 @@ internal class RemotePageSyncController(
                 if (active) {
                     store.beginStudentGeneration()
                     if (enteredFallback) {
-                        seededStudentBooks.clear()
+                        clearStudentInventoryScan()
                         currentPresence?.takeIf(StudentStudyPresence::active)?.let { presence ->
                             refreshStudentPage(requireNotNull(presence.bookId), requireNotNull(presence.pageNumber) - 1)
                         }
-                        seedAllStudentBooks()
+                        scheduleAllStudentBooks()
                         manifestDueAtElapsedMs = nowElapsedMs()
-                        manifestBatchesRemaining = requiredManifestBatchCount(store.studentPages().size)
+                        manifestBatchesRemaining = requiredManifestBatchCount(expectedStudentInventoryPageCount())
                     }
                 } else if (lanOwnsData) {
                     store.closeStudentGeneration()
                     manifestDueAtElapsedMs = Long.MAX_VALUE
                     manifestBatchesRemaining = 0
+                    manifestChangedSinceReservation = false
                 }
             }
             RemoteReviewRole.TEACHER -> {
@@ -162,6 +202,45 @@ internal class RemotePageSyncController(
             null -> Unit
         }
         if (!active) RemoteStudentCursorBus.clear(RemoteStudentCursorTransport.TELEGRAM)
+        notifyUiChanged()
+    }
+
+    /** Accelerates exactly one recovery cycle after an authenticated peer reply. */
+    @Synchronized
+    fun onPeerAvailable() {
+        val currentSession = session ?: return
+        if (!telegramActive) return
+        when (currentSession.role) {
+            RemoteReviewRole.STUDENT -> {
+                store.outstandingStudentManifest()?.let { manifest ->
+                    if (outboundState(RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST.name, manifest.transferId) ==
+                        RemotePageSyncOutboundState.SENT
+                    ) store.clearOutstandingStudentManifest(manifest.transferId)
+                }
+                currentPresence?.takeIf(StudentStudyPresence::active)?.let { presence ->
+                    refreshStudentPage(
+                        requireNotNull(presence.bookId),
+                        requireNotNull(presence.pageNumber) - 1,
+                    )
+                }
+                abandonUnavailableStudentResponses()
+                scheduleAllStudentBooks(retryFailed = true)
+                retryFailedStudentInventoryPages()
+                manifestDueAtElapsedMs = nowElapsedMs()
+                manifestBatchesRemaining = requiredManifestBatchCount(expectedStudentInventoryPageCount())
+            }
+            RemoteReviewRole.TEACHER -> {
+                store.teacherPages().firstOrNull { it.requestTransferId != null }?.let { active ->
+                    val transferId = requireNotNull(active.requestTransferId)
+                    if (outboundState(RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST.name, transferId) ==
+                        RemotePageSyncOutboundState.SENT
+                    ) store.clearTeacherRequest(active.pageToken, transferId)
+                }
+                requestCooldownUntilElapsedMs = 0L
+                nextTeacherReviewSendAtElapsedMs = 0L
+            }
+        }
+        tickLocked()
         notifyUiChanged()
     }
 
@@ -208,7 +287,7 @@ internal class RemotePageSyncController(
         queueTeacherEvent(event)
         drainTeacherPublishIntents()
         nextTeacherReviewSendAtElapsedMs = minOf(nextTeacherReviewSendAtElapsedMs, nowElapsedMs())
-        tick()
+        tickLocked()
     }
 
     /** Captured by Reader before its immutable publication preparation is fsynced. */
@@ -264,8 +343,12 @@ internal class RemotePageSyncController(
         }
     }
 
-    @Synchronized
     fun tick() {
+        synchronized(this) { tickLocked() }
+        processOneStudentInventoryPage()
+    }
+
+    private fun tickLocked() {
         val currentSession = session ?: return
         if (currentSession.role == RemoteReviewRole.TEACHER) {
             drainTeacherPublishIntents()
@@ -422,10 +505,10 @@ internal class RemotePageSyncController(
             val reservedTransferId = current.outgoingAnnotationTransferId
             val reservedRequestId = current.responseToRequestTransferId
             if (reservedTransferId != null && reservedRequestId != null) {
-                val reservedState = outboundState(
-                    RemoteReviewEnvelopeType.PAGE_ANNOTATION.name,
-                    reservedTransferId,
-                )
+                val reservedIds = current.outgoingAnnotationChunkTransferIds.ifEmpty {
+                    listOf(reservedTransferId)
+                }
+                val reservedState = aggregatePageAnnotationOutboundState(reservedIds)
                 if (reservedRequestId == envelope.transferId && reservedState in setOf(
                         RemotePageSyncOutboundState.PENDING,
                         RemotePageSyncOutboundState.SENT,
@@ -445,6 +528,7 @@ internal class RemotePageSyncController(
                         RemotePageSyncOutboundState.NONE,
                         RemotePageSyncOutboundState.FAILED,
                         RemotePageSyncOutboundState.ACKNOWLEDGED,
+                        RemotePageSyncOutboundState.SENT,
                     )
                 if (oldReservationCanBeAbandoned) {
                     // A different request proves the teacher moved past this response. In
@@ -486,16 +570,22 @@ internal class RemotePageSyncController(
                     return RemotePageSyncIncomingResult.RETAIN
                 }
             }
-            val annotation = buildStudentAnnotationResponse(envelope, current)
+            val response = buildStudentAnnotationResponse(envelope, current)
+            val annotation = response.envelopes.first()
             if (reservedRequestId == envelope.transferId && reservedTransferId != null) {
-                require(annotation.transferId == reservedTransferId) {
+                require(response.groupTransferId == reservedTransferId) {
                     "Replayed request produced a different annotation transfer"
+                }
+                require(response.envelopes.map(PageAnnotationEnvelope::transferId) ==
+                    current.outgoingAnnotationChunkTransferIds.ifEmpty { listOf(reservedTransferId) }) {
+                    "Replayed request produced different checkpoint fragments"
                 }
             }
             store.markStudentAnnotationInFlight(
                 pageToken = current.pageToken,
                 requestTransferId = envelope.transferId,
-                annotationTransferId = annotation.transferId,
+                annotationTransferId = response.groupTransferId,
+                annotationChunkTransferIds = response.envelopes.map(PageAnnotationEnvelope::transferId),
                 sourceRevision = annotation.sourceRevision,
                 originCursor = if (annotation.kind == PageAnnotationKind.DELTA) {
                     annotation.sourceOriginCursor
@@ -504,10 +594,21 @@ internal class RemotePageSyncController(
                 resultLayerSha256 = annotation.resultLayerSha256,
                 sentAtEpochMs = nowEpochMs(),
             )
-            if (sendEnvelope(annotation).isDurablyAccepted()) {
+            val allDurable = response.envelopes.all { fragment ->
+                when (outboundState(RemoteReviewEnvelopeType.PAGE_ANNOTATION.name, fragment.transferId)) {
+                    RemotePageSyncOutboundState.PENDING,
+                    RemotePageSyncOutboundState.SENT,
+                    RemotePageSyncOutboundState.ACKNOWLEDGED,
+                    -> true
+                    RemotePageSyncOutboundState.NONE -> sendEnvelope(fragment).isDurablyAccepted()
+                    RemotePageSyncOutboundState.FAILED -> false
+                }
+            }
+            if (allDurable) {
                 RemotePageSyncIncomingResult.ACKNOWLEDGE
             } else RemotePageSyncIncomingResult.RETAIN
-        }.getOrElse {
+        }.getOrElse { error ->
+            if (error is Error) throw error
             val current = store.studentPage(envelope.pageToken) ?: known
             val rejection = pageSyncAck(
                 syncGeneration = envelope.syncGeneration,
@@ -573,7 +674,7 @@ internal class RemotePageSyncController(
         manualRunning = true
         preferManualPageNext = true
         requestCooldownUntilElapsedMs = minOf(requestCooldownUntilElapsedMs, nowElapsedMs())
-        tick()
+        tickLocked()
         notifyUiChanged()
     }
 
@@ -638,7 +739,7 @@ internal class RemotePageSyncController(
     fun onDataRootReplaced() {
         store.resetCurrentPair()
         currentPresence = null
-        seededStudentBooks.clear()
+        clearStudentInventoryScan()
         failedPageTokens.clear()
         failedTeacherReviewKeys.clear()
         manualRunning = false
@@ -646,8 +747,9 @@ internal class RemotePageSyncController(
         lastRequestedPageToken = null
         preferManualPageNext = false
         manifestDueAtElapsedMs = if (telegramActive) nowElapsedMs() else Long.MAX_VALUE
+        manifestChangedSinceReservation = false
         manifestBatchesRemaining = if (telegramActive) {
-            requiredManifestBatchCount(store.studentPages().size)
+            requiredManifestBatchCount(expectedStudentInventoryPageCount())
         } else {
             0
         }
@@ -665,22 +767,27 @@ internal class RemotePageSyncController(
         if (!telegramOnline) return
         if (store.studentGeneration() == 0L) {
             store.beginStudentGeneration()
-            seededStudentBooks.clear()
+            clearStudentInventoryScan()
+            scheduleAllStudentBooks()
         }
         reconcileStudentInventory()
         val outstanding = store.outstandingStudentManifest()
         if (outstanding != null) {
             when (outboundState(RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST.name, outstanding.transferId)) {
                 RemotePageSyncOutboundState.ACKNOWLEDGED -> {
+                    val changedAfterReservation = manifestChangedSinceReservation
                     store.acknowledgeOutstandingStudentManifest(outstanding.transferId)
-                    if (manifestBatchesRemaining <= 0) {
-                        manifestBatchesRemaining = requiredManifestBatchCount(store.studentPages().size)
-                    }
-                    manifestBatchesRemaining = (manifestBatchesRemaining - 1).coerceAtLeast(0)
-                    manifestDueAtElapsedMs = if (manifestBatchesRemaining > 0) {
-                        safeAdd(nowElapsedMs(), MANIFEST_INTERVAL_MS)
-                    } else {
-                        Long.MAX_VALUE
+                    manifestChangedSinceReservation = false
+                    resolveStudentManifestAckSchedule(
+                        changedAfterReservation = changedAfterReservation,
+                        batchesRemaining = manifestBatchesRemaining,
+                        requiredBatchCount = requiredManifestBatchCount(expectedStudentInventoryPageCount()),
+                        scheduledDueAtElapsedMs = manifestDueAtElapsedMs,
+                        nowElapsedMs = nowElapsedMs(),
+                        intervalMs = MANIFEST_INTERVAL_MS,
+                    ).let { schedule ->
+                        manifestBatchesRemaining = schedule.batchesRemaining
+                        manifestDueAtElapsedMs = schedule.dueAtElapsedMs
                     }
                 }
                 RemotePageSyncOutboundState.PENDING,
@@ -708,9 +815,10 @@ internal class RemotePageSyncController(
             refreshStudentPage(requireNotNull(presence.bookId), requireNotNull(presence.pageNumber) - 1)
         }
         if (manifestBatchesRemaining <= 0) {
-            manifestBatchesRemaining = requiredManifestBatchCount(store.studentPages().size)
+            manifestBatchesRemaining = requiredManifestBatchCount(expectedStudentInventoryPageCount())
         }
         val reservation = store.reserveStudentManifest(randomTransferId("manifest"), nowEpochMs())
+        manifestChangedSinceReservation = false
         val manifest = buildManifest(reservation)
         if (runCatching { sendEnvelope(manifest).isDurablyAccepted() }.getOrDefault(false)) {
             lastManifestSentAtElapsedMs = nowElapsedMs()
@@ -770,7 +878,9 @@ internal class RemotePageSyncController(
                 )
             },
             entries = entries,
-            inventoryPageCount = store.studentPages().size,
+            inventoryPageCount = expectedStudentInventoryPageCount().takeIf {
+                studentInventoryCatalogComplete()
+            },
         )
     }
 
@@ -817,10 +927,11 @@ internal class RemotePageSyncController(
             return
         }
         val automaticTokens = automaticPageTokens()
+        val inventoryComplete = store.teacherInventoryComplete()
         val next = selectNextTeacherPage(
             pending,
             automaticTokens,
-            manualRunning,
+            manualRunning && inventoryComplete,
             failedPageTokens,
             lastRequestedPageToken,
             preferManualPageNext,
@@ -1020,12 +1131,13 @@ internal class RemotePageSyncController(
         }
         val activeCorrelation = record.requestTransferId == envelope.responseToTransferId
         val completedCorrelation = record.lastCompletedRequestTransferId == envelope.responseToTransferId &&
-            record.lastCompletedAnnotationTransferId == envelope.transferId
+            record.lastCompletedAnnotationTransferId == envelope.chunkGroupId
         if (!activeCorrelation && !completedCorrelation) return RemotePageSyncIncomingResult.DROP
         if (envelope.sourceRevision <= record.appliedRevision) {
             if (envelope.sourceRevision == record.appliedRevision &&
                 envelope.resultLayerSha256 != record.appliedStudentLayerSha256
             ) return rejectStudentAnnotation(envelope, "REVISION_DIGEST_MISMATCH", false)
+            if (envelope.chunked) store.clearTeacherPageChunkGroup(envelope.chunkGroupId)
             return acknowledgeAnnotation(envelope, PageSyncAckDisposition.DUPLICATE)
         }
         if (!activeCorrelation) return RemotePageSyncIncomingResult.DROP
@@ -1035,12 +1147,41 @@ internal class RemotePageSyncController(
         if (envelope.kind == PageAnnotationKind.DELTA && envelope.baseRevision != record.requesterRevision) {
             return rejectStudentAnnotation(envelope, "BASE_REVISION_MISMATCH", true)
         }
+        val checkpointPayload = if (envelope.chunked) {
+            val offer = runCatching {
+                store.offerTeacherPageChunk(
+                    descriptor = TeacherPageChunkDescriptor(
+                        syncGeneration = envelope.syncGeneration,
+                        chunkGroupId = envelope.chunkGroupId,
+                        responseToTransferId = requireNotNull(envelope.responseToTransferId),
+                        pageToken = envelope.pageToken,
+                        pageNumber = envelope.pageNumber,
+                        attemptNos = envelope.attemptNos,
+                        sourceRevision = envelope.sourceRevision,
+                        resultLayerSha256 = envelope.resultLayerSha256,
+                        payloadSha256 = envelope.payloadSha256,
+                        chunkCount = envelope.chunkCount,
+                        assembledPayloadSizeBytes = envelope.assembledPayloadSizeBytes,
+                    ),
+                    chunkIndex = envelope.chunkIndex,
+                    chunkSha256 = envelope.chunkSha256,
+                    decodedChunk = envelope.copyDecodedPayloadBytes(),
+                )
+            }.getOrElse { error ->
+                if (error is Error) throw error
+                null
+            } ?: return rejectStudentAnnotation(envelope, "CHUNK_STORE_FAILED", true)
+            when (offer) {
+                TeacherPageChunkOfferResult.Partial -> return RemotePageSyncIncomingResult.ACKNOWLEDGE
+                is TeacherPageChunkOfferResult.Complete -> offer.assembledPayload
+            }
+        } else envelope.copyDecodedPayloadBytes()
         val applied = runCatching {
             val layerSha = when (envelope.kind) {
                 PageAnnotationKind.DELTA -> annotationStore.applyEncodedStudentDelta(
                     localBookId = record.localBookId,
                     pageNumber = record.pageNumber,
-                    encodedOperations = RemotePageDeltaCodec.decode(envelope.copyDecodedPayloadBytes()),
+                    encodedOperations = RemotePageDeltaCodec.decode(checkpointPayload),
                     expectedOriginDeviceId = requireNotNull(envelope.deltaOriginDeviceId),
                     baseOriginCursor = envelope.baseOriginCursor,
                     sourceOriginCursor = envelope.sourceOriginCursor,
@@ -1050,14 +1191,17 @@ internal class RemotePageSyncController(
                 PageAnnotationKind.CHECKPOINT -> annotationStore.applyStudentLayerCheckpoint(
                     localBookId = record.localBookId,
                     pageNumber = record.pageNumber,
-                    checkpointBytes = envelope.copyDecodedPayloadBytes(),
+                    checkpointBytes = checkpointPayload,
                     expectedResultLayerSha256 = envelope.resultLayerSha256,
                     allowedAttemptNos = envelope.attemptNos,
                 ).layerSha256
             }
             applyObservedAttempts(record, envelope.attemptNos)
             layerSha
-        }.getOrNull() ?: return rejectStudentAnnotation(envelope, "APPLY_FAILED", true)
+        }.getOrElse { error ->
+            if (error is Error) throw error
+            null
+        } ?: return rejectStudentAnnotation(envelope, "APPLY_FAILED", true)
         if (applied != envelope.resultLayerSha256) {
             return rejectStudentAnnotation(envelope, "RESULT_DIGEST_MISMATCH", true)
         }
@@ -1067,16 +1211,20 @@ internal class RemotePageSyncController(
             envelope.resultLayerSha256,
             envelope.attemptNos,
             requireNotNull(envelope.responseToTransferId),
-            envelope.transferId,
+            envelope.chunkGroupId,
         )
         failedPageTokens -= envelope.pageToken
         requestCooldownUntilElapsedMs = safeAdd(nowElapsedMs(), intervalSeconds.toLong() * 1_000L)
         RemoteStudentPageAppliedBus.publish(
-            RemoteStudentPageApplied(record.localBookId, record.pageNumber, envelope.sourceRevision, envelope.transferId),
+            RemoteStudentPageApplied(record.localBookId, record.pageNumber, envelope.sourceRevision, envelope.chunkGroupId),
         )
         publishTeacherCursor()
         notifyUiChanged()
-        return acknowledgeAnnotation(envelope, PageSyncAckDisposition.APPLIED)
+        return acknowledgeAnnotation(envelope, PageSyncAckDisposition.APPLIED).also { result ->
+            if (result == RemotePageSyncIncomingResult.ACKNOWLEDGE && envelope.chunked) {
+                store.clearTeacherPageChunkGroup(envelope.chunkGroupId)
+            }
+        }
     }
 
     private fun receiveTeacherReview(envelope: PageAnnotationEnvelope): RemotePageSyncIncomingResult {
@@ -1235,26 +1383,29 @@ internal class RemotePageSyncController(
     private fun buildStudentAnnotationResponse(
         request: PageSyncRequestEnvelope,
         page: StudentPageSyncRecord,
-    ): PageAnnotationEnvelope {
+    ): StudentAnnotationResponse {
         val canDelta = request.requesterRevision > 0L &&
             request.requesterRevision == page.acknowledgedRevision &&
             request.requesterRevision < page.sourceRevision &&
             page.acknowledgedOriginCursor < page.originDeviceHighWater &&
             page.attemptNos.isNotEmpty()
         if (canDelta) {
-            val operations = annotationStore.encodedOperationsAfter(
+            val batch = annotationStore.encodedOperationsAfterBounded(
                 page.bookId,
                 page.pageNumber,
                 library.deviceId,
                 page.acknowledgedOriginCursor,
+                maxFramedBytes = RemoteReviewLimits.MAX_PAGE_ANNOTATION_DELTA_BYTES,
+                fixedFrameBytes = PAGE_DELTA_HEADER_BYTES,
+                perOperationFrameBytes = PAGE_DELTA_OPERATION_FRAME_BYTES,
                 includeTeacherDrafts = false,
             )
-            val lastClock = operations.lastOrNull()?.let(annotationStore::operationCursor)?.logicalClock
-            val decoded = runCatching { RemotePageDeltaCodec.encode(operations) }.getOrNull()
-            if (decoded != null && decoded.size <= RemoteReviewLimits.PAGE_ANNOTATION_DELTA_TARGET_BYTES &&
-                lastClock == page.originDeviceHighWater
+            val decoded = batch.operations.takeIf { batch.complete && it.isNotEmpty() }
+                ?.let { runCatching { RemotePageDeltaCodec.encode(it) }.getOrNull() }
+            if (decoded != null && decoded.size <= RemoteReviewLimits.MAX_PAGE_ANNOTATION_DELTA_BYTES &&
+                batch.lastLogicalClock == page.originDeviceHighWater
             ) {
-                return PageAnnotationEnvelope.fromDecodedPayload(
+                val envelope = PageAnnotationEnvelope.fromDecodedPayload(
                     transferId = stableTransferId(
                         "page_delta",
                         "${request.transferId}:${page.sourceRevision}:${page.studentLayerSha256}",
@@ -1276,32 +1427,53 @@ internal class RemotePageSyncController(
                     decodedPayloadBytes = decoded,
                     resultLayerSha256 = page.studentLayerSha256,
                 )
+                return StudentAnnotationResponse(envelope.transferId, listOf(envelope))
             }
         }
         val export = annotationStore.exportStudentLayerCheckpoint(page.bookId, page.pageNumber, library.deviceId)
         require(export.layerSha256 == page.studentLayerSha256)
-        return PageAnnotationEnvelope.fromDecodedPayload(
-            transferId = stableTransferId(
-                "page_checkpoint",
-                "${request.transferId}:${page.sourceRevision}:${page.studentLayerSha256}",
-            ),
-            createdAtEpochMs = nowEpochMs(),
-            syncGeneration = page.syncGeneration,
-            purpose = PageAnnotationPurpose.STUDENT_PAGE,
-            responseToTransferId = request.transferId,
-            pageToken = page.pageToken,
-            pageNumber = page.pageNumber + 1,
-            attemptNos = page.attemptNos,
-            kind = PageAnnotationKind.CHECKPOINT,
-            baseRevision = 0L,
-            sourceRevision = page.sourceRevision,
-            deltaOriginDeviceId = null,
-            baseOriginCursor = 0L,
-            sourceOriginCursor = 0L,
-            compression = PageAnnotationCompression.GZIP,
-            decodedPayloadBytes = export.copyCheckpointBytes(),
-            resultLayerSha256 = export.layerSha256,
+        val checkpoint = export.copyCheckpointBytes()
+        val fragments = splitPageCheckpointPayload(
+            checkpoint,
+            RemoteReviewLimits.MAX_PAGE_ANNOTATION_CHECKPOINT_BYTES,
         )
+        val groupTransferId = stableTransferId(
+            if (fragments.size == 1) "page_checkpoint" else "page_checkpoint_group",
+            "${request.transferId}:${page.sourceRevision}:${page.studentLayerSha256}",
+        )
+        val payloadSha256 = pageAnnotationSha256Hex(checkpoint)
+        val createdAt = nowEpochMs()
+        val envelopes = fragments.mapIndexed { index, fragment ->
+            val transferId = if (fragments.size == 1) groupTransferId else stableTransferId(
+                "page_checkpoint_chunk",
+                "$groupTransferId:$index:${fragments.size}",
+            )
+            PageAnnotationEnvelope.fromDecodedPayload(
+                transferId = transferId,
+                createdAtEpochMs = createdAt,
+                syncGeneration = page.syncGeneration,
+                purpose = PageAnnotationPurpose.STUDENT_PAGE,
+                responseToTransferId = request.transferId,
+                pageToken = page.pageToken,
+                pageNumber = page.pageNumber + 1,
+                attemptNos = page.attemptNos,
+                kind = PageAnnotationKind.CHECKPOINT,
+                baseRevision = 0L,
+                sourceRevision = page.sourceRevision,
+                deltaOriginDeviceId = null,
+                baseOriginCursor = 0L,
+                sourceOriginCursor = 0L,
+                compression = PageAnnotationCompression.GZIP,
+                decodedPayloadBytes = fragment,
+                resultLayerSha256 = export.layerSha256,
+                chunkGroupId = groupTransferId,
+                chunkIndex = index,
+                chunkCount = fragments.size,
+                assembledPayloadSizeBytes = checkpoint.size,
+                assembledPayloadSha256 = payloadSha256,
+            )
+        }
+        return StudentAnnotationResponse(groupTransferId, envelopes)
     }
 
     private fun rejectStudentAnnotation(
@@ -1312,6 +1484,7 @@ internal class RemotePageSyncController(
         failedPageTokens += envelope.pageToken
         val result = acknowledgeAnnotation(envelope, PageSyncAckDisposition.REJECTED, reasonCode)
         if (result == RemotePageSyncIncomingResult.ACKNOWLEDGE) {
+            if (envelope.chunked) store.clearTeacherPageChunkGroup(envelope.chunkGroupId)
             store.clearTeacherRequest(
                 envelope.pageToken,
                 envelope.responseToTransferId,
@@ -1331,7 +1504,7 @@ internal class RemotePageSyncController(
         val ack = pageSyncAck(
             envelope.syncGeneration,
             PageSyncAckSourceType.ANNOTATION,
-            envelope.transferId,
+            envelope.chunkGroupId,
             envelope.pageToken,
             envelope.pageNumber,
             envelope.sourceRevision,
@@ -1376,6 +1549,11 @@ internal class RemotePageSyncController(
             it.id == bookId && it.studentId == state.selectedStudentId
         } ?: return null
         if (pageNumber !in 0 until book.pageCount || book.contentSha256.length != 64) return null
+        synchronized(this) {
+            if (session == currentSession && store.studentGeneration() == generation) {
+                expectedStudentInventoryPages.getOrPut(bookId, ::linkedSetOf).add(pageNumber)
+            }
+        }
         val attempts = library.attempts(bookId, pageNumber)
         val snapshot = annotationStore.loadPage(bookId, pageNumber)
         val attemptNos = (attempts.map(Attempt::attemptNo) + snapshot.activeStrokes.asSequence()
@@ -1411,7 +1589,9 @@ internal class RemotePageSyncController(
             historicalChangedAtEpochMs = historicalChangedAt,
             nowEpochMs = nowEpochMs(),
         )
+        if (!synchronized(this) { session == currentSession && store.studentGeneration() == generation }) return null
         return store.updateStudentPage(
+            expectedSyncGeneration = generation,
             pageToken = token,
             workbookToken = workbookToken(currentSession.pairId, bookId),
             bookId = bookId,
@@ -1428,16 +1608,219 @@ internal class RemotePageSyncController(
     }
 
     private fun seedStudentBook(bookId: String) {
-        if (!seededStudentBooks.add(bookId)) return
-        library.attemptsForSync(bookId).map(Attempt::pageNumber).distinct().forEach { refreshStudentPage(bookId, it) }
+        scheduleStudentBook(bookId)
     }
 
-    /** Seeds the complete attempted-page catalog once per fallback generation. */
-    private fun seedAllStudentBooks() {
+    /** Schedules metadata only; annotation files are opened by one bounded background step per tick. */
+    private fun scheduleAllStudentBooks(retryFailed: Boolean = false) {
         val state = library.state
         state.books.asSequence()
             .filter { it.studentId == state.selectedStudentId }
-            .forEach { seedStudentBook(it.id) }
+            .forEach { scheduleStudentBook(it.id, retryFailed) }
+    }
+
+    private fun scheduleStudentBook(bookId: String, retryFailed: Boolean = false) {
+        val current = session?.takeIf { it.role == RemoteReviewRole.STUDENT } ?: return
+        val generation = store.studentGeneration().takeIf { it > 0L } ?: return
+        val target = StudentInventoryBook(current.pairId, generation, bookId)
+        val failedRetryAt = failedStudentInventoryBooks[target.key]
+        val retryAllowed = failedRetryAt != null && (retryFailed || failedRetryAt <= nowElapsedMs())
+        if ((bookId !in discoveredStudentBooks || retryAllowed) && target.key !in queuedStudentInventoryBookKeys &&
+            (target.key !in failedStudentInventoryBooks || retryAllowed)
+        ) {
+            queuedStudentInventoryBooks.addLast(target)
+            queuedStudentInventoryBookKeys += target.key
+            if (retryAllowed) failedStudentInventoryBooks -= target.key
+        }
+    }
+
+    private fun processOneStudentInventoryPage() {
+        val bookTarget = synchronized(this) { nextStudentInventoryBook() }
+        if (bookTarget != null) {
+            try {
+                val pages = try {
+                    library.attemptsForSync(bookTarget.bookId).map(Attempt::pageNumber).distinct().sorted()
+                } catch (error: Exception) {
+                    if (error is InterruptedException) Thread.currentThread().interrupt()
+                    null
+                }
+                synchronized(this) {
+                    queuedStudentInventoryBookKeys -= bookTarget.key
+                    if (bookTarget.syncGeneration != store.studentGeneration() ||
+                        bookTarget.pairId != session?.pairId
+                    ) return
+                    if (pages == null) {
+                        failedStudentInventoryBooks[bookTarget.key] =
+                            safeAdd(nowElapsedMs(), INVENTORY_PAGE_RETRY_MS)
+                        return
+                    }
+                    failedStudentInventoryBooks -= bookTarget.key
+                    discoveredStudentBooks += bookTarget.bookId
+                    val expected = expectedStudentInventoryPages.getOrPut(bookTarget.bookId, ::linkedSetOf)
+                    expected += pages
+                    pages.forEach { pageNumber ->
+                        queueStudentInventoryPage(bookTarget, pageNumber)
+                    }
+                    markStudentBookSeededIfComplete(
+                        bookTarget.bookId,
+                        bookTarget.pairId,
+                        bookTarget.syncGeneration,
+                    )
+                    scheduleManifestAtRateBoundary()
+                }
+            } catch (error: Throwable) {
+                synchronized(this) { recoverStudentInventoryBookAfterFatal(bookTarget) }
+                if (error is InterruptedException) Thread.currentThread().interrupt()
+                throw error
+            }
+            return
+        }
+        val target = synchronized(this) { nextStudentInventoryPage() } ?: return
+        try {
+            val refreshed = try {
+                refreshStudentPage(target.bookId, target.pageNumber)
+            } catch (error: Exception) {
+                if (error is InterruptedException) Thread.currentThread().interrupt()
+                null
+            }
+            synchronized(this) {
+                queuedStudentInventoryKeys -= target.key
+                if (target.syncGeneration != store.studentGeneration() || target.pairId != session?.pairId) return
+                if (refreshed == null) {
+                    failedStudentInventoryPages[target.key] = safeAdd(nowElapsedMs(), INVENTORY_PAGE_RETRY_MS)
+                    failedStudentInventoryPageTargets[target.key] = target
+                } else {
+                    failedStudentInventoryPages -= target.key
+                    failedStudentInventoryPageTargets -= target.key
+                    markStudentBookSeededIfComplete(target.bookId, target.pairId, target.syncGeneration)
+                    scheduleManifestAtRateBoundary()
+                }
+            }
+        } catch (error: Throwable) {
+            synchronized(this) { recoverStudentInventoryPageAfterFatal(target) }
+            if (error is InterruptedException) Thread.currentThread().interrupt()
+            throw error
+        }
+    }
+
+    private fun recoverStudentInventoryBookAfterFatal(target: StudentInventoryBook) {
+        queuedStudentInventoryBookKeys -= target.key
+        if (target.syncGeneration != store.studentGeneration() || target.pairId != session?.pairId) return
+        discoveredStudentBooks -= target.bookId
+        failedStudentInventoryBooks[target.key] = safeAdd(nowElapsedMs(), INVENTORY_PAGE_RETRY_MS)
+    }
+
+    private fun recoverStudentInventoryPageAfterFatal(target: StudentInventoryPage) {
+        queuedStudentInventoryKeys -= target.key
+        if (target.syncGeneration != store.studentGeneration() || target.pairId != session?.pairId) return
+        failedStudentInventoryPages[target.key] = safeAdd(nowElapsedMs(), INVENTORY_PAGE_RETRY_MS)
+        failedStudentInventoryPageTargets[target.key] = target
+    }
+
+    private fun nextStudentInventoryBook(): StudentInventoryBook? {
+        if (session?.role != RemoteReviewRole.STUDENT || !telegramActive) return null
+        while (queuedStudentInventoryBooks.isNotEmpty()) {
+            val candidate = queuedStudentInventoryBooks.removeFirst()
+            if (candidate.syncGeneration == store.studentGeneration() && candidate.pairId == session?.pairId) {
+                return candidate
+            }
+            queuedStudentInventoryBookKeys -= candidate.key
+        }
+        return null
+    }
+
+    private fun nextStudentInventoryPage(): StudentInventoryPage? {
+        if (session?.role != RemoteReviewRole.STUDENT || !telegramActive) return null
+        failedStudentInventoryPageTargets.values.firstOrNull { target ->
+            failedStudentInventoryPages[target.key]?.let { it <= nowElapsedMs() } == true
+        }?.let { target ->
+            queueStudentInventoryPage(
+                StudentInventoryBook(target.pairId, target.syncGeneration, target.bookId),
+                target.pageNumber,
+            )
+        }
+        while (queuedStudentInventoryPages.isNotEmpty()) {
+            val candidate = queuedStudentInventoryPages.removeFirst()
+            if (candidate.syncGeneration == store.studentGeneration() && candidate.pairId == session?.pairId) {
+                return candidate
+            }
+            queuedStudentInventoryKeys -= candidate.key
+        }
+        return null
+    }
+
+    private fun queueStudentInventoryPage(book: StudentInventoryBook, pageNumber: Int) {
+        val target = StudentInventoryPage(book.pairId, book.syncGeneration, book.bookId, pageNumber)
+        val alreadyPresent = store.studentPage(
+            pageToken(book.pairId, book.bookId, pageNumber, book.syncGeneration),
+        ) != null
+        val retryAllowed = failedStudentInventoryPages[target.key]?.let { it <= nowElapsedMs() } == true
+        if ((!alreadyPresent || retryAllowed) && target.key !in queuedStudentInventoryKeys &&
+            (target.key !in failedStudentInventoryPages || retryAllowed)
+        ) {
+            queuedStudentInventoryPages.addLast(target)
+            queuedStudentInventoryKeys += target.key
+            if (retryAllowed) {
+                failedStudentInventoryPages -= target.key
+                failedStudentInventoryPageTargets -= target.key
+            }
+        }
+    }
+
+    private fun markStudentBookSeededIfComplete(bookId: String, pairId: String, generation: Long) {
+        val expected = expectedStudentInventoryPages[bookId].orEmpty()
+        val bookKey = StudentInventoryBook(pairId, generation, bookId).key
+        val complete = bookKey !in queuedStudentInventoryBookKeys && bookKey !in failedStudentInventoryBooks &&
+            expected.all { page ->
+            store.studentPage(pageToken(pairId, bookId, page, generation)) != null
+        } && expected.none { page ->
+            val key = StudentInventoryPage(pairId, generation, bookId, page).key
+            key in queuedStudentInventoryKeys || key in failedStudentInventoryPages
+        }
+        if (complete) seededStudentBooks += bookId else seededStudentBooks -= bookId
+    }
+
+    private fun clearStudentInventoryScan() {
+        seededStudentBooks.clear()
+        discoveredStudentBooks.clear()
+        expectedStudentInventoryPages.clear()
+        queuedStudentInventoryBooks.clear()
+        queuedStudentInventoryBookKeys.clear()
+        failedStudentInventoryBooks.clear()
+        queuedStudentInventoryPages.clear()
+        queuedStudentInventoryKeys.clear()
+        failedStudentInventoryPages.clear()
+        failedStudentInventoryPageTargets.clear()
+    }
+
+    private fun expectedStudentInventoryPageCount(): Int = expectedStudentInventoryPages.values.sumOf(Set<Int>::size)
+
+    private fun studentInventoryCatalogComplete(): Boolean =
+        queuedStudentInventoryBookKeys.isEmpty() && failedStudentInventoryBooks.isEmpty()
+
+    private fun retryFailedStudentInventoryPages() {
+        val current = session?.takeIf { it.role == RemoteReviewRole.STUDENT } ?: return
+        val generation = store.studentGeneration().takeIf { it > 0L } ?: return
+        failedStudentInventoryPages.keys.toList().forEach { failedStudentInventoryPages[it] = 0L }
+        failedStudentInventoryPageTargets.values.toList().forEach { target ->
+            if (target.pairId == current.pairId && target.syncGeneration == generation) {
+                queueStudentInventoryPage(
+                    StudentInventoryBook(target.pairId, target.syncGeneration, target.bookId),
+                    target.pageNumber,
+                )
+            }
+        }
+    }
+
+    private fun abandonUnavailableStudentResponses() {
+        store.studentPages().forEach { page ->
+            val requestId = page.responseToRequestTransferId ?: return@forEach
+            val groupId = page.outgoingAnnotationTransferId ?: return@forEach
+            val ids = page.outgoingAnnotationChunkTransferIds.ifEmpty { listOf(groupId) }
+            if (aggregatePageAnnotationOutboundState(ids) == RemotePageSyncOutboundState.SENT) {
+                store.abandonStudentAnnotationResponse(page.pageToken, requestId)
+            }
+        }
     }
 
     /** A removed/re-imported book changes opaque workbook identity and therefore starts a generation. */
@@ -1447,10 +1830,14 @@ internal class RemotePageSyncController(
             .filter { it.studentId == state.selectedStudentId }
             .map { it.id }
             .toSet()
-        if (store.studentPages().any { it.bookId !in visibleBookIds }) {
+        if (store.studentPages().any { it.bookId !in visibleBookIds } ||
+            expectedStudentInventoryPages.keys.any { it !in visibleBookIds } ||
+            queuedStudentInventoryBooks.any { it.bookId !in visibleBookIds }
+        ) {
             store.closeStudentGeneration()
             store.beginStudentGeneration()
-            seededStudentBooks.clear()
+            clearStudentInventoryScan()
+            manifestChangedSinceReservation = false
             currentPresence?.takeIf(StudentStudyPresence::active)
                 ?.takeIf { requireNotNull(it.bookId) in visibleBookIds }
                 ?.let { presence ->
@@ -1460,11 +1847,11 @@ internal class RemotePageSyncController(
                 )
             }
             if (currentPresence?.bookId !in visibleBookIds) currentPresence = null
-            seedAllStudentBooks()
-            manifestBatchesRemaining = requiredManifestBatchCount(store.studentPages().size)
+            scheduleAllStudentBooks()
+            manifestBatchesRemaining = requiredManifestBatchCount(expectedStudentInventoryPageCount())
             manifestDueAtElapsedMs = nowElapsedMs()
         } else {
-            seedAllStudentBooks()
+            scheduleAllStudentBooks()
         }
     }
 
@@ -1563,11 +1950,12 @@ internal class RemotePageSyncController(
         val pages = store.teacherPages().filterNot(TeacherPageSyncRecord::mappingRequired)
         if (pages.isEmpty()) return emptyList()
         val cursorToken = store.teacherCursor()?.pageToken
-        return buildList {
-            cursorToken?.takeIf { token -> pages.any { it.pageToken == token } }?.let(::add)
-            pages.asSequence().map(TeacherPageSyncRecord::pageToken).filterNot(::contains)
-                .take(MAX_AUTOMATIC_PAGES - size).forEach(::add)
-        }
+        return selectAutomaticPageTokens(
+            pages.map(TeacherPageSyncRecord::pageToken),
+            cursorToken,
+            store.teacherInventoryComplete(),
+            MAX_AUTOMATIC_PAGES,
+        )
     }
 
     private fun buildUiState(): RemotePageSyncUiState {
@@ -1800,9 +2188,10 @@ internal class RemotePageSyncController(
         .toList()
 
     private fun scheduleManifestAtRateBoundary() {
+        if (store.outstandingStudentManifest() != null) manifestChangedSinceReservation = true
         manifestBatchesRemaining = maxOf(
             manifestBatchesRemaining,
-            requiredManifestBatchCount(store.studentPages().size),
+            requiredManifestBatchCount(expectedStudentInventoryPageCount()),
         )
         val now = nowElapsedMs()
         val boundary = lastManifestSentAtElapsedMs?.let { safeAdd(it, MANIFEST_INTERVAL_MS) } ?: now
@@ -1828,6 +2217,19 @@ internal class RemotePageSyncController(
         return "${prefix}_${digest.take(48)}"
     }
 
+    private fun aggregatePageAnnotationOutboundState(transferIds: List<String>): RemotePageSyncOutboundState {
+        val states = transferIds.map { transferId ->
+            outboundState(RemoteReviewEnvelopeType.PAGE_ANNOTATION.name, transferId)
+        }
+        return when {
+            states.any { it == RemotePageSyncOutboundState.FAILED } -> RemotePageSyncOutboundState.FAILED
+            states.any { it == RemotePageSyncOutboundState.NONE } -> RemotePageSyncOutboundState.NONE
+            states.all { it == RemotePageSyncOutboundState.ACKNOWLEDGED } -> RemotePageSyncOutboundState.ACKNOWLEDGED
+            states.any { it == RemotePageSyncOutboundState.PENDING } -> RemotePageSyncOutboundState.PENDING
+            else -> RemotePageSyncOutboundState.SENT
+        }
+    }
+
     private fun safeAdd(left: Long, right: Long): Long = if (left > Long.MAX_VALUE - right) Long.MAX_VALUE else left + right
 
     private companion object {
@@ -1839,6 +2241,40 @@ internal class RemotePageSyncController(
         const val SEND_RETRY_MS = 30_000L
         const val TEACHER_REVIEW_INTERVAL_MS = 60_000L
         const val APPLICATION_ACK_RECOVERY_MS = 2 * 60_000L
+        const val INVENTORY_PAGE_RETRY_MS = 60_000L
+        const val PAGE_DELTA_HEADER_BYTES = 8
+        const val PAGE_DELTA_OPERATION_FRAME_BYTES = 4
+    }
+}
+
+internal fun splitPageCheckpointPayload(payload: ByteArray, maxChunkBytes: Int): List<ByteArray> {
+    require(payload.isNotEmpty() && maxChunkBytes > 0)
+    val count = (payload.size.toLong() + maxChunkBytes - 1L) / maxChunkBytes.toLong()
+    require(count <= RemoteReviewLimits.MAX_PAGE_ANNOTATION_CHUNKS)
+    if (count == 1L) return listOf(payload.copyOf())
+    return buildList(count.toInt()) {
+        var offset = 0
+        while (offset < payload.size) {
+            val end = minOf(payload.size, offset + maxChunkBytes)
+            add(payload.copyOfRange(offset, end))
+            offset = end
+        }
+    }
+}
+
+internal fun selectAutomaticPageTokens(
+    latestFirstPageTokens: List<String>,
+    currentPageToken: String?,
+    inventoryComplete: Boolean,
+    maximumCount: Int = 3,
+): List<String> {
+    require(maximumCount > 0)
+    val stable = latestFirstPageTokens.filter(String::isNotBlank).distinct()
+    val current = currentPageToken?.takeIf { it in stable }
+    if (!inventoryComplete) return current?.let(::listOf).orEmpty()
+    return buildList {
+        current?.let(::add)
+        stable.asSequence().filterNot(::contains).take(maximumCount - size).forEach(::add)
     }
 }
 
@@ -1847,6 +2283,34 @@ internal fun requiredManifestBatchCount(pageCount: Int): Int {
     return maxOf(
         1,
         (pageCount + REMOTE_MANIFEST_PAGE_WINDOW - 1) / REMOTE_MANIFEST_PAGE_WINDOW,
+    )
+}
+
+internal data class StudentManifestAckSchedule(
+    val batchesRemaining: Int,
+    val dueAtElapsedMs: Long,
+)
+
+internal fun resolveStudentManifestAckSchedule(
+    changedAfterReservation: Boolean,
+    batchesRemaining: Int,
+    requiredBatchCount: Int,
+    scheduledDueAtElapsedMs: Long,
+    nowElapsedMs: Long,
+    intervalMs: Long,
+): StudentManifestAckSchedule {
+    require(batchesRemaining >= 0 && requiredBatchCount > 0 && nowElapsedMs >= 0L && intervalMs > 0L)
+    val remaining = if (changedAfterReservation) {
+        requiredBatchCount
+    } else {
+        ((if (batchesRemaining <= 0) requiredBatchCount else batchesRemaining) - 1).coerceAtLeast(0)
+    }
+    val ordinaryDue = if (remaining > 0) {
+        if (nowElapsedMs > Long.MAX_VALUE - intervalMs) Long.MAX_VALUE else nowElapsedMs + intervalMs
+    } else Long.MAX_VALUE
+    return StudentManifestAckSchedule(
+        batchesRemaining = remaining,
+        dueAtElapsedMs = if (changedAfterReservation) minOf(scheduledDueAtElapsedMs, ordinaryDue) else ordinaryDue,
     )
 }
 
@@ -1955,6 +2419,13 @@ internal fun selectNextTeacherPage(
     lastServedPageToken: String? = null,
     preferManual: Boolean = false,
 ): TeacherPageSyncRecord? {
+    // The live cursor is a strict preemption target. Rotation is only for the two recent fallbacks;
+    // otherwise a large offline queue can postpone the page the student is actually using.
+    automaticTokens.firstOrNull()?.let { currentToken ->
+        pending.firstOrNull {
+            it.pageToken == currentToken && it.pageToken !in failedPageTokens
+        }?.let { return it }
+    }
     val automaticOrder = automaticTokens.rotateAfter(lastServedPageToken)
     val queueOrder = if (manualRunning && preferManual) {
         listOf(false, true)

@@ -27,6 +27,8 @@ internal data class StudentPageSyncRecord(
     val approximateBytes: Long,
     val responseToRequestTransferId: String? = null,
     val outgoingAnnotationTransferId: String? = null,
+    /** Every transport fragment for [outgoingAnnotationTransferId], or the singleton legacy id. */
+    val outgoingAnnotationChunkTransferIds: List<String> = emptyList(),
     val outgoingSourceRevision: Long = 0L,
     val outgoingOriginCursor: Long = 0L,
     val outgoingStateFingerprint: String? = null,
@@ -34,6 +36,25 @@ internal data class StudentPageSyncRecord(
     val outgoingSentAtEpochMs: Long? = null,
 ) {
     val dirty: Boolean get() = sourceRevision > acknowledgedRevision
+}
+
+internal data class TeacherPageChunkDescriptor(
+    val syncGeneration: Long,
+    val chunkGroupId: String,
+    val responseToTransferId: String,
+    val pageToken: String,
+    val pageNumber: Int,
+    val attemptNos: List<Int>,
+    val sourceRevision: Long,
+    val resultLayerSha256: String,
+    val payloadSha256: String,
+    val chunkCount: Int,
+    val assembledPayloadSizeBytes: Int,
+)
+
+internal sealed interface TeacherPageChunkOfferResult {
+    data object Partial : TeacherPageChunkOfferResult
+    data class Complete(val assembledPayload: ByteArray) : TeacherPageChunkOfferResult
 }
 
 internal data class TeacherPageSyncRecord(
@@ -148,10 +169,13 @@ internal enum class TeacherManifestInstallResult { APPLIED, DUPLICATE, STALE, RE
 internal class RemotePageSyncStore(
     file: File,
     private val beforePersistWrite: (() -> Unit)? = null,
+    private val beforeChunkWrite: (() -> Unit)? = null,
 ) {
     private val atomicFile = AtomicFile(file)
     /** Redundant monotonic epoch survives a valid-but-corrupt main pair journal. */
     private val generationHighWaterFile = AtomicFile(File(file.parentFile, "${file.name}.generation"))
+    /** Received fragments live beside (and are scoped exactly like) the pair journal. */
+    private val teacherPageChunkRoot = File(file.parentFile, "${file.name}.page-chunks")
     private var pairId: String? = null
 
     private var studentGenerationCounter = 0L
@@ -175,7 +199,9 @@ internal class RemotePageSyncStore(
 
     init {
         file.parentFile?.let { check(it.mkdirs() || it.isDirectory) }
+        check(teacherPageChunkRoot.mkdirs() || teacherPageChunkRoot.isDirectory)
         load()
+        removeExpiredTeacherPageChunks()
     }
 
     @Synchronized
@@ -269,6 +295,7 @@ internal class RemotePageSyncStore(
     /** Advances only for a semantic page/attempt change, never by reusing an operation clock. */
     @Synchronized
     fun updateStudentPage(
+        expectedSyncGeneration: Long,
         pageToken: String,
         workbookToken: String,
         bookId: String,
@@ -283,7 +310,8 @@ internal class RemotePageSyncStore(
         approximateBytes: Long,
     ): StudentPageSyncRecord {
         val generation = studentOpenGeneration
-        require(generation > 0L && pageToken.isNotBlank() && workbookToken.isNotBlank())
+        require(generation > 0L && generation == expectedSyncGeneration &&
+            pageToken.isNotBlank() && workbookToken.isNotBlank())
         require(bookId.isNotBlank() && pageNumber >= 0 && originDeviceHighWater >= 0L)
         val attempts = attemptNos.distinct().sorted()
         val submitted = submittedAttemptNos.distinct().sorted()
@@ -330,6 +358,7 @@ internal class RemotePageSyncStore(
             approximateBytes = approximateBytes.coerceAtLeast(0L),
             responseToRequestTransferId = previous?.responseToRequestTransferId,
             outgoingAnnotationTransferId = previous?.outgoingAnnotationTransferId,
+            outgoingAnnotationChunkTransferIds = previous?.outgoingAnnotationChunkTransferIds.orEmpty(),
             outgoingSourceRevision = previous?.outgoingSourceRevision ?: 0L,
             outgoingOriginCursor = previous?.outgoingOriginCursor ?: 0L,
             outgoingStateFingerprint = previous?.outgoingStateFingerprint,
@@ -363,6 +392,7 @@ internal class RemotePageSyncStore(
         pageToken: String,
         requestTransferId: String,
         annotationTransferId: String,
+        annotationChunkTransferIds: List<String> = listOf(annotationTransferId),
         sourceRevision: Long,
         originCursor: Long,
         stateFingerprint: String,
@@ -371,9 +401,13 @@ internal class RemotePageSyncStore(
     ): Boolean {
         val current = studentPages[pageToken] ?: return false
         require(sourceRevision in 1L..current.sourceRevision && originCursor >= 0L && sentAtEpochMs >= 0L)
+        val chunkIds = annotationChunkTransferIds.distinct()
+        require(chunkIds.isNotEmpty() && chunkIds.size == annotationChunkTransferIds.size &&
+            chunkIds.size <= MAX_TEACHER_PAGE_CHUNKS && chunkIds.all(String::isNotBlank))
         studentPages[pageToken] = current.copy(
             responseToRequestTransferId = requestTransferId,
             outgoingAnnotationTransferId = annotationTransferId,
+            outgoingAnnotationChunkTransferIds = chunkIds,
             outgoingSourceRevision = sourceRevision,
             outgoingOriginCursor = originCursor,
             outgoingStateFingerprint = stateFingerprint,
@@ -391,6 +425,7 @@ internal class RemotePageSyncStore(
         studentPages[pageToken] = current.copy(
             responseToRequestTransferId = null,
             outgoingAnnotationTransferId = null,
+            outgoingAnnotationChunkTransferIds = emptyList(),
             outgoingSourceRevision = 0L,
             outgoingOriginCursor = 0L,
             outgoingStateFingerprint = null,
@@ -432,6 +467,7 @@ internal class RemotePageSyncStore(
             acknowledgedOriginCursor = acknowledgedOriginCursor.coerceAtMost(current.originDeviceHighWater),
             responseToRequestTransferId = null,
             outgoingAnnotationTransferId = null,
+            outgoingAnnotationChunkTransferIds = emptyList(),
             outgoingSourceRevision = 0L,
             outgoingOriginCursor = 0L,
             outgoingStateFingerprint = null,
@@ -440,6 +476,89 @@ internal class RemotePageSyncStore(
         )
         persist()
         return true
+    }
+
+    /**
+     * Durably accepts one out-of-order checkpoint fragment. Returning [Partial] means the caller may
+     * transport-ACK this document: the bytes survive process death and a later duplicate is exact.
+     */
+    @Synchronized
+    fun offerTeacherPageChunk(
+        descriptor: TeacherPageChunkDescriptor,
+        chunkIndex: Int,
+        chunkSha256: String,
+        decodedChunk: ByteArray,
+    ): TeacherPageChunkOfferResult {
+        require(descriptor.syncGeneration > 0L && descriptor.chunkGroupId.isNotBlank())
+        require(descriptor.responseToTransferId.isNotBlank() && descriptor.pageToken.isNotBlank())
+        require(descriptor.pageNumber > 0 && descriptor.sourceRevision >= 0L)
+        require(descriptor.attemptNos.distinct().size == descriptor.attemptNos.size &&
+            descriptor.attemptNos.all { it > 0 })
+        require(descriptor.chunkCount in 2..MAX_TEACHER_PAGE_CHUNKS &&
+            chunkIndex in 0 until descriptor.chunkCount)
+        require(descriptor.assembledPayloadSizeBytes in 1..MAX_ASSEMBLED_TEACHER_PAGE_BYTES)
+        require(decodedChunk.isNotEmpty() && decodedChunk.size <= MAX_TEACHER_PAGE_CHUNK_BYTES)
+        require(sha256(decodedChunk) == chunkSha256)
+
+        val groupDirectory = teacherPageChunkDirectory(descriptor.chunkGroupId)
+        if (!groupDirectory.exists()) check(groupDirectory.mkdirs())
+        val metadataFile = File(groupDirectory, TEACHER_PAGE_CHUNK_METADATA)
+        val existingDescriptor = if (metadataFile.exists()) decodeChunkDescriptor(metadataFile) else null
+        if (existingDescriptor == null) {
+            if (metadataFile.exists()) error("Stored page chunk metadata is corrupt")
+            removeObsoleteTeacherPageChunks(descriptor)
+            writeAtomicBytes(metadataFile, encodeChunkDescriptor(descriptor).toByteArray(Charsets.UTF_8))
+        } else {
+            require(existingDescriptor == descriptor) { "Page chunk group identity changed" }
+        }
+
+        val target = File(groupDirectory, "$chunkIndex.chunk")
+        if (target.exists()) {
+            require(target.length() in 1..MAX_TEACHER_PAGE_CHUNK_BYTES.toLong()) {
+                "Stored page chunk has an invalid size"
+            }
+            val existing = target.readBytes()
+            require(sha256(existing) == chunkSha256 && existing.contentEquals(decodedChunk)) {
+                "Duplicate page chunk bytes changed"
+            }
+        } else {
+            writeAtomicBytes(target, decodedChunk)
+        }
+        groupDirectory.setLastModified(System.currentTimeMillis())
+
+        var assembledSize = 0L
+        repeat(descriptor.chunkCount) { index ->
+            val file = File(groupDirectory, "$index.chunk")
+            if (!file.exists()) return TeacherPageChunkOfferResult.Partial
+            require(file.length() in 1..MAX_TEACHER_PAGE_CHUNK_BYTES.toLong())
+            assembledSize += file.length()
+            require(assembledSize <= descriptor.assembledPayloadSizeBytes.toLong())
+        }
+        require(assembledSize == descriptor.assembledPayloadSizeBytes.toLong())
+        val assembled = ByteArray(descriptor.assembledPayloadSizeBytes)
+        var offset = 0
+        repeat(descriptor.chunkCount) { index ->
+            val file = File(groupDirectory, "$index.chunk")
+            file.inputStream().use { input ->
+                var remaining = file.length().toInt()
+                while (remaining > 0) {
+                    val count = input.read(assembled, offset, remaining)
+                    require(count > 0 && count <= remaining && offset + count <= assembled.size)
+                    offset += count
+                    remaining -= count
+                }
+                require(input.read() == -1)
+            }
+        }
+        require(offset == assembled.size)
+        require(sha256(assembled) == descriptor.payloadSha256) { "Assembled page digest changed" }
+        return TeacherPageChunkOfferResult.Complete(assembled)
+    }
+
+    @Synchronized
+    fun clearTeacherPageChunkGroup(chunkGroupId: String) {
+        if (chunkGroupId.isBlank()) return
+        teacherPageChunkDirectory(chunkGroupId).deleteRecursively()
     }
 
     @Synchronized
@@ -630,7 +749,9 @@ internal class RemotePageSyncStore(
             }
         ) return TeacherManifestInstallResult.REGRESSION
 
-        val previousPages = if (syncGeneration == teacherManifestGeneration) teacherPages.toMap() else emptyMap()
+        val generationChanged = syncGeneration != teacherManifestGeneration
+        val previousPages = if (!generationChanged) teacherPages.toMap() else emptyMap()
+        if (generationChanged) clearAllTeacherPageChunks()
         teacherPages.clear()
         // A bounded manifest is a page upsert batch within one generation. Retaining omitted rows
         // keeps an in-flight request/correlation alive when another newly changed page pushes it
@@ -671,6 +792,7 @@ internal class RemotePageSyncStore(
     /** LAN READY invalidates page ownership but keeps high-waters that reject delayed old manifests. */
     @Synchronized
     fun clearTeacherManifestPagesForLan() {
+        clearAllTeacherPageChunks()
         if (teacherPages.isEmpty() && teacherCursor == null && teacherInventoryPageCount == null) return
         teacherPages.clear()
         teacherCursor = null
@@ -1029,7 +1151,8 @@ internal class RemotePageSyncStore(
         transportAcknowledgedAtEpochMs = null,
     )
 
-    private fun clearPairState(resetGenerationCounter: Boolean) {
+    private fun clearPairState(resetGenerationCounter: Boolean, clearChunkFiles: Boolean = true) {
+        if (clearChunkFiles) clearAllTeacherPageChunks()
         if (resetGenerationCounter) studentGenerationCounter = 0L
         studentOpenGeneration = 0L
         studentManifestSequence = 0L
@@ -1047,6 +1170,87 @@ internal class RemotePageSyncStore(
         pendingTeacherReviews.clear()
         completedTeacherPublications.clear()
     }
+
+    private fun removeObsoleteTeacherPageChunks(descriptor: TeacherPageChunkDescriptor) {
+        teacherPageChunkRoot.listFiles().orEmpty().forEach { directory ->
+            if (!directory.isDirectory || directory == teacherPageChunkDirectory(descriptor.chunkGroupId)) return@forEach
+            val old = decodeChunkDescriptor(File(directory, TEACHER_PAGE_CHUNK_METADATA))
+            val expired = System.currentTimeMillis() - directory.lastModified() > TEACHER_PAGE_CHUNK_TTL_MS
+            val samePageDifferentGroup = old?.let {
+                it.syncGeneration == descriptor.syncGeneration && it.pageToken == descriptor.pageToken
+            } == true
+            if (old == null || expired || samePageDifferentGroup) directory.deleteRecursively()
+        }
+    }
+
+    private fun removeExpiredTeacherPageChunks() {
+        val now = System.currentTimeMillis()
+        teacherPageChunkRoot.listFiles().orEmpty().forEach { directory ->
+            if (!directory.isDirectory || now - directory.lastModified() > TEACHER_PAGE_CHUNK_TTL_MS) {
+                directory.deleteRecursively()
+            }
+        }
+    }
+
+    private fun clearAllTeacherPageChunks() {
+        teacherPageChunkRoot.listFiles().orEmpty().forEach(File::deleteRecursively)
+    }
+
+    private fun teacherPageChunkDirectory(chunkGroupId: String): File = File(
+        teacherPageChunkRoot,
+        sha256(chunkGroupId.toByteArray(Charsets.UTF_8)),
+    )
+
+    private fun encodeChunkDescriptor(value: TeacherPageChunkDescriptor): String = JSONObject()
+        .put("generation", value.syncGeneration)
+        .put("chunkGroupId", value.chunkGroupId)
+        .put("responseToTransferId", value.responseToTransferId)
+        .put("pageToken", value.pageToken)
+        .put("pageNumber", value.pageNumber)
+        .put("attemptNos", value.attemptNos.toJsonArray())
+        .put("sourceRevision", value.sourceRevision)
+        .put("resultLayerSha256", value.resultLayerSha256)
+        .put("payloadSha256", value.payloadSha256)
+        .put("chunkCount", value.chunkCount)
+        .put("assembledPayloadSizeBytes", value.assembledPayloadSizeBytes)
+        .toString()
+
+    private fun decodeChunkDescriptor(file: File): TeacherPageChunkDescriptor? = runCatching {
+        require(file.length() in 1..MAX_TEACHER_PAGE_CHUNK_METADATA_BYTES.toLong())
+        val value = JSONObject(file.readText(Charsets.UTF_8))
+        TeacherPageChunkDescriptor(
+            syncGeneration = value.getLong("generation"),
+            chunkGroupId = value.getString("chunkGroupId"),
+            responseToTransferId = value.getString("responseToTransferId"),
+            pageToken = value.getString("pageToken"),
+            pageNumber = value.getInt("pageNumber"),
+            attemptNos = value.getJSONArray("attemptNos").toIntList(),
+            sourceRevision = value.getLong("sourceRevision"),
+            resultLayerSha256 = value.getString("resultLayerSha256"),
+            payloadSha256 = value.getString("payloadSha256"),
+            chunkCount = value.getInt("chunkCount"),
+            assembledPayloadSizeBytes = value.getInt("assembledPayloadSizeBytes"),
+        )
+    }.getOrNull()
+
+    private fun writeAtomicBytes(file: File, bytes: ByteArray) {
+        val atomic = AtomicFile(file)
+        beforeChunkWrite?.invoke()
+        val output = atomic.startWrite()
+        try {
+            output.write(bytes)
+            output.flush()
+            output.fd.sync()
+            atomic.finishWrite(output)
+        } catch (error: Throwable) {
+            runCatching { atomic.failWrite(output) }
+            throw error
+        }
+    }
+
+    private fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
+        .digest(bytes)
+        .joinToString("") { byte -> (byte.toInt() and 0xff).toString(16).padStart(2, '0') }
 
     private fun load() {
         val durableGenerationHighWater = readGenerationHighWater()
@@ -1211,7 +1415,7 @@ internal class RemotePageSyncStore(
     private fun resetInMemoryState() {
         pairId = null
         studentGenerationCounter = 0L
-        clearPairState(resetGenerationCounter = false)
+        clearPairState(resetGenerationCounter = false, clearChunkFiles = false)
     }
 
     private fun encode(v: StudentManifestReservation) = JSONObject()
@@ -1233,6 +1437,7 @@ internal class RemotePageSyncStore(
         .put("lastChangedAt", v.lastChangedAtEpochMs).put("approximateBytes", v.approximateBytes)
         .put("responseToRequestTransferId", v.responseToRequestTransferId ?: JSONObject.NULL)
         .put("outgoingAnnotationTransferId", v.outgoingAnnotationTransferId ?: JSONObject.NULL)
+        .put("outgoingAnnotationChunkTransferIds", v.outgoingAnnotationChunkTransferIds.toStringJsonArray())
         .put("outgoingSourceRevision", v.outgoingSourceRevision)
         .put("outgoingOriginCursor", v.outgoingOriginCursor)
         .put("outgoingStateFingerprint", v.outgoingStateFingerprint ?: JSONObject.NULL)
@@ -1304,6 +1509,10 @@ internal class RemotePageSyncStore(
         lastChangedAtEpochMs = v.getLong("lastChangedAt"), approximateBytes = v.optLong("approximateBytes"),
         responseToRequestTransferId = v.optNullableString("responseToRequestTransferId"),
         outgoingAnnotationTransferId = v.optNullableString("outgoingAnnotationTransferId"),
+        outgoingAnnotationChunkTransferIds = v.optJSONArray("outgoingAnnotationChunkTransferIds")
+            ?.toStringList().orEmpty().ifEmpty {
+                v.optNullableString("outgoingAnnotationTransferId")?.let(::listOf).orEmpty()
+            },
         outgoingSourceRevision = v.optLong("outgoingSourceRevision"), outgoingOriginCursor = v.optLong("outgoingOriginCursor"),
         outgoingStateFingerprint = v.optNullableString("outgoingStateFingerprint"),
         outgoingResultLayerSha256 = v.optNullableString("outgoingResultLayerSha256"),
@@ -1372,8 +1581,12 @@ internal class RemotePageSyncStore(
     private fun JSONArray?.toIntList(): List<Int> = if (this == null) emptyList() else buildList {
         for (index in 0 until length()) add(getInt(index))
     }
+    private fun JSONArray.toStringList(): List<String> = buildList {
+        for (index in 0 until length()) add(getString(index))
+    }
     private fun JSONArray.forEachObject(block: (JSONObject) -> Unit) { for (index in 0 until length()) block(getJSONObject(index)) }
     private fun List<Int>.toJsonArray() = JSONArray().apply { forEach(::put) }
+    private fun List<String>.toStringJsonArray() = JSONArray().apply { forEach(::put) }
     private fun JSONObject.optNullableString(name: String): String? = if (isNull(name)) null else optString(name).takeIf(String::isNotBlank)
     private fun JSONObject.optNullableLong(name: String): Long? = if (isNull(name)) null else getLong(name)
     private fun JSONObject.optNullableInt(name: String): Int? = if (isNull(name)) null else getInt(name)
@@ -1382,6 +1595,12 @@ internal class RemotePageSyncStore(
         const val MIN_SUPPORTED_VERSION = 2
         const val VERSION = 4
         const val MAX_COMPLETED_TEACHER_PUBLICATIONS = 1_024
+        const val MAX_TEACHER_PAGE_CHUNKS = 8
+        const val MAX_TEACHER_PAGE_CHUNK_BYTES = 2 * 1024 * 1024 - 32 * 1024
+        const val MAX_ASSEMBLED_TEACHER_PAGE_BYTES = 8 * 1024 * 1024
+        const val TEACHER_PAGE_CHUNK_TTL_MS = 7 * 24 * 60 * 60 * 1_000L
+        const val TEACHER_PAGE_CHUNK_METADATA = "metadata.json"
+        const val MAX_TEACHER_PAGE_CHUNK_METADATA_BYTES = 16 * 1024
     }
 }
 

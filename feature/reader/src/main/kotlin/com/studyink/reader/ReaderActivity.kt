@@ -57,7 +57,11 @@ import com.studyink.monitor.telegram.RemoteMonitorGateway
 import com.studyink.monitor.telegram.RemoteMonitorPreferences
 import com.studyink.monitor.telegram.RemoteReviewPeerStatus
 import com.studyink.monitor.telegram.TelegramEnqueueResult
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private val viewModel: ReaderViewModel by viewModels()
@@ -75,6 +79,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private lateinit var parentMessageSpeaker: ParentMessageSpeaker
     private lateinit var studentVoiceController: StudentVoiceMessageController
     private lateinit var remoteMonitorGateway: RemoteMonitorGateway
+    private lateinit var peerChatAnnouncementStore: PeerChatAnnouncementStore
     private lateinit var bookId: String
     private lateinit var teacherAccess: TeacherAccessController
 
@@ -114,6 +119,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var peerChatPrimed = false
     private var lastPeerChatMessageId: String? = null
     private val peerChatOverlayDeliveryGate = PeerChatOverlayDeliveryGate()
+    private val peerChatAnnouncementMutex = Mutex()
     private var readerStarted = false
     private var readerResumed = false
     private var activeStudentPresence: StudentStudyPresence? = null
@@ -136,6 +142,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         }
         teacherAccess = TeacherAccessController(this)
         remoteMonitorGateway = RemoteMonitorGateway.get(this)
+        peerChatAnnouncementStore = PeerChatAnnouncementStore.get(this)
         val requestedRole = intent.getStringExtra(EXTRA_ROLE)
             ?.let { runCatching { ReaderRole.valueOf(it) }.getOrNull() }
             ?: ReaderRole.STUDENT
@@ -762,16 +769,36 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             messageId = messageId,
             text = text,
             canDisplayNow = readerResumed,
-        )?.let { showIncomingPeerChat(it.text) }
+        )?.let(::claimAndShowIncomingPeerChat)
     }
 
     private fun deliverPendingPeerChat() {
         val activePairId = (remoteMonitorGateway.remoteReviewPeerStatus()
             as? RemoteReviewPeerStatus.Connected)?.pairId
-        peerChatOverlayDeliveryGate.resume(activePairId)?.let { showIncomingPeerChat(it.text) }
+        peerChatOverlayDeliveryGate.resume(activePairId)?.let(::claimAndShowIncomingPeerChat)
     }
 
-    private fun showIncomingPeerChat(text: String) {
+    private fun claimAndShowIncomingPeerChat(delivery: PeerChatOverlayDelivery) {
+        lifecycleScope.launch {
+            peerChatAnnouncementMutex.withLock {
+                val claimed = withContext(Dispatchers.IO) {
+                    runCatching {
+                        peerChatAnnouncementStore.claim(delivery.pairId, delivery.messageId)
+                    }.onFailure { error ->
+                        Log.w(REMOTE_MONITOR_LOG_TAG, "Unable to persist peer-chat announcement claim", error)
+                    }.getOrDefault(false)
+                }
+                if (!claimed || !readerStarted || !readerResumed) return@withLock
+                val activePairId = (remoteMonitorGateway.remoteReviewPeerStatus()
+                    as? RemoteReviewPeerStatus.Connected)?.pairId
+                if (activePairId != delivery.pairId) return@withLock
+                showClaimedIncomingPeerChat(delivery.text)
+            }
+        }
+    }
+
+    /** Visible and audible side effects are allowed only after a durable announcement claim. */
+    private fun showClaimedIncomingPeerChat(text: String) {
         parentMessageOverlay.showMessage(text)
         if (latestState.role == ReaderRole.STUDENT && remoteMonitorPreferences.ttsEnabled) {
             if (voiceState.blocksParentSpeech()) deferredParentSpeech = text

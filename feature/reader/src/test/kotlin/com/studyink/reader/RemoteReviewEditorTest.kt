@@ -4,10 +4,38 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RemoteReviewEditorTest {
+    @Test
+    fun eraseWorkerResolutionCommitsOnlyNormalUninterruptedResults() {
+        assertEquals(
+            RemoteEraseResolution.Success(setOf("stroke-1")),
+            resolveRemoteEraseWork(resolve = { setOf("stroke-1") }, isInterrupted = { false }),
+        )
+        assertSame(
+            RemoteEraseResolution.Failed,
+            resolveRemoteEraseWork(
+                resolve = { throw OutOfMemoryError("simulated worker exhaustion") },
+                isInterrupted = { false },
+            ),
+        )
+        assertSame(
+            RemoteEraseResolution.Failed,
+            resolveRemoteEraseWork(resolve = { setOf("stroke-1") }, isInterrupted = { true }),
+        )
+        var interruptChecks = 0
+        assertSame(
+            RemoteEraseResolution.Failed,
+            resolveRemoteEraseWork(
+                resolve = { setOf("stroke-1") },
+                isInterrupted = { ++interruptChecks > 1 },
+            ),
+        )
+    }
+
     @Test
     fun acceptedPublishBecomesCleanWithoutTouchingAnyExternalAnnotationState() {
         val editor = RemoteReviewEditor()
@@ -61,6 +89,74 @@ class RemoteReviewEditorTest {
         assertEquals(listOf("far"), editor.state.strokes.map(RemoteFeedbackStroke::id))
         assertTrue(editor.undo())
         assertEquals(listOf("near", "far"), editor.state.strokes.map(RemoteFeedbackStroke::id))
+    }
+
+    @Test
+    fun eraseCompletionIsRejectedAfterAnotherEditAndCannotCommitTwice() {
+        val editor = RemoteReviewEditor()
+        editor.openSnapshot(snapshot())
+        editor.addStroke(
+            RemoteFeedbackStrokeTool.PEN,
+            0xFFD94747.toInt(),
+            0.004f,
+            listOf(point(0.1f, 0.2f), point(0.9f, 0.2f)),
+            "erase-target",
+        )
+        val stalePlan = requireNotNull(
+            editor.prepareErase(
+                path = listOf(point(0.5f, 0.1f), point(0.5f, 0.3f)),
+                radiusFraction = 0.02f,
+            ),
+        )
+        val staleCandidates = editor.resolveErase(stalePlan)
+
+        editor.addStroke(
+            RemoteFeedbackStrokeTool.PEN,
+            0xFFD94747.toInt(),
+            0.004f,
+            listOf(point(0.1f, 0.8f), point(0.9f, 0.8f)),
+            "newer-edit",
+        )
+
+        assertTrue(editor.commitErase(stalePlan, staleCandidates).isEmpty())
+        assertEquals(
+            listOf("erase-target", "newer-edit"),
+            editor.state.strokes.map(RemoteFeedbackStroke::id),
+        )
+
+        val freshPlan = requireNotNull(
+            editor.prepareErase(
+                path = listOf(point(0.5f, 0.1f), point(0.5f, 0.3f)),
+                radiusFraction = 0.02f,
+            ),
+        )
+        val freshCandidates = editor.resolveErase(freshPlan)
+        assertEquals(setOf("erase-target"), editor.commitErase(freshPlan, freshCandidates))
+        assertTrue(editor.commitErase(freshPlan, freshCandidates).isEmpty())
+        assertEquals(listOf("newer-edit"), editor.state.strokes.map(RemoteFeedbackStroke::id))
+    }
+
+    @Test
+    fun eraseFromEarlierVisitCannotCommitAfterReopeningIdenticalSnapshotAndRevision() {
+        val editor = RemoteReviewEditor()
+        val initial = feedbackWithSingleStroke()
+        editor.openSnapshot(snapshot(), initialFeedback = initial)
+        val oldPlan = requireNotNull(
+            editor.prepareErase(
+                path = listOf(point(0.5f, 0.1f), point(0.5f, 0.3f)),
+                radiusFraction = 0.02f,
+            ),
+        )
+        val oldCandidates = editor.resolveErase(oldPlan)
+
+        assertTrue(editor.clearSnapshot(discardUnpublishedChanges = true))
+        assertEquals(
+            RemoteSnapshotOpenResult.OPENED,
+            editor.openSnapshot(snapshot(), initialFeedback = initial),
+        )
+
+        assertTrue(editor.commitErase(oldPlan, oldCandidates).isEmpty())
+        assertEquals(listOf("same-revision-stroke"), editor.state.strokes.map(RemoteFeedbackStroke::id))
     }
 
     @Test
@@ -161,6 +257,26 @@ class RemoteReviewEditorTest {
         imageWidthPx = 900,
         imageHeightPx = 1_200,
         receivedAtEpochMillis = 10L,
+    )
+
+    private fun feedbackWithSingleStroke() = RemoteTeacherFeedback(
+        feedbackId = "existing-feedback",
+        sourceTransferId = "student-transfer-1",
+        pageToken = "opaque-book-page",
+        bookFingerprint = "book-sha256",
+        pageNumber = 3,
+        basedOnStudentRevision = 7L,
+        feedbackRevision = 11L,
+        strokes = listOf(
+            RemoteFeedbackStroke(
+                id = "same-revision-stroke",
+                tool = RemoteFeedbackStrokeTool.PEN,
+                colorArgb = 0xFFD94747.toInt(),
+                widthFraction = 0.004f,
+                points = listOf(point(0.1f, 0.2f), point(0.9f, 0.2f)),
+            ),
+        ),
+        createdAtEpochMillis = 9L,
     )
 
     private fun point(x: Float, y: Float) = RemoteNormalizedPoint(x, y)

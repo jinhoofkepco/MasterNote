@@ -27,10 +27,12 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
     private val peerDocumentInbox = TelegramPeerDocumentInbox(paths.peerInboxJournal, paths.peerInboxDirectory)
     private val peerReceipts = TelegramPeerReceiptStore(paths.peerReceiptJournal)
     private val peerHandshake = TelegramPeerHandshakeStateStore(paths.peerHandshakeFile)
+    private val peerLink = TelegramPeerLinkStateStore(paths.peerLinkStateFile)
     private val setupClient = TelegramSetupClient(credentials, offsets)
     private val lifecycleLock = Any()
     private val statusLock = Any()
     private val statusListeners = linkedSetOf<(RemoteMonitorStatus) -> Unit>()
+    private val peerLinkListeners = linkedSetOf<(TelegramPeerLinkState) -> Unit>()
     private var poller: TelegramInboxPoller? = null
     private var uploader: TelegramOutboxWorker? = null
     private var currentStatus: RemoteMonitorStatus = if (credentials.load() == null) {
@@ -38,6 +40,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
     } else {
         RemoteMonitorStatus.Stopped
     }
+    private var lastPublishedPeerLinkState: TelegramPeerLinkState = peerLinkState()
 
     init {
         val recoveryFiles = recoverUnqueuedVoiceMedia(
@@ -47,6 +50,11 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             nowEpochMs = System.currentTimeMillis(),
         )
         cleanupUnqueuedOwnedMedia(paths, outbox, recoveryFiles)
+        // A crash can land after the durable server-accepted receipt but before normal ciphertext
+        // deletion. Such entries are never uploaded again, so retaining their files wastes space.
+        outbox.pendingSnapshot()
+            .filter(::isServerAcceptedPeerDocument)
+            .forEach { deleteOwnedPeerFile(it.file) }
     }
 
     val mediaDirectory: File get() = paths.mediaDirectory
@@ -68,6 +76,28 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         pending = peerHandshake.load(),
         nowEpochMs = System.currentTimeMillis(),
     )
+
+    fun peerLinkState(nowEpochMs: Long = System.currentTimeMillis()): TelegramPeerLinkState =
+        resolveTelegramPeerLinkState(
+            peerStatus = remoteReviewPeerStatus(),
+            record = peerLink.load(),
+            nowEpochMs = nowEpochMs,
+            freshnessMs = PEER_FRESHNESS_MS,
+        )
+
+    fun subscribePeerLinkState(
+        emitCurrent: Boolean = true,
+        listener: (TelegramPeerLinkState) -> Unit,
+    ): RemoteMonitorStatusSubscription {
+        val initial = synchronized(statusLock) {
+            peerLinkListeners += listener
+            if (emitCurrent) peerLinkState() else null
+        }
+        initial?.let(listener)
+        return RemoteMonitorStatusSubscription {
+            synchronized(statusLock) { peerLinkListeners -= listener }
+        }
+    }
 
     /**
      * Creates the student QR payload. It contains the local bot identity and a new 256-bit session
@@ -117,6 +147,9 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             mutatePeerWorkersLocked {
                 val nonce = TelegramPeerProtocol.newNonce()
                 revokePeerStateLocked(now)
+                // This installation is becoming the teacher. Parent-mode screenshots, reports,
+                // text inboxes and pending /screen commands must not survive the role boundary.
+                cancelParentTrafficLocked(now)
                 val configured = active.withRemoteReviewPairing(
                     role = RemoteReviewRole.TEACHER,
                     pairId = decoded.pairId,
@@ -158,6 +191,144 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             revokePeerStateLocked(System.currentTimeMillis())
             credentials.save(active.withoutRemoteReview())
         }
+        publishPeerLinkState(TelegramPeerLinkState.UNAVAILABLE)
+    }
+
+    /**
+     * Teacher-initiated, expiring wake-up request. It carries no page data and never changes the
+     * pinned pairing; the student answers only when the HMAC and exact bot identity both match.
+     */
+    fun requestPeerConnection(
+        lifetimeMs: Long = TelegramPeerProtocol.DEFAULT_CONTROL_REQUEST_LIFETIME_MS,
+    ): TelegramEnqueueResult {
+        require(lifetimeMs in 15_000L..TelegramPeerProtocol.MAX_CONTROL_REQUEST_LIFETIME_MS)
+        val resultAndState = synchronized(lifecycleLock) {
+            val connected = remoteReviewPeerStatus() as? RemoteReviewPeerStatus.Connected
+                ?: return@synchronized TelegramEnqueueResult.NOT_CONFIGURED to peerLinkState()
+            if (connected.role != RemoteReviewRole.TEACHER) {
+                return@synchronized TelegramEnqueueResult.NOT_CONFIGURED to peerLinkState()
+            }
+            val active = credentials.load() ?: return@synchronized TelegramEnqueueResult.NOT_CONFIGURED to peerLinkState()
+            val key = active.peerSharedKey() ?: return@synchronized TelegramEnqueueResult.NOT_CONFIGURED to peerLinkState()
+            val now = System.currentTimeMillis()
+            var record = ensurePeerLinkRecordLocked(connected.pairId)
+            val existingRequestId = record.pendingRequestId
+            if (existingRequestId != null && hasUsablePendingConnectionRequest(record, now)) {
+                // Repeated UI taps refer to the same outstanding request. Do not create another
+                // Telegram server update which could be replayed after a long offline period.
+                uploader?.wake()
+                poller?.wake()
+                return@synchronized TelegramEnqueueResult.ALREADY_PENDING to
+                    resolvePeerLinkStateLocked(now)
+            }
+            if (existingRequestId != null) {
+                outbox.cancelPeerTextTransfers(setOf(existingRequestId), now)
+                record = record.withoutRequest()
+            }
+            val requestId = TelegramPeerProtocol.newRequestId()
+            val expiresAt = safeEpochAdd(now, lifetimeMs)
+            record = record.copy(
+                pendingRequestId = requestId,
+                pendingRequestExpiresAtEpochMs = expiresAt,
+                // An explicit request also counts as this stale episode's probe. If it receives no
+                // answer, maintenance must not follow it with an endless automatic PING stream.
+                lastPingScheduledAtEpochMs = now,
+            )
+            peerLink.save(record)
+            val result = enqueuePeerControlLocked(
+                active = active,
+                transferId = requestId,
+                kind = "connect",
+                text = TelegramPeerProtocol.connectRequest(requestId, now, expiresAt, key),
+                nowEpochMs = now,
+            )
+            if (!result.isDurablyQueued()) {
+                record = record.withoutRequest()
+                peerLink.save(record)
+            }
+            result to resolvePeerLinkStateLocked(now)
+        }
+        publishPeerLinkState(resultAndState.second)
+        if (resultAndState.first.isDurablyQueued()) start()
+        return resultAndState.first
+    }
+
+    /**
+     * Idempotent watchdog invoked by the application clock. Only the teacher originates probes;
+     * therefore a healthy pair costs one tiny PING/PONG exchange per interval and never doubles it.
+     */
+    fun maintainPeerLink(nowEpochMs: Long = System.currentTimeMillis()): TelegramPeerLinkState {
+        require(nowEpochMs >= 0L)
+        val next = synchronized(lifecycleLock) {
+            val connected = remoteReviewPeerStatus() as? RemoteReviewPeerStatus.Connected
+            if (connected == null) {
+                if (peerLink.load() != null) peerLink.clear()
+                TelegramPeerLinkState.UNAVAILABLE
+            } else {
+                val active = credentials.load()
+                val key = active?.peerSharedKey()
+                var record = ensurePeerLinkRecordLocked(connected.pairId)
+                var persistedRecord = record
+                if (record.pendingRequestId != null &&
+                    !hasUsablePendingConnectionRequest(record, nowEpochMs)
+                ) {
+                    outbox.cancelPeerTextTransfers(setOf(requireNotNull(record.pendingRequestId)), nowEpochMs)
+                    record = record.withoutRequest()
+                }
+                if (record.pendingPingNonce != null && !isUsablePeerControlWindow(
+                        record.pendingPingSentAtEpochMs,
+                        record.pendingPingExpiresAtEpochMs,
+                        nowEpochMs,
+                    )
+                ) {
+                    outbox.cancelPeerTextTransfers(setOf(requireNotNull(record.pendingPingNonce)), nowEpochMs)
+                    record = record.withoutPing()
+                }
+                val shouldPing = connected.role == RemoteReviewRole.TEACHER &&
+                    active != null && key != null &&
+                    shouldScheduleAutomaticPeerPing(
+                        record = record,
+                        nowEpochMs = nowEpochMs,
+                        intervalMs = PEER_PING_INTERVAL_MS,
+                        freshnessMs = PEER_FRESHNESS_MS,
+                    )
+                if (shouldPing) {
+                    val nonce = TelegramPeerProtocol.newNonce()
+                    val expiresAt = safeEpochAdd(nowEpochMs, PEER_PING_LIFETIME_MS)
+                    record = record.copy(
+                        pendingPingNonce = nonce,
+                        pendingPingSentAtEpochMs = nowEpochMs,
+                        pendingPingExpiresAtEpochMs = expiresAt,
+                        lastPingScheduledAtEpochMs = nowEpochMs,
+                    )
+                    peerLink.save(record)
+                    persistedRecord = record
+                    val queued = enqueuePeerControlLocked(
+                        active = active,
+                        transferId = nonce,
+                        kind = "ping",
+                        text = TelegramPeerProtocol.ping(
+                            record.sessionId,
+                            nonce,
+                            nowEpochMs,
+                            expiresAt,
+                            key,
+                        ),
+                        nowEpochMs = nowEpochMs,
+                    )
+                    if (!queued.isDurablyQueued()) record = record.withoutPing()
+                }
+                if (record != persistedRecord) peerLink.save(record)
+                resolveTelegramPeerLinkState(
+                    connected,
+                    record,
+                    nowEpochMs,
+                    PEER_FRESHNESS_MS,
+                )
+            }
+        }
+        publishPeerLinkState(next)
+        return next
     }
 
     fun subscribePeerDocuments(
@@ -173,7 +344,9 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
     fun pendingPeerDocumentTransfers(
         payloadTypes: Set<String>,
     ): List<PendingTelegramPeerDocumentTransfer> = inspectPendingPeerDocumentTransfers(
-        entries = outbox.pendingSnapshot(),
+        // A server-accepted document is retained only as 24-hour ACK bookkeeping. Its ciphertext
+        // has already been deleted and it must not inflate the UI's pending-byte estimate.
+        entries = outbox.pendingSnapshot().filterNot(::isServerAcceptedPeerDocument),
         payloadTypes = payloadTypes,
     )
 
@@ -194,6 +367,19 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                 payloadTypes = requested,
                 cancelledAtEpochMs = System.currentTimeMillis(),
             )
+        }
+    }
+
+    /** A teacher installation must never flush traffic left by the human-parent mode. */
+    fun cancelParentRenderTrafficForRemoteTeacher(): Int = synchronized(lifecycleLock) {
+        val isTeacher = when (val status = remoteReviewPeerStatus()) {
+            is RemoteReviewPeerStatus.WaitingForStudentAck -> true
+            is RemoteReviewPeerStatus.Connected -> status.role == RemoteReviewRole.TEACHER
+            else -> false
+        }
+        if (!isTeacher) return@synchronized 0
+        mutatePeerWorkersLocked {
+            cancelParentTrafficLocked(System.currentTimeMillis())
         }
     }
 
@@ -234,7 +420,9 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             peerTransferId = transferId,
         )
         val pendingPeerDocuments = outbox.pendingSnapshot().filter { pending ->
-            pending.route == TelegramOutboxRoute.PEER && pending.kind == TelegramOutboxKind.DOCUMENT
+            pending.route == TelegramOutboxRoute.PEER &&
+                pending.kind == TelegramOutboxKind.DOCUMENT &&
+                !isServerAcceptedPeerDocument(pending)
         }
         val alreadyPending = pendingPeerDocuments.any { it.idempotencyKey == entry.idempotencyKey }
         val pendingBytes = pendingPeerDocuments.sumOf { pending ->
@@ -351,6 +539,20 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             return false
         }
         stopLocked(updateStoppedStatus = false)
+        // Package replacement starts this gateway from a BroadcastReceiver immediately after the
+        // process is created. Retire superseded rendered-page traffic before constructing either
+        // worker so an old durable document cannot win the race against the coordinator's first
+        // scheduled tick and be uploaded after an update.
+        if (
+            !retireLegacyPeerDocumentsBeforeWorkerStart(
+                outbox = outbox,
+                ownedPeerOutboxRoot = paths.peerOutboxDirectory,
+                nowEpochMs = System.currentTimeMillis(),
+            )
+        ) {
+            updateStatus(RemoteMonitorStatus.Error(activeCredentials.chatLabel, "구형 전송 큐 정리 실패"))
+            return false
+        }
         updateStatus(RemoteMonitorStatus.Starting(activeCredentials.chatLabel))
         val connectionTracker = TelegramConnectionTracker(
             TelegramConnectionStateStore(paths.connectionStateFile),
@@ -628,6 +830,113 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         result
     }
 
+    private fun ensurePeerLinkRecordLocked(pairId: String): TelegramPeerLinkRecord {
+        val existing = peerLink.load()?.takeIf { it.pairId == pairId }
+        if (existing != null) return existing
+        return TelegramPeerLinkRecord(
+            pairId = pairId,
+            sessionId = TelegramPeerProtocol.newSessionId(),
+        ).also(peerLink::save)
+    }
+
+    private fun resolvePeerLinkStateLocked(nowEpochMs: Long): TelegramPeerLinkState =
+        resolveTelegramPeerLinkState(
+            peerStatus = remoteReviewPeerStatus(),
+            record = peerLink.load(),
+            nowEpochMs = nowEpochMs,
+            freshnessMs = PEER_FRESHNESS_MS,
+        )
+
+    private fun enqueuePeerControlLocked(
+        active: TelegramCredentials,
+        transferId: String,
+        kind: String,
+        text: String,
+        nowEpochMs: Long,
+    ): TelegramEnqueueResult {
+        val peer = active.peerBinding ?: return TelegramEnqueueResult.NOT_CONFIGURED
+        val pairId = active.peerPairId ?: return TelegramEnqueueResult.NOT_CONFIGURED
+        val result = outbox.enqueuePeerLinkControl(
+            TelegramOutboxEntry(
+                idempotencyKey = "telegram-peer-control:$pairId:$kind:$transferId",
+                destinationChatId = peer.botId,
+                kind = TelegramOutboxKind.TEXT,
+                filePath = null,
+                text = text,
+                mimeType = null,
+                displayName = null,
+                attempts = 0,
+                nextAttemptEpochMs = nowEpochMs,
+                createdAtEpochMs = nowEpochMs,
+                deleteAfterSend = false,
+                route = TelegramOutboxRoute.PEER,
+                destinationUsername = peer.username,
+                peerTransferId = transferId,
+            ),
+        )
+        if (result.isDurablyQueued()) {
+            uploader?.wake()
+            // A manual request can arrive while the inbox poller is in a long network backoff.
+            // Wake its interrupt-safe retry condition so CONNECT_ACCEPT/PONG is observed promptly.
+            poller?.wake()
+        }
+        return result
+    }
+
+    private fun markPeerObservedLocked(
+        pairId: String,
+        observedAtEpochMs: Long,
+        resolveAtEpochMs: Long = observedAtEpochMs,
+        transform: (TelegramPeerLinkRecord) -> TelegramPeerLinkRecord = { it },
+    ): TelegramPeerLinkState {
+        val current = ensurePeerLinkRecordLocked(pairId)
+        val next = transform(current).copy(
+            lastPeerResponseEpochMs = mergeAuthenticatedPeerObservation(
+                current.lastPeerResponseEpochMs,
+                observedAtEpochMs,
+            ),
+        )
+        peerLink.save(next)
+        return resolvePeerLinkStateLocked(resolveAtEpochMs)
+    }
+
+    private fun currentPinnedPeerMatchesLocked(
+        pairId: String,
+        senderId: Long,
+        senderUsername: String,
+    ): Boolean {
+        val current = credentials.load() ?: return false
+        val pinned = current.peerBinding ?: return false
+        return current.peerPairId == pairId && pinned.botId == senderId &&
+            pinned.username == senderUsername
+    }
+
+    private fun cancelParentTrafficLocked(nowEpochMs: Long): Int {
+        parentMessageInbox.clear()
+        screenRequestInbox.clear()
+        return outbox.cancelParentEntries(nowEpochMs).also { cancelled ->
+            cancelled.forEach { entry ->
+                if (entry.deleteAfterSend && entry.file?.let(::isOwnedMedia) == true) {
+                    runCatching { entry.file?.delete() }
+                }
+            }
+        }.size
+    }
+
+    private fun isServerAcceptedPeerDocument(entry: TelegramOutboxEntry): Boolean =
+        entry.route == TelegramOutboxRoute.PEER &&
+            entry.kind == TelegramOutboxKind.DOCUMENT &&
+            entry.peerTransferId?.let(peerReceipts::receipt)?.serverAcceptedAtEpochMs != null
+
+    private fun publishPeerLinkState(state: TelegramPeerLinkState = peerLinkState()) {
+        val listeners = synchronized(statusLock) {
+            if (state == lastPublishedPeerLinkState) return
+            lastPublishedPeerLinkState = state
+            peerLinkListeners.toList()
+        }
+        listeners.forEach { listener -> runCatching { listener(state) } }
+    }
+
     private fun handlePeerInbound(api: TelegramBotApi, update: TelegramInboundUpdate) {
         val active = credentials.load() ?: return
         val key = active.peerSharedKey() ?: return
@@ -652,6 +961,16 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         }
         val document = accepted.document
         val header = accepted.header
+        if (shouldDiscardLegacyPeerPayload(header.payloadType)) {
+            // Pre-delta builds uploaded full pages and immediate feedback envelopes repeatedly.
+            // Consume them without downloading obsolete ciphertext during migration. An ACK also
+            // settles a mixed-version old sender which still retries until RECEIVED.
+            ensurePeerResponseDurablyQueued(
+                enqueuePeerDeliveryAckLocked(header.transferId, update.updateId),
+            )
+            Log.i(PEER_INBOUND_LOG_TAG, "Discarded legacy peer page snapshot; update=${update.updateId}")
+            return
+        }
         if (!accepted.recognizedMime) {
             // Telegram may omit or normalize this advisory field. Authenticity comes from the
             // pinned sender, strict caption/pair, size bound, and AES-GCM below—not MIME text.
@@ -659,7 +978,9 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         }
         if (peerDocumentInbox.hasSeen(update.updateId, header.transferId)) {
             if (peerDocumentInbox.isCompleted(header.transferId)) {
-                enqueuePeerDeliveryAckLocked(header.transferId, update.updateId)
+                ensurePeerResponseDurablyQueued(
+                    enqueuePeerDeliveryAckLocked(header.transferId, update.updateId),
+                )
             }
             return
         }
@@ -678,7 +999,8 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                 key = key,
                 associatedData = requireNotNull(update.caption),
             )
-            peerDocumentInbox.offer(
+            val receivedAt = System.currentTimeMillis()
+            val stored = peerDocumentInbox.offer(
                 PendingTelegramPeerDocument(
                     updateId = update.updateId,
                     telegramMessageId = messageId,
@@ -691,10 +1013,33 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                     mimeType = null,
                     byteCount = byteCount,
                     localFilePath = plaintext.absolutePath,
-                    receivedAtEpochMs = System.currentTimeMillis(),
+                    receivedAtEpochMs = receivedAt,
                     replyToMessageId = update.replyToMessageId,
                 ),
             )
+            val serverObservedAt = freshTelegramPeerUpdateEpochMs(
+                update.sentAtEpochSeconds,
+                receivedAt,
+                PEER_FRESHNESS_MS,
+            )
+            if (stored && serverObservedAt != null) {
+                // Liveness is derived metadata, not part of the durable document transaction. A
+                // peer-link journal failure after PUT must never fall into the payload-delete path.
+                val observed = runCatching {
+                    synchronized(lifecycleLock) {
+                        if (currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername)) {
+                            markPeerObservedLocked(
+                                pairId = pairId,
+                                observedAtEpochMs = serverObservedAt,
+                                resolveAtEpochMs = receivedAt,
+                            )
+                        } else {
+                            null
+                        }
+                    }
+                }.getOrNull()
+                observed?.let(::publishPeerLinkState)
+            }
         } catch (error: Throwable) {
             plaintext.delete()
             // Invalid/oversized/authentication-failed content from the exact peer is consumed so a
@@ -728,65 +1073,148 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         control: TelegramPeerProtocol.PeerControl,
     ) {
         if (update.chatId != senderId) return
-        when (control) {
-            is TelegramPeerProtocol.PeerControl.Received -> {
-                val pinned = active.peerBinding ?: return
-                if (pinned.botId != senderId || pinned.username != senderUsername || control.pairId != pairId) return
-                val acknowledgedAt = System.currentTimeMillis()
-                if (peerReceipts.recordAcknowledged(
-                        control.transferId,
-                        update.messageId,
-                        acknowledgedAt,
-                    )
-                ) {
-                    peerReceipts.receipt(control.transferId)?.outboxKey?.let { outboxKey ->
-                        outbox.makeDueNow(outboxKey, acknowledgedAt)
+        var nextLinkState: TelegramPeerLinkState? = null
+        synchronized(lifecycleLock) {
+            val now = System.currentTimeMillis()
+            when (control) {
+                is TelegramPeerProtocol.PeerControl.Received -> {
+                    if (control.pairId != pairId ||
+                        !currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername)
+                    ) return
+                    if (peerReceipts.recordAcknowledged(
+                            control.transferId,
+                            update.messageId,
+                            now,
+                        )
+                    ) {
+                        peerReceipts.receipt(control.transferId)?.outboxKey?.let { outboxKey ->
+                            outbox.makeDueNow(outboxKey, now)
+                        }
+                        uploader?.wake()
                     }
-                    uploader?.wake()
+                    freshTelegramPeerUpdateEpochMs(
+                        update.sentAtEpochSeconds,
+                        now,
+                        PEER_FRESHNESS_MS,
+                    )?.let { serverObservedAt ->
+                        nextLinkState = markPeerObservedLocked(
+                            pairId = pairId,
+                            observedAtEpochMs = serverObservedAt,
+                            resolveAtEpochMs = now,
+                        )
+                    }
                 }
-            }
-            is TelegramPeerProtocol.PeerControl.Hello -> {
-                if (active.remoteReviewRole != RemoteReviewRole.STUDENT || control.pairId != pairId) return
-                if (control.botId != senderId || control.username != senderUsername) return
-                val state = peerHandshake.load() ?: return
-                if (state.role != RemoteReviewRole.STUDENT || state.pairId != pairId ||
-                    System.currentTimeMillis() > state.expiresAtEpochMs
-                ) return
-                active.peerBinding?.let { pinned ->
-                    if (pinned.botId != senderId || pinned.username != senderUsername) return
+                is TelegramPeerProtocol.PeerControl.Hello -> {
+                    if (active.remoteReviewRole != RemoteReviewRole.STUDENT || control.pairId != pairId) return
+                    if (control.botId != senderId || control.username != senderUsername) return
+                    val state = peerHandshake.load() ?: return
+                    if (state.role != RemoteReviewRole.STUDENT || state.pairId != pairId ||
+                        now > state.expiresAtEpochMs
+                    ) return
+                    active.peerBinding?.let { pinned ->
+                        if (pinned.botId != senderId || pinned.username != senderUsername) return
+                    }
+                    val localId = active.localBotId ?: return
+                    val localUsername = active.localBotUsername ?: return
+                    val binding = TelegramPeerBinding(senderId, senderUsername)
+                    credentials.save(active.withPeer(binding))
+                    peerHandshake.save(
+                        state.copy(
+                            expectedPeerBotId = senderId,
+                            expectedPeerUsername = senderUsername,
+                            nonce = control.nonce,
+                        ),
+                    )
+                    api.sendPeerMessage(
+                        senderUsername,
+                        TelegramPeerProtocol.ack(
+                            pairId,
+                            TelegramBotIdentity(localId, localUsername, "MasterNote bot"),
+                            control.nonce,
+                            key,
+                        ),
+                    )
+                    nextLinkState = markPeerObservedLocked(pairId, now)
                 }
-                val localId = active.localBotId ?: return
-                val localUsername = active.localBotUsername ?: return
-                val binding = TelegramPeerBinding(senderId, senderUsername)
-                credentials.save(active.withPeer(binding))
-                peerHandshake.save(
-                    state.copy(
-                        expectedPeerBotId = senderId,
-                        expectedPeerUsername = senderUsername,
-                        nonce = control.nonce,
-                    ),
-                )
-                api.sendPeerMessage(
-                    senderUsername,
-                    TelegramPeerProtocol.ack(
-                        pairId,
-                        TelegramBotIdentity(localId, localUsername, "MasterNote bot"),
-                        control.nonce,
-                        key,
-                    ),
-                )
-            }
-            is TelegramPeerProtocol.PeerControl.PairAck -> {
-                if (active.remoteReviewRole != RemoteReviewRole.TEACHER || control.pairId != pairId) return
-                val state = peerHandshake.load() ?: return
-                if (state.role != RemoteReviewRole.TEACHER || state.pairId != pairId ||
-                    state.nonce != control.nonce || state.expectedPeerBotId != senderId ||
-                    state.expectedPeerUsername != senderUsername || control.botId != senderId ||
-                    control.username != senderUsername || System.currentTimeMillis() > state.expiresAtEpochMs
-                ) return
-                credentials.save(active.withPeer(TelegramPeerBinding(senderId, senderUsername)))
+                is TelegramPeerProtocol.PeerControl.PairAck -> {
+                    if (active.remoteReviewRole != RemoteReviewRole.TEACHER || control.pairId != pairId) return
+                    val state = peerHandshake.load() ?: return
+                    if (state.role != RemoteReviewRole.TEACHER || state.pairId != pairId ||
+                        state.nonce != control.nonce || state.expectedPeerBotId != senderId ||
+                        state.expectedPeerUsername != senderUsername || control.botId != senderId ||
+                        control.username != senderUsername || now > state.expiresAtEpochMs
+                    ) return
+                    credentials.save(active.withPeer(TelegramPeerBinding(senderId, senderUsername)))
+                    nextLinkState = markPeerObservedLocked(pairId, now)
+                }
+                is TelegramPeerProtocol.PeerControl.ConnectRequest -> {
+                    if (active.remoteReviewRole != RemoteReviewRole.STUDENT ||
+                        !currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername) ||
+                        !isUsablePeerControlWindow(
+                            control.sentAtEpochMs,
+                            control.expiresAtEpochMs,
+                            now,
+                        )
+                    ) return
+                    nextLinkState = markPeerObservedLocked(pairId, now)
+                    ensurePeerResponseDurablyQueued(
+                        enqueuePeerControlLocked(
+                            active = requireNotNull(credentials.load()),
+                            transferId = peerControlTransferId("accept", control.requestId),
+                            kind = "accept",
+                            text = TelegramPeerProtocol.connectAccept(control.requestId, now, key),
+                            nowEpochMs = now,
+                        ),
+                    )
+                }
+                is TelegramPeerProtocol.PeerControl.ConnectAccept -> {
+                    if (active.remoteReviewRole != RemoteReviewRole.TEACHER ||
+                        !currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername) ||
+                        !isFreshPeerControlResponse(control.sentAtEpochMs, now)
+                    ) return
+                    val record = peerLink.load()?.takeIf { it.pairId == pairId } ?: return
+                    if (record.pendingRequestId != control.requestId ||
+                        now > record.pendingRequestExpiresAtEpochMs
+                    ) return
+                    nextLinkState = markPeerObservedLocked(pairId, now) { it.withoutRequest() }
+                }
+                is TelegramPeerProtocol.PeerControl.Ping -> {
+                    if (active.remoteReviewRole != RemoteReviewRole.STUDENT ||
+                        !currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername) ||
+                        !isUsablePeerControlWindow(
+                            control.sentAtEpochMs,
+                            control.expiresAtEpochMs,
+                            now,
+                        )
+                    ) return
+                    nextLinkState = markPeerObservedLocked(pairId, now)
+                    ensurePeerResponseDurablyQueued(
+                        enqueuePeerControlLocked(
+                            active = requireNotNull(credentials.load()),
+                            transferId = peerControlTransferId("pong", control.nonce),
+                            kind = "pong",
+                            text = TelegramPeerProtocol.pong(control.sessionId, control.nonce, now, key),
+                            nowEpochMs = now,
+                        ),
+                    )
+                }
+                is TelegramPeerProtocol.PeerControl.Pong -> {
+                    if (active.remoteReviewRole != RemoteReviewRole.TEACHER ||
+                        !currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername) ||
+                        !isFreshPeerControlResponse(control.sentAtEpochMs, now)
+                    ) return
+                    val record = peerLink.load()?.takeIf { it.pairId == pairId } ?: return
+                    if (record.sessionId != control.sessionId ||
+                        record.pendingPingNonce != control.nonce ||
+                        now > record.pendingPingExpiresAtEpochMs ||
+                        control.sentAtEpochMs + TelegramPeerProtocol.MAX_CONTROL_CLOCK_SKEW_MS <
+                        record.pendingPingSentAtEpochMs
+                    ) return
+                    nextLinkState = markPeerObservedLocked(pairId, now) { it.withoutPing() }
+                }
             }
         }
+        nextLinkState?.let(::publishPeerLinkState)
     }
 
     private fun enqueuePeerDeliveryAckLocked(
@@ -799,7 +1227,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         val key = active.peerSharedKey() ?: return TelegramEnqueueResult.NOT_CONFIGURED
         val ackTransportId = peerDeliveryAckInstanceId(pairId, transferId, deliveryUpdateId)
         val now = System.currentTimeMillis()
-        val result = outbox.enqueue(
+        val result = outbox.enqueuePeerLinkControl(
             TelegramOutboxEntry(
                 idempotencyKey = "telegram-peer-received:$ackTransportId",
                 destinationChatId = peer.botId,
@@ -866,6 +1294,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         peerDocumentInbox.clear()
         peerReceipts.clear()
         peerHandshake.clear()
+        peerLink.clear()
     }
 
     private fun deleteOwnedPeerFile(file: File?) {
@@ -877,6 +1306,12 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         .take(16)
         .joinToString("") { "%02x".format(it) }
 
+    private fun peerControlTransferId(prefix: String, id: String): String =
+        "${prefix}_$id".also { require(PEER_IDENTIFIER.matches(it)) }
+
+    private fun safeEpochAdd(left: Long, right: Long): Long =
+        if (left > Long.MAX_VALUE - right) Long.MAX_VALUE else left + right
+
     private fun handleInbound(
         activeCredentials: TelegramCredentials,
         update: TelegramInboundUpdate,
@@ -884,7 +1319,11 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
     ) {
         // A remote-review peer can keep this bot's single poller alive even while the human-parent
         // monitor is disabled. In that state consume but do not retain or execute parent traffic.
-        if (!preferenceStore.get().monitoringEnabled) return
+        if (!shouldAcceptParentInbound(
+                monitoringEnabled = preferenceStore.get().monitoringEnabled,
+                remoteReviewRole = activeCredentials.remoteReviewRole,
+            )
+        ) return
         when (action) {
             is ParentInboundAction.Text -> {
                 // Persist before TelegramInboxPoller commits the update offset. The legacy process
@@ -985,11 +1424,27 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
 
     companion object {
         private const val ACTIVITY_MODE_CONFIRMATION_COALESCE_KEY = "activity-mode-confirmation"
+        const val PEER_FRESHNESS_MS = 90_000L
+        private const val PEER_PING_INTERVAL_MS = 30_000L
+        private const val PEER_PING_LIFETIME_MS = 60_000L
         @Volatile private var instance: RemoteMonitorGateway? = null
 
         fun get(context: Context): RemoteMonitorGateway = instance ?: synchronized(this) {
             instance ?: RemoteMonitorGateway(context.applicationContext).also { instance = it }
         }
+    }
+}
+
+internal fun TelegramEnqueueResult.isDurablyQueued(): Boolean = this in setOf(
+    TelegramEnqueueResult.ENQUEUED,
+    TelegramEnqueueResult.ALREADY_PENDING,
+    TelegramEnqueueResult.ALREADY_DELIVERED,
+)
+
+/** Returning from an inbound handler commits its Telegram update offset. */
+internal fun ensurePeerResponseDurablyQueued(result: TelegramEnqueueResult) {
+    check(result.isDurablyQueued()) {
+        "Required peer response was not durably queued: $result"
     }
 }
 
@@ -1000,10 +1455,18 @@ internal fun enqueuePrecondition(
     expectedChatId: Long?,
 ): TelegramEnqueueResult? = when {
     !monitoringEnabled || activeCredentials == null -> TelegramEnqueueResult.NOT_CONFIGURED
+    activeCredentials.remoteReviewRole == RemoteReviewRole.TEACHER ->
+        TelegramEnqueueResult.NOT_CONFIGURED
     expectedChatId != null && expectedChatId != activeCredentials.allowedPrivateChatId ->
         TelegramEnqueueResult.CHAT_CHANGED
     else -> null
 }
+
+/** Teacher mode owns this bot exclusively for peer review; human-parent updates are consumed. */
+internal fun shouldAcceptParentInbound(
+    monitoringEnabled: Boolean,
+    remoteReviewRole: RemoteReviewRole?,
+): Boolean = monitoringEnabled && remoteReviewRole != RemoteReviewRole.TEACHER
 
 internal enum class PeerDocumentRejectionReason {
     WRONG_PEER,
@@ -1015,6 +1478,37 @@ internal enum class PeerDocumentRejectionReason {
     AUTHENTICATION_FAILED,
     INVALID_CIPHERTEXT,
 }
+
+private val RETIRED_LEGACY_PEER_PAYLOAD_TYPES = setOf(
+    "PAGE_SNAPSHOT",
+    "TEACHER_FEEDBACK",
+    "REMOTE_GRADE",
+)
+
+/** Legacy full-page and immediate-feedback envelopes were superseded by the page-delta protocol. */
+internal fun shouldDiscardLegacyPeerPayload(payloadType: String): Boolean =
+    payloadType in RETIRED_LEGACY_PEER_PAYLOAD_TYPES
+
+/**
+ * Startup gate for the uploader. Cancellation is journaled before entries leave the in-memory
+ * queue; any I/O failure therefore keeps the uploader stopped and lets a later start retry safely.
+ */
+internal fun retireLegacyPeerDocumentsBeforeWorkerStart(
+    outbox: TelegramOutbox,
+    ownedPeerOutboxRoot: File,
+    nowEpochMs: Long,
+): Boolean = runCatching {
+    cancelPeerDocumentPayloads(
+        outbox = outbox,
+        ownedPeerOutboxRoot = ownedPeerOutboxRoot,
+        payloadTypes = RETIRED_LEGACY_PEER_PAYLOAD_TYPES,
+        cancelledAtEpochMs = nowEpochMs,
+    )
+    inspectPendingPeerDocumentTransfers(
+        entries = outbox.pendingSnapshot(),
+        payloadTypes = RETIRED_LEGACY_PEER_PAYLOAD_TYPES,
+    ).isEmpty()
+}.getOrDefault(false)
 
 internal sealed interface PeerDocumentMetadataDecision {
     data class Accepted(

@@ -189,6 +189,56 @@ internal object TelegramPeerProtocol {
         return "$unsigned ${mac(key, unsigned)}"
     }
 
+    fun connectRequest(
+        requestId: String,
+        sentAtEpochMs: Long,
+        expiresAtEpochMs: Long,
+        key: ByteArray,
+    ): String {
+        requireControlId(requestId, "requestId")
+        requireExpiringControlWindow(sentAtEpochMs, expiresAtEpochMs)
+        val unsigned = "$VERSION CONNECT_REQUEST $requestId $sentAtEpochMs $expiresAtEpochMs"
+        return "$unsigned ${mac(key, unsigned)}"
+    }
+
+    fun connectAccept(
+        requestId: String,
+        sentAtEpochMs: Long,
+        key: ByteArray,
+    ): String {
+        requireControlId(requestId, "requestId")
+        require(sentAtEpochMs > 0L)
+        val unsigned = "$VERSION CONNECT_ACCEPT $requestId $sentAtEpochMs"
+        return "$unsigned ${mac(key, unsigned)}"
+    }
+
+    fun ping(
+        sessionId: String,
+        nonce: String,
+        sentAtEpochMs: Long,
+        expiresAtEpochMs: Long,
+        key: ByteArray,
+    ): String {
+        requireControlId(sessionId, "sessionId")
+        requireControlId(nonce, "nonce")
+        requireExpiringControlWindow(sentAtEpochMs, expiresAtEpochMs)
+        val unsigned = "$VERSION PING $sessionId $nonce $sentAtEpochMs $expiresAtEpochMs"
+        return "$unsigned ${mac(key, unsigned)}"
+    }
+
+    fun pong(
+        sessionId: String,
+        nonce: String,
+        sentAtEpochMs: Long,
+        key: ByteArray,
+    ): String {
+        requireControlId(sessionId, "sessionId")
+        requireControlId(nonce, "nonce")
+        require(sentAtEpochMs > 0L)
+        val unsigned = "$VERSION PONG $sessionId $nonce $sentAtEpochMs"
+        return "$unsigned ${mac(key, unsigned)}"
+    }
+
     fun parseDocumentCaption(value: String?): PeerDocumentHeader? {
         val fields = value?.trim()?.split(' ') ?: return null
         if (fields.size != 5 || fields[0] != VERSION || fields[1] != "DOC") return null
@@ -230,12 +280,50 @@ internal object TelegramPeerProtocol {
                     transferId = fields[3],
                 )
             }
+            fields.size == 6 && fields[1] == "CONNECT_REQUEST" -> {
+                val requestId = fields[2].takeIf(PEER_IDENTIFIER::matches) ?: return null
+                val unsigned = fields.take(5).joinToString(" ")
+                if (!validMac(key, unsigned, fields[5])) return null
+                val sentAt = fields[3].toLongOrNull() ?: return null
+                val expiresAt = fields[4].toLongOrNull() ?: return null
+                if (!isValidExpiringControlWindow(sentAt, expiresAt)) return null
+                PeerControl.ConnectRequest(requestId, sentAt, expiresAt)
+            }
+            fields.size == 5 && fields[1] == "CONNECT_ACCEPT" -> {
+                val requestId = fields[2].takeIf(PEER_IDENTIFIER::matches) ?: return null
+                val unsigned = fields.take(4).joinToString(" ")
+                if (!validMac(key, unsigned, fields[4])) return null
+                val sentAt = fields[3].toLongOrNull() ?: return null
+                if (sentAt <= 0L) return null
+                PeerControl.ConnectAccept(requestId, sentAt)
+            }
+            fields.size == 7 && fields[1] == "PING" -> {
+                val sessionId = fields[2].takeIf(PEER_IDENTIFIER::matches) ?: return null
+                val nonce = fields[3].takeIf(PEER_IDENTIFIER::matches) ?: return null
+                val unsigned = fields.take(6).joinToString(" ")
+                if (!validMac(key, unsigned, fields[6])) return null
+                val sentAt = fields[4].toLongOrNull() ?: return null
+                val expiresAt = fields[5].toLongOrNull() ?: return null
+                if (!isValidExpiringControlWindow(sentAt, expiresAt)) return null
+                PeerControl.Ping(sessionId, nonce, sentAt, expiresAt)
+            }
+            fields.size == 6 && fields[1] == "PONG" -> {
+                val sessionId = fields[2].takeIf(PEER_IDENTIFIER::matches) ?: return null
+                val nonce = fields[3].takeIf(PEER_IDENTIFIER::matches) ?: return null
+                val unsigned = fields.take(5).joinToString(" ")
+                if (!validMac(key, unsigned, fields[5])) return null
+                val sentAt = fields[4].toLongOrNull() ?: return null
+                if (sentAt <= 0L) return null
+                PeerControl.Pong(sessionId, nonce, sentAt)
+            }
             else -> null
         }
     }
 
     fun newPairId(): String = randomId(18)
     fun newNonce(): String = randomId(18)
+    fun newRequestId(): String = randomId(18)
+    fun newSessionId(): String = randomId(18)
     fun newSharedKey(): ByteArray = ByteArray(32).also(SECURE_RANDOM::nextBytes)
     fun encodeKey(key: ByteArray): String {
         require(key.size == 32)
@@ -261,14 +349,53 @@ internal object TelegramPeerProtocol {
         return MessageDigest.isEqual(expected, actual)
     }
 
+    private fun requireControlId(value: String, field: String) {
+        require(PEER_IDENTIFIER.matches(value)) { "$field is invalid" }
+    }
+
+    private fun requireExpiringControlWindow(sentAtEpochMs: Long, expiresAtEpochMs: Long) {
+        require(sentAtEpochMs > 0L)
+        require(expiresAtEpochMs >= sentAtEpochMs)
+    }
+
+    private fun isValidExpiringControlWindow(
+        sentAtEpochMs: Long,
+        expiresAtEpochMs: Long,
+    ): Boolean = sentAtEpochMs > 0L &&
+        expiresAtEpochMs >= sentAtEpochMs
+
     data class PeerDocumentHeader(val pairId: String, val transferId: String, val payloadType: String)
     sealed interface PeerControl {
         data class Hello(val pairId: String, val botId: Long, val username: String, val nonce: String) : PeerControl
         data class PairAck(val pairId: String, val botId: Long, val username: String, val nonce: String) : PeerControl
         data class Received(val pairId: String, val transferId: String) : PeerControl
+        data class ConnectRequest(
+            val requestId: String,
+            val sentAtEpochMs: Long,
+            val expiresAtEpochMs: Long,
+        ) : PeerControl
+        data class ConnectAccept(
+            val requestId: String,
+            val sentAtEpochMs: Long,
+        ) : PeerControl
+        data class Ping(
+            val sessionId: String,
+            val nonce: String,
+            val sentAtEpochMs: Long,
+            val expiresAtEpochMs: Long,
+        ) : PeerControl
+        data class Pong(
+            val sessionId: String,
+            val nonce: String,
+            val sentAtEpochMs: Long,
+        ) : PeerControl
     }
 
     const val DEFAULT_PAIRING_LIFETIME_MS = 15L * 60L * 1_000L
+    const val DEFAULT_CONTROL_REQUEST_LIFETIME_MS = 2L * 60L * 1_000L
+    const val MAX_CONTROL_REQUEST_LIFETIME_MS = 5L * 60L * 1_000L
+    const val MAX_CONTROL_RESPONSE_AGE_MS = 5L * 60L * 1_000L
+    const val MAX_CONTROL_CLOCK_SKEW_MS = 2L * 60L * 1_000L
     private const val MAX_PAIRING_LIFETIME_MS = 30L * 60L * 1_000L
     private const val PAYLOAD_PREFIX = "masternote-telegram-peer:v1:"
     private val PAYLOAD_TYPE = Regex("^[A-Z][A-Z0-9_]{0,39}$")

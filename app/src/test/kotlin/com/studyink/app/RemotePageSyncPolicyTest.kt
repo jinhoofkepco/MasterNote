@@ -1,6 +1,8 @@
 package com.studyink.app
 
 import com.studyink.annotation.storage.TeacherReviewPublishIntent
+import com.studyink.monitor.core.RemoteReviewEnvelopeType
+import com.studyink.monitor.core.RemoteReviewLimits
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -8,6 +10,18 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RemotePageSyncPolicyTest {
+    @Test fun legacyRenderedPageMessagesAreRetiredWithoutBlockingPageSyncOrChat() {
+        assertTrue(isRetiredLegacyRemoteReviewPayloadType(RemoteReviewEnvelopeType.PAGE_SNAPSHOT.name))
+        assertTrue(isRetiredLegacyRemoteReviewPayloadType(RemoteReviewEnvelopeType.TEACHER_FEEDBACK.name))
+        assertTrue(isRetiredLegacyRemoteReviewPayloadType(RemoteReviewEnvelopeType.REMOTE_GRADE.name))
+
+        assertFalse(isRetiredLegacyRemoteReviewPayloadType(RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST.name))
+        assertFalse(isRetiredLegacyRemoteReviewPayloadType(RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST.name))
+        assertFalse(isRetiredLegacyRemoteReviewPayloadType(RemoteReviewEnvelopeType.PAGE_ANNOTATION.name))
+        assertFalse(isRetiredLegacyRemoteReviewPayloadType(RemoteReviewEnvelopeType.PAGE_SYNC_ACK.name))
+        assertFalse(isRetiredLegacyRemoteReviewPayloadType(RemoteReviewEnvelopeType.CHAT_MESSAGE.name))
+    }
+
     @Test fun recoveredReviewUsesOnlyItsDurablePairOwnership() {
         val exact = TeacherReviewPublishIntent(
             bookId = "book-a",
@@ -62,6 +76,20 @@ class RemotePageSyncPolicyTest {
             selectManifestPageTokens(tokens, tokens[0], 1L).takeLast(47),
         )
         assertTrue(selectManifestPageTokens(tokens, tokens.last(), 0L).size <= 48)
+    }
+
+    @Test fun slowManifestAckCannotEraseInventoryChangesDiscoveredWhileItWasInFlight() {
+        val schedule = resolveStudentManifestAckSchedule(
+            changedAfterReservation = true,
+            batchesRemaining = 1,
+            requiredBatchCount = 3,
+            scheduledDueAtElapsedMs = 60_000L,
+            nowElapsedMs = 90_000L,
+            intervalMs = 60_000L,
+        )
+
+        assertEquals(3, schedule.batchesRemaining)
+        assertEquals(60_000L, schedule.dueAtElapsedMs)
     }
 
     @Test fun redundantGenerationHighWaterNeverReopensAnOlderJournalGeneration() {
@@ -172,17 +200,49 @@ class RemotePageSyncPolicyTest {
         val automatic = listOf(current.pageToken, recent.pageToken, older.pageToken)
 
         assertEquals(
-            recent,
+            current,
             selectNextTeacherPage(pending, automatic, true, emptySet(), current.pageToken, false),
         )
         assertEquals(
             manual,
-            selectNextTeacherPage(pending, automatic, true, emptySet(), recent.pageToken, true),
+            selectNextTeacherPage(pending - current, automatic, true, emptySet(), recent.pageToken, true),
         )
         assertEquals(
             older,
-            selectNextTeacherPage(pending, automatic, true, emptySet(), recent.pageToken, false),
+            selectNextTeacherPage(pending - current, automatic, true, emptySet(), recent.pageToken, false),
         )
+    }
+
+    @Test fun incompleteInventoryAutomaticallyRequestsOnlyTheCurrentPage() {
+        val latest = (1..60).map { "page-$it" }
+
+        assertEquals(
+            listOf("page-52"),
+            selectAutomaticPageTokens(latest, "page-52", inventoryComplete = false),
+        )
+        assertTrue(selectAutomaticPageTokens(latest, null, inventoryComplete = false).isEmpty())
+    }
+
+    @Test fun completeLargeInventoryHasExactlyCurrentPlusTwoLatestWithoutAccumulation() {
+        val firstWindow = (1..48).map { "page-$it" }
+        val secondWindow = (49..96).map { "page-$it" } + firstWindow
+
+        assertEquals(
+            listOf("page-82", "page-49", "page-50"),
+            selectAutomaticPageTokens(secondWindow, "page-82", inventoryComplete = true),
+        )
+        assertEquals(3, selectAutomaticPageTokens(firstWindow, "page-40", true).size)
+        assertEquals(3, selectAutomaticPageTokens(secondWindow, "page-82", true).size)
+    }
+
+    @Test fun checkpointSplitIsBoundedAndReassemblesWithoutByteChanges() {
+        val limit = RemoteReviewLimits.MAX_PAGE_ANNOTATION_CHECKPOINT_BYTES
+        val payload = ByteArray(limit + 501) { index -> (index % 251).toByte() }
+        val chunks = splitPageCheckpointPayload(payload, limit)
+
+        assertEquals(listOf(limit, 501), chunks.map(ByteArray::size))
+        assertTrue(chunks.all { it.size <= limit })
+        assertTrue(payload.contentEquals(chunks.reduce { left, right -> left + right }))
     }
 
     @Test fun unavailableNewestReviewDoesNotStarveAnExactSubmittedReview() {

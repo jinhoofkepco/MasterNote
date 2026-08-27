@@ -1057,9 +1057,7 @@ class LanSyncService : Service(),
             artifact.markGroups,
         )
         val payloadSha = sha256Hex(payload)
-        val chunks = payload.asList().chunked(TEACHER_REVIEW_CHUNK_BYTES).map { values ->
-            values.toByteArray()
-        }
+        val chunks = splitLanTeacherReviewPayload(payload, TEACHER_REVIEW_CHUNK_BYTES)
         if (chunks.isEmpty() || chunks.size > MAX_TEACHER_REVIEW_CHUNKS) return false
         return chunks.indices.all { index ->
             if (connectionGeneration != expectedGeneration || writer == null) return@all false
@@ -1617,6 +1615,21 @@ class LanSyncService : Service(),
             )
         }
         fun stop(context: Context) = context.startService(Intent(context, LanSyncService::class.java).setAction(ACTION_STOP))
+    }
+}
+
+/** Splits a review without boxing every byte into a heap-heavy `List<Byte>`. */
+internal fun splitLanTeacherReviewPayload(payload: ByteArray, maxChunkBytes: Int): List<ByteArray> {
+    require(maxChunkBytes > 0)
+    if (payload.isEmpty()) return emptyList()
+    val chunkCount = ((payload.size.toLong() + maxChunkBytes - 1L) / maxChunkBytes).toInt()
+    return ArrayList<ByteArray>(chunkCount).apply {
+        var offset = 0
+        while (offset < payload.size) {
+            val end = minOf(payload.size, offset + maxChunkBytes)
+            add(payload.copyOfRange(offset, end))
+            offset = end
+        }
     }
 }
 

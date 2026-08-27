@@ -69,6 +69,7 @@ import com.studyink.monitor.telegram.RemoteMonitorGateway
 import com.studyink.monitor.telegram.RemoteReviewPeerStatus
 import com.studyink.monitor.telegram.RemoteReviewRole
 import com.studyink.monitor.telegram.RemoteMonitorStatus
+import com.studyink.monitor.telegram.TelegramPeerLinkState
 import com.studyink.monitor.telegram.TelegramEnqueueResult
 import com.studyink.reader.RemoteFeedbackStrokeTool
 import com.studyink.reader.RemoteFeedbackStroke
@@ -96,6 +97,12 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.max
 import kotlin.math.min
+
+private val RETIRED_LEGACY_REMOTE_REVIEW_PAYLOAD_TYPES = setOf(
+    RemoteReviewEnvelopeType.PAGE_SNAPSHOT.name,
+    RemoteReviewEnvelopeType.TEACHER_FEEDBACK.name,
+    RemoteReviewEnvelopeType.REMOTE_GRADE.name,
+)
 
 /**
  * Application boundary for the optional Telegram remote-review path.
@@ -160,6 +167,13 @@ object MasterNoteRemoteReviewCoordinator {
     /** Queues one encrypted peer-to-peer text message. Human Telegram chat is not used here. */
     fun sendRemotePeerChat(text: String): TelegramEnqueueResult =
         runtime?.sendRemotePeerChat(text) ?: TelegramEnqueueResult.NOT_CONFIGURED
+
+    /** Sends an expiring signed wake-up to the already-paired student bot. */
+    fun requestRemotePeerConnection(): TelegramEnqueueResult =
+        runtime?.requestRemotePeerConnection() ?: TelegramEnqueueResult.NOT_CONFIGURED
+
+    fun remotePeerLinkState(): TelegramPeerLinkState =
+        runtime?.remotePeerLinkState() ?: TelegramPeerLinkState.UNAVAILABLE
 
     /** Durably clears the unread badge for the exact current pairing. */
     fun markRemotePeerChatRead(): RemotePeerChatState? = runtime?.markRemotePeerChatRead()
@@ -299,7 +313,7 @@ private class RemoteReviewRuntime(
                 gateway.deadLetters().any { it.entry.peerTransferId == transferId } ->
                     RemotePageSyncOutboundState.FAILED
                 receipt != null && isUnacknowledgedPeerReceiptExpired(
-                    receipt.sentAtEpochMs,
+                    receipt.serverAcceptedAtEpochMs ?: receipt.sentAtEpochMs,
                     System.currentTimeMillis(),
                 ) -> RemotePageSyncOutboundState.FAILED
                 receipt != null -> RemotePageSyncOutboundState.SENT
@@ -315,13 +329,21 @@ private class RemoteReviewRuntime(
     private var hybridDecision: HybridLinkDecision? = null
     private var pageSyncTransportRoute = GlobalPageSyncTransportRoute.TELEGRAM
     private var telegramStatus: RemoteMonitorStatus = gateway.status()
+    private var telegramPeerLinkState: TelegramPeerLinkState = gateway.peerLinkState()
     private var observedSession: ConnectedRemoteReviewSession? = null
     private var presenceSubscription: AutoCloseable? = null
     private var heartbeatSubscription: AutoCloseable? = null
     private var peerDocumentSubscription: AutoCloseable? = null
     private var telegramStatusSubscription: AutoCloseable? = null
+    private var telegramPeerLinkSubscription: AutoCloseable? = null
     private var teacherReviewSubscription: AutoCloseable? = null
     private var teacherReviewProvenanceSubscription: AutoCloseable? = null
+    /**
+     * Rendered snapshots and their separate feedback/grade replies had no ordering relation with
+     * page sync. Keep retrying durable cancellation until the outbox proves all three types empty;
+     * a disk-full failure must not leave a stale action queued for the next reconnect.
+     */
+    private var legacyRenderedPageTransportRetired = false
     /** Decode failures are retried after process/session restart, but skipped within this runtime. */
     private val retainedUndecodableUpdateIds = linkedSetOf<Long>()
     private val lanListener = object : LanSyncBus.Listener {
@@ -388,6 +410,15 @@ private class RemoteReviewRuntime(
                 hybridBookId?.let(::updateHybridLink)
                 refreshPageSyncTransportState()
                 pageSync.tick()
+            }
+        }
+        telegramPeerLinkSubscription = gateway.subscribePeerLinkState { state ->
+            execute {
+                val becameAvailable = !telegramPeerLinkState.peerRecent && state.peerRecent
+                telegramPeerLinkState = state
+                hybridBookId?.let(::updateHybridLink)
+                refreshPageSyncTransportState()
+                if (becameAvailable) pageSync.onPeerAvailable() else pageSync.tick()
             }
         }
         // The LAN service can already be running before this application coordinator starts.
@@ -470,6 +501,22 @@ private class RemoteReviewRuntime(
         }
     }
 
+    fun requestRemotePeerConnection(): TelegramEnqueueResult {
+        if (closed || pausedForMaintenance) return TelegramEnqueueResult.NOT_CONFIGURED
+        val session = connectedSession()?.takeIf { it.role == RemoteReviewRole.TEACHER }
+            ?: return TelegramEnqueueResult.NOT_CONFIGURED
+        return gateway.requestPeerConnection().also { result ->
+            if (result.isDurablyAccepted()) execute {
+                telegramPeerLinkState = gateway.peerLinkState()
+                if (session.pairId == telegramPeerLinkState.pairId) {
+                    hybridBookId?.let(::updateHybridLink)
+                }
+            }
+        }
+    }
+
+    fun remotePeerLinkState(): TelegramPeerLinkState = gateway.peerLinkState()
+
     fun markRemotePeerChatRead(): RemotePeerChatState? {
         if (closed || pausedForMaintenance) return null
         return synchronized(operationLock) {
@@ -539,82 +586,21 @@ private class RemoteReviewRuntime(
         }
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun publishTeacherFeedback(feedback: RemoteTeacherFeedback): TelegramEnqueueResult {
-        if (closed || pausedForMaintenance) return TelegramEnqueueResult.NOT_CONFIGURED
-        return synchronized(operationLock) {
-            if (closed || pausedForMaintenance) {
-                TelegramEnqueueResult.NOT_CONFIGURED
-            } else {
-                publishTeacherFeedbackLocked(feedback)
-            }
-        }
+        // The exact-attempt page-sync publication is the only supported teacher-data path. A
+        // legacy reply cannot be ordered against it and could otherwise overwrite newer work.
+        return TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun publishRemoteGrade(
         snapshotTransferId: String,
         anchorX: Float,
         anchorY: Float,
         color: MarkColor,
     ): TelegramEnqueueResult {
-        if (closed || pausedForMaintenance) return TelegramEnqueueResult.NOT_CONFIGURED
-        if (color == MarkColor.GRAY || !anchorX.isFinite() || !anchorY.isFinite() ||
-            anchorX !in 0f..1f || anchorY !in 0f..1f
-        ) return TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
-        return synchronized(operationLock) {
-            if (!allowsTelegramUserActionNow()) {
-                return@synchronized TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
-            }
-            val session = connectedSession()?.takeIf { it.role == RemoteReviewRole.TEACHER }
-                ?: return@synchronized TelegramEnqueueResult.NOT_CONFIGURED
-            val scope = chatScope(session)
-                ?: return@synchronized TelegramEnqueueResult.NOT_CONFIGURED
-            val source = ledger.incoming(snapshotTransferId)
-                ?: return@synchronized TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
-            if (ownership.owner(source.transferId)?.matches(session) != true) {
-                return@synchronized TelegramEnqueueResult.CHAT_CHANGED
-            }
-            val attemptNo = source.attemptNo
-                ?: return@synchronized TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
-            val inkDigest = source.studentInkDigest
-                ?: return@synchronized TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
-            val suffix = UUID.randomUUID().toString().replace("-", "")
-            val now = System.currentTimeMillis()
-            val envelope = RemoteGradeEnvelope(
-                transferId = "grade_$suffix",
-                createdAtEpochMs = now,
-                actionId = "gradeaction_$suffix",
-                sourceSnapshot = SnapshotReference(
-                    transferId = source.transferId,
-                    pageToken = source.pageToken,
-                    revision = source.studentRevision,
-                    dimensions = ReviewCanvasDimensions(source.widthPx, source.heightPx),
-                ),
-                attemptNo = attemptNo,
-                studentInkDigest = inkDigest,
-                gradeGroupId = "gradegroup_$suffix",
-                syncRevision = 1L,
-                // A Telegram grade is conflict-resolved only under the pinned bot identity. Do
-                // not expose or trust an arbitrary local installation id across this boundary.
-                lastModifiedByDeviceId = scope.localDeviceId,
-                anchor = NormalizedGradeAnchor(anchorX, anchorY),
-                score = if (color == MarkColor.BLUE) 1 else 0,
-                maximumScore = 1,
-            )
-            val document = writeProtocolDocument(envelope)
-            try {
-                if (!allowsTelegramUserActionNow()) {
-                    TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
-                } else {
-                    gateway.enqueuePeerDocument(
-                        transferId = envelope.transferId,
-                        payloadType = envelope.type.name,
-                        plaintext = document,
-                    )
-                }
-            } finally {
-                document.delete()
-            }
-        }
+        return TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED
     }
 
     private fun publishTeacherFeedbackLocked(
@@ -777,6 +763,12 @@ private class RemoteReviewRuntime(
     private fun tick() {
         if (closed) return
         refreshSession() ?: return
+        retireLegacyRenderedPageTransport()
+        val previousPeerRecent = telegramPeerLinkState.peerRecent
+        telegramPeerLinkState = gateway.maintainPeerLink()
+        if (!previousPeerRecent && telegramPeerLinkState.peerRecent) {
+            pageSync.onPeerAvailable()
+        }
         val activeLan = LanSyncBus.activeSessionSnapshot()
         if (activeLan != null) {
             updateHybridLink(activeLan.bookId, activeLan.session)
@@ -833,9 +825,9 @@ private class RemoteReviewRuntime(
                 lanPageCatchUpComplete = phase == LanSessionPhase.READY,
                 telegramConfigured = peerConnected,
                 telegramApiHealthy = telegramStatus is RemoteMonitorStatus.Connected,
-                // A pinned, completed pairing is enough to attempt fallback. Authenticated ACKs
-                // remain the durable proof for each document and drive retry/file retention.
-                telegramPeerRecent = peerConnected,
+                // Pairing proves identity; only a recent authenticated reply proves the remote
+                // device is currently able to receive fallback traffic.
+                telegramPeerRecent = peerConnected && telegramPeerLinkState.peerRecent,
                 nowElapsedMs = SystemClock.elapsedRealtime(),
                 // Grace is reserved for an authenticated socket that is temporarily catching up.
                 // IDLE, CONNECTING, and DISCONNECTED all hand off to Telegram immediately.
@@ -873,7 +865,7 @@ private class RemoteReviewRuntime(
         }
         pageSync.setTransportState(
             active = route == GlobalPageSyncTransportRoute.TELEGRAM,
-            online = telegramStatus is RemoteMonitorStatus.Connected,
+            online = telegramStatus is RemoteMonitorStatus.Connected && telegramPeerLinkState.peerRecent,
             lanOwnsData = route == GlobalPageSyncTransportRoute.LAN_OWNS,
         )
         if (route == GlobalPageSyncTransportRoute.LAN_OWNS && previousRoute != route) {
@@ -901,7 +893,7 @@ private class RemoteReviewRuntime(
         )
         pageSync.setTransportState(
             active = false,
-            online = telegramStatus is RemoteMonitorStatus.Connected,
+            online = telegramStatus is RemoteMonitorStatus.Connected && telegramPeerLinkState.peerRecent,
             lanOwnsData = true,
         )
         if (connectedSession()?.role != RemoteReviewRole.STUDENT) return
@@ -920,6 +912,7 @@ private class RemoteReviewRuntime(
         if (current == observedSession) return current
         pageSync.bindSession(current?.let { RemotePageSyncSession(it.role, it.pairId) })
         observedSession = current
+        telegramPeerLinkState = gateway.peerLinkState()
         captureState.reset()
         retainedUndecodableUpdateIds.clear()
         current?.let { session ->
@@ -1147,6 +1140,13 @@ private class RemoteReviewRuntime(
             dropIncoming(pending)
             return
         }
+        // New builds exchange one ordered page-scoped stream. Any part of the former rendered
+        // snapshot/reply protocol may have spent days in Telegram while a device was offline;
+        // settle it before decoding so it cannot overwrite a newer exact-attempt page state.
+        if (isRetiredLegacyRemoteReviewPayloadType(pending.payloadType)) {
+            dropIncoming(pending)
+            return
+        }
         if (pending.byteCount !in 1..RemoteReviewLimits.OPERATIONAL_DOCUMENT_BYTES.toLong()) {
             dropIncoming(pending)
             return
@@ -1200,37 +1200,18 @@ private class RemoteReviewRuntime(
                 }
             }
             is PageSnapshotEnvelope -> {
-                if (session.role != RemoteReviewRole.TEACHER ||
-                    pending.payloadType != RemoteReviewEnvelopeType.PAGE_SNAPSHOT.name
-                ) {
-                    dropIncoming(pending)
-                    return
-                }
-                processTelegramPageDataIncoming(pending) {
-                    receivePageSnapshot(pending, envelope, session)
-                }
+                // Retained only in the codec for historical readability. The pre-decode gate
+                // normally catches this; keep a decoded defense for mismatched/crafted metadata.
+                dropIncoming(pending)
+                return
             }
             is TeacherFeedbackEnvelope -> {
-                if (session.role != RemoteReviewRole.STUDENT ||
-                    pending.payloadType != RemoteReviewEnvelopeType.TEACHER_FEEDBACK.name
-                ) {
-                    dropIncoming(pending)
-                    return
-                }
-                processTelegramPageDataIncoming(pending) {
-                    receiveTeacherFeedback(pending, envelope, session)
-                }
+                dropIncoming(pending)
+                return
             }
             is RemoteGradeEnvelope -> {
-                if (session.role != RemoteReviewRole.STUDENT ||
-                    pending.payloadType != RemoteReviewEnvelopeType.REMOTE_GRADE.name
-                ) {
-                    dropIncoming(pending)
-                    return
-                }
-                processTelegramPageDataIncoming(pending) {
-                    receiveRemoteGrade(pending, envelope, session)
-                }
+                dropIncoming(pending)
+                return
             }
             is ChatMessageEnvelope -> {
                 if (pending.payloadType != RemoteReviewEnvelopeType.CHAT_MESSAGE.name) {
@@ -1309,6 +1290,17 @@ private class RemoteReviewRuntime(
         // Gateway authenticated/decrypted this exact pinned peer. A transport receipt lets it drop
         // an unsupported or invalid payload instead of replaying a permanent poison entry.
         gateway.acknowledgePeerDocument(pending.updateId)
+    }
+
+    private fun retireLegacyRenderedPageTransport() {
+        if (legacyRenderedPageTransportRetired) return
+        captureState.reset()
+        gateway.cancelPendingPeerDocumentTransfers(
+            RETIRED_LEGACY_REMOTE_REVIEW_PAYLOAD_TYPES,
+        )
+        legacyRenderedPageTransportRetired = gateway.pendingPeerDocumentTransfers(
+            RETIRED_LEGACY_REMOTE_REVIEW_PAYLOAD_TYPES,
+        ).isEmpty()
     }
 
     private fun receivePageSnapshot(
@@ -1537,6 +1529,7 @@ private class RemoteReviewRuntime(
         heartbeatSubscription?.close()
         peerDocumentSubscription?.close()
         telegramStatusSubscription?.close()
+        telegramPeerLinkSubscription?.close()
         teacherReviewSubscription?.close()
         teacherReviewProvenanceSubscription?.close()
         worker.shutdownNow()
@@ -1560,6 +1553,10 @@ private class RemoteReviewRuntime(
 }
 
 internal enum class GlobalPageSyncTransportRoute { TELEGRAM, LAN_GRACE, LAN_OWNS }
+
+/** Legacy rendered-page messages have no shared revision order with the page-sync stream. */
+internal fun isRetiredLegacyRemoteReviewPayloadType(payloadType: String): Boolean =
+    payloadType in RETIRED_LEGACY_REMOTE_REVIEW_PAYLOAD_TYPES
 
 internal fun globalHybridDisplayDecision(
     route: GlobalPageSyncTransportRoute,
@@ -1603,9 +1600,9 @@ internal fun isLanTransportDefinitelyDisconnected(connectionState: LanConnection
     connectionState != LanConnectionState.CONNECTED
 
 /** Mirrors the gateway's 24-hour peer-document retention after bounded dead-letter eviction. */
-internal fun isUnacknowledgedPeerReceiptExpired(sentAtEpochMs: Long, nowEpochMs: Long): Boolean =
-    sentAtEpochMs >= 0L && nowEpochMs >= sentAtEpochMs &&
-        nowEpochMs - sentAtEpochMs >= 24L * 60L * 60L * 1_000L
+internal fun isUnacknowledgedPeerReceiptExpired(acceptedAtEpochMs: Long, nowEpochMs: Long): Boolean =
+    acceptedAtEpochMs >= 0L && nowEpochMs >= acceptedAtEpochMs &&
+        nowEpochMs - acceptedAtEpochMs >= 24L * 60L * 60L * 1_000L
 
 internal data class RemoteReviewCaptureTarget(
     val bookId: String,

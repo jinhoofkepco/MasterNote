@@ -289,6 +289,16 @@ object RemoteReviewDocumentCodec {
                     output.write(annotationPayload)
                     output.writeBoundedString(envelope.payloadSha256)
                     output.writeBoundedString(envelope.resultLayerSha256)
+                    // Optional trailing extension: old queued single-part frames end above and
+                    // remain byte-for-byte decodable. Only fragmented checkpoints carry it.
+                    if (envelope.chunked) {
+                        output.writeByte(PAGE_ANNOTATION_CHUNK_EXTENSION_VERSION)
+                        output.writeBoundedString(envelope.chunkGroupId)
+                        output.writeInt(envelope.chunkIndex)
+                        output.writeInt(envelope.chunkCount)
+                        output.writeInt(envelope.assembledPayloadSizeBytes)
+                        output.writeBoundedString(envelope.chunkSha256)
+                    }
                 }
 
                 is PageSyncAckEnvelope -> {
@@ -523,6 +533,24 @@ object RemoteReviewDocumentCodec {
                 val annotationPayload = input.readBoundedBytes(kind.maxPayloadBytes())
                 val payloadSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES)
                 val resultLayerSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES)
+                var chunkGroupId: String? = null
+                var chunkIndex = 0
+                var chunkCount = 1
+                var assembledPayloadSizeBytes: Int? = null
+                var chunkSha256: String? = null
+                if (input.available() > 0) {
+                    val extensionVersion = input.readUnsignedByte()
+                    if (extensionVersion != PAGE_ANNOTATION_CHUNK_EXTENSION_VERSION) {
+                        fail(RemoteReviewCodecError.UNSUPPORTED_VERSION) {
+                            "Unsupported page annotation chunk extension $extensionVersion."
+                        }
+                    }
+                    chunkGroupId = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES)
+                    chunkIndex = input.readInt()
+                    chunkCount = input.readInt()
+                    assembledPayloadSizeBytes = input.readInt()
+                    chunkSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES)
+                }
                 PageAnnotationEnvelope(
                     transferId = transferId,
                     createdAtEpochMs = createdAtEpochMs,
@@ -542,6 +570,11 @@ object RemoteReviewDocumentCodec {
                     payloadBytes = annotationPayload,
                     payloadSha256 = payloadSha256,
                     resultLayerSha256 = resultLayerSha256,
+                    chunkGroupId = chunkGroupId,
+                    chunkIndex = chunkIndex,
+                    chunkCount = chunkCount,
+                    assembledPayloadSizeBytes = assembledPayloadSizeBytes,
+                    chunkSha256 = chunkSha256,
                 )
             }
 
@@ -991,6 +1024,7 @@ object RemoteReviewDocumentCodec {
     private const val SHA256_BYTES: Int = 32
     private const val FRAME_BYTES: Int = 4 + 1 + 1 + 4 + SHA256_BYTES
     private const val MAX_DETAIL_CODE_BYTES: Int = 64
+    private const val PAGE_ANNOTATION_CHUNK_EXTENSION_VERSION: Int = 1
     private const val PNG_CHUNK_OVERHEAD_BYTES: Int = 12
     private const val PNG_IHDR_DATA_BYTES: Int = 13
     private val SNAPSHOT_DIGEST_HEX = Regex("[0-9a-f]{${RemoteReviewLimits.SHA256_HEX_BYTES}}")

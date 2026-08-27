@@ -15,11 +15,20 @@ class RemoteReviewEditor {
     private val undoStack = ArrayDeque<List<RemoteFeedbackStroke>>()
     private var editRevision = 0L
     private var publishedRevision = 0L
+    /**
+     * Monotonic identity for the exact in-memory stroke state. Unlike [editRevision], this is not
+     * reset when a page is opened, so an erase computed for an earlier visit to the same transfer
+     * can never be committed after a page transition.
+     */
+    private var mutationEpoch = 0L
 
     val state: RemoteReviewState
         get() = RemoteReviewState(
             snapshot = snapshot,
-            strokes = strokes,
+            // Copy only the small outer list. Point lists were already sanitized into immutable
+            // values when strokes entered the editor, so copying 120k points on ACTION_UP is not
+            // necessary and would itself risk a UI pause.
+            strokes = strokes.toList(),
             editRevision = editRevision,
             publishedRevision = publishedRevision,
             canUndo = undoStack.isNotEmpty(),
@@ -46,6 +55,7 @@ class RemoteReviewEditor {
         undoStack.clear()
         editRevision = matchingFeedback?.feedbackRevision?.coerceAtLeast(0L) ?: 0L
         publishedRevision = editRevision
+        advanceMutationEpoch()
         return RemoteSnapshotOpenResult.OPENED
     }
 
@@ -57,6 +67,7 @@ class RemoteReviewEditor {
         undoStack.clear()
         editRevision = 0L
         publishedRevision = 0L
+        advanceMutationEpoch()
         return true
     }
 
@@ -87,32 +98,72 @@ class RemoteReviewEditor {
         return stroke
     }
 
+    /**
+     * Captures immutable input for a whole-trace erase without doing geometric work. The returned
+     * plan is safe to evaluate on a worker thread; [commitErase] must be called on the editor's
+     * owning thread afterwards.
+     */
+    internal fun prepareErase(
+        path: List<RemoteNormalizedPoint>,
+        radiusFraction: Float,
+    ): RemoteReviewErasePlan? {
+        val currentSnapshot = snapshot ?: return null
+        if (!radiusFraction.isFinite() || radiusFraction <= 0f) return null
+        val cleanPath = sanitizePoints(path)
+        if (cleanPath.isEmpty()) return null
+        return RemoteReviewErasePlan(
+            snapshot = currentSnapshot,
+            editRevision = editRevision,
+            mutationEpoch = mutationEpoch,
+            strokes = strokes,
+            path = cleanPath,
+            radiusFraction = radiusFraction.coerceAtMost(MAX_ERASER_RADIUS_FRACTION),
+        )
+    }
+
+    /** Pure, potentially expensive phase intended for a background thread. */
+    internal fun resolveErase(plan: RemoteReviewErasePlan): Set<String> =
+        RemoteReviewGeometry.intersectingStrokeIds(
+            strokes = plan.strokes,
+            eraserPath = plan.path,
+            eraserRadiusFraction = plan.radiusFraction,
+            pageWidthPx = plan.snapshot.imageWidthPx,
+            pageHeightPx = plan.snapshot.imageHeightPx,
+        )
+
+    /**
+     * Applies an evaluated erase only if the snapshot and stroke revision are still exactly those
+     * captured by [prepareErase]. A stale or duplicate completion is a no-op and creates no undo
+     * entry.
+     */
+    internal fun commitErase(
+        plan: RemoteReviewErasePlan,
+        candidateStrokeIds: Set<String>,
+    ): Set<String> {
+        if (
+            snapshot != plan.snapshot ||
+            editRevision != plan.editRevision ||
+            mutationEpoch != plan.mutationEpoch
+        ) return emptySet()
+        if (candidateStrokeIds.isEmpty()) return emptySet()
+        val plannedIds = plan.strokes.asSequence().map(RemoteFeedbackStroke::id).toHashSet()
+        val currentIds = strokes.asSequence().map(RemoteFeedbackStroke::id).toHashSet()
+        val removed = candidateStrokeIds.asSequence()
+            .filterTo(linkedSetOf()) { id -> id in plannedIds && id in currentIds }
+        if (removed.isEmpty()) return emptySet()
+        rememberForUndo()
+        strokes = strokes.filterNot { stroke -> stroke.id in removed }
+        advanceRevision()
+        return removed
+    }
+
     /** Whole-trace erase. It examines and mutates only this editor's teacher layer. */
     fun erase(
         path: List<RemoteNormalizedPoint>,
         radiusFraction: Float,
     ): Set<String> {
-        val currentSnapshot = snapshot ?: return emptySet()
-        if (!radiusFraction.isFinite() || radiusFraction <= 0f) return emptySet()
-        val cleanPath = sanitizePoints(path)
-        if (cleanPath.isEmpty()) return emptySet()
-        val removed = strokes.asSequence()
-            .filter { stroke ->
-                RemoteReviewGeometry.intersectsEraser(
-                    stroke = stroke,
-                    eraserPath = cleanPath,
-                    eraserRadiusFraction = radiusFraction.coerceAtMost(MAX_ERASER_RADIUS_FRACTION),
-                    pageWidthPx = currentSnapshot.imageWidthPx,
-                    pageHeightPx = currentSnapshot.imageHeightPx,
-                )
-            }
-            .map(RemoteFeedbackStroke::id)
-            .toSet()
-        if (removed.isEmpty()) return emptySet()
-        rememberForUndo()
-        strokes = strokes.filterNot { it.id in removed }
-        advanceRevision()
-        return removed
+        val plan = prepareErase(path, radiusFraction) ?: return emptySet()
+        return commitErase(plan, resolveErase(plan))
     }
 
     fun undo(): Boolean {
@@ -161,6 +212,11 @@ class RemoteReviewEditor {
 
     private fun advanceRevision() {
         editRevision = if (editRevision == Long.MAX_VALUE) 1L else editRevision + 1L
+        advanceMutationEpoch()
+    }
+
+    private fun advanceMutationEpoch() {
+        mutationEpoch = if (mutationEpoch == Long.MAX_VALUE) 1L else mutationEpoch + 1L
     }
 
     private fun sanitizedStroke(stroke: RemoteFeedbackStroke): RemoteFeedbackStroke = stroke.copy(
@@ -212,3 +268,13 @@ class RemoteReviewEditor {
         private const val MAX_TOTAL_POINTS = 120_000
     }
 }
+
+/** Immutable erase input that may cross from the UI thread to one worker thread. */
+internal data class RemoteReviewErasePlan(
+    val snapshot: RemotePageSnapshotRef,
+    val editRevision: Long,
+    val mutationEpoch: Long,
+    val strokes: List<RemoteFeedbackStroke>,
+    val path: List<RemoteNormalizedPoint>,
+    val radiusFraction: Float,
+)

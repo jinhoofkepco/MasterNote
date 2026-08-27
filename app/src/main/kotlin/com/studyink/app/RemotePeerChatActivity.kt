@@ -30,6 +30,8 @@ import com.studyink.monitor.telegram.RemoteReviewPeerStatus
 import com.studyink.monitor.telegram.RemoteMonitorGateway
 import com.studyink.monitor.telegram.RemoteReviewRole
 import com.studyink.monitor.telegram.TelegramEnqueueResult
+import com.studyink.monitor.telegram.TelegramPeerLinkHealth
+import com.studyink.monitor.telegram.TelegramPeerLinkState
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -47,11 +49,14 @@ class RemotePeerChatActivity : ComponentActivity() {
     private lateinit var input: EditText
     private lateinit var sendButton: Button
     private lateinit var pageButton: Button
+    private lateinit var connectionRequestButton: Button
     private lateinit var pageSyncPanel: RemotePageSyncPanelView
     private var stateSubscription: AutoCloseable? = null
     private var pageSyncSubscription: AutoCloseable? = null
+    private var peerLinkSubscription: AutoCloseable? = null
     private var renderedRevision = Long.MIN_VALUE
     private var sendBusy = false
+    private var connectionRequestBusy = false
     private var pageSyncCommandBusy = false
     private var selectedPageSyncIntervalSeconds = DEFAULT_REMOTE_PAGE_SYNC_INTERVAL_SECONDS
 
@@ -80,6 +85,12 @@ class RemotePeerChatActivity : ComponentActivity() {
                 if (!isFinishing && !isDestroyed) renderPageSyncState(state)
             }
         }
+        peerLinkSubscription?.close()
+        peerLinkSubscription = gateway.subscribePeerLinkState { state ->
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) renderPeerLinkState(state)
+            }
+        }
         refreshCurrentState()
         refreshPageSyncState()
     }
@@ -96,6 +107,8 @@ class RemotePeerChatActivity : ComponentActivity() {
         stateSubscription = null
         pageSyncSubscription?.close()
         pageSyncSubscription = null
+        peerLinkSubscription?.close()
+        peerLinkSubscription = null
         super.onStop()
     }
 
@@ -107,6 +120,7 @@ class RemotePeerChatActivity : ComponentActivity() {
     override fun onDestroy() {
         stateSubscription?.close()
         pageSyncSubscription?.close()
+        peerLinkSubscription?.close()
         worker.shutdownNow()
         super.onDestroy()
     }
@@ -137,7 +151,13 @@ class RemotePeerChatActivity : ComponentActivity() {
             }
         }
         header.addView(pageButton)
-        header.addView(smallButton("연결").apply {
+        connectionRequestButton = smallButton("요청").apply {
+            contentDescription = "학생 기기에 Telegram 연결 요청"
+            visibility = View.GONE
+            setOnClickListener { requestPeerConnection() }
+        }
+        header.addView(connectionRequestButton)
+        header.addView(smallButton("설정").apply {
             setOnClickListener {
                 startActivity(Intent(this@RemotePeerChatActivity, RemoteReviewSetupActivity::class.java))
             }
@@ -270,8 +290,10 @@ class RemotePeerChatActivity : ComponentActivity() {
                 return
             }
         if (state.scope.pairId != peer.pairId) return
-        statusText.text = "텔 대화 · @${peer.peer.username}"
+        renderPeerLinkState(gateway.peerLinkState())
         pageButton.visibility = if (peer.role == RemoteReviewRole.TEACHER) View.VISIBLE else View.GONE
+        connectionRequestButton.visibility =
+            if (peer.role == RemoteReviewRole.TEACHER) View.VISIBLE else View.GONE
         input.isEnabled = !sendBusy
         sendButton.isEnabled = !sendBusy
         if (!force && state.stateRevision == renderedRevision) return
@@ -321,7 +343,9 @@ class RemotePeerChatActivity : ComponentActivity() {
     private fun showDisconnected() {
         renderedRevision = Long.MIN_VALUE
         statusText.text = "텔 대화 · 연결 필요"
+        statusText.setTextColor(COLOR_MUTED)
         pageButton.visibility = View.GONE
+        connectionRequestButton.visibility = View.GONE
         input.isEnabled = false
         sendButton.isEnabled = false
         messageList.removeAllViews()
@@ -367,6 +391,65 @@ class RemotePeerChatActivity : ComponentActivity() {
                 refreshCurrentState()
             }
         }
+    }
+
+    private fun requestPeerConnection() {
+        val peer = gateway.remoteReviewPeerStatus() as? RemoteReviewPeerStatus.Connected ?: return
+        val state = gateway.peerLinkState()
+        val exactStaleTeacherPair = peer.role == RemoteReviewRole.TEACHER &&
+            state.role == peer.role && state.pairId == peer.pairId &&
+            state.health == TelegramPeerLinkHealth.STALE && !state.connectionRequestPending
+        if (connectionRequestBusy || !exactStaleTeacherPair) return
+        connectionRequestBusy = true
+        connectionRequestButton.isEnabled = false
+        worker.execute {
+            val result = runCatching {
+                MasterNoteRemoteReviewCoordinator.requestRemotePeerConnection()
+            }.getOrNull()
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                connectionRequestBusy = false
+                val accepted = result?.accepted() == true
+                Toast.makeText(
+                    this,
+                    if (accepted) "학생 기기에 연결 확인을 요청했습니다." else "연결 요청을 저장하지 못했습니다.",
+                    if (accepted) Toast.LENGTH_SHORT else Toast.LENGTH_LONG,
+                ).show()
+                renderPeerLinkState(MasterNoteRemoteReviewCoordinator.remotePeerLinkState())
+            }
+        }
+    }
+
+    private fun renderPeerLinkState(state: TelegramPeerLinkState) {
+        val peer = gateway.remoteReviewPeerStatus() as? RemoteReviewPeerStatus.Connected
+            ?: return showDisconnected()
+        val stateMatchesCurrentPair = state.pairId == peer.pairId && state.role == peer.role
+        val scopedHealth = if (stateMatchesCurrentPair) {
+            state.health
+        } else {
+            TelegramPeerLinkHealth.STALE
+        }
+        val suffix = "@${peer.peer.username}"
+        statusText.text = when (scopedHealth) {
+            TelegramPeerLinkHealth.CONNECTED -> "텔 · 연결됨 · $suffix"
+            TelegramPeerLinkHealth.CHECKING -> "텔 · 확인 중 · $suffix"
+            TelegramPeerLinkHealth.STALE -> "텔 · 응답 없음 · $suffix"
+            TelegramPeerLinkHealth.UNAVAILABLE -> "텔 대화 · 연결 필요"
+        }
+        statusText.setTextColor(
+            when (scopedHealth) {
+                TelegramPeerLinkHealth.CONNECTED -> COLOR_CONNECTED
+                TelegramPeerLinkHealth.CHECKING -> COLOR_CHECKING
+                TelegramPeerLinkHealth.STALE,
+                TelegramPeerLinkHealth.UNAVAILABLE,
+                -> COLOR_MUTED
+            },
+        )
+        val isTeacher = peer.role == RemoteReviewRole.TEACHER
+        connectionRequestButton.visibility = if (isTeacher) View.VISIBLE else View.GONE
+        connectionRequestButton.isEnabled = isTeacher && stateMatchesCurrentPair &&
+            scopedHealth == TelegramPeerLinkHealth.STALE &&
+            !state.connectionRequestPending && !connectionRequestBusy
     }
 
     private fun startPendingPageSync(intervalSeconds: Int) {
@@ -491,5 +574,7 @@ class RemotePeerChatActivity : ComponentActivity() {
         const val COLOR_OUTGOING = 0xFFDCEBFF.toInt()
         const val COLOR_TEXT = 0xFF24272C.toInt()
         const val COLOR_MUTED = 0xFF6C727B.toInt()
+        const val COLOR_CONNECTED = 0xFF147A43.toInt()
+        const val COLOR_CHECKING = 0xFF9A6200.toInt()
     }
 }

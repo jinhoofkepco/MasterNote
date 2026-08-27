@@ -51,6 +51,9 @@ internal class TelegramInboxPoller(
 ) : AutoCloseable {
     private val running = AtomicBoolean(false)
     private val executor = Executors.newSingleThreadExecutor(namedThreadFactory("telegram-inbox"))
+    private val retrySignalLock = ReentrantLock()
+    private val retrySignal = retrySignalLock.newCondition()
+    private var retryWakeRequested = false
     @Volatile private var ownership: String? = null
     val isRunning: Boolean get() = running.get()
 
@@ -106,11 +109,7 @@ internal class TelegramInboxPoller(
                         consecutiveFailures++,
                         jitter.nextFraction().coerceIn(0.0, 1.0),
                     )
-                    try {
-                        Thread.sleep(delayMs)
-                    } catch (_: InterruptedException) {
-                        break
-                    }
+                    if (!awaitRetryDelay(delayMs)) break
                 }
             }
         } catch (error: Throwable) {
@@ -144,8 +143,34 @@ internal class TelegramInboxPoller(
         return active.peerPairId != null && isHandshake
     }
 
+    /**
+     * Coalesced wake-up for a poller in retry backoff. Keeping a remembered flag avoids the classic
+     * lost-signal race when a manual CONNECT_REQUEST is queued just before this thread starts to
+     * wait. Interruption remains terminal and the interrupted status is restored for callers.
+     */
+    fun wake() = retrySignalLock.withLock {
+        retryWakeRequested = true
+        retrySignal.signalAll()
+    }
+
+    private fun awaitRetryDelay(delayMs: Long): Boolean = try {
+        retrySignalLock.withLock {
+            var remainingNanos = delayMs.coerceAtLeast(0L)
+                .coerceAtMost(Long.MAX_VALUE / 1_000_000L) * 1_000_000L
+            while (running.get() && !retryWakeRequested && remainingNanos > 0L) {
+                remainingNanos = retrySignal.awaitNanos(remainingNanos)
+            }
+            retryWakeRequested = false
+            running.get()
+        }
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        false
+    }
+
     override fun close() {
         running.set(false)
+        wake()
         api.close() // disconnects an outstanding long poll before the executor is interrupted
         val neverStarted = executor.shutdownNow().isNotEmpty()
         if (neverStarted) {
@@ -178,18 +203,38 @@ internal class TelegramOutboxProcessor(
     private val credentialsProvider: () -> TelegramCredentials = { credentials },
     private val peerReceipts: TelegramPeerReceiptStore? = null,
 ) : AutoCloseable {
+    private val claimStateLock = Any()
+    private var closed = false
+    private var activePreTransportClaim: String? = null
+
     fun processOne(nowEpochMs: Long): OutboxProcessResult {
         val gate = retryGate.nextAllowedEpochMs()
         if (gate > nowEpochMs) return OutboxProcessResult.Waiting(gate)
         retryGate.clearIfElapsed(nowEpochMs)
         val entry = outbox.claimDue(nowEpochMs) ?: return outbox.nextWakeEpochMs()
             ?.let(OutboxProcessResult::Waiting) ?: OutboxProcessResult.Idle
+        if (!registerPreTransportClaim(entry.idempotencyKey)) {
+            outbox.releaseClaim(entry.idempotencyKey)
+            throw IllegalStateException("Telegram outbox processor is closed.")
+        }
 
-        val activeCredentials = credentialsProvider()
-        when (entry.route) {
-            TelegramOutboxRoute.PARENT -> if (entry.destinationChatId != activeCredentials.allowedPrivateChatId) {
-                outbox.deadLetter(entry.idempotencyKey, "연결된 부모 채팅이 변경됨", nowEpochMs)
-                return OutboxProcessResult.Dead(entry.idempotencyKey)
+        var transportAttemptStarted = false
+        try {
+            val activeCredentials = credentialsProvider()
+            when (entry.route) {
+            TelegramOutboxRoute.PARENT -> {
+                val rejection = when {
+                    activeCredentials.remoteReviewRole == RemoteReviewRole.TEACHER ->
+                        "원격 선생 기기에서는 부모 모니터 전송을 사용하지 않음"
+                    entry.destinationChatId != activeCredentials.allowedPrivateChatId ->
+                        "연결된 부모 채팅이 변경됨"
+                    else -> null
+                }
+                if (rejection != null) {
+                    val dead = outbox.deadLetter(entry.idempotencyKey, rejection, nowEpochMs)
+                    if (dead?.entry?.deleteAfterSend == true) deleteOwnedFile(dead.entry.file)
+                    return OutboxProcessResult.Dead(entry.idempotencyKey)
+                }
             }
             TelegramOutboxRoute.PEER -> {
                 val peer = activeCredentials.peerBinding
@@ -205,7 +250,27 @@ internal class TelegramOutboxProcessor(
                     return OutboxProcessResult.Dead(entry.idempotencyKey)
                 }
                 val transferId = requireNotNull(entry.peerTransferId)
-                val receipt = peerReceipts?.receipt(transferId)
+                var receipt = peerReceipts?.receipt(transferId)
+                if (entry.kind == TelegramOutboxKind.DOCUMENT &&
+                    receipt?.serverAcceptedAtEpochMs == null &&
+                    entry.lastError == PEER_ACK_WAIT_REASON
+                ) {
+                    // Migration from the old uploader: this reason was persisted only after a
+                    // successful Telegram API response. Mark it accepted before it can be uploaded
+                    // once more by the new binary. Rebuild a missing/corrupt receipt journal from
+                    // the stronger durable outbox success marker when necessary.
+                    val intent = receipt ?: peerReceipts?.recordSent(
+                        transferId = transferId,
+                        outboxKey = entry.idempotencyKey,
+                        telegramMessageId = null,
+                        sentAtEpochMs = entry.createdAtEpochMs,
+                    )
+                    receipt = peerReceipts?.recordServerAccepted(
+                        transferId = transferId,
+                        telegramMessageId = intent?.telegramMessageId,
+                        acceptedAtEpochMs = intent?.sentAtEpochMs ?: entry.createdAtEpochMs,
+                    ) ?: intent
+                }
                 if (entry.kind == TelegramOutboxKind.DOCUMENT &&
                     receipt?.acknowledgedAtEpochMs != null
                 ) {
@@ -214,8 +279,19 @@ internal class TelegramOutboxProcessor(
                     return OutboxProcessResult.Sent(entry.idempotencyKey)
                 }
                 if (entry.kind == TelegramOutboxKind.DOCUMENT &&
-                    peerAcknowledgementExpired(entry.createdAtEpochMs, nowEpochMs)
+                    receipt?.serverAcceptedAtEpochMs != null
                 ) {
+                    val acceptedAt = requireNotNull(receipt.serverAcceptedAtEpochMs)
+                    val deadline = safeAdd(acceptedAt, PEER_ACK_RETENTION_MS)
+                    if (!peerAcknowledgementExpired(acceptedAt, nowEpochMs)) {
+                        val deferred = outbox.deferUntil(
+                            entry.idempotencyKey,
+                            deadline,
+                            PEER_ACK_WAIT_REASON,
+                        )
+                        if (deferred?.deleteAfterSend == true) deleteOwnedFile(deferred.file)
+                        return OutboxProcessResult.Retried(entry.idempotencyKey, deadline)
+                    }
                     val dead = outbox.deadLetter(
                         entry.idempotencyKey,
                         "원격 기기 수신 확인이 24시간 동안 없음",
@@ -224,10 +300,21 @@ internal class TelegramOutboxProcessor(
                     if (dead?.entry?.deleteAfterSend == true) deleteOwnedFile(dead.entry.file)
                     return OutboxProcessResult.Dead(entry.idempotencyKey)
                 }
+                if (entry.kind == TelegramOutboxKind.DOCUMENT &&
+                    peerAcknowledgementExpired(entry.createdAtEpochMs, nowEpochMs)
+                ) {
+                    val dead = outbox.deadLetter(
+                        entry.idempotencyKey,
+                        "Telegram 서버 전송이 24시간 동안 성공하지 않음",
+                        nowEpochMs,
+                    )
+                    if (dead?.entry?.deleteAfterSend == true) deleteOwnedFile(dead.entry.file)
+                    return OutboxProcessResult.Dead(entry.idempotencyKey)
+                }
             }
         }
 
-        if (entry.route == TelegramOutboxRoute.PEER && entry.kind == TelegramOutboxKind.DOCUMENT) {
+            if (entry.route == TelegramOutboxRoute.PEER && entry.kind == TelegramOutboxKind.DOCUMENT) {
             // Establish the durable transfer record before the network call. The receiving bot can
             // acknowledge very quickly, on a different worker, so recording only after upload
             // completion leaves a small ACK-before-SENT loss window.
@@ -237,9 +324,14 @@ internal class TelegramOutboxProcessor(
                 telegramMessageId = null,
                 sentAtEpochMs = nowEpochMs,
             )
-        }
+            }
 
-        return try {
+            // From this point on an exception may be ambiguous: Telegram could have accepted the
+            // request before the client observed a response. Never memory-release a peer document
+            // claim through the preflight recovery path after transport has started.
+            markTransportAttemptStarted(entry.idempotencyKey)
+            transportAttemptStarted = true
+            val sendResult: TelegramSendResult = try {
             when (entry.route) {
                 TelegramOutboxRoute.PARENT -> when (entry.kind) {
                     TelegramOutboxKind.TEXT -> api.sendMessage(entry.destinationChatId, entry.text)
@@ -270,33 +362,8 @@ internal class TelegramOutboxProcessor(
                     TelegramOutboxKind.VOICE -> error("Peer voice transport is not supported.")
                 }
             }
-            connectionTracker.success(nowEpochMs)
-            if (entry.route == TelegramOutboxRoute.PEER && entry.kind == TelegramOutboxKind.DOCUMENT) {
-                // Telegram accepting an upload is not proof that the peer persisted it. Keep the
-                // encrypted payload until the authenticated RECEIVED control arrives, and retry
-                // with the same transfer id so the receiver can deduplicate safely.
-                val delay = peerAcknowledgementRetryDelayMs(entry.attempts)
-                val next = safeAdd(nowEpochMs, delay)
-                outbox.retry(
-                    idempotencyKey = entry.idempotencyKey,
-                    nowEpochMs = nowEpochMs,
-                    delayMs = delay,
-                    reason = "원격 기기 수신 확인 대기",
-                )
-                if (peerReceipts?.receipt(requireNotNull(entry.peerTransferId))
-                        ?.acknowledgedAtEpochMs != null
-                ) {
-                    val acknowledged = outbox.acknowledge(entry.idempotencyKey, nowEpochMs)
-                    if (acknowledged?.deleteAfterSend == true) deleteOwnedFile(acknowledged.file)
-                    return OutboxProcessResult.Sent(entry.idempotencyKey)
-                }
-                return OutboxProcessResult.Retried(entry.idempotencyKey, next)
-            }
-            val acknowledged = outbox.acknowledge(entry.idempotencyKey, nowEpochMs)
-            if (acknowledged?.deleteAfterSend == true) deleteOwnedFile(acknowledged.file)
-            OutboxProcessResult.Sent(entry.idempotencyKey)
         } catch (error: Throwable) {
-            connectionTracker.failure(error, nowEpochMs)
+            runCatching { connectionTracker.failure(error, nowEpochMs) }
             if (entry.route == TelegramOutboxRoute.PEER &&
                 entry.kind == TelegramOutboxKind.DOCUMENT &&
                 peerReceipts?.receipt(requireNotNull(entry.peerTransferId))
@@ -307,7 +374,7 @@ internal class TelegramOutboxProcessor(
                 return OutboxProcessResult.Sent(entry.idempotencyKey)
             }
             val reason = TelegramRetryPolicy.shortReason(error)
-            if (TelegramRetryPolicy.isPermanent(error)) {
+            return if (TelegramRetryPolicy.isPermanent(error)) {
                 val dead = outbox.deadLetter(entry.idempotencyKey, reason, nowEpochMs)
                 if (dead?.entry?.deleteAfterSend == true) deleteOwnedFile(dead.entry.file)
                 OutboxProcessResult.Dead(entry.idempotencyKey)
@@ -325,6 +392,71 @@ internal class TelegramOutboxProcessor(
                 OutboxProcessResult.Retried(entry.idempotencyKey, next)
             }
         }
+
+            if (entry.route == TelegramOutboxRoute.PEER && entry.kind == TelegramOutboxKind.DOCUMENT) {
+            val transferId = requireNotNull(entry.peerTransferId)
+            val receiptStore = requireNotNull(peerReceipts) { "Peer receipt store is unavailable." }
+            val accepted = runCatching {
+                receiptStore.recordServerAccepted(
+                    transferId = transferId,
+                    telegramMessageId = sendResult.messageId,
+                    acceptedAtEpochMs = nowEpochMs,
+                ) ?: error("Peer transfer intent record is missing.")
+            }.getOrElse { error ->
+                // Telegram has already accepted this upload. A local bookkeeping failure must stop
+                // the transfer instead of scheduling another server upload with the same payload.
+                val dead = outbox.deadLetter(
+                    entry.idempotencyKey,
+                    "Telegram 전송 완료 후 로컬 확인 저장 실패: ${TelegramRetryPolicy.shortReason(error)}",
+                    nowEpochMs,
+                )
+                if (dead?.entry?.deleteAfterSend == true) deleteOwnedFile(dead.entry.file)
+                return OutboxProcessResult.Dead(entry.idempotencyKey)
+            }
+            val deadline = safeAdd(accepted.serverAcceptedAtEpochMs ?: nowEpochMs, PEER_ACK_RETENTION_MS)
+            val deferred = outbox.deferUntil(
+                entry.idempotencyKey,
+                deadline,
+                PEER_ACK_WAIT_REASON,
+            )
+            if (deferred?.deleteAfterSend == true) deleteOwnedFile(deferred.file)
+            runCatching { connectionTracker.success(nowEpochMs) }
+            if (receiptStore.receipt(transferId)?.acknowledgedAtEpochMs != null) {
+                val acknowledged = outbox.acknowledge(entry.idempotencyKey, nowEpochMs)
+                if (acknowledged?.deleteAfterSend == true) deleteOwnedFile(acknowledged.file)
+                return OutboxProcessResult.Sent(entry.idempotencyKey)
+            }
+            return OutboxProcessResult.Retried(entry.idempotencyKey, deadline)
+            }
+
+            runCatching { connectionTracker.success(nowEpochMs) }
+            val acknowledged = outbox.acknowledge(entry.idempotencyKey, nowEpochMs)
+            if (acknowledged?.deleteAfterSend == true) deleteOwnedFile(acknowledged.file)
+            return OutboxProcessResult.Sent(entry.idempotencyKey)
+        } catch (error: Throwable) {
+            if (!transportAttemptStarted) outbox.releaseClaim(entry.idempotencyKey)
+            throw error
+        } finally {
+            clearPreTransportClaim(entry.idempotencyKey)
+        }
+    }
+
+    private fun registerPreTransportClaim(idempotencyKey: String): Boolean =
+        synchronized(claimStateLock) {
+            if (closed) return@synchronized false
+            check(activePreTransportClaim == null)
+            activePreTransportClaim = idempotencyKey
+            true
+        }
+
+    private fun markTransportAttemptStarted(idempotencyKey: String) = synchronized(claimStateLock) {
+        check(!closed) { "Telegram outbox processor closed before transport." }
+        check(activePreTransportClaim == idempotencyKey)
+        activePreTransportClaim = null
+    }
+
+    private fun clearPreTransportClaim(idempotencyKey: String) = synchronized(claimStateLock) {
+        if (activePreTransportClaim == idempotencyKey) activePreTransportClaim = null
     }
 
     private fun requireFile(entry: TelegramOutboxEntry): File = entry.file
@@ -341,17 +473,14 @@ internal class TelegramOutboxProcessor(
     private fun safeAdd(left: Long, right: Long): Long =
         if (Long.MAX_VALUE - left < right) Long.MAX_VALUE else left + right
 
-    override fun close() = api.close()
-}
-
-/**
- * Retry quickly while a peer is likely just waking up, then taper to a three-hour ceiling so an
- * offline phone cannot repeatedly upload the same page all day on mobile data.
- */
-internal fun peerAcknowledgementRetryDelayMs(attempts: Int): Long {
-    require(attempts >= 0)
-    return PEER_ACK_RETRY_DELAYS_MINUTES[attempts.coerceAtMost(PEER_ACK_RETRY_DELAYS_MINUTES.lastIndex)] *
-        60_000L
+    override fun close() {
+        val unsentClaim = synchronized(claimStateLock) {
+            closed = true
+            activePreTransportClaim.also { activePreTransportClaim = null }
+        }
+        unsentClaim?.let(outbox::releaseClaim)
+        api.close()
+    }
 }
 
 internal fun peerAcknowledgementExpired(createdAtEpochMs: Long, nowEpochMs: Long): Boolean {
@@ -360,8 +489,8 @@ internal fun peerAcknowledgementExpired(createdAtEpochMs: Long, nowEpochMs: Long
         nowEpochMs - createdAtEpochMs >= PEER_ACK_RETENTION_MS
 }
 
-private val PEER_ACK_RETRY_DELAYS_MINUTES = longArrayOf(1L, 2L, 4L, 8L, 15L, 30L, 60L, 180L)
-private const val PEER_ACK_RETENTION_MS = 24L * 60L * 60L * 1_000L
+internal const val PEER_ACK_RETENTION_MS = 24L * 60L * 60L * 1_000L
+private const val PEER_ACK_WAIT_REASON = "원격 기기 수신 확인 대기"
 
 internal class TelegramOutboxWorker(
     private val outbox: TelegramOutbox,
@@ -419,6 +548,9 @@ internal class TelegramOutboxWorker(
         wake()
         executor.shutdownNow()
         processor.close()
+        // Pair/role mutation starts only after an in-flight parent or peer upload has actually
+        // observed interruption/API close, avoiding a send racing past durable cancellation.
+        runCatching { executor.awaitTermination(2L, TimeUnit.SECONDS) }
     }
 
     private companion object {

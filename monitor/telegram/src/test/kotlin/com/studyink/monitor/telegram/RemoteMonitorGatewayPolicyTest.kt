@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class RemoteMonitorGatewayPolicyTest {
@@ -58,6 +59,16 @@ class RemoteMonitorGatewayPolicyTest {
         )
     }
 
+    @Test fun parentOutboxIsRejectedForTeacherRoleButPreservedForStudentRole() {
+        val teacher = credentials(chatId = 7L, role = RemoteReviewRole.TEACHER)
+        val student = credentials(chatId = 7L, role = RemoteReviewRole.STUDENT)
+        assertEquals(
+            TelegramEnqueueResult.NOT_CONFIGURED,
+            enqueuePrecondition(true, teacher, expectedChatId = 7L),
+        )
+        assertNull(enqueuePrecondition(true, student, expectedChatId = 7L))
+    }
+
     @Test fun peerDocumentsHaveASeparateCountAndDiskQuota() {
         assertTrue(withinPeerDocumentDiskQuota(47, 94L * 1_024L * 1_024L, 2L * 1_024L * 1_024L))
         assertFalse(withinPeerDocumentDiskQuota(48, 0L, 1L))
@@ -72,9 +83,38 @@ class RemoteMonitorGatewayPolicyTest {
         assertFalse(first == peerDeliveryAckInstanceId("pair_12345678", "snapshot_12345678", 42L))
     }
 
-    private fun credentials(chatId: Long) = TelegramCredentials(
+    @Test fun teacherRoleConsumesParentCommandsAtGatewayBoundaryButStudentKeepsThem() {
+        assertFalse(shouldAcceptParentInbound(false, null))
+        assertFalse(shouldAcceptParentInbound(true, RemoteReviewRole.TEACHER))
+        assertTrue(shouldAcceptParentInbound(true, RemoteReviewRole.STUDENT))
+        assertTrue(shouldAcceptParentInbound(true, null))
+    }
+
+    @Test fun inboundPeerResponseRequiresDurableQueueStateBeforeOffsetCommit() {
+        listOf(
+            TelegramEnqueueResult.ENQUEUED,
+            TelegramEnqueueResult.ALREADY_PENDING,
+            TelegramEnqueueResult.ALREADY_DELIVERED,
+        ).forEach(::ensurePeerResponseDurablyQueued)
+        listOf(
+            TelegramEnqueueResult.QUEUE_FULL,
+            TelegramEnqueueResult.PREVIOUSLY_DEAD,
+            TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED,
+            TelegramEnqueueResult.NOT_CONFIGURED,
+        ).forEach { result ->
+            assertThrows(IllegalStateException::class.java) {
+                ensurePeerResponseDurablyQueued(result)
+            }
+        }
+    }
+
+    private fun credentials(chatId: Long, role: RemoteReviewRole? = null) = TelegramCredentials(
         botToken = "123456:test-token",
         allowedPrivateChatId = chatId,
         chatLabel = "parent",
+        remoteReviewRole = role,
+        peerPairId = role?.let { "pair_identifier_123" },
+        peerSharedKeyBase64 = role?.let { TelegramPeerProtocol.encodeKey(ByteArray(32) { 1 }) },
+        peerPairingExpiresAtEpochMs = role?.let { 1_000_000L },
     )
 }

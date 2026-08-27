@@ -41,6 +41,41 @@ class TelegramPeerInboxTest {
         assertEquals(1, inbox.pending().size)
     }
 
+    @Test fun listenerFailureCannotRollBackOrDeleteADurableDocumentPut() {
+        val root = temporary.newFolder()
+        val owned = root.resolve("inbox").apply { mkdirs() }
+        val journal = root.resolve("journal")
+        val inbox = TelegramPeerDocumentInbox(journal, owned)
+        inbox.subscribe(emitPending = false) { error("listener failed") }
+        val payload = owned.resolve("payload.bin").apply { writeText("page") }
+        val pending = entry(payload).copy(
+            updateId = 91L,
+            transferId = "transfer_listener_123",
+        )
+
+        assertTrue(inbox.offer(pending))
+        assertTrue(payload.isFile)
+        assertEquals(listOf(pending), TelegramPeerDocumentInbox(journal, owned).pending())
+    }
+
+    @Test fun serverAcceptedAndPeerAcknowledgedReceiptStagesSurviveRestart() {
+        val journal = temporary.newFile("receipts.v1")
+        val first = TelegramPeerReceiptStore(journal)
+        first.recordSent("transfer_123", "outbox_123", null, 100L)
+        val accepted = requireNotNull(first.recordServerAccepted("transfer_123", 91L, 200L))
+        assertEquals(91L, accepted.telegramMessageId)
+        assertEquals(200L, accepted.serverAcceptedAtEpochMs)
+
+        val recovered = TelegramPeerReceiptStore(journal)
+        assertEquals(200L, recovered.receipt("transfer_123")?.serverAcceptedAtEpochMs)
+        assertTrue(recovered.recordAcknowledged("transfer_123", 92L, 300L))
+
+        val acknowledged = TelegramPeerReceiptStore(journal).receipt("transfer_123")
+        assertEquals(200L, acknowledged?.serverAcceptedAtEpochMs)
+        assertEquals(300L, acknowledged?.acknowledgedAtEpochMs)
+        assertEquals(92L, acknowledged?.acknowledgementMessageId)
+    }
+
     private fun entry(file: java.io.File) = PendingTelegramPeerDocument(
         updateId = 7L,
         telegramMessageId = 9L,
