@@ -105,12 +105,16 @@ internal class RemotePageSyncController(
     private var telegramOnline = false
     private var lanOwnsData = false
     private var currentPresence: StudentStudyPresence? = null
-    private var manifestDueAtElapsedMs = Long.MAX_VALUE
+    private var inventoryManifestDueAtElapsedMs = Long.MAX_VALUE
+    private var interactiveManifestDueAtElapsedMs = Long.MAX_VALUE
+    private var inventoryManifestRetryNotBeforeElapsedMs = 0L
+    private var interactiveManifestRetryNotBeforeElapsedMs = 0L
     private var lastManifestSentAtElapsedMs: Long? = null
+    private var lastInventoryManifestSentAtElapsedMs: Long? = null
     /** Remaining bounded manifest windows in the current inventory advertisement cycle. */
     private var manifestBatchesRemaining = 0
-    /** Inventory/page state changed after the currently outstanding manifest was frozen. */
-    private var manifestChangedSinceReservation = false
+    /** Inventory state changed after the currently outstanding inventory manifest was frozen. */
+    private var inventoryChangedSinceReservation = false
     private val seededStudentBooks = linkedSetOf<String>()
     private val discoveredStudentBooks = linkedSetOf<String>()
     private val expectedStudentInventoryPages = linkedMapOf<String, LinkedHashSet<Int>>()
@@ -146,10 +150,14 @@ internal class RemotePageSyncController(
         }
         session = next
         currentPresence = null
-        manifestDueAtElapsedMs = Long.MAX_VALUE
+        inventoryManifestDueAtElapsedMs = Long.MAX_VALUE
+        interactiveManifestDueAtElapsedMs = Long.MAX_VALUE
+        inventoryManifestRetryNotBeforeElapsedMs = 0L
+        interactiveManifestRetryNotBeforeElapsedMs = 0L
         lastManifestSentAtElapsedMs = null
+        lastInventoryManifestSentAtElapsedMs = null
         manifestBatchesRemaining = 0
-        manifestChangedSinceReservation = false
+        inventoryChangedSinceReservation = false
         clearStudentInventoryScan()
         manualRunning = false
         requestCooldownUntilElapsedMs = 0L
@@ -160,7 +168,7 @@ internal class RemotePageSyncController(
         nextTeacherReviewSendAtElapsedMs = 0L
         if (next?.role == RemoteReviewRole.STUDENT && telegramActive) {
             scheduleAllStudentBooks()
-            manifestDueAtElapsedMs = nowElapsedMs()
+            inventoryManifestDueAtElapsedMs = nowElapsedMs()
             manifestBatchesRemaining = requiredManifestBatchCount(expectedStudentInventoryPageCount())
         }
         RemoteStudentCursorBus.clear(RemoteStudentCursorTransport.TELEGRAM)
@@ -183,14 +191,20 @@ internal class RemotePageSyncController(
                             refreshStudentPage(requireNotNull(presence.bookId), requireNotNull(presence.pageNumber) - 1)
                         }
                         scheduleAllStudentBooks()
-                        manifestDueAtElapsedMs = nowElapsedMs()
+                        inventoryManifestDueAtElapsedMs = nowElapsedMs()
+                        interactiveManifestDueAtElapsedMs = Long.MAX_VALUE
+                        inventoryManifestRetryNotBeforeElapsedMs = 0L
+                        interactiveManifestRetryNotBeforeElapsedMs = 0L
                         manifestBatchesRemaining = requiredManifestBatchCount(expectedStudentInventoryPageCount())
                     }
                 } else if (lanOwnsData) {
                     store.closeStudentGeneration()
-                    manifestDueAtElapsedMs = Long.MAX_VALUE
+                    inventoryManifestDueAtElapsedMs = Long.MAX_VALUE
+                    interactiveManifestDueAtElapsedMs = Long.MAX_VALUE
+                    inventoryManifestRetryNotBeforeElapsedMs = 0L
+                    interactiveManifestRetryNotBeforeElapsedMs = 0L
                     manifestBatchesRemaining = 0
-                    manifestChangedSinceReservation = false
+                    inventoryChangedSinceReservation = false
                 }
             }
             RemoteReviewRole.TEACHER -> {
@@ -230,7 +244,8 @@ internal class RemotePageSyncController(
                 abandonUnavailableStudentResponses()
                 scheduleAllStudentBooks(retryFailed = true)
                 retryFailedStudentInventoryPages()
-                manifestDueAtElapsedMs = nowElapsedMs()
+                inventoryManifestDueAtElapsedMs = nowElapsedMs()
+                inventoryManifestRetryNotBeforeElapsedMs = 0L
                 manifestBatchesRemaining = requiredManifestBatchCount(expectedStudentInventoryPageCount())
             }
             RemoteReviewRole.TEACHER -> {
@@ -260,7 +275,7 @@ internal class RemotePageSyncController(
             val bookId = requireNotNull(presence.bookId)
             refreshStudentPage(bookId, requireNotNull(presence.pageNumber) - 1)
             seedStudentBook(bookId)
-            scheduleManifestAtRateBoundary()
+            scheduleInteractiveManifest()
         }
     }
 
@@ -272,7 +287,7 @@ internal class RemotePageSyncController(
         val oneBasedPage = heartbeat.pageNumber ?: presence?.pageNumber ?: return
         if (!isVisibleStudentBook(bookId)) return
         refreshStudentPage(bookId, oneBasedPage - 1)
-        scheduleManifestAtRateBoundary()
+        scheduleInteractiveManifest()
     }
 
     @Synchronized
@@ -280,7 +295,7 @@ internal class RemotePageSyncController(
         if (session?.role != RemoteReviewRole.STUDENT || !telegramActive) return
         if (!isVisibleStudentBook(bookId)) return
         refreshStudentPage(bookId, pageNumber)
-        scheduleManifestAtRateBoundary()
+        scheduleInteractiveManifest()
     }
 
     @Synchronized
@@ -529,7 +544,7 @@ internal class RemotePageSyncController(
                 )
                 if (sendEnvelope(rejection).isDurablyAccepted()) {
                     store.removeStudentPage(envelope.pageToken)
-                    scheduleManifestAtRateBoundary()
+                    scheduleInteractiveManifest()
                     return RemotePageSyncIncomingResult.ACKNOWLEDGE
                 }
                 return RemotePageSyncIncomingResult.RETAIN
@@ -684,7 +699,7 @@ internal class RemotePageSyncController(
                 )
                 if (!resolved) return RemotePageSyncIncomingResult.DROP
                 store.studentPage(envelope.pageToken)?.let { refreshStudentPage(it.bookId, it.pageNumber) }
-                scheduleManifestAtRateBoundary()
+                scheduleInteractiveManifest()
                 RemotePageSyncIncomingResult.ACKNOWLEDGE
             }
             RemoteReviewRole.TEACHER -> receiveTeacherAck(envelope)
@@ -778,8 +793,13 @@ internal class RemotePageSyncController(
         requestCooldownUntilElapsedMs = 0L
         lastRequestedPageToken = null
         preferManualPageNext = false
-        manifestDueAtElapsedMs = if (telegramActive) nowElapsedMs() else Long.MAX_VALUE
-        manifestChangedSinceReservation = false
+        inventoryManifestDueAtElapsedMs = if (telegramActive) nowElapsedMs() else Long.MAX_VALUE
+        interactiveManifestDueAtElapsedMs = Long.MAX_VALUE
+        inventoryManifestRetryNotBeforeElapsedMs = 0L
+        interactiveManifestRetryNotBeforeElapsedMs = 0L
+        lastManifestSentAtElapsedMs = null
+        lastInventoryManifestSentAtElapsedMs = null
+        inventoryChangedSinceReservation = false
         manifestBatchesRemaining = if (telegramActive) {
             requiredManifestBatchCount(expectedStudentInventoryPageCount())
         } else {
@@ -807,19 +827,21 @@ internal class RemotePageSyncController(
         if (outstanding != null) {
             when (outboundState(RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST.name, outstanding.transferId)) {
                 RemotePageSyncOutboundState.ACKNOWLEDGED -> {
-                    val changedAfterReservation = manifestChangedSinceReservation
+                    val inventoryChangedAfterReservation = inventoryChangedSinceReservation
                     store.acknowledgeOutstandingStudentManifest(outstanding.transferId)
-                    manifestChangedSinceReservation = false
-                    resolveStudentManifestAckSchedule(
-                        changedAfterReservation = changedAfterReservation,
-                        batchesRemaining = manifestBatchesRemaining,
-                        requiredBatchCount = requiredManifestBatchCount(expectedStudentInventoryPageCount()),
-                        scheduledDueAtElapsedMs = manifestDueAtElapsedMs,
-                        nowElapsedMs = nowElapsedMs(),
-                        intervalMs = MANIFEST_INTERVAL_MS,
-                    ).let { schedule ->
-                        manifestBatchesRemaining = schedule.batchesRemaining
-                        manifestDueAtElapsedMs = schedule.dueAtElapsedMs
+                    if (outstanding.advancesInventoryWindow) {
+                        inventoryChangedSinceReservation = false
+                        resolveStudentManifestAckSchedule(
+                            changedAfterReservation = inventoryChangedAfterReservation,
+                            batchesRemaining = manifestBatchesRemaining,
+                            requiredBatchCount = requiredManifestBatchCount(expectedStudentInventoryPageCount()),
+                            scheduledDueAtElapsedMs = inventoryManifestDueAtElapsedMs,
+                            nowElapsedMs = nowElapsedMs(),
+                            intervalMs = INVENTORY_MANIFEST_INTERVAL_MS,
+                        ).let { schedule ->
+                            manifestBatchesRemaining = schedule.batchesRemaining
+                            inventoryManifestDueAtElapsedMs = schedule.dueAtElapsedMs
+                        }
                     }
                 }
                 RemotePageSyncOutboundState.PENDING,
@@ -829,59 +851,106 @@ internal class RemotePageSyncController(
                     // A reservation does not persist a byte snapshot. Never rebuild a possibly
                     // different manifest under the same transfer id after a crash/journal loss.
                     store.clearOutstandingStudentManifest(outstanding.transferId)
-                    manifestDueAtElapsedMs = nowElapsedMs()
+                    scheduleManifestLaneNow(outstanding)
                     return
                 }
                 RemotePageSyncOutboundState.FAILED -> {
                     // A terminal uploader failure may remain visible for many ticks. Back off the
                     // replacement transfer so a permanent 4xx or local file error cannot create a
                     // new Telegram document and disk file every second.
-                    deferStudentManifestRetry(outstanding.transferId)
+                    deferStudentManifestRetry(outstanding)
                     return
                 }
             }
         }
-        if (nowElapsedMs() < manifestDueAtElapsedMs) return
+        val now = nowElapsedMs()
+        val inventoryReady = manifestLaneReady(
+            dueAtElapsedMs = inventoryManifestDueAtElapsedMs,
+            retryNotBeforeElapsedMs = inventoryManifestRetryNotBeforeElapsedMs,
+            nowElapsedMs = now,
+        )
+        val interactiveReady = manifestLaneReady(
+            dueAtElapsedMs = interactiveManifestDueAtElapsedMs,
+            retryNotBeforeElapsedMs = interactiveManifestRetryNotBeforeElapsedMs,
+            nowElapsedMs = now,
+        )
+        if (!inventoryReady && !interactiveReady) return
         currentPresence?.takeIf(StudentStudyPresence::active)?.let { presence ->
             refreshStudentPage(requireNotNull(presence.bookId), requireNotNull(presence.pageNumber) - 1)
         }
-        if (manifestBatchesRemaining <= 0) {
+        // Inventory wins when both are ready, but its 47+current row bound may omit two recent
+        // pages. A pending fast lane is therefore preserved after the inventory send.
+        val advancesInventoryWindow = inventoryReady
+        if (advancesInventoryWindow && manifestBatchesRemaining <= 0) {
             manifestBatchesRemaining = requiredManifestBatchCount(expectedStudentInventoryPageCount())
         }
-        val reservation = store.reserveStudentManifest(randomTransferId("manifest"), nowEpochMs())
-        manifestChangedSinceReservation = false
+        val reservation = store.reserveStudentManifest(
+            transferId = randomTransferId("manifest"),
+            createdAtEpochMs = nowEpochMs(),
+            advancesInventoryWindow = advancesInventoryWindow,
+        )
+        if (reservation.advancesInventoryWindow) inventoryChangedSinceReservation = false
         val manifest = try {
             buildManifest(reservation)
         } catch (error: Exception) {
             logStudentManifestFailure("build", error)
-            deferStudentManifestRetry(reservation.transferId)
+            deferStudentManifestRetry(reservation)
             return
         }
         val enqueueResult = try {
             sendEnvelope(manifest)
         } catch (error: Exception) {
             logStudentManifestFailure("enqueue", error)
-            deferStudentManifestRetry(reservation.transferId)
+            deferStudentManifestRetry(reservation)
             return
         }
         if (enqueueResult.isDurablyAccepted()) {
-            lastManifestSentAtElapsedMs = nowElapsedMs()
+            val sentAt = nowElapsedMs()
+            lastManifestSentAtElapsedMs = sentAt
             // Do not advance the inventory window until the gateway durably acknowledges this
             // document. A terminal uploader failure must retry without losing that window.
-            manifestDueAtElapsedMs = Long.MAX_VALUE
+            if (reservation.advancesInventoryWindow) {
+                lastInventoryManifestSentAtElapsedMs = sentAt
+                inventoryManifestDueAtElapsedMs = Long.MAX_VALUE
+                inventoryManifestRetryNotBeforeElapsedMs = 0L
+                interactiveManifestDueAtElapsedMs = preserveInteractiveManifestDueAfterInventorySend(
+                    pendingDueAtElapsedMs = interactiveManifestDueAtElapsedMs,
+                    inventorySentAtElapsedMs = sentAt,
+                )
+            } else {
+                interactiveManifestDueAtElapsedMs = Long.MAX_VALUE
+                interactiveManifestRetryNotBeforeElapsedMs = 0L
+            }
         } else {
             Log.w(LOG_TAG, "Student manifest enqueue rejected (${enqueueResult.name}); retry delayed")
-            deferStudentManifestRetry(reservation.transferId)
+            deferStudentManifestRetry(reservation)
         }
     }
 
     /** Clears the unsent reservation and establishes the backoff before any fallible disk write. */
-    private fun deferStudentManifestRetry(transferId: String) {
-        manifestDueAtElapsedMs = safeAdd(nowElapsedMs(), SEND_RETRY_MS)
+    private fun deferStudentManifestRetry(reservation: StudentManifestReservation) {
+        val retryAt = safeAdd(nowElapsedMs(), SEND_RETRY_MS)
+        if (reservation.advancesInventoryWindow) {
+            inventoryManifestDueAtElapsedMs = retryAt
+            inventoryManifestRetryNotBeforeElapsedMs = retryAt
+        } else {
+            interactiveManifestDueAtElapsedMs = retryAt
+            interactiveManifestRetryNotBeforeElapsedMs = retryAt
+        }
         try {
-            store.clearOutstandingStudentManifest(transferId)
+            store.clearOutstandingStudentManifest(reservation.transferId)
         } catch (error: Exception) {
             logStudentManifestFailure("reservation cleanup", error)
+        }
+    }
+
+    private fun scheduleManifestLaneNow(reservation: StudentManifestReservation) {
+        if (reservation.advancesInventoryWindow) {
+            inventoryManifestDueAtElapsedMs = nowElapsedMs()
+            inventoryManifestRetryNotBeforeElapsedMs = 0L
+        } else {
+            interactiveManifestDueAtElapsedMs = nowElapsedMs()
+            interactiveManifestRetryNotBeforeElapsedMs = 0L
         }
     }
 
@@ -906,11 +975,19 @@ internal class RemotePageSyncController(
             )
         }
         val pagesByToken = store.studentPages().associateBy(StudentPageSyncRecord::pageToken)
-        val ordered = selectManifestPageTokens(
-            pagesByToken.keys,
-            currentToken,
-            reservation.windowOrdinal,
-        ).mapNotNull(pagesByToken::get)
+        val selectedTokens = if (reservation.advancesInventoryWindow) {
+            selectManifestPageTokens(
+                pagesByToken.keys,
+                currentToken,
+                reservation.windowOrdinal,
+            )
+        } else {
+            selectInteractiveManifestPageTokens(
+                latestFirstPageTokens = pagesByToken.keys.toList(),
+                currentPageToken = currentToken,
+            )
+        }
+        val ordered = selectedTokens.mapNotNull(pagesByToken::get)
         val entries = ordered.map { page ->
             PageSyncManifestEntry(
                 pageToken = page.pageToken,
@@ -1001,13 +1078,15 @@ internal class RemotePageSyncController(
             preferManualPageNext,
         ) ?: return
         val requesterRevision = if (next.forceCheckpoint) 0L else next.appliedRevision
+        val requestWasAutomatic = next.pageToken in automaticTokens
         val transferId = randomTransferId("page_request")
         val reserved = store.reserveTeacherRequest(
-            next.pageToken,
-            transferId,
-            nowEpochMs(),
-            next.sourceRevision,
-            requesterRevision,
+            pageToken = next.pageToken,
+            transferId = transferId,
+            createdAtEpochMs = nowEpochMs(),
+            requestedSourceRevision = next.sourceRevision,
+            requesterRevision = requesterRevision,
+            requestWasAutomatic = requestWasAutomatic,
         ) ?: return
         lastRequestedPageToken = next.pageToken
         if (manualRunning) preferManualPageNext = next.pageToken in automaticTokens
@@ -1283,7 +1362,14 @@ internal class RemotePageSyncController(
             envelope.chunkGroupId,
         )
         failedPageTokens -= envelope.pageToken
-        requestCooldownUntilElapsedMs = safeAdd(nowElapsedMs(), intervalSeconds.toLong() * 1_000L)
+        requestCooldownUntilElapsedMs = safeAdd(
+            nowElapsedMs(),
+            successfulPageSyncCooldownMs(
+                kind = envelope.kind,
+                automatic = record.requestWasAutomatic,
+                checkpointIntervalSeconds = intervalSeconds,
+            ),
+        )
         RemoteStudentPageAppliedBus.publish(
             RemoteStudentPageApplied(record.localBookId, record.pageNumber, envelope.sourceRevision, envelope.chunkGroupId),
         )
@@ -1921,7 +2007,11 @@ internal class RemotePageSyncController(
             store.closeStudentGeneration()
             store.beginStudentGeneration()
             clearStudentInventoryScan()
-            manifestChangedSinceReservation = false
+            inventoryChangedSinceReservation = false
+            interactiveManifestDueAtElapsedMs = Long.MAX_VALUE
+            inventoryManifestRetryNotBeforeElapsedMs = 0L
+            interactiveManifestRetryNotBeforeElapsedMs = 0L
+            lastInventoryManifestSentAtElapsedMs = null
             currentPresence?.takeIf(StudentStudyPresence::active)
                 ?.takeIf { requireNotNull(it.bookId) in visibleBookIds }
                 ?.let { presence ->
@@ -1933,7 +2023,7 @@ internal class RemotePageSyncController(
             if (currentPresence?.bookId !in visibleBookIds) currentPresence = null
             scheduleAllStudentBooks()
             manifestBatchesRemaining = requiredManifestBatchCount(expectedStudentInventoryPageCount())
-            manifestDueAtElapsedMs = nowElapsedMs()
+            inventoryManifestDueAtElapsedMs = nowElapsedMs()
         } else {
             scheduleAllStudentBooks()
         }
@@ -2333,15 +2423,29 @@ internal class RemotePageSyncController(
         }
         .toList()
 
+    private fun scheduleInteractiveManifest() {
+        interactiveManifestDueAtElapsedMs = resolveManifestRateBoundaryDueAt(
+            scheduledDueAtElapsedMs = interactiveManifestDueAtElapsedMs,
+            lastManifestSentAtElapsedMs = lastManifestSentAtElapsedMs,
+            nowElapsedMs = nowElapsedMs(),
+            intervalMs = INTERACTIVE_PAGE_SYNC_INTERVAL_MS,
+        )
+    }
+
     private fun scheduleManifestAtRateBoundary() {
-        if (store.outstandingStudentManifest() != null) manifestChangedSinceReservation = true
+        if (store.outstandingStudentManifest()?.advancesInventoryWindow == true) {
+            inventoryChangedSinceReservation = true
+        }
         manifestBatchesRemaining = maxOf(
             manifestBatchesRemaining,
             requiredManifestBatchCount(expectedStudentInventoryPageCount()),
         )
-        val now = nowElapsedMs()
-        val boundary = lastManifestSentAtElapsedMs?.let { safeAdd(it, MANIFEST_INTERVAL_MS) } ?: now
-        manifestDueAtElapsedMs = minOf(manifestDueAtElapsedMs, boundary)
+        inventoryManifestDueAtElapsedMs = resolveManifestRateBoundaryDueAt(
+            scheduledDueAtElapsedMs = inventoryManifestDueAtElapsedMs,
+            lastManifestSentAtElapsedMs = lastInventoryManifestSentAtElapsedMs,
+            nowElapsedMs = nowElapsedMs(),
+            intervalMs = INVENTORY_MANIFEST_INTERVAL_MS,
+        )
     }
 
     private fun notifyUiChanged() {
@@ -2385,7 +2489,6 @@ internal class RemotePageSyncController(
         // Forty-eight rows fit below the two MiB document limit even when each row contains the
         // protocol maximum of 4,096 attempt numbers twice. Larger inventories rotate by window.
         const val MAX_MANIFEST_PAGES = REMOTE_MANIFEST_PAGE_WINDOW + 1
-        const val MANIFEST_INTERVAL_MS = 60_000L
         const val SEND_RETRY_MS = 30_000L
         const val TEACHER_REVIEW_INTERVAL_MS = 60_000L
         const val APPLICATION_ACK_RECOVERY_MS = 2 * 60_000L
@@ -2393,6 +2496,59 @@ internal class RemotePageSyncController(
         const val PAGE_DELTA_HEADER_BYTES = 8
         const val PAGE_DELTA_OPERATION_FRAME_BYTES = 4
     }
+}
+
+/** Event-driven current-page and small-delta cadence; this is not a periodic full-book scan. */
+internal const val INTERACTIVE_PAGE_SYNC_INTERVAL_MS = 5_000L
+
+/** Slow lane for rotating the bounded 47-page inventory window. */
+internal const val INVENTORY_MANIFEST_INTERVAL_MS = 60_000L
+
+internal fun successfulPageSyncCooldownMs(
+    kind: PageAnnotationKind,
+    automatic: Boolean,
+    checkpointIntervalSeconds: Int,
+): Long = if (automatic && kind == PageAnnotationKind.DELTA) {
+    INTERACTIVE_PAGE_SYNC_INTERVAL_MS
+} else {
+    normalizeRemotePageSyncInterval(checkpointIntervalSeconds).toLong() * 1_000L
+}
+
+internal fun resolveManifestRateBoundaryDueAt(
+    scheduledDueAtElapsedMs: Long,
+    lastManifestSentAtElapsedMs: Long?,
+    nowElapsedMs: Long,
+    intervalMs: Long,
+): Long {
+    require(scheduledDueAtElapsedMs >= 0L && nowElapsedMs >= 0L && intervalMs > 0L)
+    require(lastManifestSentAtElapsedMs == null || lastManifestSentAtElapsedMs >= 0L)
+    val boundary = lastManifestSentAtElapsedMs?.let { last ->
+        if (last > Long.MAX_VALUE - intervalMs) Long.MAX_VALUE else last + intervalMs
+    } ?: nowElapsedMs
+    return minOf(scheduledDueAtElapsedMs, boundary)
+}
+
+internal fun manifestLaneReady(
+    dueAtElapsedMs: Long,
+    retryNotBeforeElapsedMs: Long,
+    nowElapsedMs: Long,
+): Boolean {
+    require(dueAtElapsedMs >= 0L && retryNotBeforeElapsedMs >= 0L && nowElapsedMs >= 0L)
+    return nowElapsedMs >= dueAtElapsedMs && nowElapsedMs >= retryNotBeforeElapsedMs
+}
+
+internal fun preserveInteractiveManifestDueAfterInventorySend(
+    pendingDueAtElapsedMs: Long,
+    inventorySentAtElapsedMs: Long,
+): Long {
+    require(pendingDueAtElapsedMs >= 0L && inventorySentAtElapsedMs >= 0L)
+    if (pendingDueAtElapsedMs == Long.MAX_VALUE) return Long.MAX_VALUE
+    val nextFastBoundary = if (inventorySentAtElapsedMs > Long.MAX_VALUE - INTERACTIVE_PAGE_SYNC_INTERVAL_MS) {
+        Long.MAX_VALUE
+    } else {
+        inventorySentAtElapsedMs + INTERACTIVE_PAGE_SYNC_INTERVAL_MS
+    }
+    return maxOf(pendingDueAtElapsedMs, nextFastBoundary)
 }
 
 /** Cheap high-water classification that must run before workbook lookup or annotation IO. */
@@ -2491,6 +2647,16 @@ internal fun selectAutomaticPageTokens(
         stable.asSequence().filterNot(::contains).take(maximumCount - size).forEach(::add)
     }
 }
+
+/** The five-second manifest carries only the live automatic set, never a 47-page scan window. */
+internal fun selectInteractiveManifestPageTokens(
+    latestFirstPageTokens: List<String>,
+    currentPageToken: String?,
+): List<String> = selectAutomaticPageTokens(
+    latestFirstPageTokens = latestFirstPageTokens,
+    currentPageToken = currentPageToken,
+    inventoryComplete = true,
+)
 
 internal fun requiredManifestBatchCount(pageCount: Int): Int {
     if (pageCount <= 0) return 1

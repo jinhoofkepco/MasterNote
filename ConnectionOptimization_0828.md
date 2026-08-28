@@ -102,7 +102,7 @@
 - Telegram update offset, outbox journal, peer inbox journal을 연결 시마다 지우면 오래된 메시지 반복 재생 또는 새 메시지 유실이 생긴다.
 - inbound document는 암호문 다운로드·검증 뒤 `TelegramPeerDocumentInbox.offer()`가 payload와 `PUT`을 fsync한 다음에만 Telegram update offset을 commit한다. 이 순서를 뒤집지 않는다.
 - 수신 완료 시에도 durable `RECEIVED` control enqueue가 먼저고 inbox 원문 삭제가 나중이다. ACK enqueue 실패 상태에서 원문을 삭제하면 안 된다.
-- manifest의 window/sequence는 `reserveStudentManifest()`로 예약하되, 해당 문서의 transport ACK를 확인한 뒤에만 `acknowledgeOutstandingStudentManifest()`로 전진한다. 단순 enqueue나 Telegram server accept를 window 완료로 간주하지 않는다.
+- manifest의 window/sequence는 `reserveStudentManifest()`로 예약하되, inventory 문서의 transport ACK를 확인한 뒤에만 `acknowledgeOutstandingStudentManifest()`로 inventory window를 전진한다. 단순 enqueue나 Telegram server accept를 window 완료로 간주하지 않으며, 5초 fast manifest의 ACK는 window ordinal을 전진시키지 않는다.
 - 같은 page request ID를 재수신하면 기존에 예약한 동일 응답 artifact를 재사용한다. 같은 request ID로 더 최신 필기를 다시 캡처하면 ACK correlation과 payload 불변성이 깨진다.
 - 선생 수신부는 exact active request 또는 exact completed duplicate만 허용한다. chunk는 조각 파일 영속화 뒤 transport ACK, 전체 조립·hash·원자 적용 뒤 application ACK 순서를 유지한다.
 - duplicate/stale manifest는 교재 조회나 annotation log 재생보다 먼저 high-water로 분류한다.
@@ -132,6 +132,7 @@
 
 - 네트워크, 파일 읽기, checkpoint 조립, PDF 렌더, 큰 JSON canonicalization을 Android main thread에서 실행하지 않는다.
 - coordinator는 1초 tick에서 inbox를 최대 8건만 처리하고, inventory scan은 tick당 페이지 하나만 연다. 이 bounded work를 한 번에 전체 책 스캔으로 되돌리지 않는다.
+- 5초 경로는 학생의 현재 페이지·새 필기 이벤트와 자동 대상의 작은 delta만을 위한 fast lane이다. 47페이지 inventory window, checkpoint, 수동 backlog, 실패 retry까지 5초로 일괄 축소하면 안 된다.
 - decoded page index LRU는 3개, revision-keyed student layer digest LRU는 32개다. 이를 무제한 캐시로 바꾸거나 모든 manifest 페이지의 decoded index를 장기 보유하지 않는다.
 - `RemotePageSyncController.uiState()`는 volatile cached state를 즉시 반환한다. UI attach가 multi-MB decode를 잡고 있는 controller monitor 뒤에서 기다리지 않게 한 장치다.
 - 조각 진행률 조회는 활성 요청 한 건에 대해서만 metadata와 파일 길이를 읽는다. 매 렌더마다 모든 chunk payload를 읽거나 hash하지 않는다.
@@ -158,11 +159,16 @@
 ### Telegram page sync
 
 - peer freshness는 최근 인증 응답 90초, ping 간격은 30초다.
-- manifest 기본 경계는 60초, 일반 retry는 30초, teacher review 전송 간격은 60초, application ACK recovery는 2분이다.
-- manifest는 stable token 47개를 회전시키고, 그 window 밖의 현재 페이지를 하나 추가해 최대 48행을 전송한다. 큰 inventory의 window ordinal은 해당 manifest의 transport ACK 뒤에만 전진한다.
+- 학생의 현재 페이지 이동·heartbeat·새 필기처럼 화면 추적에 직접 필요한 이벤트는 마지막 manifest 전송 뒤 5초 경계부터 다음 manifest를 보낼 수 있게 예약한다. 이는 5초마다 책 전체를 스캔하는 timer가 아니다.
+- 47페이지 inventory window의 순환은 기존 60초를 유지한다. 일반 retry는 30초이며, 그 사이 새 펜 이벤트가 생겨도 실패한 manifest lane의 retry gate를 앞당기지 않는다. teacher review 전송 간격은 60초, application ACK recovery는 2분이다.
+- 5초 fast manifest는 현재 페이지와 최근 변경 두 페이지, 최대 3행만 전송하고 inventory window ordinal을 소비하지 않는다. inventory와 동시에 due면 inventory를 먼저 보내되, 누락될 수 있는 최근 두 페이지를 위해 fast 예약을 `inventory 전송 + 5초` 이후로 보존한다.
+- 60초 inventory manifest는 stable token 47개를 회전시키고, 그 window 밖의 현재 페이지를 하나 추가해 최대 48행을 전송한다. 큰 inventory의 window ordinal은 해당 inventory manifest의 transport ACK 뒤에만 전진한다.
 - inventory를 전부 발견하기 전에는 현재 학생 페이지 한 쪽만 자동 대상이다. 완료 뒤에는 현재 페이지와 최근 변경 두 페이지를 합쳐 최대 3페이지가 자동 대상이며, 학생이 다음 페이지로 이동하면 가장 오래된 페이지가 자동 대상에서 밀릴 수 있다.
-- 나머지는 선생이 시작하는 수동 backlog다. 현재 구현의 30초/1분 page cooldown은 수동 목록뿐 아니라 자동 3페이지 사이에도 적용되므로, 재연결 직후 세 쪽이 동시에 보이지 않고 수 분에 걸쳐 순차 반영되는 것이 정상이다.
+- 자동 대상(현재 페이지 + 최근 두 페이지)의 작은 DELTA를 성공적으로 적용한 뒤 다음 페이지 요청까지의 cooldown은 5초다. 무변경 revision/hash에는 `PAGE_ANNOTATION`을 만들지 않는다.
+- 자동/수동 request lane은 요청 예약 시점에 고정해 journal에 남긴다. Telegram 왕복 중 학생 커서가 여러 쪽 이동해도 완료 시점의 자동 목록으로 cooldown을 재판정하지 않는다.
+- 큰 CHECKPOINT와 선생이 시작하는 수동 backlog DELTA는 사용자가 고른 30초/60초 cooldown을 유지한다. 직전 응답이 CHECKPOINT였다면 그 휴지 시간 중 생긴 새 DELTA도 다음 요청까지 기다릴 수 있다.
 - 한 번에 페이지 하나만 전송한다. 오랜 오프라인 뒤에도 모든 페이지를 한꺼번에 밀어 넣지 않는다.
+- 위 5초는 앱에서 다음 왕복을 시작할 수 있는 가장 빠른 경계다. Telegram의 manifest → request → delta와 서버 polling을 거치므로 실제 화면 도착을 항상 5초 이내로 보장한다는 뜻은 아니다.
 - multi-chunk 활성 페이지는 저장 완료된 조각 기준 `n/N`과 byte percentage를 표시한다. 단일 조각은 중간 전송률을 알 수 없으므로 가짜 퍼센트 없이 `응답 대기` 후 완료된다.
 - 이미 최신 revision/hash까지 적용된 페이지는 “동기화 필요” 목록에 나오지 않는다. 자동 대상이 실제 전송 중이면 별도 활성 행으로 표시한다.
 
@@ -300,7 +306,7 @@ git diff --check
 - 세 페이지 모두 1회차 제출 상태가 일치했다. 97쪽에 있던 선생 레이어 3획도 양쪽에 남아 있었다.
 - 학생 변경은 16:56:20~16:56:37에 연속 발생했지만 선생 checkpoint 반영은 97쪽 16:58, 99쪽 17:00, 98쪽 17:01이었다. 즉 이 관찰은 영구 유실이 아니라 단일 요청 슬롯과 page cooldown 때문에 순서가 뒤집혀 수 분 동안 부분적으로 보인 사례다.
 
-구체적으로 reconnect 직후에는 inventory scan보다 첫 manifest가 먼저 나갈 수 있고, scan은 1초 tick당 페이지 하나라 이 교재의 44개 durable 페이지 발견에 약 45초가 필요하다. inventory 불완전 중에는 current-only이며, complete manifest는 60초 경계를 기다릴 수 있다. 그 뒤에도 한 페이지 적용마다 기본 60초 cooldown이 있으므로 총 2~3분의 부분 표시가 가능하다. 또한 현재 정책의 “자동 3쪽”은 최근 작성 3쪽에 current를 별도로 더하는 것이 아니라 `current + 최근 변경 2쪽`, 총 3쪽이다. 학생이 빈 다음 페이지로 이동하면 세 번째 최근 작성 페이지는 수동 목록으로 밀릴 수 있다.
+위 관찰은 5초 fast lane을 넣기 전의 60초 기본 cooldown 빌드에서 수집한 기록이다. 현재 빌드에서도 reconnect 직후 inventory scan은 1초 tick당 페이지 하나이고 60초 window 순환을 유지하지만, 현재 페이지·최근 변경 metadata는 최대 3행 fast manifest로 분리되고 자동 DELTA 뒤 cooldown은 5초다. 다만 첫 응답이 CHECKPOINT면 설정된 30초/60초 휴지는 그대로 적용되므로 초기 복구가 즉시 끝난다고 가정하면 안 된다. “자동 3쪽”은 최근 작성 3쪽에 current를 별도로 더하는 것이 아니라 `current + 최근 변경 2쪽`, 총 3쪽이다. 학생이 빈 다음 페이지로 이동하면 세 번째 최근 작성 페이지는 수동 목록으로 밀릴 수 있다.
 
 UI는 대기 중인 automatic 행을 일반 목록에서 숨기고 현재 active 한 건만 별도로 보여준다. 따라서 최적화 검증에서는 “최종 수렴”과 “사용자가 중간에 보는 대기 상태”를 구분한다. 자동 대상 3쪽 각각의 대기/요청/수신/적용/ACK 단계와 예상 다음 요청 시각을 UI 또는 익명화 로그로 관찰할 수 있게 하는 것은 안전한 개선 후보지만, 이 사례만 보고 병렬 전송이나 ACK 선처리를 도입하면 안 된다.
 

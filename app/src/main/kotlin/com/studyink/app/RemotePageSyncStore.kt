@@ -88,6 +88,8 @@ internal data class TeacherPageSyncRecord(
     val requestTransportAcknowledgedAtEpochMs: Long? = null,
     val requestedSourceRevision: Long = 0L,
     val requesterRevision: Long = 0L,
+    /** Request lane is frozen at reservation so cursor movement cannot change its cooldown. */
+    val requestWasAutomatic: Boolean = false,
     /** A rejected/invalid delta must recover with a full checkpoint even after process death. */
     val forceCheckpoint: Boolean = false,
     val lastCompletedRequestTransferId: String? = null,
@@ -150,6 +152,8 @@ internal data class StudentManifestReservation(
     val createdAtEpochMs: Long,
     /** Inventory window advances only after this exact document is transport-acknowledged. */
     val windowOrdinal: Long = 0L,
+    /** Fast current/recent-page manifests must not consume a 47-page inventory window. */
+    val advancesInventoryWindow: Boolean = true,
 )
 
 internal data class WorkbookMappingRecord(
@@ -264,7 +268,11 @@ internal class RemotePageSyncStore(
     @Synchronized fun studentGeneration(): Long = studentOpenGeneration
 
     @Synchronized
-    fun reserveStudentManifest(transferId: String, createdAtEpochMs: Long): StudentManifestReservation {
+    fun reserveStudentManifest(
+        transferId: String,
+        createdAtEpochMs: Long,
+        advancesInventoryWindow: Boolean = true,
+    ): StudentManifestReservation {
         require(studentOpenGeneration > 0L && transferId.isNotBlank() && createdAtEpochMs >= 0L)
         outstandingStudentManifest?.let { return it }
         studentManifestSequence = safeIncrement(studentManifestSequence)
@@ -274,6 +282,7 @@ internal class RemotePageSyncStore(
             transferId,
             createdAtEpochMs,
             studentManifestWindowOrdinal,
+            advancesInventoryWindow,
         ).also {
             outstandingStudentManifest = it
             persist()
@@ -292,9 +301,11 @@ internal class RemotePageSyncStore(
 
     @Synchronized
     fun acknowledgeOutstandingStudentManifest(transferId: String): Boolean {
-        if (outstandingStudentManifest?.transferId != transferId) return false
+        val outstanding = outstandingStudentManifest?.takeIf { it.transferId == transferId } ?: return false
         outstandingStudentManifest = null
-        studentManifestWindowOrdinal = safeIncrement(studentManifestWindowOrdinal)
+        if (outstanding.advancesInventoryWindow) {
+            studentManifestWindowOrdinal = safeIncrement(studentManifestWindowOrdinal)
+        }
         persist()
         return true
     }
@@ -656,6 +667,7 @@ internal class RemotePageSyncStore(
                     requestTransportAcknowledgedAtEpochMs = null,
                     requestedSourceRevision = 0L,
                     requesterRevision = 0L,
+                    requestWasAutomatic = false,
                     forceCheckpoint = false,
                     lastCompletedRequestTransferId = null,
                     lastCompletedAnnotationTransferId = null,
@@ -711,6 +723,7 @@ internal class RemotePageSyncStore(
                 requestTransportAcknowledgedAtEpochMs = null,
                 requestedSourceRevision = 0L,
                 requesterRevision = 0L,
+                requestWasAutomatic = false,
                 forceCheckpoint = localLayerSha256 != page.studentLayerSha256,
                 lastCompletedRequestTransferId = null,
                 lastCompletedAnnotationTransferId = null,
@@ -742,6 +755,7 @@ internal class RemotePageSyncStore(
                 requestTransportAcknowledgedAtEpochMs = null,
                 requestedSourceRevision = 0L,
                 requesterRevision = 0L,
+                requestWasAutomatic = false,
                 forceCheckpoint = false,
                 lastCompletedRequestTransferId = null,
                 lastCompletedAnnotationTransferId = null,
@@ -871,6 +885,7 @@ internal class RemotePageSyncStore(
         createdAtEpochMs: Long,
         requestedSourceRevision: Long,
         requesterRevision: Long,
+        requestWasAutomatic: Boolean,
     ): TeacherPageSyncRecord? {
         val current = teacherPages[pageToken] ?: return null
         if (current.mappingRequired || current.requestTransferId != null) return current
@@ -880,6 +895,7 @@ internal class RemotePageSyncStore(
             requestTransportAcknowledgedAtEpochMs = null,
             requestedSourceRevision = requestedSourceRevision,
             requesterRevision = requesterRevision,
+            requestWasAutomatic = requestWasAutomatic,
         ).also {
             teacherPages[pageToken] = it
             persist()
@@ -917,6 +933,7 @@ internal class RemotePageSyncStore(
             requestTransportAcknowledgedAtEpochMs = null,
             requestedSourceRevision = 0L,
             requesterRevision = 0L,
+            requestWasAutomatic = false,
             forceCheckpoint = current.forceCheckpoint || forceCheckpoint,
         )
         if (next == current) return false
@@ -947,6 +964,7 @@ internal class RemotePageSyncStore(
             requestTransportAcknowledgedAtEpochMs = null,
             requestedSourceRevision = 0L,
             requesterRevision = 0L,
+            requestWasAutomatic = false,
             forceCheckpoint = false,
             lastCompletedRequestTransferId = requestTransferId,
             lastCompletedAnnotationTransferId = annotationTransferId,
@@ -1476,6 +1494,7 @@ internal class RemotePageSyncStore(
         .put("generation", v.syncGeneration).put("sequence", v.sequence)
         .put("transferId", v.transferId).put("createdAt", v.createdAtEpochMs)
         .put("windowOrdinal", v.windowOrdinal)
+        .put("advancesInventoryWindow", v.advancesInventoryWindow)
 
     private fun encode(v: StudentPageSyncRecord) = JSONObject()
         .put("generation", v.syncGeneration).put("pageToken", v.pageToken)
@@ -1513,6 +1532,7 @@ internal class RemotePageSyncStore(
         .put("requestCreatedAt", v.requestCreatedAtEpochMs ?: JSONObject.NULL)
         .put("requestTransportAcknowledgedAt", v.requestTransportAcknowledgedAtEpochMs ?: JSONObject.NULL)
         .put("requestedSourceRevision", v.requestedSourceRevision).put("requesterRevision", v.requesterRevision)
+        .put("requestWasAutomatic", v.requestWasAutomatic)
         .put("forceCheckpoint", v.forceCheckpoint)
         .put("lastCompletedRequestTransferId", v.lastCompletedRequestTransferId ?: JSONObject.NULL)
         .put("lastCompletedAnnotationTransferId", v.lastCompletedAnnotationTransferId ?: JSONObject.NULL)
@@ -1548,6 +1568,7 @@ internal class RemotePageSyncStore(
     private fun decodeManifest(v: JSONObject) = StudentManifestReservation(
         v.getLong("generation"), v.getLong("sequence"), v.getString("transferId"), v.getLong("createdAt"),
         v.optLong("windowOrdinal").coerceAtLeast(0L),
+        v.optBoolean("advancesInventoryWindow", true),
     )
 
     private fun decodeStudent(v: JSONObject): StudentPageSyncRecord? = runCatching { StudentPageSyncRecord(
@@ -1588,6 +1609,7 @@ internal class RemotePageSyncStore(
         requestTransferId = v.optNullableString("requestTransferId"), requestCreatedAtEpochMs = v.optNullableLong("requestCreatedAt"),
         requestTransportAcknowledgedAtEpochMs = v.optNullableLong("requestTransportAcknowledgedAt"),
         requestedSourceRevision = v.optLong("requestedSourceRevision"), requesterRevision = v.optLong("requesterRevision"),
+        requestWasAutomatic = v.optBoolean("requestWasAutomatic"),
         forceCheckpoint = v.optBoolean("forceCheckpoint"),
         lastCompletedRequestTransferId = v.optNullableString("lastCompletedRequestTransferId"),
         lastCompletedAnnotationTransferId = v.optNullableString("lastCompletedAnnotationTransferId"),
@@ -1737,6 +1759,7 @@ internal fun mergeTeacherPageFromManifest(
         requestTransportAcknowledgedAtEpochMs = previous.requestTransportAcknowledgedAtEpochMs,
         requestedSourceRevision = previous.requestedSourceRevision,
         requesterRevision = previous.requesterRevision,
+        requestWasAutomatic = previous.requestWasAutomatic,
         forceCheckpoint = previous.forceCheckpoint,
         lastCompletedRequestTransferId = previous.lastCompletedRequestTransferId,
         lastCompletedAnnotationTransferId = previous.lastCompletedAnnotationTransferId,

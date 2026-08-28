@@ -2,6 +2,7 @@ package com.studyink.app
 
 import com.studyink.annotation.storage.TeacherReviewPublishIntent
 import com.studyink.core.model.Attempt
+import com.studyink.monitor.core.PageAnnotationKind
 import com.studyink.monitor.core.RemoteReviewEnvelopeType
 import com.studyink.monitor.core.RemoteReviewLimits
 import org.junit.Assert.assertEquals
@@ -91,6 +92,138 @@ class RemotePageSyncPolicyTest {
 
         assertEquals(3, schedule.batchesRemaining)
         assertEquals(60_000L, schedule.dueAtElapsedMs)
+    }
+
+    @Test fun interactiveManifestUsesFiveSecondsWithoutAcceleratingInventoryWindows() {
+        val interactive = resolveManifestRateBoundaryDueAt(
+            scheduledDueAtElapsedMs = Long.MAX_VALUE,
+            lastManifestSentAtElapsedMs = 10_000L,
+            nowElapsedMs = 11_000L,
+            intervalMs = INTERACTIVE_PAGE_SYNC_INTERVAL_MS,
+        )
+        val inventory = resolveManifestRateBoundaryDueAt(
+            scheduledDueAtElapsedMs = Long.MAX_VALUE,
+            lastManifestSentAtElapsedMs = 10_000L,
+            nowElapsedMs = 11_000L,
+            intervalMs = INVENTORY_MANIFEST_INTERVAL_MS,
+        )
+        val inventoryChangeWhileManifestIsInFlight = resolveStudentManifestAckSchedule(
+            changedAfterReservation = true,
+            batchesRemaining = 1,
+            requiredBatchCount = 3,
+            scheduledDueAtElapsedMs = inventory,
+            nowElapsedMs = 12_000L,
+            intervalMs = INVENTORY_MANIFEST_INTERVAL_MS,
+        )
+
+        assertEquals(15_000L, interactive)
+        assertEquals(70_000L, inventory)
+        assertEquals(70_000L, inventoryChangeWhileManifestIsInFlight.dueAtElapsedMs)
+        assertEquals(3, inventoryChangeWhileManifestIsInFlight.batchesRemaining)
+    }
+
+    @Test fun interactiveManifestIsBoundedToCurrentAndTwoRecentPages() {
+        val latestFirst = (1..80).map { "page-$it" }
+
+        assertEquals(
+            listOf("page-80", "page-1", "page-2"),
+            selectInteractiveManifestPageTokens(latestFirst, currentPageToken = "page-80"),
+        )
+        assertEquals(
+            listOf("page-1", "page-2", "page-3"),
+            selectInteractiveManifestPageTokens(latestFirst, currentPageToken = null),
+        )
+    }
+
+    @Test fun newPenEventsCannotBypassThirtySecondManifestFailureBackoff() {
+        assertFalse(
+            manifestLaneReady(
+                dueAtElapsedMs = 5_000L,
+                retryNotBeforeElapsedMs = 30_000L,
+                nowElapsedMs = 29_999L,
+            ),
+        )
+        assertTrue(
+            manifestLaneReady(
+                dueAtElapsedMs = 5_000L,
+                retryNotBeforeElapsedMs = 30_000L,
+                nowElapsedMs = 30_000L,
+            ),
+        )
+        assertFalse(
+            manifestLaneReady(
+                dueAtElapsedMs = 60_000L,
+                retryNotBeforeElapsedMs = 0L,
+                nowElapsedMs = 30_000L,
+            ),
+        )
+    }
+
+    @Test fun dueInventoryManifestCannotErasePendingRecentPageAdvertisement() {
+        assertEquals(
+            65_000L,
+            preserveInteractiveManifestDueAfterInventorySend(
+                pendingDueAtElapsedMs = 55_000L,
+                inventorySentAtElapsedMs = 60_000L,
+            ),
+        )
+        assertEquals(
+            80_000L,
+            preserveInteractiveManifestDueAfterInventorySend(
+                pendingDueAtElapsedMs = 80_000L,
+                inventorySentAtElapsedMs = 60_000L,
+            ),
+        )
+        assertEquals(
+            Long.MAX_VALUE,
+            preserveInteractiveManifestDueAfterInventorySend(
+                pendingDueAtElapsedMs = Long.MAX_VALUE,
+                inventorySentAtElapsedMs = 60_000L,
+            ),
+        )
+    }
+
+    @Test fun onlyAutomaticDeltaUsesFiveSecondSuccessCooldown() {
+        assertEquals(
+            5_000L,
+            successfulPageSyncCooldownMs(
+                kind = PageAnnotationKind.DELTA,
+                automatic = true,
+                checkpointIntervalSeconds = 60,
+            ),
+        )
+        assertEquals(
+            30_000L,
+            successfulPageSyncCooldownMs(
+                kind = PageAnnotationKind.CHECKPOINT,
+                automatic = true,
+                checkpointIntervalSeconds = 30,
+            ),
+        )
+        assertEquals(
+            60_000L,
+            successfulPageSyncCooldownMs(
+                kind = PageAnnotationKind.CHECKPOINT,
+                automatic = true,
+                checkpointIntervalSeconds = 60,
+            ),
+        )
+        assertEquals(
+            30_000L,
+            successfulPageSyncCooldownMs(
+                kind = PageAnnotationKind.DELTA,
+                automatic = false,
+                checkpointIntervalSeconds = 30,
+            ),
+        )
+        assertEquals(
+            60_000L,
+            successfulPageSyncCooldownMs(
+                kind = PageAnnotationKind.DELTA,
+                automatic = false,
+                checkpointIntervalSeconds = 60,
+            ),
+        )
     }
 
     @Test fun redundantGenerationHighWaterNeverReopensAnOlderJournalGeneration() {

@@ -9,6 +9,74 @@ import org.junit.Test
 
 class RemotePageSyncStoreInventoryTest {
     @Test
+    fun automaticRequestLaneSurvivesCursorChangesAndProcessRestart() =
+        withStoreFile { file ->
+            val page = teacherPages(syncGeneration = 4L, count = 1).single()
+            RemotePageSyncStore(file).apply {
+                bindPair(PAIR_ID)
+                assertEquals(
+                    TeacherManifestInstallResult.APPLIED,
+                    replaceTeacherManifest(4L, 1L, listOf(page), null, 1),
+                )
+                val reserved = requireNotNull(
+                    reserveTeacherRequest(
+                        pageToken = page.pageToken,
+                        transferId = "page_request_automatic_0001",
+                        createdAtEpochMs = 1L,
+                        requestedSourceRevision = page.sourceRevision,
+                        requesterRevision = 0L,
+                        requestWasAutomatic = true,
+                    ),
+                )
+                assertTrue(reserved.requestWasAutomatic)
+            }
+
+            RemotePageSyncStore(file).apply {
+                val recovered = requireNotNull(teacherPage(page.pageToken))
+                assertTrue(recovered.requestWasAutomatic)
+                assertTrue(clearTeacherRequest(page.pageToken, recovered.requestTransferId))
+                assertFalse(requireNotNull(teacherPage(page.pageToken)).requestWasAutomatic)
+            }
+        }
+
+    @Test
+    fun interactiveManifestAckSurvivesRestartWithoutAdvancingInventoryWindow() =
+        withStoreFile { file ->
+            RemotePageSyncStore(file).apply {
+                bindPair(PAIR_ID)
+                beginStudentGeneration()
+                val firstInventory = reserveStudentManifest(
+                    transferId = "manifest_inventory_0001",
+                    createdAtEpochMs = 1L,
+                    advancesInventoryWindow = true,
+                )
+                assertEquals(0L, firstInventory.windowOrdinal)
+                assertTrue(acknowledgeOutstandingStudentManifest(firstInventory.transferId))
+
+                val interactive = reserveStudentManifest(
+                    transferId = "manifest_interactive_0001",
+                    createdAtEpochMs = 2L,
+                    advancesInventoryWindow = false,
+                )
+                assertEquals(1L, interactive.windowOrdinal)
+                assertFalse(interactive.advancesInventoryWindow)
+            }
+
+            RemotePageSyncStore(file).apply {
+                val recovered = requireNotNull(outstandingStudentManifest())
+                assertFalse(recovered.advancesInventoryWindow)
+                assertTrue(acknowledgeOutstandingStudentManifest(recovered.transferId))
+
+                val nextInventory = reserveStudentManifest(
+                    transferId = "manifest_inventory_0002",
+                    createdAtEpochMs = 3L,
+                    advancesInventoryWindow = true,
+                )
+                assertEquals(1L, nextInventory.windowOrdinal)
+            }
+        }
+
+    @Test
     fun deletedWorkbookMappingStaysExplicitAcrossRestartUntilUserRebinds() =
         withStoreFile { file ->
             val token = "workbook_token_a"
