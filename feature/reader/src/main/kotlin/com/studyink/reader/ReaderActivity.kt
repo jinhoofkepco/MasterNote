@@ -57,6 +57,9 @@ import com.studyink.monitor.telegram.RemoteMonitorGateway
 import com.studyink.monitor.telegram.RemoteMonitorPreferences
 import com.studyink.monitor.telegram.RemoteReviewPeerStatus
 import com.studyink.monitor.telegram.TelegramEnqueueResult
+import com.studyink.sync.lan.LanPeerRole
+import com.studyink.sync.lan.LanSyncBus
+import com.studyink.sync.lan.LanSyncService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -164,6 +167,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             exitOnPinCancel = false
             role = requestedRole
         }
+        ensureLanRoleForReader()
         ensureS23StripStartsExpanded()
 
         val readerBackgroundColor = ReaderPaperBackdropDrawable.NAVIGATION_BAR_COLOR
@@ -626,6 +630,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                             role = requestedTeacherRole ?: ReaderRole.TEACHER_TABLET
                             ensureS23StripStartsExpanded()
                             workflow = requestedTeacherWorkflow ?: ReaderWorkflow.defaultFor(role)
+                            ensureLanRoleForReader()
                             requestedTeacherRole = null
                             requestedTeacherWorkflow = null
                             val targetAttempt = if (workflow == ReaderWorkflow.REVIEW) {
@@ -707,6 +712,18 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 },
             )
         }
+    }
+
+    /**
+     * Opening a book from the library's default student perspective can leave the phone's single
+     * LAN service running as another student server. A teacher Reader must correct that ownership
+     * once, otherwise two student servers can sit on the same hotspot forever while the UI falls
+     * back to Telegram.
+     */
+    private fun ensureLanRoleForReader() {
+        if (role != ReaderRole.TEACHER_PHONE || workflow != ReaderWorkflow.LIVE_MONITOR) return
+        if (LanSyncBus.sessionRole(bookId) == LanPeerRole.TEACHER_CLIENT) return
+        LanSyncService.startTeacher(this, bookId)
     }
 
     private fun undoCurrentPage() {

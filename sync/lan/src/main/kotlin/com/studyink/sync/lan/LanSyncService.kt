@@ -176,6 +176,7 @@ class LanSyncService : Service(),
         stopping.set(false)
         role = LanPeerRole.STUDENT_SERVER
         bookId = targetBookId
+        LanSyncBus.sessionRoleChanged(bookId, requireNotNull(role))
         documentHash = requireLanDocumentHash(targetBookId)
         pairingToken = loadOrCreateStudentPairingSecret(targetBookId, documentHash)
         explicitPairingWindow = true
@@ -211,6 +212,7 @@ class LanSyncService : Service(),
         stopping.set(false)
         role = LanPeerRole.TEACHER_CLIENT
         bookId = targetBookId
+        LanSyncBus.sessionRoleChanged(bookId, requireNotNull(role))
         documentHash = requireLanDocumentHash(targetBookId)
         pairingToken = storedPairingSecret(LanPeerRole.TEACHER_CLIENT, targetBookId, documentHash).orEmpty()
         explicitPairingWindow = false
@@ -255,6 +257,7 @@ class LanSyncService : Service(),
         stopping.set(false)
         role = LanPeerRole.TEACHER_CLIENT
         bookId = targetBookId
+        LanSyncBus.sessionRoleChanged(bookId, requireNotNull(role))
         documentHash = requireLanDocumentHash(targetBookId)
         require(isValidLanSha256(payload.token)) { "LAN pairing secret is invalid" }
         pairingToken = payload.token
@@ -1180,8 +1183,13 @@ class LanSyncService : Service(),
         require(payload.size == completed.payloadSize && sha256Hex(payload) == completed.payloadSha256)
         val decoded = decodeLanTeacherReviewPayload(payload, bookId, page)
         require(
-            library.attempts(bookId, page).any { it.attemptNo == attemptNo && it.locked }
-        ) { "Teacher review attempt is not submitted" }
+            isExactLanTeacherReviewAttempt(
+                attempts = library.attempts(bookId, page),
+                bookId = bookId,
+                pageNumber = page,
+                attemptNo = attemptNo,
+            ),
+        ) { "Teacher review attempt does not exist" }
         val applied = store.applyPublishedTeacherLayerCheckpoint(
             localBookId = bookId,
             pageNumber = page,
@@ -1631,6 +1639,16 @@ internal fun splitLanTeacherReviewPayload(payload: ByteArray, maxChunkBytes: Int
             offset = end
         }
     }
+}
+
+/** Submission locks editing; it is not part of the identity of an explicitly published review. */
+internal fun isExactLanTeacherReviewAttempt(
+    attempts: List<Attempt>,
+    bookId: String,
+    pageNumber: Int,
+    attemptNo: Int,
+): Boolean = attemptNo > 0 && attempts.any { attempt ->
+    attempt.bookId == bookId && attempt.pageNumber == pageNumber && attempt.attemptNo == attemptNo
 }
 
 /** Attempt grades are released only by the atomic TEACHER_REVIEW_CHUNK protocol. */

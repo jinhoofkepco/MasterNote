@@ -257,6 +257,15 @@ class PageOperationLogStore(
         0.75f,
         true,
     )
+    /**
+     * A portable digest is stable for one durable page revision. Cache only that tiny value so a
+     * manifest revisit does not rematerialize canonical JSON or defeat the bounded page cache.
+     */
+    private val studentLayerDigests = LinkedHashMap<PageKey, StudentLayerDigest>(
+        MAX_CACHED_STUDENT_LAYER_DIGESTS + 1,
+        0.75f,
+        true,
+    )
     private val teacherReviewPublishIntents = linkedMapOf<TeacherReviewIntentKey, TeacherReviewPublishIntent>()
     /**
      * Bridges the tiny in-process race where the coordinator promotes and LAN acknowledges an
@@ -568,15 +577,38 @@ class PageOperationLogStore(
      * partial-erase lineage and reactivated/redo assets self-contained without exporting teacher
      * layers or unrelated historical assets.
      */
-    @Synchronized
-    fun studentLayerSha256(bookId: String, pageNumber: Int): String =
-        portableStudentLayer(pageIndex(bookId, pageNumber).snapshot).sha256
+    fun studentLayerSha256(bookId: String, pageNumber: Int): String {
+        val key = PageKey(bookId, pageNumber)
+        val snapshot = synchronized(this) {
+            val captured = pageIndex(bookId, pageNumber).snapshot
+            studentLayerDigests[key]
+                ?.takeIf { it.revision == captured.revision }
+                ?.let { return it.sha256 }
+            captured
+        }
+        // AnnotationSnapshot and StrokeAsset are immutable. Canonicalizing a large page outside
+        // the store monitor keeps Reader/LAN append calls responsive while inventory hashes it.
+        val digest = portableStudentLayer(snapshot).sha256
+        synchronized(this) {
+            val cachedRevision = studentLayerDigests[key]?.revision ?: Long.MIN_VALUE
+            if (snapshot.revision >= cachedRevision) {
+                studentLayerDigests[key] = StudentLayerDigest(snapshot.revision, digest)
+            }
+            while (studentLayerDigests.size > MAX_CACHED_STUDENT_LAYER_DIGESTS) {
+                studentLayerDigests.entries.iterator().apply {
+                    next()
+                    remove()
+                }
+            }
+        }
+        return digest
+    }
 
     /**
-     * Captures checkpoint bytes, their exact target-layer digest, and one origin cursor under the
-     * same store lock. The returned bytes are defensively copied on every access.
+     * Captures one immutable snapshot and its origin cursor under the same short store lock, then
+     * encodes the potentially large checkpoint after releasing it. Returned bytes are defensively
+     * copied on every access.
      */
-    @Synchronized
     fun exportStudentLayerCheckpoint(
         bookId: String,
         pageNumber: Int,
@@ -585,20 +617,26 @@ class PageOperationLogStore(
         require(originDeviceId.isNotBlank() && originDeviceId.length <= MAX_CHECKPOINT_IDENTIFIER_CHARS) {
             "Student checkpoint origin device id is invalid"
         }
+        val captured = synchronized(this) {
+            val index = pageIndex(bookId, pageNumber)
+            StudentCheckpointCapture(
+                snapshot = index.snapshot,
+                originDeviceHighWater = index.maximumClockByDevice[originDeviceId] ?: 0L,
+            )
+        }
         return buildStudentLayerCheckpointExport(
             pageNumber = pageNumber,
-            index = pageIndex(bookId, pageNumber),
-            originDeviceId = originDeviceId,
+            snapshot = captured.snapshot,
+            originDeviceHighWater = captured.originDeviceHighWater,
         )
     }
 
-    @Synchronized
     fun encodeStudentLayerCheckpoint(bookId: String, pageNumber: Int): ByteArray {
-        val index = pageIndex(bookId, pageNumber)
+        val snapshot = synchronized(this) { pageIndex(bookId, pageNumber).snapshot }
         return buildStudentLayerCheckpointExport(
             pageNumber = pageNumber,
-            index = index,
-            originDeviceId = null,
+            snapshot = snapshot,
+            originDeviceHighWater = 0L,
         ).copyCheckpointBytes()
     }
 
@@ -940,6 +978,7 @@ class PageOperationLogStore(
             appliedOperationIds = current.appliedOperationIds,
         )
         val resultLayer = portableStudentLayer(simulated)
+        validateStudentCheckpointLayerAssets(resultLayer.assets, pageNumber)
         require(resultLayer.sha256 == expectedResultLayerSha256) {
             "Student delta result digest does not match"
         }
@@ -1319,15 +1358,19 @@ class PageOperationLogStore(
 
     private fun buildStudentLayerCheckpointExport(
         pageNumber: Int,
-        index: PageIndex,
-        originDeviceId: String?,
+        snapshot: AnnotationSnapshot,
+        originDeviceHighWater: Long,
     ): StudentLayerCheckpointExport {
-        val layer = portableStudentLayer(index.snapshot)
-        val originHighWater = originDeviceId?.let { index.maximumClockByDevice[it] } ?: 0L
+        val activeIds = activeStudentStrokeIds(snapshot)
+        val layer = portableStudentLayer(
+            pageNumber = snapshot.pageNumber,
+            assets = collectStudentCheckpointAssets(snapshot, activeIds),
+            activeStrokeIds = activeIds,
+        )
         // Erase and undo operations may advance the origin clock without leaving an asset that can
         // carry it. The exported checkpoint must still advance a receiver past that causal point.
         val highWater = maxOf(
-            originHighWater,
+            originDeviceHighWater,
             layer.assets.maxOfOrNull(StrokeAsset::logicalClock) ?: 0L,
         )
         require(highWater in 0 until Long.MAX_VALUE) { "Student layer checkpoint clock is invalid" }
@@ -1347,7 +1390,7 @@ class PageOperationLogStore(
         return StudentLayerCheckpointExport(
             checkpointBytes = encoded,
             layerSha256 = layer.sha256,
-            originDeviceHighWater = originHighWater,
+            originDeviceHighWater = originDeviceHighWater,
         )
     }
 
@@ -1378,16 +1421,19 @@ class PageOperationLogStore(
     }
 
     private fun portableStudentLayer(snapshot: AnnotationSnapshot): PortableLayer {
-        val activeIds = snapshot.activeStrokeIds.asSequence()
-            .filter { id -> snapshot.assets[id]?.authorId == STUDENT_AUTHOR_ID }
-            .sortedBy(StrokeId::value)
-            .toCollection(linkedSetOf())
+        val activeIds = activeStudentStrokeIds(snapshot)
         return portableStudentLayer(
             pageNumber = snapshot.pageNumber,
-            assets = collectStudentCheckpointAssets(snapshot, activeIds),
+            assets = collectPortableStudentLayerAssets(snapshot, activeIds),
             activeStrokeIds = activeIds,
         )
     }
+
+    private fun activeStudentStrokeIds(snapshot: AnnotationSnapshot): Set<StrokeId> =
+        snapshot.activeStrokeIds.asSequence()
+            .filter { id -> snapshot.assets[id]?.authorId == STUDENT_AUTHOR_ID }
+            .sortedBy(StrokeId::value)
+            .toCollection(linkedSetOf())
 
     private fun portableStudentLayer(
         pageNumber: Int,
@@ -1989,6 +2035,9 @@ class PageOperationLogStore(
     internal fun cachedPageIndexCount(): Int = pageIndexes.size
 
     @Synchronized
+    internal fun cachedStudentLayerDigestCount(): Int = studentLayerDigests.size
+
+    @Synchronized
     internal fun isPageIndexCached(bookId: String, pageNumber: Int): Boolean =
         PageKey(bookId, pageNumber) in pageIndexes
 
@@ -2010,19 +2059,34 @@ class PageOperationLogStore(
         snapshot: AnnotationSnapshot,
         activeStudentIds: Set<StrokeId>,
     ): List<StrokeAsset> {
+        val assets = collectPortableStudentLayerAssets(snapshot, activeStudentIds)
+        validateStudentCheckpointLayerAssets(assets, snapshot.pageNumber)
+        return assets
+    }
+
+    private fun validateStudentCheckpointLayerAssets(assets: List<StrokeAsset>, pageNumber: Int) {
+        require(assets.size <= MAX_STUDENT_LAYER_CHECKPOINT_STROKES) {
+            "Student layer checkpoint contains too many assets"
+        }
+        require(assets.sumOf { it.points.size.toLong() } <= MAX_STUDENT_LAYER_CHECKPOINT_TOTAL_POINTS) {
+            "Student layer checkpoint contains too many points"
+        }
+        assets.forEach { validateStudentCheckpointAsset(it, pageNumber) }
+    }
+
+    /** Collects semantic student ink without applying a transport allocation policy to inventory. */
+    private fun collectPortableStudentLayerAssets(
+        snapshot: AnnotationSnapshot,
+        activeStudentIds: Set<StrokeId>,
+    ): List<StrokeAsset> {
         val included = linkedMapOf<StrokeId, StrokeAsset>()
         val pending = ArrayDeque(activeStudentIds)
-        var totalPoints = 0L
         while (pending.isNotEmpty()) {
             val id = pending.removeFirst()
             if (id in included) continue
             val asset = requireNotNull(snapshot.assets[id]) { "Active student asset payload is missing" }
-            validateStudentCheckpointAsset(asset, snapshot.pageNumber)
+            validatePortableStudentLayerAsset(asset, snapshot.pageNumber)
             included[id] = asset
-            totalPoints += asset.points.size.toLong()
-            require(totalPoints <= MAX_STUDENT_LAYER_CHECKPOINT_TOTAL_POINTS) {
-                "Student layer checkpoint contains too many points"
-            }
             asset.parentStrokeId?.let { parentId ->
                 require(parentId != id) { "Student checkpoint asset cannot parent itself" }
                 val parent = requireNotNull(snapshot.assets[parentId]) {
@@ -2032,9 +2096,6 @@ class PageOperationLogStore(
                     "Student checkpoint parent must belong to the same student page"
                 }
                 pending.addLast(parentId)
-            }
-            require(included.size + pending.size <= MAX_STUDENT_LAYER_CHECKPOINT_STROKES) {
-                "Student layer checkpoint contains too many assets"
             }
         }
         return included.values.sortedBy { it.id.value }
@@ -2323,8 +2384,24 @@ class PageOperationLogStore(
         )
     }
 
+    private fun validatePortableStudentLayerAsset(asset: StrokeAsset, sourcePageNumber: Int) {
+        validateCheckpointAssetPayload(
+            asset = asset,
+            sourcePageNumber = sourcePageNumber,
+            label = "Student layer",
+            maxPointsPerStroke = null,
+        )
+        require(asset.authorId == STUDENT_AUTHOR_ID) { "Student layer contains a non-student asset" }
+        require(asset.attemptNo > 0) { "Student layer attempt must be positive" }
+    }
+
     private fun validateStudentCheckpointAsset(asset: StrokeAsset, sourcePageNumber: Int) {
-        validateCheckpointAssetPayload(asset, sourcePageNumber, "Student checkpoint")
+        validateCheckpointAssetPayload(
+            asset = asset,
+            sourcePageNumber = sourcePageNumber,
+            label = "Student checkpoint",
+            maxPointsPerStroke = MAX_STUDENT_CHECKPOINT_POINTS_PER_STROKE,
+        )
         require(asset.authorId == STUDENT_AUTHOR_ID) { "Student checkpoint contains a non-student asset" }
         require(asset.attemptNo > 0) { "Student checkpoint attempt must be positive" }
     }
@@ -2334,14 +2411,24 @@ class PageOperationLogStore(
         sourcePageNumber: Int,
         attemptNo: Int,
     ) {
-        validateCheckpointAssetPayload(asset, sourcePageNumber, "Published teacher checkpoint")
+        validateCheckpointAssetPayload(
+            asset = asset,
+            sourcePageNumber = sourcePageNumber,
+            label = "Published teacher checkpoint",
+            maxPointsPerStroke = MAX_PUBLISHED_TEACHER_CHECKPOINT_POINTS_PER_STROKE,
+        )
         require(asset.authorId == TEACHER_AUTHOR_ID) {
             "Published teacher checkpoint contains a non-teacher asset"
         }
         require(asset.attemptNo == attemptNo) { "Published teacher checkpoint attempt mismatch" }
     }
 
-    private fun validateCheckpointAssetPayload(asset: StrokeAsset, sourcePageNumber: Int, label: String) {
+    private fun validateCheckpointAssetPayload(
+        asset: StrokeAsset,
+        sourcePageNumber: Int,
+        label: String,
+        maxPointsPerStroke: Int?,
+    ) {
         require(asset.id.value.isNotBlank() && asset.id.value.length <= MAX_CHECKPOINT_IDENTIFIER_CHARS) {
             "$label asset id is invalid"
         }
@@ -2360,7 +2447,9 @@ class PageOperationLogStore(
             parentStrokeId.value.length <= MAX_CHECKPOINT_IDENTIFIER_CHARS
         ) { "$label parent id is invalid" }
         require(asset.width.isFinite() && asset.width > 0f) { "$label width is invalid" }
-        require(asset.points.isNotEmpty() && asset.points.size <= MAX_CHECKPOINT_POINTS_PER_STROKE) {
+        require(asset.points.isNotEmpty() &&
+            (maxPointsPerStroke == null || asset.points.size <= maxPointsPerStroke)
+        ) {
             "$label point count is invalid"
         }
         require(asset.points.all { point ->
@@ -2463,6 +2552,13 @@ class PageOperationLogStore(
     )
 
     private data class PageKey(val bookId: String, val pageNumber: Int)
+
+    private data class StudentLayerDigest(val revision: Long, val sha256: String)
+
+    private data class StudentCheckpointCapture(
+        val snapshot: AnnotationSnapshot,
+        val originDeviceHighWater: Long,
+    )
 
     private data class TeacherReviewIntentKey(
         val bookId: String,
@@ -2958,7 +3054,7 @@ class PageOperationLogStore(
 
     companion object {
         /** Complete checkpoints are fragmented into ordinary <=2 MiB transport documents. */
-        const val MAX_STUDENT_LAYER_CHECKPOINT_BYTES = 8 * 1024 * 1024
+        const val MAX_STUDENT_LAYER_CHECKPOINT_BYTES = 8 * (2 * 1024 * 1024 - 32 * 1024)
         const val MAX_PUBLISHED_TEACHER_LAYER_CHECKPOINT_BYTES = 2 * 1024 * 1024 - 32 * 1024
         const val MAX_TEACHER_REVIEW_MARK_GROUP_BYTES = 512 * 1024
 
@@ -2988,6 +3084,7 @@ class PageOperationLogStore(
             applicationInstance?.let { current ->
                 synchronized(current) {
                     current.pageIndexes.clear()
+                    current.studentLayerDigests.clear()
                     current.teacherReviewPublishIntents.clear()
                     current.teacherReviewPublishIntentsLoaded = false
                     applicationInstance = null
@@ -2997,6 +3094,7 @@ class PageOperationLogStore(
 
         private const val DEFAULT_CHECKPOINT_INTERVAL = 64
         internal const val MAX_CACHED_PAGE_INDEXES = 3
+        internal const val MAX_CACHED_STUDENT_LAYER_DIGESTS = 32
         private const val CHECKPOINT_FILE = "checkpoint.json"
         private const val LOG_FILE = "operations.log"
         private const val MAX_ENCODED_OPERATION_BYTES = 512 * 1024
@@ -3017,8 +3115,9 @@ class PageOperationLogStore(
         private const val PUBLISHED_TEACHER_LAYER_DIGEST_KIND = "published-teacher"
         private const val MAX_STUDENT_LAYER_CHECKPOINT_STROKES = 8_192
         private const val MAX_PUBLISHED_TEACHER_LAYER_CHECKPOINT_STROKES = 8_192
-        private const val MAX_CHECKPOINT_POINTS_PER_STROKE = 8_192
-        private const val MAX_STUDENT_LAYER_CHECKPOINT_TOTAL_POINTS = 120_000L
+        private const val MAX_STUDENT_CHECKPOINT_POINTS_PER_STROKE = 32_768
+        private const val MAX_PUBLISHED_TEACHER_CHECKPOINT_POINTS_PER_STROKE = 8_192
+        private const val MAX_STUDENT_LAYER_CHECKPOINT_TOTAL_POINTS = 300_000L
         private const val MAX_PUBLISHED_TEACHER_LAYER_CHECKPOINT_TOTAL_POINTS = 120_000L
         private const val MAX_CHECKPOINT_IDENTIFIER_CHARS = 256
         private const val MAX_CHECKPOINT_ITEM_ID_CHARS = 1_024

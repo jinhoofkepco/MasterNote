@@ -57,6 +57,13 @@ internal sealed interface TeacherPageChunkOfferResult {
     data class Complete(val assembledPayload: ByteArray) : TeacherPageChunkOfferResult
 }
 
+internal data class TeacherPageChunkProgress(
+    val receivedChunks: Int,
+    val totalChunks: Int,
+    val receivedBytes: Long,
+    val totalBytes: Long,
+)
+
 internal data class TeacherPageSyncRecord(
     val syncGeneration: Long,
     val pageToken: String,
@@ -553,6 +560,53 @@ internal class RemotePageSyncStore(
         require(offset == assembled.size)
         require(sha256(assembled) == descriptor.payloadSha256) { "Assembled page digest changed" }
         return TeacherPageChunkOfferResult.Complete(assembled)
+    }
+
+    /**
+     * Reports only fragments that have completed their atomic write for the exact active request.
+     * Chunk payloads are deliberately not read or hashed on this UI-facing path.
+     */
+    @Synchronized
+    fun teacherPageChunkProgress(
+        responseToTransferId: String,
+        pageToken: String,
+    ): TeacherPageChunkProgress? {
+        if (responseToTransferId.isBlank() || pageToken.isBlank()) return null
+        var best: TeacherPageChunkProgress? = null
+        teacherPageChunkRoot.listFiles().orEmpty().forEach { directory ->
+            if (!directory.isDirectory) return@forEach
+            val metadataFile = File(directory, TEACHER_PAGE_CHUNK_METADATA)
+            if (!metadataFile.isFile) return@forEach
+            val descriptor = decodeChunkDescriptor(metadataFile) ?: return@forEach
+            if (descriptor.responseToTransferId != responseToTransferId ||
+                descriptor.pageToken != pageToken ||
+                descriptor.chunkCount !in 2..MAX_TEACHER_PAGE_CHUNKS ||
+                descriptor.assembledPayloadSizeBytes !in 1..MAX_ASSEMBLED_TEACHER_PAGE_BYTES
+            ) return@forEach
+
+            var receivedChunks = 0
+            var receivedBytes = 0L
+            repeat(descriptor.chunkCount) { index ->
+                val chunk = File(directory, "$index.chunk")
+                val length = if (chunk.isFile) chunk.length() else 0L
+                if (length in 1..MAX_TEACHER_PAGE_CHUNK_BYTES.toLong()) {
+                    receivedChunks++
+                    receivedBytes += length
+                }
+            }
+            val totalBytes = descriptor.assembledPayloadSizeBytes.toLong()
+            if (receivedBytes > totalBytes) return@forEach
+            val progress = TeacherPageChunkProgress(
+                receivedChunks = receivedChunks,
+                totalChunks = descriptor.chunkCount,
+                receivedBytes = receivedBytes,
+                totalBytes = totalBytes,
+            )
+            if (best == null || progress.receivedBytes > requireNotNull(best).receivedBytes) {
+                best = progress
+            }
+        }
+        return best
     }
 
     @Synchronized
@@ -1597,7 +1651,8 @@ internal class RemotePageSyncStore(
         const val MAX_COMPLETED_TEACHER_PUBLICATIONS = 1_024
         const val MAX_TEACHER_PAGE_CHUNKS = 8
         const val MAX_TEACHER_PAGE_CHUNK_BYTES = 2 * 1024 * 1024 - 32 * 1024
-        const val MAX_ASSEMBLED_TEACHER_PAGE_BYTES = 8 * 1024 * 1024
+        const val MAX_ASSEMBLED_TEACHER_PAGE_BYTES =
+            MAX_TEACHER_PAGE_CHUNKS * MAX_TEACHER_PAGE_CHUNK_BYTES
         const val TEACHER_PAGE_CHUNK_TTL_MS = 7 * 24 * 60 * 60 * 1_000L
         const val TEACHER_PAGE_CHUNK_METADATA = "metadata.json"
         const val MAX_TEACHER_PAGE_CHUNK_METADATA_BYTES = 16 * 1024

@@ -114,6 +114,84 @@ class PageOperationLogStoreTest {
     }
 
     @Test
+    fun studentDigestCacheIsBoundedAndNeverMasksANewerRevision() {
+        val root = Files.createTempDirectory("masternote-student-digest-lru").toFile()
+        try {
+            val store = PageOperationLogStore(root, checkpointInterval = 10_000)
+            repeat(PageOperationLogStore.MAX_CACHED_STUDENT_LAYER_DIGESTS + 1) { page ->
+                store.append(
+                    AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, page))
+                        .addStroke(stroke("student-device").copy(pageNumber = page)),
+                )
+                store.studentLayerSha256(BOOK_ID, page)
+            }
+            assertEquals(
+                PageOperationLogStore.MAX_CACHED_STUDENT_LAYER_DIGESTS,
+                store.cachedStudentLayerDigestCount(),
+            )
+
+            val before = store.studentLayerSha256(BOOK_ID, 0)
+            val current = store.loadPage(BOOK_ID, 0)
+            store.append(
+                AnnotationDocument(current).addStroke(
+                    stroke("student-device").copy(
+                        pageNumber = 0,
+                        points = listOf(PagePoint(10f, 10f), PagePoint(20f, 20f)),
+                    ),
+                ),
+            )
+            assertFalse(before == store.studentLayerSha256(BOOK_ID, 0))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun studentDigestIsIndependentOfCheckpointPointPolicyAndExpandedLimitRoundTrips() {
+        val supportedRoot = Files.createTempDirectory("masternote-student-large-stroke").toFile()
+        val oversizedRoot = Files.createTempDirectory("masternote-student-digest-only").toFile()
+        val targetRoot = Files.createTempDirectory("masternote-student-large-target").toFile()
+        try {
+            assertEquals(
+                8 * (2 * 1024 * 1024 - 32 * 1024),
+                PageOperationLogStore.MAX_STUDENT_LAYER_CHECKPOINT_BYTES,
+            )
+            val supported = PageOperationLogStore(supportedRoot, checkpointInterval = 10_000)
+            supported.append(
+                AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE)).addStroke(
+                    stroke("student-device").copy(points = largePath(32_768)),
+                ),
+            )
+            val export = supported.exportStudentLayerCheckpoint(BOOK_ID, PAGE, "student-device")
+            val target = PageOperationLogStore(targetRoot)
+            val applied = target.applyStudentLayerCheckpoint(
+                BOOK_ID,
+                PAGE,
+                export.copyCheckpointBytes(),
+                export.layerSha256,
+                listOf(1),
+            )
+            assertEquals(export.layerSha256, applied.layerSha256)
+            assertEquals(export.layerSha256, target.studentLayerSha256(BOOK_ID, PAGE))
+
+            val digestOnly = PageOperationLogStore(oversizedRoot, checkpointInterval = 10_000)
+            digestOnly.append(
+                AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE)).addStroke(
+                    stroke("student-device").copy(points = largePath(32_769)),
+                ),
+            )
+            assertTrue(Regex("[0-9a-f]{64}").matches(digestOnly.studentLayerSha256(BOOK_ID, PAGE)))
+            assertThrows(IllegalArgumentException::class.java) {
+                digestOnly.exportStudentLayerCheckpoint(BOOK_ID, PAGE, "student-device")
+            }
+        } finally {
+            supportedRoot.deleteRecursively()
+            oversizedRoot.deleteRecursively()
+            targetRoot.deleteRecursively()
+        }
+    }
+
+    @Test
     fun localAppendSignalsExactlyOnceAfterItIsReadableFromTheStableRoot() {
         val root = Files.createTempDirectory("masternote-commit-local").toFile()
         try {
@@ -1520,6 +1598,10 @@ class PageOperationLogStoreTest {
         attemptNo = 1,
         deviceId = deviceId,
     )
+
+    private fun largePath(size: Int): List<PagePoint> = List(size) { index ->
+        PagePoint((index % 512).toFloat(), (index / 512).toFloat())
+    }
 
     private companion object {
         const val BOOK_ID = "book"

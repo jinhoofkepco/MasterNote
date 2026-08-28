@@ -297,6 +297,7 @@ object LanSyncBus {
     private val remoteStudentLocations = mutableMapOf<String, StudentLocation>()
     private val connectionStates = mutableMapOf<String, LanConnectionState>()
     private val sessionPhases = mutableMapOf<String, LanSessionPhase>()
+    private val sessionRoles = mutableMapOf<String, LanPeerRole>()
     private val pairingUris = mutableMapOf<String, String>()
     private var activeSessionBookId: String? = null
 
@@ -325,6 +326,9 @@ object LanSyncBus {
     fun sessionPhase(bookId: String): LanSessionPhase = synchronized(this) {
         sessionPhases[bookId] ?: LanSessionPhase.IDLE
     }
+
+    /** The role actually owned by the running service, independent of the Reader's UI role. */
+    fun sessionRole(bookId: String): LanPeerRole? = synchronized(this) { sessionRoles[bookId] }
 
     fun sessionSnapshot(bookId: String): LanSessionSnapshot = synchronized(this) {
         sessionSnapshotLocked(bookId)
@@ -375,9 +379,17 @@ object LanSyncBus {
 
     internal fun clearConnectionState(bookId: String) {
         if (bookId.isBlank()) return
-        synchronized(this) { pairingUris.remove(bookId) }
+        synchronized(this) {
+            pairingUris.remove(bookId)
+            sessionRoles.remove(bookId)
+        }
         connectionStateChanged(bookId, LanConnectionState.IDLE)
         sessionPhaseChanged(bookId, LanSessionPhase.IDLE)
+    }
+
+    internal fun sessionRoleChanged(bookId: String, role: LanPeerRole) {
+        if (bookId.isBlank()) return
+        synchronized(this) { sessionRoles[bookId] = role }
     }
 
     internal fun sessionPhaseChanged(bookId: String, phase: LanSessionPhase) {

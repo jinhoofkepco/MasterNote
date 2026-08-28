@@ -4,13 +4,16 @@ import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ClipDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.text.TextUtils
 import android.util.AttributeSet
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -146,10 +149,15 @@ class RemotePageSyncPanelView @JvmOverloads constructor(
         }
 
         pageList.removeAllViews()
-        val pages = remotePageSyncPagesLatestFirst(state.pendingPages)
-        pages.forEach { page -> pageList.addView(pageRow(page, state.activePageNumber)) }
+        val activePage = state.activePage
+        activePage?.let { page -> pageList.addView(pageRow(page, active = true)) }
+        val pages = remotePageSyncPagesLatestFirst(state.pendingPages).filterNot { page ->
+            activePage != null && page.pageToken == activePage.pageToken
+        }
+        pages.forEach { page -> pageList.addView(pageRow(page, active = false)) }
+        val visibleRowCount = pages.size + if (activePage == null) 0 else 1
         pageScroller.layoutParams = (pageScroller.layoutParams as LayoutParams).apply {
-            height = if (pages.size > MAX_VISIBLE_PAGE_ROWS) {
+            height = if (visibleRowCount > MAX_VISIBLE_PAGE_ROWS) {
                 dp(PAGE_LIST_MAX_HEIGHT_DP)
             } else {
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -197,9 +205,9 @@ class RemotePageSyncPanelView @JvmOverloads constructor(
         }
     }
 
-    private fun pageRow(page: RemotePageSyncPageUi, activePageNumber: Int?): View {
-        val active = page.pageNumber == activePageNumber
-        val status = page.status.displayText()
+    private fun pageRow(page: RemotePageSyncPageUi, active: Boolean): View {
+        val status = formatRemotePageSyncPageStatus(page)
+        val queuePrefix = if (page.queueMode == RemotePageSyncQueueMode.AUTOMATIC) "자동 · " else ""
         val attempts = page.attemptNos.asSequence()
             .filter { it > 0 }
             .distinct()
@@ -221,6 +229,7 @@ class RemotePageSyncPanelView @JvmOverloads constructor(
                 radiusDp = 9f,
             )
             contentDescription = buildString {
+                if (queuePrefix.isNotEmpty()) append("자동 동기화, ")
                 append(page.workbookLabel).append(", ").append(page.pageNumber).append("쪽, ").append(attempts)
                 append(", ").append(status)
                 append(", 약 ").append(formatRemotePageSyncBytes(page.approxBytes))
@@ -228,7 +237,8 @@ class RemotePageSyncPanelView @JvmOverloads constructor(
             }
 
             val identity = TextView(context).apply {
-                text = "${page.workbookLabel} · ${page.pageNumber}쪽 · $attempts\n약 ${formatRemotePageSyncBytes(page.approxBytes)} · $changed"
+                text = "$queuePrefix${page.workbookLabel} · ${page.pageNumber}쪽 · $attempts\n" +
+                    "약 ${formatRemotePageSyncBytes(page.approxBytes)} · $changed"
                 textSize = 13f
                 setTextColor(COLOR_TEXT)
                 maxLines = 2
@@ -236,15 +246,7 @@ class RemotePageSyncPanelView @JvmOverloads constructor(
                 if (active) setTypeface(typeface, Typeface.BOLD)
                 importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
             }
-            val statusText = TextView(context).apply {
-                text = status
-                textSize = 12f
-                gravity = Gravity.CENTER
-                setTextColor(page.status.textColor())
-                setPadding(dp(8), dp(4), dp(8), dp(4))
-                background = rounded(page.status.backgroundColor(), 8f)
-                importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
-            }
+            val statusText = pageStatusView(page, status)
             addView(identity, LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(statusText, LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 marginStart = dp(8)
@@ -263,14 +265,43 @@ class RemotePageSyncPanelView @JvmOverloads constructor(
         }
     }
 
-    private fun RemotePageSyncPageStatus.displayText(): String = when (this) {
-        RemotePageSyncPageStatus.WAITING -> "대기"
-        RemotePageSyncPageStatus.SYNCING -> "동기화 중"
-        RemotePageSyncPageStatus.READY -> "준비됨"
-        RemotePageSyncPageStatus.FAILED -> "다시 시도"
-        RemotePageSyncPageStatus.DEVICE_OFFLINE -> "기기 오프라인"
-        RemotePageSyncPageStatus.MAPPING_REQUIRED -> "교재 선택 필요"
-    }
+    private fun pageStatusView(page: RemotePageSyncPageUi, status: String): View =
+        FrameLayout(context).apply {
+            background = statusBackground(page)
+            importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
+            addView(
+                TextView(context).apply {
+                    text = status
+                    textSize = 12f
+                    gravity = Gravity.CENTER
+                    setTextColor(page.status.textColor())
+                    setPadding(dp(8), dp(4), dp(8), dp(4))
+                },
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER,
+                ),
+            )
+        }
+
+    private fun statusBackground(page: RemotePageSyncPageUi) =
+        remotePageSyncProgressFraction(page.progress)
+            ?.takeIf { page.status == RemotePageSyncPageStatus.SYNCING }
+            ?.let { fraction ->
+                val fill = ClipDrawable(
+                    rounded(COLOR_SYNCING_PROGRESS, 8f),
+                    Gravity.START,
+                    ClipDrawable.HORIZONTAL,
+                ).apply { level = (fraction * CLIP_DRAWABLE_MAX_LEVEL).toInt() }
+                LayerDrawable(
+                    arrayOf(
+                        rounded(page.status.backgroundColor(), 8f),
+                        fill,
+                    ),
+                )
+            }
+            ?: rounded(page.status.backgroundColor(), 8f)
 
     private fun RemotePageSyncPageStatus.textColor(): Int = when (this) {
         RemotePageSyncPageStatus.READY -> COLOR_READY_TEXT
@@ -317,6 +348,7 @@ class RemotePageSyncPanelView @JvmOverloads constructor(
     private companion object {
         const val MAX_VISIBLE_PAGE_ROWS = 3
         const val PAGE_LIST_MAX_HEIGHT_DP = 154
+        const val CLIP_DRAWABLE_MAX_LEVEL = 10_000
         const val COLOR_PANEL = 0xFFF8FAFD.toInt()
         const val COLOR_PANEL_BORDER = 0xFFD8DEE8.toInt()
         const val COLOR_PAGE_ROW = 0xFFFFFFFF.toInt()
@@ -329,6 +361,7 @@ class RemotePageSyncPanelView @JvmOverloads constructor(
         const val COLOR_READY_BACKGROUND = 0xFFDDF4E5.toInt()
         const val COLOR_READY_TEXT = 0xFF23653A.toInt()
         const val COLOR_SYNCING_BACKGROUND = 0xFFFFE9C8.toInt()
+        const val COLOR_SYNCING_PROGRESS = 0xFF9AD5AA.toInt()
         const val COLOR_SYNCING_TEXT = 0xFF805200.toInt()
         const val COLOR_FAILED_BACKGROUND = 0xFFFFE0E0.toInt()
         const val COLOR_FAILED_TEXT = 0xFF9A2B2B.toInt()

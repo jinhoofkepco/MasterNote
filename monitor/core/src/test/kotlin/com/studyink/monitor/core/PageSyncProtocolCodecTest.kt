@@ -235,6 +235,72 @@ class PageSyncProtocolCodecTest {
         assertArrayEquals(fragment, decoded.copyDecodedPayloadBytes())
     }
 
+    @Test fun eightStudentCheckpointFragmentsMayDeclareTheirExactMaximumAssembly() {
+        assertEquals(
+            RemoteReviewLimits.MAX_PAGE_ANNOTATION_CHUNKS *
+                RemoteReviewLimits.MAX_PAGE_ANNOTATION_CHECKPOINT_BYTES,
+            RemoteReviewLimits.MAX_PAGE_ANNOTATION_ASSEMBLED_BYTES,
+        )
+        val fragment = "bounded-fragment".toByteArray()
+        val original = PageAnnotationEnvelope.fromDecodedPayload(
+            transferId = "checkpoint_chunk_transfer_0008",
+            createdAtEpochMs = 20_000L,
+            syncGeneration = 7L,
+            purpose = PageAnnotationPurpose.STUDENT_PAGE,
+            responseToTransferId = REQUEST_TRANSFER_ID,
+            pageToken = PAGE_TOKEN,
+            pageNumber = 37,
+            attemptNos = listOf(1),
+            kind = PageAnnotationKind.CHECKPOINT,
+            baseRevision = 0L,
+            sourceRevision = 92L,
+            deltaOriginDeviceId = null,
+            baseOriginCursor = 0L,
+            sourceOriginCursor = 0L,
+            compression = PageAnnotationCompression.GZIP,
+            decodedPayloadBytes = fragment,
+            resultLayerSha256 = RESULT_LAYER_SHA,
+            chunkGroupId = "checkpoint_group_transfer_0008",
+            chunkIndex = 7,
+            chunkCount = 8,
+            assembledPayloadSizeBytes = RemoteReviewLimits.MAX_PAGE_ANNOTATION_ASSEMBLED_BYTES,
+            assembledPayloadSha256 = "d".repeat(64),
+        )
+
+        val decoded = roundTrip(original) as PageAnnotationEnvelope
+        assertEquals(8, decoded.chunkCount)
+        assertEquals(7, decoded.chunkIndex)
+        assertEquals(RemoteReviewLimits.MAX_PAGE_ANNOTATION_ASSEMBLED_BYTES,
+            decoded.assembledPayloadSizeBytes)
+
+        assertValidationField("assembledPayloadSizeBytes") {
+            PageAnnotationEnvelope.fromDecodedPayload(
+                transferId = "checkpoint_chunk_transfer_over",
+                createdAtEpochMs = 20_000L,
+                syncGeneration = 7L,
+                purpose = PageAnnotationPurpose.STUDENT_PAGE,
+                responseToTransferId = REQUEST_TRANSFER_ID,
+                pageToken = PAGE_TOKEN,
+                pageNumber = 37,
+                attemptNos = listOf(1),
+                kind = PageAnnotationKind.CHECKPOINT,
+                baseRevision = 0L,
+                sourceRevision = 92L,
+                deltaOriginDeviceId = null,
+                baseOriginCursor = 0L,
+                sourceOriginCursor = 0L,
+                compression = PageAnnotationCompression.GZIP,
+                decodedPayloadBytes = fragment,
+                resultLayerSha256 = RESULT_LAYER_SHA,
+                chunkGroupId = "checkpoint_group_transfer_over",
+                chunkIndex = 0,
+                chunkCount = 8,
+                assembledPayloadSizeBytes = RemoteReviewLimits.MAX_PAGE_ANNOTATION_ASSEMBLED_BYTES + 1,
+                assembledPayloadSha256 = "e".repeat(64),
+            )
+        }
+    }
+
     @Test fun pageSyncAckRoundTripsGenerationSourceTypeExactPageRevisionAndReason() {
         val annotationApplied = ack()
         val requestRejected = ack(

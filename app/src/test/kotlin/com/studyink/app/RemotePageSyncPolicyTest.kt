@@ -1,6 +1,7 @@
 package com.studyink.app
 
 import com.studyink.annotation.storage.TeacherReviewPublishIntent
+import com.studyink.core.model.Attempt
 import com.studyink.monitor.core.RemoteReviewEnvelopeType
 import com.studyink.monitor.core.RemoteReviewLimits
 import org.junit.Assert.assertEquals
@@ -129,6 +130,133 @@ class RemotePageSyncPolicyTest {
         assertFalse(isTeacherManifestStale(4, 8, 5, 1))
     }
 
+    @Test fun duplicateAndStaleManifestsAreClassifiedBeforeAnyPagePreparation() {
+        assertEquals(
+            TeacherManifestInstallResult.DUPLICATE,
+            teacherManifestPreflightResult(4L, 8L, 4L, 8L),
+        )
+        assertEquals(
+            TeacherManifestInstallResult.STALE,
+            teacherManifestPreflightResult(4L, 8L, 3L, 99L),
+        )
+        assertEquals(
+            TeacherManifestInstallResult.STALE,
+            teacherManifestPreflightResult(4L, 8L, 4L, 7L),
+        )
+        assertEquals(null, teacherManifestPreflightResult(4L, 8L, 4L, 9L))
+        assertEquals(null, teacherManifestPreflightResult(4L, 8L, 5L, 1L))
+    }
+
+    @Test fun inventoryTotalWaitsForQueuedOrFailedPagesAndEveryDiscoveredBook() {
+        fun complete(
+            queuedBooks: Set<String> = emptySet(),
+            failedBooks: Set<String> = emptySet(),
+            queuedPages: Set<String> = emptySet(),
+            failedPages: Set<String> = emptySet(),
+            discovered: Set<String> = setOf("book"),
+            seeded: Set<String> = setOf("book"),
+        ) = isStudentInventoryCatalogComplete(
+            queuedBooks,
+            failedBooks,
+            queuedPages,
+            failedPages,
+            discovered,
+            seeded,
+        )
+
+        assertTrue(complete())
+        assertFalse(complete(queuedBooks = setOf("book")))
+        assertFalse(complete(failedBooks = setOf("book")))
+        assertFalse(complete(queuedPages = setOf("book:73")))
+        assertFalse(complete(failedPages = setOf("book:73")))
+        assertFalse(complete(seeded = emptySet()))
+    }
+
+    @Test fun manifestInventoryIncludesDurablePagesMissingFromTheAttemptCatalog() {
+        // A previously opened page may have a durable empty/ink row without an Attempt record.
+        // The envelope must never advertise a total smaller than the rows it carries.
+        assertEquals(37, effectiveStudentInventoryPageCount(36, 37))
+        assertEquals(37, effectiveStudentInventoryPageCount(37, 36))
+    }
+
+    @Test fun reconnectGenerationReusesOnlyTheExactDurableLocalPageDigest() {
+        val previouslyApplied = teacherPage(
+            token = "old-generation-token",
+            sourceRevision = 7L,
+            layerSha = SHA_B,
+            appliedRevision = 7L,
+            appliedLayerSha = SHA_B,
+        )
+
+        val reused = reusableTeacherStudentLayerSha256(
+            previouslyInstalledPages = listOf(previouslyApplied),
+            workbookToken = previouslyApplied.workbookToken,
+            contentSha256 = previouslyApplied.contentSha256,
+            localBookId = previouslyApplied.localBookId,
+            pageNumber = previouslyApplied.pageNumber,
+        )
+        val reconnected = teacherPage(
+            token = "new-generation-token",
+            sourceRevision = 1L,
+            layerSha = SHA_B,
+            appliedRevision = if (reused == SHA_B) 1L else 0L,
+            appliedLayerSha = reused,
+        ).copy(syncGeneration = 2L)
+
+        assertEquals(SHA_B, reused)
+        assertFalse(reconnected.pending)
+    }
+
+    @Test fun unknownOrMismatchedLocalPageStaysPendingWithoutGuessingADigest() {
+        val previouslyApplied = teacherPage(
+            token = "old-token",
+            sourceRevision = 3L,
+            layerSha = SHA_A,
+            appliedRevision = 3L,
+            appliedLayerSha = SHA_A,
+        )
+        val unknown = reusableTeacherStudentLayerSha256(
+            previouslyInstalledPages = listOf(previouslyApplied),
+            workbookToken = previouslyApplied.workbookToken,
+            contentSha256 = previouslyApplied.contentSha256,
+            localBookId = "different-local-import",
+            pageNumber = previouslyApplied.pageNumber,
+        )
+        val incoming = teacherPage(
+            token = "new-token",
+            sourceRevision = 4L,
+            layerSha = SHA_B,
+            appliedRevision = 0L,
+            appliedLayerSha = unknown,
+        ).copy(syncGeneration = 2L)
+
+        assertEquals(null, unknown)
+        assertTrue(incoming.pending)
+        assertEquals(
+            null,
+            reusableTeacherStudentLayerSha256(
+                previouslyInstalledPages = emptyList(),
+                workbookToken = previouslyApplied.workbookToken,
+                contentSha256 = previouslyApplied.contentSha256,
+                localBookId = previouslyApplied.localBookId,
+                pageNumber = previouslyApplied.pageNumber,
+            ),
+        )
+        assertEquals(
+            null,
+            reusableTeacherStudentLayerSha256(
+                previouslyInstalledPages = listOf(
+                    previouslyApplied,
+                    previouslyApplied.copy(pageToken = "conflict", appliedStudentLayerSha256 = SHA_C),
+                ),
+                workbookToken = previouslyApplied.workbookToken,
+                contentSha256 = previouslyApplied.contentSha256,
+                localBookId = previouslyApplied.localBookId,
+                pageNumber = previouslyApplied.pageNumber,
+            ),
+        )
+    }
+
     @Test fun sameRevisionCannotChangeLayerDigest() {
         assertTrue(isTeacherPageRegression(5, SHA_A, 4, SHA_A))
         assertTrue(isTeacherPageRegression(5, SHA_A, 5, SHA_B))
@@ -245,15 +373,28 @@ class RemotePageSyncPolicyTest {
         assertTrue(payload.contentEquals(chunks.reduce { left, right -> left + right }))
     }
 
-    @Test fun unavailableNewestReviewDoesNotStarveAnExactSubmittedReview() {
+    @Test fun unavailableNewestReviewDoesNotStarveAnExactOpenAttemptReview() {
         val unavailable = pendingReview("book-a").copy(queuedAtEpochMs = 20L)
         val sendable = pendingReview("book-b").copy(queuedAtEpochMs = 10L)
         val selected = selectTransmittableTeacherReview(
             pendingReviews = listOf(unavailable, sendable),
-            pages = listOf(teacherPage("page-b", bookId = "book-b", submitted = listOf(2))),
+            pages = listOf(teacherPage("page-b", bookId = "book-b")),
         )
 
         assertEquals(sendable.key, selected?.pending?.key)
+    }
+
+    @Test fun exactOpenAttemptMayReceivePublishedReviewWithoutBeingSubmitted() {
+        val open = Attempt(
+            bookId = "book-a",
+            pageNumber = 81,
+            attemptNo = 4,
+            locked = false,
+        )
+
+        assertTrue(isKnownStudentAttemptForReview(listOf(open), 4))
+        assertTrue(isKnownStudentAttemptForReview(listOf(open.copy(locked = true)), 4))
+        assertFalse(isKnownStudentAttemptForReview(listOf(open), 3))
     }
 
     @Test fun pendingReviewNeverMovesToAnotherRemoteWorkbookWithTheSamePdfIdentity() {
@@ -261,7 +402,6 @@ class RemotePageSyncPolicyTest {
         val wrongRemoteWorkbook = teacherPage(
             "page-wrong",
             bookId = "book-a",
-            submitted = listOf(2),
         ).copy(workbookToken = "workbook-reimported")
         assertEquals(
             null,
@@ -272,7 +412,6 @@ class RemotePageSyncPolicyTest {
         val sameRemoteWorkbook = teacherPage(
             "page-reconnected",
             bookId = "book-a",
-            submitted = listOf(2),
         ).copy(syncGeneration = 9L)
         assertEquals(
             sameRemoteWorkbook.pageToken,
@@ -280,17 +419,57 @@ class RemotePageSyncPolicyTest {
         )
     }
 
-    @Test fun onlyExplicitNewUnresolvedReviewMayBindToOneExactSubmittedWorkbook() {
-        val heldLegacy = pendingReview("book-a").copy(workbookToken = null)
-        val deferred = heldLegacy.copy(deferredWorkbookBinding = true)
-        val exact = teacherPage("page-exact", bookId = "book-a", submitted = listOf(2))
+    @Test fun publicationProvenanceNeedsOneExactBidirectionalWorkbookMappingButNotFullInventory() {
+        val exact = teacherPage("page-exact", bookId = "book-a")
 
-        assertEquals(null, resolveDeferredReviewWorkbookToken(heldLegacy, listOf(exact), true, 2L, 1L))
         assertEquals(
             exact.workbookToken,
-            resolveDeferredReviewWorkbookToken(deferred, listOf(exact), true, 2L, 1L),
+            resolveExactPublishedReviewWorkbookToken(
+                localBookId = "book-a",
+                contentSha256 = SHA_A,
+                pageNumber = 81,
+                attemptNo = 2,
+                mappedWorkbookToken = exact.workbookToken,
+                mappedLocalBookId = "book-a",
+                pages = listOf(exact),
+            ),
         )
-        assertEquals(null, resolveDeferredReviewWorkbookToken(deferred, listOf(exact), false, 2L, 1L))
+        assertEquals(
+            null,
+            resolveExactPublishedReviewWorkbookToken(
+                "book-a",
+                SHA_A,
+                81,
+                2,
+                exact.workbookToken,
+                "book-b",
+                listOf(exact),
+            ),
+        )
+        assertEquals(
+            null,
+            resolveExactPublishedReviewWorkbookToken(
+                "book-a",
+                SHA_A,
+                81,
+                3,
+                exact.workbookToken,
+                "book-a",
+                listOf(exact),
+            ),
+        )
+    }
+
+    @Test fun onlyExplicitNewUnresolvedReviewMayBindFromOneExactNewManifestRow() {
+        val heldLegacy = pendingReview("book-a").copy(workbookToken = null)
+        val deferred = heldLegacy.copy(deferredWorkbookBinding = true)
+        val exact = reviewEvidence("workbook-book-a", "book-a", listOf(2), generation = 2L, sequence = 1L)
+
+        assertEquals(null, resolveDeferredReviewWorkbookToken(heldLegacy, listOf(exact)))
+        assertEquals(
+            exact.workbookToken,
+            resolveDeferredReviewWorkbookToken(deferred, listOf(exact)),
+        )
         assertEquals(
             null,
             resolveDeferredReviewWorkbookToken(
@@ -299,23 +478,16 @@ class RemotePageSyncPolicyTest {
                     deferredAfterManifestSequence = 1L,
                 ),
                 listOf(exact),
-                true,
-                2L,
-                1L,
             ),
         )
         assertEquals(
             null,
             resolveDeferredReviewWorkbookToken(
                 deferred,
-                listOf(exact, exact.copy(pageToken = "page-other", workbookToken = "workbook-other")),
-                true,
-                2L,
-                1L,
+                listOf(exact, exact.copy(workbookToken = "workbook-other")),
             ),
         )
         val separatelyMappedDuplicate = exact.copy(
-            pageToken = "page-other-local",
             workbookToken = "workbook-book-b",
             localBookId = "book-b",
         )
@@ -324,19 +496,27 @@ class RemotePageSyncPolicyTest {
             resolveDeferredReviewWorkbookToken(
                 deferred,
                 listOf(exact, separatelyMappedDuplicate),
-                true,
-                2L,
-                1L,
             ),
         )
         assertEquals(
             null,
             resolveDeferredReviewWorkbookToken(
                 deferred,
-                listOf(exact.copy(submittedAttemptNos = listOf(1))),
-                true,
-                2L,
-                1L,
+                listOf(exact.copy(attemptNos = listOf(1))),
+            ),
+        )
+        assertEquals(
+            null,
+            resolveDeferredReviewWorkbookToken(
+                deferred,
+                listOf(exact.copy(pageNumber = 82)),
+            ),
+        )
+        assertEquals(
+            exact.workbookToken,
+            resolveDeferredReviewWorkbookToken(
+                deferred.copy(deferredAfterManifestGeneration = 2L, deferredAfterManifestSequence = 99L),
+                listOf(exact.copy(manifestGeneration = 3L, manifestSequence = 1L)),
             ),
         )
     }
@@ -345,8 +525,8 @@ class RemotePageSyncPolicyTest {
         val first = pendingReview("book-a").copy(queuedAtEpochMs = 20L)
         val second = pendingReview("book-b").copy(queuedAtEpochMs = 10L)
         val pages = listOf(
-            teacherPage("page-a", bookId = "book-a", submitted = listOf(2)),
-            teacherPage("page-b", bookId = "book-b", submitted = listOf(2)),
+            teacherPage("page-a", bookId = "book-a"),
+            teacherPage("page-b", bookId = "book-b"),
         )
 
         assertEquals(
@@ -406,6 +586,22 @@ class RemotePageSyncPolicyTest {
         appliedStudentLayerSha256 = appliedLayerSha,
         lastChangedAtEpochMs = lastChangedAt,
         approximateBytes = 100L,
+    )
+
+    private fun reviewEvidence(
+        workbookToken: String,
+        localBookId: String,
+        attempts: List<Int>,
+        generation: Long,
+        sequence: Long,
+    ) = TeacherReviewManifestEvidence(
+        workbookToken = workbookToken,
+        contentSha256 = SHA_A,
+        localBookId = localBookId,
+        pageNumber = 81,
+        attemptNos = attempts,
+        manifestGeneration = generation,
+        manifestSequence = sequence,
     )
 
     private companion object {

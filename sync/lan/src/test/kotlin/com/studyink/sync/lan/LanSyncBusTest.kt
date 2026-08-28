@@ -1,5 +1,6 @@
 package com.studyink.sync.lan
 
+import com.studyink.core.model.Attempt
 import com.studyink.core.model.Mark
 import com.studyink.core.model.MarkColor
 import com.studyink.core.model.MarkGroup
@@ -19,6 +20,17 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LanSyncBusTest {
+
+    @Test
+    fun publishedReviewTargetsExactOpenOrSubmittedAttempt() {
+        val open = Attempt("book-a", pageNumber = 93, attemptNo = 4, locked = false)
+
+        assertTrue(isExactLanTeacherReviewAttempt(listOf(open), "book-a", 93, 4))
+        assertTrue(isExactLanTeacherReviewAttempt(listOf(open.copy(locked = true)), "book-a", 93, 4))
+        assertFalse(isExactLanTeacherReviewAttempt(listOf(open), "book-a", 93, 3))
+        assertFalse(isExactLanTeacherReviewAttempt(listOf(open), "book-a", 92, 4))
+        assertFalse(isExactLanTeacherReviewAttempt(listOf(open), "book-b", 93, 4))
+    }
 
     @Test
     fun mutualAuthProofBindsBothPeersRolesBooksDigestAndNonces() {
@@ -260,6 +272,25 @@ class LanSyncBusTest {
             )
             LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.IDLE)
             assertNull(LanSyncBus.activeSessionSnapshot())
+        } finally {
+            LanSyncBus.clearConnectionState(bookId)
+        }
+    }
+
+    @Test
+    fun serviceSessionRoleIsStickyUntilThatSessionIsCleared() {
+        val bookId = "role-book-${UUID.randomUUID()}"
+        try {
+            assertNull(LanSyncBus.sessionRole(bookId))
+
+            LanSyncBus.sessionRoleChanged(bookId, LanPeerRole.STUDENT_SERVER)
+            assertEquals(LanPeerRole.STUDENT_SERVER, LanSyncBus.sessionRole(bookId))
+
+            LanSyncBus.sessionRoleChanged(bookId, LanPeerRole.TEACHER_CLIENT)
+            assertEquals(LanPeerRole.TEACHER_CLIENT, LanSyncBus.sessionRole(bookId))
+
+            LanSyncBus.clearConnectionState(bookId)
+            assertNull(LanSyncBus.sessionRole(bookId))
         } finally {
             LanSyncBus.clearConnectionState(bookId)
         }
