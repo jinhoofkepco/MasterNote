@@ -1,6 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
         <activity
+            android:name="com.studyink.reader.AnswerPdfActivity"
+            android:configChanges="keyboardHidden|orientation|screenSize"
+            android:exported="false"
+            android:screenOrientation="fullSensor" />
+        <activity
             android:name="com.studyink.reader.GptAssistantActivity"
             android:configChanges="keyboardHidden|orientation|screenSize"
             android:exported="false"

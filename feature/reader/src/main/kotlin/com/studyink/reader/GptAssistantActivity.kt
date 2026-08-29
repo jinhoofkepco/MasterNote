@@ -48,6 +48,8 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
     private lateinit var saveButton: Button
     private lateinit var manualButton: Button
     private lateinit var copyButton: Button
+    private lateinit var workspaceToggleButton: Button
+    private lateinit var queryActions: LinearLayout
     private lateinit var answerEditActions: LinearLayout
     private lateinit var penDeleteButton: Button
     private lateinit var undoDeleteButton: Button
@@ -55,6 +57,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
     private lateinit var request: GptAssistantRequest
     private var queryRunning = false
     private var latestResult: ChatGptResult? = null
+    private var showingGptWorkspace = true
     private var penDeleteMode = false
     private var penDeleteAnchor = -1
     private var penDeleteCurrent = -1
@@ -94,6 +97,16 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
             maxLines = 2
         }
         header.addView(status, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        workspaceToggleButton = Button(this).apply {
+            text = "GPT 보기"
+            isAllCaps = false
+            visibility = View.GONE
+            setOnClickListener { toggleWorkspace() }
+        }
+        header.addView(
+            workspaceToggleButton,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)),
+        )
         header.addView(Button(this).apply {
             text = "닫기"
             isAllCaps = false
@@ -108,10 +121,10 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
 
         answerEditor = EditText(this).apply {
             hint = "받은 답변을 확인하거나 직접 붙여넣으세요"
-            minLines = 3
-            maxLines = 7
+            maxLines = Int.MAX_VALUE
             gravity = Gravity.TOP or Gravity.START
             visibility = View.GONE
+            isVerticalScrollBarEnabled = true
             setBackgroundColor(Color.rgb(255, 253, 247))
             setPadding(dp(10), dp(7), dp(10), dp(7))
             filters = arrayOf(InputFilter.LengthFilter(MAX_ANSWER_CHARS))
@@ -119,7 +132,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         }
         root.addView(
             answerEditor,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
         )
 
         answerEditActions = LinearLayout(this).apply {
@@ -133,7 +146,8 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         undoDeleteButton = actionButton("마지막 삭제 되돌리기") { undoLastPenDeletion() }.apply {
             isEnabled = false
         }
-        listOf(penDeleteButton, undoDeleteButton).forEach { button ->
+        saveButton = actionButton("페이지에 저장") { saveAnswer() }.apply { isEnabled = false }
+        listOf(penDeleteButton, undoDeleteButton, saveButton).forEach { button ->
             answerEditActions.addView(button, LinearLayout.LayoutParams(0, dp(42), 1f).apply {
                 marginStart = dp(2)
                 marginEnd = dp(2)
@@ -144,7 +158,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
         )
 
-        val actions = LinearLayout(this).apply {
+        queryActions = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             setPadding(dp(6), dp(5), dp(6), dp(7))
@@ -153,14 +167,16 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         sendButton = actionButton("질문 보내기") { beginQuery() }
         copyButton = actionButton("질문 복사") { copyPrompt() }
         manualButton = actionButton("답변 붙여넣기") { showManualAnswerDialog() }
-        saveButton = actionButton("페이지에 저장") { saveAnswer() }.apply { isEnabled = false }
-        listOf(sendButton, copyButton, manualButton, saveButton).forEach { button ->
-            actions.addView(button, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+        listOf(sendButton, copyButton, manualButton).forEach { button ->
+            queryActions.addView(button, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
                 marginStart = dp(2)
                 marginEnd = dp(2)
             })
         }
-        root.addView(actions, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(
+            queryActions,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
         return FrameLayout(this).apply {
             addView(root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             ViewCompat.setOnApplyWindowInsetsListener(this) { view, insets ->
@@ -213,7 +229,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         answerEditor.setText(result.text)
         answerEditor.setSelection(answerEditor.text.length)
         saveButton.isEnabled = result.text.isNotBlank()
-        status.text = "답변을 받았습니다. 확인 후 페이지에 저장하세요."
+        showEditorWorkspace("답변을 받았습니다. 확인 후 페이지에 저장하세요.")
     }
 
     private fun showPartialAnswer(text: String) {
@@ -224,7 +240,35 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         answerEditor.setText(text.take(MAX_ANSWER_CHARS))
         answerEditor.setSelection(answerEditor.text.length)
         saveButton.isEnabled = answerEditor.text.isNotBlank()
-        status.text = "응답 완료는 확인하지 못했습니다. 보이는 답변을 검토한 뒤 저장할 수 있어요."
+        showEditorWorkspace("응답 완료는 확인하지 못했습니다. 보이는 답변을 검토한 뒤 저장할 수 있어요.")
+    }
+
+    private fun toggleWorkspace() {
+        if (showingGptWorkspace) showEditorWorkspace() else showGptWorkspace()
+    }
+
+    private fun showEditorWorkspace(message: String = "답변 편집 중 · 필요하면 GPT 보기를 누르세요.") {
+        showingGptWorkspace = false
+        setPenDeleteMode(false)
+        controller.hide()
+        answerEditor.visibility = View.VISIBLE
+        answerEditActions.visibility = View.VISIBLE
+        queryActions.visibility = View.GONE
+        workspaceToggleButton.visibility = View.VISIBLE
+        workspaceToggleButton.text = "GPT 보기"
+        status.text = message
+    }
+
+    private fun showGptWorkspace() {
+        showingGptWorkspace = true
+        setPenDeleteMode(false)
+        answerEditor.visibility = View.GONE
+        answerEditActions.visibility = View.GONE
+        queryActions.visibility = View.VISIBLE
+        workspaceToggleButton.visibility = View.VISIBLE
+        workspaceToggleButton.text = "편집 보기"
+        controller.open()
+        status.text = "GPT 원본 화면 · 편집 보기로 돌아갈 수 있어요."
     }
 
     private fun setPenDeleteMode(enabled: Boolean) {
@@ -434,6 +478,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
             answerEditor.setText(restoredAnswer.take(MAX_ANSWER_CHARS))
             answerEditor.setSelection(answerEditor.text.length)
             saveButton.isEnabled = answerEditor.text.isNotBlank()
+            showEditorWorkspace()
         }
         state.getString(STATE_STATUS_TEXT)?.takeIf(String::isNotBlank)?.let { savedStatus ->
             status.text = if (state.getBoolean(STATE_QUERY_WAS_RUNNING, false)) {

@@ -153,6 +153,59 @@ class BackupArchiveTest {
     }
 
     @Test
+    fun roundTrip_includesAttachedAnswerPdf() {
+        val archiveRoot = validArchiveRoot()
+        val documentBytes = "problem-pdf".toByteArray()
+        val answerBytes = "answer-pdf".toByteArray()
+        File(archiveRoot, "data/books/book-1/document.pdf").apply {
+            parentFile!!.mkdirs()
+            writeBytes(documentBytes)
+        }
+        File(archiveRoot, "data/books/book-1/answer-test.pdf").writeBytes(answerBytes)
+        File(archiveRoot, CATALOG_PATH).writeText(
+            catalogWithBook(
+                pdfPath = "book-1/document.pdf",
+                pdfHash = BackupArchive.sha256(documentBytes),
+                answerPdfPath = "book-1/answer-test.pdf",
+            ),
+        )
+        BackupArchive.writeManifest(archiveRoot, 1L, "package", "version", 1L, 0L)
+        val zipBytes = ByteArrayOutputStream().also { BackupArchive.writeZip(archiveRoot, it) }.toByteArray()
+        val extraction = temporaryFolder.newFolder("answer-extracted")
+
+        BackupArchive.validate(ByteArrayInputStream(zipBytes), extraction)
+
+        assertArrayEquals(
+            answerBytes,
+            File(extraction, "data/books/book-1/answer-test.pdf").readBytes(),
+        )
+    }
+
+    @Test
+    fun catalogAnswerPdfReference_mustExistInProtectedFileList() {
+        val archiveRoot = validArchiveRoot()
+        val pdfBytes = "problem-pdf".toByteArray()
+        File(archiveRoot, "data/books/book-1/document.pdf").apply {
+            parentFile!!.mkdirs()
+            writeBytes(pdfBytes)
+        }
+        File(archiveRoot, CATALOG_PATH).writeText(
+            catalogWithBook(
+                pdfPath = "book-1/document.pdf",
+                pdfHash = BackupArchive.sha256(pdfBytes),
+                answerPdfPath = "book-1/answer-missing.pdf",
+            ),
+        )
+        BackupArchive.writeManifest(archiveRoot, 1L, "package", "version", 1L, 0L)
+        val zipBytes = ByteArrayOutputStream().also { BackupArchive.writeZip(archiveRoot, it) }.toByteArray()
+
+        val error = runCatching { BackupArchive.validate(ByteArrayInputStream(zipBytes)) }.exceptionOrNull()
+
+        assertTrue(error is BackupValidationException)
+        assertTrue(error!!.message!!.contains("답안 PDF"))
+    }
+
+    @Test
     fun legacyCatalogWithoutPdfHash_isUpgradedInSnapshotBeforeManifest() {
         val archiveRoot = validArchiveRoot()
         val relativePath = "book-1/document.pdf"
@@ -203,10 +256,12 @@ class BackupArchiveTest {
         pdfPath: String,
         pdfHash: String,
         answerPath: String? = null,
+        answerPdfPath: String? = null,
         omitHash: Boolean = false,
     ): String {
         val answerValue = answerPath?.let { "\"$it\"" } ?: "null"
+        val answerPdfValue = answerPdfPath?.let { "\"$it\"" } ?: "null"
         val hashField = if (omitHash) "" else "\"contentSha256\":\"$pdfHash\","
-        return """{"formatVersion":2,"selectedStudentId":"student-1","students":[],"books":[{"id":"book-1","studentId":"student-1","title":"Book","pageCount":1,"pdfPath":"$pdfPath",$hashField"answerPath":$answerValue,"createdAt":1,"hiddenAt":null}],"attempts":[],"markGroups":[]}"""
+        return """{"formatVersion":2,"selectedStudentId":"student-1","students":[],"books":[{"id":"book-1","studentId":"student-1","title":"Book","pageCount":1,"pdfPath":"$pdfPath",$hashField"answerPath":$answerValue,"answerPdfPath":$answerPdfValue,"answerPdfPageCount":${if (answerPdfPath == null) 0 else 1},"answerPageMappings":[],"lastViewedAnswerPage":0,"createdAt":1,"hiddenAt":null}],"attempts":[],"markGroups":[]}"""
     }
 }

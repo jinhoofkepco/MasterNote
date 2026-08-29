@@ -27,6 +27,14 @@ data class Book(
     val answerSourceRelativePath: String? = null,
     val createdAtEpochMillis: Long = System.currentTimeMillis(),
     val hiddenAtEpochMillis: Long? = null,
+    /** App-private companion answer PDF path. Null means that no answer PDF is attached. */
+    val answerPdfRelativePath: String? = null,
+    /** Page count probed from [answerPdfRelativePath]; zero when no answer PDF is attached. */
+    val answerPdfPageCount: Int = 0,
+    /** Zero-based problem PDF page -> zero-based answer PDF page. */
+    val answerPageMappings: Map<Int, Int> = emptyMap(),
+    /** Zero-based page restored when the answer PDF is opened again. */
+    val lastViewedAnswerPage: Int = 0,
 )
 
 data class AnswerSource(

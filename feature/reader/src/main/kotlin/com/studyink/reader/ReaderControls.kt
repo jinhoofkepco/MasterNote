@@ -719,6 +719,7 @@ fun ReaderTopChrome(
     onResumeStudentFollow: () -> Unit = {},
     onOpenRemoteMonitor: () -> Unit = {},
     onOpenGptAssistant: () -> Unit = {},
+    onOpenAnswerPdf: () -> Unit = {},
     previewHoveredDescription: String? = null,
     /**
      * Optional compact, one-line page/attempt history. The caller owns its data and gestures so
@@ -741,6 +742,7 @@ fun ReaderTopChrome(
             onShowStudentActivity = onShowStudentActivity,
             onResumeStudentFollow = onResumeStudentFollow,
             onOpenGptAssistant = onOpenGptAssistant,
+            onOpenAnswerPdf = onOpenAnswerPdf,
             transportCellModel = s23TransportCellModelForHybrid(
                 decision = state.hybridLink,
                 legacyLanConnection = state.liveConnection,
@@ -924,6 +926,21 @@ fun ReaderTopChrome(
                                 ) {
                                     Text(
                                         text = "GPT",
+                                        color = tokens.paletteBlue,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Black,
+                                    )
+                                }
+                                IconPenButton(
+                                    description = "답안 PDF 열기",
+                                    iconRes = null,
+                                    onAction = onOpenAnswerPdf,
+                                    role = state.role,
+                                    enabled = state.documentReady,
+                                    visualSize = tokens.generalButtonSize,
+                                ) {
+                                    Text(
+                                        text = "답",
                                         color = tokens.paletteBlue,
                                         style = MaterialTheme.typography.labelSmall,
                                         fontWeight = FontWeight.Black,

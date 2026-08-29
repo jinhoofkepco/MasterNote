@@ -91,6 +91,14 @@ internal object BackupArchive {
             if (pdfPath != "$id/document.pdf") invalid("교재 PDF 경로가 교재 ID와 일치하지 않습니다: $pdfPath")
             val pdfFile = safeDestination(File(dataRoot, "books").canonicalFile, pdfPath)
             if (!pdfFile.isFile) invalid("교재 PDF가 없습니다: $pdfPath")
+            if (!book.isNull("answerPdfPath")) {
+                val answerPdfPath = requireValidAnswerPdfPath(
+                    id,
+                    requireValidCatalogRelativePath(book.getString("answerPdfPath")),
+                )
+                val answerPdfFile = safeDestination(File(dataRoot, "books").canonicalFile, answerPdfPath)
+                if (!answerPdfFile.isFile) invalid("답안 PDF가 없습니다: $answerPdfPath")
+            }
             if (book.optString("contentSha256").isBlank()) {
                 book.put("contentSha256", sha256(pdfFile))
                 changed = true
@@ -300,6 +308,15 @@ internal object BackupArchive {
                         invalid("정답 파일이 백업에 없습니다: $answerPath")
                     }
                 }
+                if (!book.isNull("answerPdfPath")) {
+                    val answerPdfPath = requireValidAnswerPdfPath(
+                        id,
+                        requireValidCatalogRelativePath(book.getString("answerPdfPath")),
+                    )
+                    if (archiveFiles["data/books/$answerPdfPath"] == null) {
+                        invalid("답안 PDF가 백업에 없습니다: $answerPdfPath")
+                    }
+                }
             }
             catalog.getJSONArray("attempts")
             catalog.getJSONArray("markGroups")
@@ -410,6 +427,17 @@ internal object BackupArchive {
             invalid("안전하지 않은 교재 ID입니다: $id")
         }
         return id
+    }
+
+    private fun requireValidAnswerPdfPath(bookId: String, path: String): String {
+        val prefix = "$bookId/answer-"
+        if (!path.startsWith(prefix) || !path.endsWith(".pdf") || path.length <= prefix.length + 4) {
+            invalid("답안 PDF 경로가 교재 ID와 일치하지 않습니다: $path")
+        }
+        if ('/' in path.removePrefix("$bookId/")) {
+            invalid("답안 PDF 경로가 교재 폴더를 벗어납니다: $path")
+        }
+        return path
     }
 
     private fun safeDestination(root: File, path: String): File {

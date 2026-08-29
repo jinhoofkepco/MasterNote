@@ -776,6 +776,25 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         }
     }
 
+    private fun openAnswerPdf() {
+        val state = latestState
+        if (state.role == ReaderRole.STUDENT || !state.documentReady || state.bookId.isBlank()) {
+            Toast.makeText(this, "선생님 문제집 화면에서 사용할 수 있어요.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val repository = LibraryRepository.get(this)
+        val book = runCatching { repository.book(state.bookId) }.getOrNull()
+        if (book == null || runCatching { repository.answerPdfFile(book) }.isFailure) {
+            Toast.makeText(
+                this,
+                "교재 화면에서 답안 PDF를 먼저 연결하세요.",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        startActivity(AnswerPdfActivity.intent(this, state.bookId, state.pageNumber))
+    }
+
     private fun beginGptRegionSelection(choice: TeacherPromptChoice) {
         if (choice.target.page.bookId != latestState.bookId ||
             choice.target.page.pageNumber != latestState.pageNumber
@@ -1107,6 +1126,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 onResumeStudentFollow = viewModel::resumeStudentFollow,
                 onOpenRemoteMonitor =(::openRemoteMonitorSetup),
                 onOpenGptAssistant =(::openTeacherGptResources),
+                onOpenAnswerPdf =(::openAnswerPdf),
             )
             if (studentActivityVisible && latestState.capabilities.showsStudentLocation) {
                 StudentActivityDialog(

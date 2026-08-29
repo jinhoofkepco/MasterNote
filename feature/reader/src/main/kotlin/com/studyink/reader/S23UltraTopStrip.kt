@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.getValue
@@ -279,6 +280,7 @@ internal fun S23UltraTopStrip(
     onShowStudentActivity: () -> Unit,
     onResumeStudentFollow: () -> Unit,
     onOpenGptAssistant: () -> Unit = {},
+    onOpenAnswerPdf: () -> Unit = {},
     transportCellModel: S23TransportCellModel =
         s23TransportCellModelForLan(state.liveConnection),
     onTransportClick: (S23TransportMode) -> Unit = { mode ->
@@ -288,6 +290,7 @@ internal fun S23UltraTopStrip(
     markHistoryContent: (@Composable () -> Unit)? = null,
 ) {
     MaterialTheme {
+        var referenceMenuVisible by remember(state.bookId) { mutableStateOf(false) }
         val tokens = readerChromeTokens(state.role)
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             // At the S23 Ultra's normal 412dp portrait width this is exactly 10 x 40dp, leaving
@@ -358,17 +361,18 @@ internal fun S23UltraTopStrip(
                             previewHoveredDescription?.startsWith("학생 현재 페이지") == true,
                     )
                     S23StripButton(
-                        description = "GPT 페이지 설명",
-                        onAction = onOpenGptAssistant,
+                        description = "GPT 또는 답안 열기",
+                        onAction = { referenceMenuVisible = true },
                         enabled = state.role != ReaderRole.STUDENT && state.documentReady,
                         role = state.role,
                         cellWidth = cellWidth,
-                        forceHovered = previewHoveredDescription == "GPT 페이지 설명",
+                        forceHovered = previewHoveredDescription == "GPT 페이지 설명" ||
+                            previewHoveredDescription == "답안 PDF 열기",
                     ) {
                         Text(
-                            text = "GPT",
+                            text = "GPT·답",
                             color = tokens.paletteBlue,
-                            fontSize = 11.sp,
+                            fontSize = 9.sp,
                             fontWeight = FontWeight.Black,
                         )
                     }
@@ -410,6 +414,26 @@ internal fun S23UltraTopStrip(
                     )
                 }
             }
+        }
+
+        if (referenceMenuVisible) {
+            AlertDialog(
+                onDismissRequest = { referenceMenuVisible = false },
+                title = { Text("자료 열기") },
+                text = { Text("현재 문제 페이지에서 볼 자료를 선택하세요.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        referenceMenuVisible = false
+                        onOpenAnswerPdf()
+                    }) { Text("답안") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        referenceMenuVisible = false
+                        onOpenGptAssistant()
+                    }) { Text("GPT") }
+                },
+            )
         }
 
         state.dataError?.let { message ->

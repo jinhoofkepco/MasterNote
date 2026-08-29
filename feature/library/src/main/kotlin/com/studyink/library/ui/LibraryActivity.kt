@@ -133,6 +133,7 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
     private var errorMessage by mutableStateOf<String?>(null)
     private var renameTarget by mutableStateOf<Book?>(null)
     private var answerTargetBookId: String? = null
+    private var answerPdfTargetBookId: String? = null
     private var pendingSyncStart: (() -> Unit)? = null
     private var pairingUri by mutableStateOf<String?>(null)
     private var qrTargetBookId: String? = null
@@ -204,6 +205,26 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                 .onFailure { error -> withContext(Dispatchers.Main) {
                     errorMessage = error.message ?: "정답 JSON을 가져오지 못했습니다."
                 } }
+        }
+    }
+
+    private val importAnswerPdf = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        val bookId = answerPdfTargetBookId.also { answerPdfTargetBookId = null }
+            ?: return@registerForActivityResult
+        if (uri == null) return@registerForActivityResult
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching { repository.importAnswerPdf(bookId, uri) }
+                .onSuccess { book ->
+                    withContext(Dispatchers.Main) {
+                        state = repository.state
+                        selectedBook = book
+                    }
+                }
+                .onFailure { error ->
+                    withContext(Dispatchers.Main) {
+                        errorMessage = error.message ?: "답안 PDF를 가져오지 못했습니다."
+                    }
+                }
         }
     }
 
@@ -317,6 +338,10 @@ class LibraryActivity : ComponentActivity(), LanSyncBus.Listener {
                         onImportAnswers = { book ->
                             answerTargetBookId = book.id
                             importAnswers.launch(arrayOf("application/json", "text/json", "text/plain"))
+                        },
+                        onImportAnswerPdf = { book ->
+                            answerPdfTargetBookId = book.id
+                            importAnswerPdf.launch(arrayOf("application/pdf"))
                         },
                         onStartStudentSync = { book ->
                             val running = LanSyncBus.pairingUri(book.id)
@@ -735,6 +760,7 @@ private fun LibraryScreen(
     onOpenPage: (Book, Int, LibraryPerspective, Boolean, Int?) -> Unit,
     onRename: (Book) -> Unit,
     onImportAnswers: (Book) -> Unit,
+    onImportAnswerPdf: (Book) -> Unit,
     onStartStudentSync: (Book) -> Unit,
     onStartTeacherSync: (Book) -> Unit,
     onScanTeacherQr: (Book) -> Unit,
@@ -805,6 +831,7 @@ private fun LibraryScreen(
                             onOpenPage = onOpenPage,
                             onRename = onRename,
                             onImportAnswers = onImportAnswers,
+                            onImportAnswerPdf = onImportAnswerPdf,
                             onStartStudentSync = onStartStudentSync,
                             onStartTeacherSync = onStartTeacherSync,
                             onScanTeacherQr = onScanTeacherQr,
@@ -837,6 +864,7 @@ private fun LibraryScreen(
                         onOpenPage = onOpenPage,
                         onRename = onRename,
                         onImportAnswers = onImportAnswers,
+                        onImportAnswerPdf = onImportAnswerPdf,
                         onStartStudentSync = onStartStudentSync,
                         onStartTeacherSync = onStartTeacherSync,
                         onScanTeacherQr = onScanTeacherQr,
@@ -982,6 +1010,7 @@ private fun LibraryMainContent(
     onOpenPage: (Book, Int, LibraryPerspective, Boolean, Int?) -> Unit,
     onRename: (Book) -> Unit,
     onImportAnswers: (Book) -> Unit,
+    onImportAnswerPdf: (Book) -> Unit,
     onStartStudentSync: (Book) -> Unit,
     onStartTeacherSync: (Book) -> Unit,
     onScanTeacherQr: (Book) -> Unit,
@@ -1015,6 +1044,7 @@ private fun LibraryMainContent(
             onBackToBooks = onBackToBooks,
             onOpenPage = onOpenPage,
             onImportAnswers = onImportAnswers,
+            onImportAnswerPdf = onImportAnswerPdf,
             onStartStudentSync = onStartStudentSync,
             onStartTeacherSync = onStartTeacherSync,
             onScanTeacherQr = onScanTeacherQr,
@@ -1225,6 +1255,7 @@ private fun BookPageContent(
     onBackToBooks: () -> Unit,
     onOpenPage: (Book, Int, LibraryPerspective, Boolean, Int?) -> Unit,
     onImportAnswers: (Book) -> Unit,
+    onImportAnswerPdf: (Book) -> Unit,
     onStartStudentSync: (Book) -> Unit,
     onStartTeacherSync: (Book) -> Unit,
     onScanTeacherQr: (Book) -> Unit,
@@ -1269,6 +1300,11 @@ private fun BookPageContent(
             if (perspective == LibraryPerspective.STUDENT) {
                 item { OutlinedButton(onClick = { onStartStudentSync(book) }) { Text("학생 기기") } }
             } else {
+                item {
+                    OutlinedButton(onClick = { onImportAnswerPdf(book) }) {
+                        Text(if (book.answerPdfRelativePath == null) "답안 PDF 연결" else "답안 PDF 교체")
+                    }
+                }
                 item { OutlinedButton(onClick = { onImportAnswers(book) }) { Text("정답 JSON") } }
                 item { OutlinedButton(onClick = { onStartTeacherSync(book) }) { Text("실시간 보기") } }
                 item { OutlinedButton(onClick = { onScanTeacherQr(book) }) { Text("QR 연결") } }
@@ -2189,6 +2225,7 @@ private fun LibraryDevicePreview(
             onOpenPage = { _, _, _, _, _ -> },
             onRename = {},
             onImportAnswers = {},
+            onImportAnswerPdf = {},
             onStartStudentSync = {},
             onStartTeacherSync = {},
             onScanTeacherQr = {},

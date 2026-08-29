@@ -126,6 +126,70 @@ class LibraryRepository private constructor(private val context: Context) {
         }
     }
 
+    /**
+     * Copies and validates a companion answer PDF before switching this book to the new file.
+     *
+     * Each successful import gets a new owned filename. The previous PDF therefore remains
+     * reachable until the atomic catalog write commits, and any failed import can leave the old
+     * file and metadata untouched.
+     */
+    @Synchronized
+    fun importAnswerPdf(bookId: String, source: Uri): Book {
+        val book = book(bookId)
+        val directory = File(booksDirectory, book.id).also {
+            check(it.isDirectory) { "교재 데이터 폴더가 없습니다." }
+        }
+        val fileName = "$ANSWER_PDF_PREFIX${UUID.randomUUID()}$ANSWER_PDF_SUFFIX"
+        val staging = File(directory, "$fileName.staging")
+        val destination = File(directory, fileName)
+        try {
+            context.contentResolver.openInputStream(source).use { input ->
+                requireNotNull(input) { "선택한 답안 PDF를 읽을 수 없습니다." }
+                FileOutputStream(staging).use { output ->
+                    input.copyTo(output)
+                    output.flush()
+                    output.fd.sync()
+                }
+            }
+            val answerPageCount = probePageCount(staging)
+            require(answerPageCount > 0) { "페이지가 없는 답안 PDF입니다." }
+            check(staging.renameTo(destination)) { "답안 PDF 사본을 확정하지 못했습니다." }
+
+            val previousCatalog = catalog
+            val updated = book.copy(
+                answerPdfRelativePath = "${book.id}/$fileName",
+                answerPdfPageCount = answerPageCount,
+                answerPageMappings = emptyMap(),
+                lastViewedAnswerPage = 0,
+            )
+            try {
+                catalog = previousCatalog.copy(books = previousCatalog.books.map {
+                    if (it.id == bookId) updated else it
+                })
+                persist()
+            } catch (error: Throwable) {
+                catalog = previousCatalog
+                if (destination.exists() && !destination.delete()) {
+                    error.addSuppressed(IllegalStateException("확정하지 못한 답안 PDF를 정리하지 못했습니다."))
+                }
+                throw error
+            }
+
+            // The durable catalog now points only at the new immutable file. Failure to remove an
+            // orphan is harmless and must not roll back a successfully committed import.
+            book.answerPdfRelativePath?.let { previousPath ->
+                runCatching { ownedAnswerPdfFile(book.id, previousPath) }
+                    .getOrNull()
+                    ?.takeIf { it != destination }
+                    ?.delete()
+            }
+            return updated
+        } catch (error: Throwable) {
+            staging.delete()
+            throw error
+        }
+    }
+
     @Synchronized
     fun renameBook(bookId: String, title: String) {
         val normalized = title.trim()
@@ -194,6 +258,42 @@ class LibraryRepository private constructor(private val context: Context) {
         }
     }
 
+    fun answerPdfFile(book: Book): File {
+        require(book.answerPdfPageCount > 0) { "연결된 답안 PDF가 없습니다." }
+        val relativePath = requireNotNull(book.answerPdfRelativePath) { "연결된 답안 PDF가 없습니다." }
+        return ownedAnswerPdfFile(book.id, relativePath).also {
+            require(it.isFile) { "답안 PDF 사본이 없습니다." }
+        }
+    }
+
+    @Synchronized
+    fun answerPageForProblem(bookId: String, problemPage: Int): Int? {
+        val book = book(bookId)
+        require(problemPage in 0 until book.pageCount) { "문제 페이지가 교재 범위를 벗어납니다." }
+        return book.answerPageMappings[problemPage]
+    }
+
+    @Synchronized
+    fun saveAnswerPageMapping(bookId: String, problemPage: Int, answerPage: Int) {
+        val current = book(bookId)
+        val updated = current.withAnswerPageMapping(problemPage, answerPage)
+        if (updated == current) return
+        catalog = catalog.copy(books = catalog.books.map { if (it.id == bookId) updated else it })
+        persist()
+    }
+
+    @Synchronized
+    fun lastViewedAnswerPage(bookId: String): Int = book(bookId).lastViewedAnswerPage
+
+    @Synchronized
+    fun saveLastViewedAnswerPage(bookId: String, answerPage: Int) {
+        val current = book(bookId)
+        val updated = current.withLastViewedAnswerPage(answerPage)
+        if (updated == current) return
+        catalog = catalog.copy(books = catalog.books.map { if (it.id == bookId) updated else it })
+        persist()
+    }
+
     @Synchronized
     fun hideBook(bookId: String) {
         val now = System.currentTimeMillis()
@@ -222,6 +322,17 @@ class LibraryRepository private constructor(private val context: Context) {
 
     fun pdfFile(book: Book): File = File(booksDirectory, book.pdfRelativePath).also {
         require(it.isFile) { "교재 PDF 사본이 없습니다." }
+    }
+
+    private fun ownedAnswerPdfFile(bookId: String, relativePath: String): File {
+        val directory = File(booksDirectory, bookId).canonicalFile
+        val candidate = File(booksDirectory, relativePath).canonicalFile
+        require(
+            candidate.parentFile == directory &&
+                candidate.name.startsWith(ANSWER_PDF_PREFIX) &&
+                candidate.name.endsWith(ANSWER_PDF_SUFFIX)
+        ) { "답안 PDF 경로가 교재 폴더와 일치하지 않습니다." }
+        return candidate
     }
 
     @Synchronized
@@ -660,6 +771,8 @@ class LibraryRepository private constructor(private val context: Context) {
     companion object {
         private const val CATALOG_FORMAT = 2
         private const val PDF_FILE = "document.pdf"
+        private const val ANSWER_PDF_PREFIX = "answer-"
+        private const val ANSWER_PDF_SUFFIX = ".pdf"
         private const val ANSWERS_FILE = "answers.json"
         private const val MAX_ANSWER_JSON_BYTES = 5L * 1024L * 1024L
 
@@ -684,6 +797,19 @@ class LibraryRepository private constructor(private val context: Context) {
             }
         }
     }
+}
+
+internal fun Book.withAnswerPageMapping(problemPage: Int, answerPage: Int): Book {
+    require(problemPage in 0 until pageCount) { "문제 페이지가 교재 범위를 벗어납니다." }
+    require(answerPdfRelativePath != null && answerPdfPageCount > 0) { "연결된 답안 PDF가 없습니다." }
+    require(answerPage in 0 until answerPdfPageCount) { "답안 페이지가 답안 PDF 범위를 벗어납니다." }
+    return copy(answerPageMappings = (answerPageMappings + (problemPage to answerPage)).toSortedMap())
+}
+
+internal fun Book.withLastViewedAnswerPage(answerPage: Int): Book {
+    require(answerPdfRelativePath != null && answerPdfPageCount > 0) { "연결된 답안 PDF가 없습니다." }
+    require(answerPage in 0 until answerPdfPageCount) { "답안 페이지가 답안 PDF 범위를 벗어납니다." }
+    return copy(lastViewedAnswerPage = answerPage)
 }
 
 internal fun isValidMarkAttemptTarget(
@@ -1021,17 +1147,25 @@ private fun MarkGroup.syncStateKey(): String = buildString {
 private fun encodeCatalog(catalog: LibraryCatalog): JSONObject {
     return JSONObject().put("formatVersion", 2).put("selectedStudentId", catalog.selectedStudentId)
         .put("students", JSONArray().apply { catalog.students.forEach { put(it.toJson()) } })
-        .put("books", JSONArray().apply { catalog.books.forEach { put(it.toJson()) } })
+        .put("books", JSONArray().apply { catalog.books.forEach { put(it.toCatalogJson()) } })
         .put("attempts", JSONArray().apply { catalog.attempts.forEach { put(it.toJson()) } })
         .put("markGroups", JSONArray().apply { catalog.markGroups.forEach { put(it.toCatalogJson()) } })
 }
 
 private fun Student.toJson() = JSONObject().put("id", id).put("displayName", displayName)
     .put("createdAt", createdAtEpochMillis).put("hiddenAt", hiddenAtEpochMillis ?: JSONObject.NULL)
-private fun Book.toJson() = JSONObject().put("id", id).put("studentId", studentId).put("title", title)
+internal fun Book.toCatalogJson() = JSONObject().put("id", id).put("studentId", studentId).put("title", title)
     .put("pageCount", pageCount).put("pdfPath", pdfRelativePath)
     .put("contentSha256", contentSha256)
     .put("answerPath", answerSourceRelativePath ?: JSONObject.NULL)
+    .put("answerPdfPath", answerPdfRelativePath ?: JSONObject.NULL)
+    .put("answerPdfPageCount", answerPdfPageCount)
+    .put("answerPageMappings", JSONArray().apply {
+        answerPageMappings.toSortedMap().forEach { (problemPage, answerPage) ->
+            put(JSONObject().put("problemPage", problemPage).put("answerPage", answerPage))
+        }
+    })
+    .put("lastViewedAnswerPage", lastViewedAnswerPage)
     .put("createdAt", createdAtEpochMillis).put("hiddenAt", hiddenAtEpochMillis ?: JSONObject.NULL)
 private fun Attempt.toJson() = JSONObject().put("bookId", bookId).put("page", pageNumber)
     .put("attemptNo", attemptNo).put("locked", locked).put("startedAt", startedAtEpochMillis)
@@ -1053,13 +1187,7 @@ private fun decodeCatalog(root: JSONObject): LibraryCatalog {
         id = getString("id"), displayName = getString("displayName"), createdAtEpochMillis = getLong("createdAt"),
         hiddenAtEpochMillis = nullableLong("hiddenAt"),
     ) }
-    val books = root.getJSONArray("books").objects { Book(
-        id = getString("id"), studentId = getString("studentId"), title = getString("title"),
-        pageCount = getInt("pageCount"), pdfRelativePath = getString("pdfPath"),
-        contentSha256 = optString("contentSha256"),
-        answerSourceRelativePath = nullableString("answerPath"), createdAtEpochMillis = getLong("createdAt"),
-        hiddenAtEpochMillis = nullableLong("hiddenAt"),
-    ) }
+    val books = root.getJSONArray("books").objects(JSONObject::toCatalogBook)
     val attempts = root.getJSONArray("attempts").objects { Attempt(
         bookId = getString("bookId"), pageNumber = getInt("page"), attemptNo = getInt("attemptNo"),
         locked = getBoolean("locked"), startedAtEpochMillis = getLong("startedAt"),
@@ -1067,6 +1195,47 @@ private fun decodeCatalog(root: JSONObject): LibraryCatalog {
     ) }
     val groups = root.getJSONArray("markGroups").objects(JSONObject::toCatalogMarkGroup)
     return LibraryCatalog(students, root.getString("selectedStudentId"), books, attempts, groups)
+}
+
+internal fun JSONObject.toCatalogBook(): Book {
+    val bookPageCount = getInt("pageCount")
+    val answerPdfPath = nullableString("answerPdfPath")
+    val answerPdfPageCount = optInt("answerPdfPageCount", 0)
+    val lastViewedAnswerPage = optInt("lastViewedAnswerPage", 0)
+    val mappings = linkedMapOf<Int, Int>()
+    val encodedMappings = optJSONArray("answerPageMappings") ?: JSONArray()
+    for (index in 0 until encodedMappings.length()) {
+        val row = encodedMappings.getJSONObject(index)
+        val problemPage = row.getInt("problemPage")
+        val answerPage = row.getInt("answerPage")
+        require(mappings.put(problemPage, answerPage) == null) { "답안 페이지 연결이 중복됩니다." }
+    }
+    if (answerPdfPath == null) {
+        require(answerPdfPageCount == 0 && mappings.isEmpty() && lastViewedAnswerPage == 0) {
+            "답안 PDF가 없는데 답안 페이지 정보가 남아 있습니다."
+        }
+    } else {
+        require(answerPdfPath.isNotBlank() && answerPdfPageCount > 0) { "답안 PDF 정보가 올바르지 않습니다." }
+        require(mappings.all { (problemPage, answerPage) ->
+            problemPage in 0 until bookPageCount && answerPage in 0 until answerPdfPageCount
+        }) { "답안 페이지 연결이 PDF 범위를 벗어납니다." }
+        require(lastViewedAnswerPage in 0 until answerPdfPageCount) { "마지막 답안 페이지가 PDF 범위를 벗어납니다." }
+    }
+    return Book(
+        id = getString("id"),
+        studentId = getString("studentId"),
+        title = getString("title"),
+        pageCount = bookPageCount,
+        pdfRelativePath = getString("pdfPath"),
+        contentSha256 = optString("contentSha256"),
+        answerSourceRelativePath = nullableString("answerPath"),
+        createdAtEpochMillis = getLong("createdAt"),
+        hiddenAtEpochMillis = nullableLong("hiddenAt"),
+        answerPdfRelativePath = answerPdfPath,
+        answerPdfPageCount = answerPdfPageCount,
+        answerPageMappings = mappings.toSortedMap(),
+        lastViewedAnswerPage = lastViewedAnswerPage,
+    )
 }
 
 internal fun JSONObject.toCatalogMarkGroup(): MarkGroup {
