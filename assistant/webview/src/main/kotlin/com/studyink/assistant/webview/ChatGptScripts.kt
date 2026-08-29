@@ -68,6 +68,9 @@ internal object ChatGptScripts {
             return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
           }
           function norm(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
+          function preserved(value) {
+            return String(value || "").replace(/\r\n?/g, "\n").trim();
+          }
           function label(el) {
             return norm([el && el.innerText, el && el.ariaLabel, el && el.title,
               el && el.getAttribute && el.getAttribute("aria-label"),
@@ -83,7 +86,7 @@ internal object ChatGptScripts {
             .filter(function(el) { return norm(el.innerText || el.textContent).length > 0; });
           const assistants = direct.length ? direct : articles;
           const last = assistants.length ? assistants[assistants.length - 1] : null;
-          const text = norm(last && (last.innerText || last.textContent));
+          const text = preserved(last && (last.innerText || last.textContent));
           const scope = last && (last.closest("[data-testid^='conversation-turn']") ||
             last.closest("article") || last.parentElement);
           const actionWords = /copy|copied|copy-turn-action-button|good response|bad response|regenerate|share|복사|좋아요|싫어요|공유|다시 생성/i;
@@ -96,7 +99,7 @@ internal object ChatGptScripts {
           return JSON.stringify({
             assistantCount: assistants.length,
             text: text,
-            hash: hash(text),
+            hash: hash(norm(text)),
             actionsReady: actionsReady,
             stopVisible: /stop|중지|정지|생성 중지|응답 중지/i.test(labels),
             uploadingVisible: /uploading|첨부 중|업로드|파일을 처리/i.test(labels)

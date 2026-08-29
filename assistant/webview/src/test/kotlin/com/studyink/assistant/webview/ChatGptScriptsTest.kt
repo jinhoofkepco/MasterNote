@@ -29,4 +29,12 @@ class ChatGptScriptsTest {
         assertTrue(script.contains("pick(${JSONObject.quote(ChatGptScripts.INPUT)})"))
         assertTrue(script.contains("pick(${JSONObject.quote(ChatGptScripts.SEND)})"))
     }
+
+    @Test
+    fun responseTextPreservesLineBreaksWhileHashNormalizesWhitespace() {
+        val script = ChatGptScripts.responseSnapshot
+
+        assertTrue(script.contains("const text = preserved"))
+        assertTrue(script.contains("hash: hash(norm(text))"))
+    }
 }

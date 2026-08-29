@@ -1,5 +1,6 @@
 package com.studyink.reader
 
+import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -9,8 +10,10 @@ import android.graphics.Color
 import android.os.Bundle
 import android.text.InputFilter
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -45,10 +48,18 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
     private lateinit var saveButton: Button
     private lateinit var manualButton: Button
     private lateinit var copyButton: Button
+    private lateinit var answerEditActions: LinearLayout
+    private lateinit var penDeleteButton: Button
+    private lateinit var undoDeleteButton: Button
 
     private lateinit var request: GptAssistantRequest
     private var queryRunning = false
     private var latestResult: ChatGptResult? = null
+    private var penDeleteMode = false
+    private var penDeleteAnchor = -1
+    private var penDeleteCurrent = -1
+    private var lastPenDeletion: PenDeletion? = null
+    private val clearUndoRunnable = Runnable { clearPenDeleteUndo() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,6 +73,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         restoreUiState(savedInstanceState)
     }
 
+    @SuppressLint("ClickableViewAccessibility")
     private fun buildContent(): View {
         val density = resources.displayMetrics.density
         fun dp(value: Int): Int = (value * density).toInt()
@@ -103,9 +115,32 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
             setBackgroundColor(Color.rgb(255, 253, 247))
             setPadding(dp(10), dp(7), dp(10), dp(7))
             filters = arrayOf(InputFilter.LengthFilter(MAX_ANSWER_CHARS))
+            setOnTouchListener { _, event -> handlePenDeleteTouch(event) }
         }
         root.addView(
             answerEditor,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+
+        answerEditActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            setPadding(dp(6), dp(3), dp(6), dp(3))
+            setBackgroundColor(Color.rgb(246, 243, 234))
+        }
+        penDeleteButton = actionButton("펜 삭제") { setPenDeleteMode(!penDeleteMode) }
+        undoDeleteButton = actionButton("마지막 삭제 되돌리기") { undoLastPenDeletion() }.apply {
+            isEnabled = false
+        }
+        listOf(penDeleteButton, undoDeleteButton).forEach { button ->
+            answerEditActions.addView(button, LinearLayout.LayoutParams(0, dp(42), 1f).apply {
+                marginStart = dp(2)
+                marginEnd = dp(2)
+            })
+        }
+        root.addView(
+            answerEditActions,
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
         )
 
@@ -171,7 +206,10 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
 
     private fun showAnswer(result: ChatGptResult) {
         latestResult = result
+        setPenDeleteMode(false)
+        clearPenDeleteUndo()
         answerEditor.visibility = View.VISIBLE
+        answerEditActions.visibility = View.VISIBLE
         answerEditor.setText(result.text)
         answerEditor.setSelection(answerEditor.text.length)
         saveButton.isEnabled = result.text.isNotBlank()
@@ -179,11 +217,106 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
     }
 
     private fun showPartialAnswer(text: String) {
+        setPenDeleteMode(false)
+        clearPenDeleteUndo()
         answerEditor.visibility = View.VISIBLE
+        answerEditActions.visibility = View.VISIBLE
         answerEditor.setText(text.take(MAX_ANSWER_CHARS))
         answerEditor.setSelection(answerEditor.text.length)
         saveButton.isEnabled = answerEditor.text.isNotBlank()
         status.text = "응답 완료는 확인하지 못했습니다. 보이는 답변을 검토한 뒤 저장할 수 있어요."
+    }
+
+    private fun setPenDeleteMode(enabled: Boolean) {
+        if (penDeleteMode == enabled) return
+        penDeleteMode = enabled
+        penDeleteButton.text = if (enabled) "펜 삭제 켬" else "펜 삭제"
+        answerEditor.showSoftInputOnFocus = !enabled
+        resetPenDeleteGesture()
+        if (enabled) {
+            answerEditor.clearFocus()
+            getSystemService(InputMethodManager::class.java)
+                ?.hideSoftInputFromWindow(answerEditor.windowToken, 0)
+            status.text = "S Pen으로 지울 글을 긁고 떼세요. 손가락은 스크롤할 수 있어요."
+        }
+    }
+
+    private fun handlePenDeleteTouch(event: MotionEvent): Boolean {
+        if (!penDeleteMode || !event.isPenEvent()) return false
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                answerEditor.parent?.requestDisallowInterceptTouchEvent(true)
+                val offset = answerEditor.getOffsetForPosition(event.x, event.y)
+                penDeleteAnchor = offset
+                penDeleteCurrent = offset
+                answerEditor.setSelection(offset)
+            }
+            MotionEvent.ACTION_MOVE -> updatePenDeleteSelection(event)
+            MotionEvent.ACTION_UP -> {
+                updatePenDeleteSelection(event)
+                deleteCurrentPenSelection()
+                answerEditor.parent?.requestDisallowInterceptTouchEvent(false)
+                resetPenDeleteGesture()
+            }
+            MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
+                answerEditor.parent?.requestDisallowInterceptTouchEvent(false)
+                resetPenDeleteGesture()
+            }
+        }
+        return true
+    }
+
+    private fun updatePenDeleteSelection(event: MotionEvent) {
+        if (penDeleteAnchor < 0) return
+        penDeleteCurrent = answerEditor.getOffsetForPosition(event.x, event.y)
+        answerEditor.setSelection(
+            minOf(penDeleteAnchor, penDeleteCurrent),
+            maxOf(penDeleteAnchor, penDeleteCurrent),
+        )
+    }
+
+    private fun deleteCurrentPenSelection() {
+        val start = minOf(penDeleteAnchor, penDeleteCurrent)
+        val end = maxOf(penDeleteAnchor, penDeleteCurrent)
+        if (start < 0 || end <= start) return
+        val editable = answerEditor.text
+        val deleted = editable.subSequence(start, end).toString()
+        editable.delete(start, end)
+        answerEditor.setSelection(start.coerceAtMost(editable.length))
+        lastPenDeletion = PenDeletion(start, deleted)
+        undoDeleteButton.isEnabled = true
+        answerEditor.removeCallbacks(clearUndoRunnable)
+        answerEditor.postDelayed(clearUndoRunnable, PEN_DELETE_UNDO_MS)
+        saveButton.isEnabled = editable.isNotBlank()
+        status.text = "선택한 글을 삭제했습니다. 필요하면 마지막 삭제를 되돌리세요."
+    }
+
+    private fun undoLastPenDeletion() {
+        val deletion = lastPenDeletion ?: return
+        val editable = answerEditor.text
+        val offset = deletion.offset.coerceIn(0, editable.length)
+        editable.insert(offset, deletion.text)
+        answerEditor.setSelection((offset + deletion.text.length).coerceAtMost(editable.length))
+        clearPenDeleteUndo()
+        saveButton.isEnabled = editable.isNotBlank()
+        status.text = "마지막 삭제를 되돌렸습니다."
+    }
+
+    private fun clearPenDeleteUndo() {
+        if (::answerEditor.isInitialized) answerEditor.removeCallbacks(clearUndoRunnable)
+        lastPenDeletion = null
+        if (::undoDeleteButton.isInitialized) undoDeleteButton.isEnabled = false
+    }
+
+    private fun resetPenDeleteGesture() {
+        penDeleteAnchor = -1
+        penDeleteCurrent = -1
+    }
+
+    private fun MotionEvent.isPenEvent(): Boolean {
+        val pointerIndex = actionIndex.coerceIn(0, pointerCount - 1)
+        return getToolType(pointerIndex) == MotionEvent.TOOL_TYPE_STYLUS ||
+            getToolType(pointerIndex) == MotionEvent.TOOL_TYPE_ERASER
     }
 
     private fun copyPrompt() {
@@ -297,6 +430,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         val restoredAnswer = state.getString(STATE_ANSWER_TEXT)
         if (restoredAnswer != null) {
             answerEditor.visibility = View.VISIBLE
+            answerEditActions.visibility = View.VISIBLE
             answerEditor.setText(restoredAnswer.take(MAX_ANSWER_CHARS))
             answerEditor.setSelection(answerEditor.text.length)
             saveButton.isEnabled = answerEditor.text.isNotBlank()
@@ -311,6 +445,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
     }
 
     override fun onDestroy() {
+        clearPenDeleteUndo()
         if (::controller.isInitialized) controller.destroy()
         // A non-finishing recreation still needs the immutable capture carried by the Intent.
         // Normal close/save deletes it; process-death leftovers are age-pruned by ReaderActivity.
@@ -327,10 +462,16 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         private const val STATE_STATUS_TEXT = "gptStatusText"
         private const val STATE_ANSWER_TEXT = "gptAnswerText"
         private const val STATE_QUERY_WAS_RUNNING = "gptQueryWasRunning"
+        private const val PEN_DELETE_UNDO_MS = 5_000L
 
         fun intent(context: Context, request: GptAssistantRequest): Intent =
             Intent(context, GptAssistantActivity::class.java).apply { request.putInto(this) }
     }
+
+    private data class PenDeletion(
+        val offset: Int,
+        val text: String,
+    )
 }
 
 data class GptAssistantRequest(

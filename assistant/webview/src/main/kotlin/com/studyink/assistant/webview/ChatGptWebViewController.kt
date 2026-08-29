@@ -117,6 +117,7 @@ class ChatGptWebViewController(
         val manual = CompletableDeferred<ChatGptResult>()
         manualResponse = manual
         var latestText = ""
+        var latestHash = ""
         var extractionFailures = 0
         var responseFallbackSent = false
         val deadline = elapsedRealtime() + timeoutMs
@@ -184,9 +185,12 @@ class ChatGptWebViewController(
                     }
                 } else {
                     extractionFailures = 0
-                    if (snapshot.text != latestText) {
+                    if (snapshot.hash != latestHash) {
+                        latestHash = snapshot.hash
                         latestText = snapshot.text
                         lastChangeAt = now
+                    } else if (snapshot.text != latestText) {
+                        latestText = snapshot.text
                     }
                     val hasNewResponse = before?.let {
                         ResponseCompletionDetector.isNew(it, snapshot)
