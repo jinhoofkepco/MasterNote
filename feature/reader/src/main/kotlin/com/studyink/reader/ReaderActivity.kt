@@ -1,9 +1,9 @@
 package com.studyink.reader
 
 import android.Manifest
-import android.app.ActivityOptions
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -26,6 +26,8 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
@@ -52,6 +54,7 @@ import com.studyink.assistant.core.AssistantRepositoryProvider
 import com.studyink.assistant.core.StudentExplanationLayer
 import com.studyink.assistant.core.StudentExplanationLayerBus
 import com.studyink.assistant.core.StudentExplanationTarget
+import com.studyink.core.model.AnswerPdfCrop
 import com.studyink.core.model.MarkColor
 import com.studyink.core.model.PageBounds
 import com.studyink.core.model.PagePoint
@@ -76,6 +79,7 @@ import com.studyink.sync.lan.LanPeerRole
 import com.studyink.sync.lan.LanSyncBus
 import com.studyink.sync.lan.LanSyncService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -112,6 +116,23 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private lateinit var peerChatAnnouncementStore: PeerChatAnnouncementStore
     private lateinit var bookId: String
     private lateinit var teacherAccess: TeacherAccessController
+    private val answerCropLoaderDelegate = lazy { AnswerCropBitmapLoader.get(this) }
+    private val answerCropLoader: AnswerCropBitmapLoader get() = answerCropLoaderDelegate.value
+
+    private val answerPdfLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        val target = launchedAnswerTarget.also { launchedAnswerTarget = null } ?: return@registerForActivityResult
+        if (isFinishing || latestState.role == ReaderRole.STUDENT ||
+            target.first != latestState.bookId || target.second != latestState.pageNumber
+        ) {
+            return@registerForActivityResult
+        }
+        val crop = runCatching {
+            LibraryRepository.get(this).answerCropForProblem(target.first, target.second)
+        }.getOrNull() ?: return@registerForActivityResult
+        showAnswerCropPopup(target.first, target.second, crop)
+    }
 
     private val gptAssistantLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -197,6 +218,13 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var loadingExplanationTarget: StudentExplanationTarget? = null
     private var explanationLoadGeneration = 0L
     private var assistantCaptureInProgress = false
+    private var answerCropPopup: AnswerCropPopupView? = null
+    private var answerPopupTarget: Pair<String, Int>? = null
+    private var answerPopupCrop: AnswerPdfCrop? = null
+    private var answerPopupLoadGeneration = 0L
+    private var answerPopupLoadJob: Job? = null
+    private var answerPopupBackCallback: OnBackPressedCallback? = null
+    private var launchedAnswerTarget: Pair<String, Int>? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -382,7 +410,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             )
         }
         root.addOnLayoutChangeListener { _, _, _, _, bottom, _, _, _, oldBottom ->
-            if (bottom != oldBottom) updateMessageOverlayPosition(bottom)
+            if (bottom != oldBottom) {
+                updateMessageOverlayPosition(bottom)
+                updateAnswerPopupBounds(restoreSavedPosition = false)
+            }
         }
         messageOverlayHost.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
             updateMessageOverlayPosition(root.height)
@@ -434,6 +465,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 viewModel.uiState.collect { state ->
                     latestState = state
+                    dismissAnswerPopupIfTargetChanged(state)
                     deliverPendingParentMessageIfStudent()
                     ensureS23StripStartsExpanded()
                     activeEraserPreviewId?.takeIf { inputView.hasActiveEraserGesture }?.let { gestureId ->
@@ -793,12 +825,169 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             ).show()
             return
         }
-        val answerIntent = AnswerPdfActivity.intent(this, state.bookId, state.pageNumber)
-            .addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
-        startActivity(
-            answerIntent,
-            ActivityOptions.makeCustomAnimation(this, 0, 0).toBundle(),
+        val target = state.bookId to state.pageNumber
+        if (answerPopupTarget == target && answerCropPopup != null) {
+            dismissAnswerCropPopup()
+            return
+        }
+        val crop = runCatching {
+            repository.answerCropForProblem(state.bookId, state.pageNumber)
+        }.getOrNull()
+        if (crop == null) {
+            launchFullAnswerPdf(target, focusExistingCrop = false)
+        } else {
+            showAnswerCropPopup(state.bookId, state.pageNumber, crop)
+        }
+    }
+
+    private fun launchFullAnswerPdf(
+        target: Pair<String, Int>,
+        focusExistingCrop: Boolean,
+    ) {
+        dismissAnswerCropPopup()
+        launchedAnswerTarget = target
+        answerPdfLauncher.launch(
+            AnswerPdfActivity.intent(
+                context = this,
+                bookId = target.first,
+                problemPage = target.second,
+                focusExistingCrop = focusExistingCrop,
+            ).addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION),
         )
+    }
+
+    private fun showAnswerCropPopup(bookId: String, problemPage: Int, crop: AnswerPdfCrop) {
+        if (rootHost.width <= 0 || rootHost.height <= 0) {
+            rootHost.post {
+                if (!isFinishing && latestState.bookId == bookId && latestState.pageNumber == problemPage) {
+                    showAnswerCropPopup(bookId, problemPage, crop)
+                }
+            }
+            return
+        }
+        dismissAnswerCropPopup()
+        if (stylusMenuExpanded) closeStylusMenu()
+        cancelActiveEraserInput()
+
+        val cropAspect = (crop.right - crop.left) / (crop.bottom - crop.top)
+        val maximumWidth = (rootHost.width * ANSWER_POPUP_MAX_WIDTH_FRACTION).roundToInt()
+            .coerceAtLeast(dp(ANSWER_POPUP_MIN_WIDTH_DP))
+        val maximumImageHeight = (rootHost.height * ANSWER_POPUP_MAX_HEIGHT_FRACTION).roundToInt()
+            .coerceAtLeast(dp(ANSWER_POPUP_MIN_IMAGE_HEIGHT_DP))
+        var imageWidth = maximumWidth.toFloat()
+        var imageHeight = imageWidth / cropAspect
+        if (imageHeight > maximumImageHeight) {
+            imageHeight = maximumImageHeight.toFloat()
+            imageWidth = imageHeight * cropAspect
+        }
+        val popupWidth = imageWidth.roundToInt()
+            .coerceIn(dp(ANSWER_POPUP_MIN_WIDTH_DP), maximumWidth)
+        val popupImageHeight = imageHeight.roundToInt()
+            .coerceIn(dp(ANSWER_POPUP_MIN_IMAGE_HEIGHT_DP), maximumImageHeight)
+        val popup = AnswerCropPopupView(this).apply {
+            showLoading()
+            onClose =(::dismissAnswerCropPopup)
+            onOpenPdf = {
+                launchFullAnswerPdf(bookId to problemPage, focusExistingCrop = true)
+            }
+            onPositionChanged = { x, y -> saveAnswerPopupPosition(x, y) }
+        }
+        val insertionIndex = rootHost.indexOfChild(messageOverlayHost).coerceAtLeast(0)
+        rootHost.addView(
+            popup,
+            insertionIndex,
+            FrameLayout.LayoutParams(
+                popupWidth,
+                popupImageHeight + dp(ANSWER_POPUP_HEADER_HEIGHT_DP),
+            ),
+        )
+        answerCropPopup = popup
+        answerPopupTarget = bookId to problemPage
+        answerPopupCrop = crop
+        answerPopupBackCallback = onBackPressedDispatcher.addCallback(this) {
+            dismissAnswerCropPopup()
+        }
+        popup.post { updateAnswerPopupBounds(restoreSavedPosition = true) }
+
+        val generation = ++answerPopupLoadGeneration
+        answerPopupLoadJob = lifecycleScope.launch {
+            val result = runCatching {
+                answerCropLoader.load(
+                    bookId = bookId,
+                    crop = crop,
+                    maximumWidthPixels = popupWidth,
+                    maximumHeightPixels = popupImageHeight,
+                )
+            }
+            if (generation != answerPopupLoadGeneration || answerCropPopup !== popup ||
+                answerPopupTarget != (bookId to problemPage) || answerPopupCrop != crop
+            ) {
+                return@launch
+            }
+            result.onSuccess(popup::showBitmap).onFailure { error ->
+                Log.w(ANSWER_PDF_LOG_TAG, "Unable to render answer crop", error)
+                popup.showError()
+                Toast.makeText(this@ReaderActivity, "저장된 답안을 불러오지 못했습니다.", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun dismissAnswerPopupIfTargetChanged(state: ReaderUiState) {
+        val target = answerPopupTarget ?: return
+        if (state.role == ReaderRole.STUDENT || target.first != state.bookId || target.second != state.pageNumber) {
+            dismissAnswerCropPopup()
+        }
+    }
+
+    private fun dismissAnswerCropPopup() {
+        answerPopupLoadGeneration += 1L
+        answerPopupLoadJob?.cancel()
+        answerPopupLoadJob = null
+        answerPopupBackCallback?.remove()
+        answerPopupBackCallback = null
+        answerCropPopup?.let { popup ->
+            popup.clearBitmap()
+            if (::rootHost.isInitialized) rootHost.removeView(popup)
+        }
+        answerCropPopup = null
+        answerPopupTarget = null
+        answerPopupCrop = null
+    }
+
+    private fun answerPopupBounds(): RectF {
+        val margin = dp(ANSWER_POPUP_MARGIN_DP).toFloat()
+        val left = systemBarInsets.left + margin
+        val right = rootHost.width - systemBarInsets.right - margin
+        val top = systemBarInsets.top + dp(TOP_CHROME_HEIGHT + ANSWER_POPUP_MARGIN_DP)
+        val bottom = rootHost.height - systemBarInsets.bottom - dp(ANSWER_POPUP_MARGIN_DP)
+        return RectF(left, top.toFloat(), right, bottom.toFloat())
+    }
+
+    private fun updateAnswerPopupBounds(restoreSavedPosition: Boolean) {
+        val popup = answerCropPopup ?: return
+        if (rootHost.width <= 0 || rootHost.height <= 0 || popup.width <= 0 || popup.height <= 0) return
+        val bounds = answerPopupBounds()
+        popup.setDragBounds(bounds)
+        if (!restoreSavedPosition) return
+        val preferences = getSharedPreferences(ANSWER_POPUP_POSITION_PREFS, Context.MODE_PRIVATE)
+        val suffix = if (rootHost.width > rootHost.height) "landscape" else "portrait"
+        val xFraction = preferences.getFloat("x_$suffix", 1f).coerceIn(0f, 1f)
+        val yFraction = preferences.getFloat("y_$suffix", 0.08f).coerceIn(0f, 1f)
+        popup.x = bounds.left + (bounds.width() - popup.width).coerceAtLeast(0f) * xFraction
+        popup.y = bounds.top + (bounds.height() - popup.height).coerceAtLeast(0f) * yFraction
+        popup.setDragBounds(bounds)
+    }
+
+    private fun saveAnswerPopupPosition(x: Float, y: Float) {
+        val popup = answerCropPopup ?: return
+        val bounds = answerPopupBounds()
+        val availableX = (bounds.width() - popup.width).coerceAtLeast(1f)
+        val availableY = (bounds.height() - popup.height).coerceAtLeast(1f)
+        val suffix = if (rootHost.width > rootHost.height) "landscape" else "portrait"
+        getSharedPreferences(ANSWER_POPUP_POSITION_PREFS, Context.MODE_PRIVATE).edit()
+            .putFloat("x_$suffix", ((x - bounds.left) / availableX).coerceIn(0f, 1f))
+            .putFloat("y_$suffix", ((y - bounds.top) / availableY).coerceIn(0f, 1f))
+            .apply()
     }
 
     private fun beginGptRegionSelection(choice: TeacherPromptChoice) {
@@ -814,6 +1003,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             return
         }
         teacherResourcesDialog?.dismiss()
+        dismissAnswerCropPopup()
         if (stylusMenuExpanded) closeStylusMenu()
         pendingPromptChoice = choice
         pageRegionSelectionView.beginSelection(pageBounds)
@@ -1594,6 +1784,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         return super.dispatchTouchEvent(event)
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        dismissAnswerCropPopup()
+        super.onConfigurationChanged(newConfig)
+    }
+
     override fun onStart() {
         super.onStart()
         readerStarted = true
@@ -1669,6 +1864,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     override fun onDestroy() {
         explanationLoadGeneration += 1L
+        dismissAnswerCropPopup()
         teacherResourcesDialog?.dismiss()
         teacherResourcesDialog = null
         parentMessageSubscription?.close()
@@ -1677,6 +1873,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         if (::studentVoiceController.isInitialized) studentVoiceController.close()
         if (::parentMessageSpeaker.isInitialized) parentMessageSpeaker.close()
         super.onDestroy()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (answerCropLoaderDelegate.isInitialized()) answerCropLoader.trimMemory(level)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -1804,6 +2005,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 view.updateFrameLayoutParams { bottomMargin = bars.bottom }
             }
             updateMessageOverlayPosition(root.height)
+            updateAnswerPopupBounds(restoreSavedPosition = false)
             windowInsets
         }
         ViewCompat.requestApplyInsets(root)
@@ -1861,6 +2063,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         private const val PEN_INPUT_LOG_TAG = "MasterNotePenInput"
         private const val REMOTE_MONITOR_LOG_TAG = "MasterNoteRemoteMonitor"
         private const val GPT_ASSISTANT_LOG_TAG = "MasterNoteGptAssistant"
+        private const val ANSWER_PDF_LOG_TAG = "MasterNoteAnswerPdf"
         private const val GPT_CAPTURE_CACHE_DIRECTORY = "gpt-assistant"
         private const val GPT_CAPTURE_MAX_EDGE_PX = 1_800
         private const val GPT_CAPTURE_MAX_BYTES = 8L * 1024L * 1024L
@@ -1875,6 +2078,13 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         private const val MESSAGE_OVERLAY_SAFE_GAP_DP = 8
         private const val MESSAGE_OVERLAY_BOTTOM_MARGIN_DP = 12
         private const val MESSAGE_OVERLAY_VERTICAL_FRACTION = 0.30f
+        private const val ANSWER_POPUP_POSITION_PREFS = "answer-crop-popup-position"
+        private const val ANSWER_POPUP_HEADER_HEIGHT_DP = 44
+        private const val ANSWER_POPUP_MARGIN_DP = 8
+        private const val ANSWER_POPUP_MIN_WIDTH_DP = 150
+        private const val ANSWER_POPUP_MIN_IMAGE_HEIGHT_DP = 96
+        private const val ANSWER_POPUP_MAX_WIDTH_FRACTION = 0.72f
+        private const val ANSWER_POPUP_MAX_HEIGHT_FRACTION = 0.46f
         private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
         private const val EXTRA_BOOK_ID = "bookId"

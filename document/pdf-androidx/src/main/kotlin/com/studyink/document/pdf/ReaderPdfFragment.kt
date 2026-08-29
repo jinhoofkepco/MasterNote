@@ -16,11 +16,24 @@ class ReaderPdfFragment : PdfViewerFragment() {
         fun onDocumentError(error: Throwable)
     }
 
+    private var readyPdfView: PdfView? = null
+
+    /**
+     * Reader pages need every page width for ink transforms. Lightweight PDF-only screens can
+     * disable that eager request and rely on PdfView's progressive page metadata loading.
+     */
+    var loadAllPageWidths: Boolean = true
+
     var listener: Listener? = null
+        set(value) {
+            field = value
+            readyPdfView?.let { view -> value?.onPdfViewReady(view) }
+        }
 
     override fun onPdfViewCreated(pdfView: PdfView) {
         super.onPdfViewCreated(pdfView)
         isToolboxVisible = false
+        readyPdfView = pdfView
         listener?.onPdfViewReady(pdfView)
     }
 
@@ -34,13 +47,23 @@ class ReaderPdfFragment : PdfViewerFragment() {
     override fun onLoadDocumentSuccess(document: PdfDocument) {
         super.onLoadDocumentSuccess(document)
         viewLifecycleOwner.lifecycleScope.launch {
-            val infos = document.getPageInfos(0 until document.pageCount)
-            listener?.onDocumentReady(document.uri, infos.associate { it.pageNum to it.width.toFloat() }, document.pageCount)
+            val pageWidths = if (loadAllPageWidths) {
+                document.getPageInfos(0 until document.pageCount)
+                    .associate { it.pageNum to it.width.toFloat() }
+            } else {
+                emptyMap()
+            }
+            listener?.onDocumentReady(document.uri, pageWidths, document.pageCount)
         }
     }
 
     override fun onLoadDocumentError(error: Throwable) {
         super.onLoadDocumentError(error)
         listener?.onDocumentError(error)
+    }
+
+    override fun onDestroyView() {
+        readyPdfView = null
+        super.onDestroyView()
     }
 }

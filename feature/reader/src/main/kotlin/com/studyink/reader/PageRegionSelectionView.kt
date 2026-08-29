@@ -27,6 +27,23 @@ class PageRegionSelectionView @JvmOverloads constructor(
     var onSelectionConfirmed: (RectF) -> Unit = {}
     var onSelectionCancelled: () -> Unit = {}
     var onSelectionChanged: (RectF?) -> Unit = {}
+    var hintText: String = "손가락이나 S Pen으로 설명할 영역을 드래그하세요"
+        set(value) {
+            field = value
+            invalidate()
+        }
+    var confirmButtonText: String = "선택"
+        set(value) {
+            field = value
+            invalidate()
+        }
+    var compactControls: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            updateButtonBounds(width)
+            invalidate()
+        }
 
     private val density = resources.displayMetrics.density
     private val dimPaint = Paint().apply { color = Color.argb(166, 20, 25, 32) }
@@ -151,10 +168,10 @@ class PageRegionSelectionView @JvmOverloads constructor(
     }
 
     private fun updateButtonBounds(width: Int) {
-        val horizontalMargin = dp(16f)
-        val top = safeTopInset + dp(16f)
-        val buttonWidth = dp(84f)
-        val buttonHeight = dp(48f)
+        val horizontalMargin = dp(if (compactControls) 10f else 16f)
+        val top = safeTopInset + dp(if (compactControls) 8f else 16f)
+        val buttonWidth = dp(if (compactControls) 68f else 84f)
+        val buttonHeight = dp(if (compactControls) 44f else 48f)
         cancelButton.set(horizontalMargin, top, horizontalMargin + buttonWidth, top + buttonHeight)
         confirmButton.set(
             width - horizontalMargin - buttonWidth,
@@ -178,9 +195,14 @@ class PageRegionSelectionView @JvmOverloads constructor(
             drawHandle(canvas, selected.right, selected.bottom)
         }
         drawButton(canvas, cancelButton, "취소", enabled = true, destructive = true)
-        drawButton(canvas, confirmButton, "선택", enabled = selection?.let(::isConfirmable) == true)
-        val hintY = cancelButton.bottom + dp(28f)
-        canvas.drawText("손가락이나 S Pen으로 설명할 영역을 드래그하세요", width / 2f, hintY, hintTextPaint)
+        drawButton(
+            canvas,
+            confirmButton,
+            confirmButtonText,
+            enabled = selection?.let(::isConfirmable) == true,
+        )
+        val hintY = cancelButton.bottom + dp(if (compactControls) 24f else 28f)
+        canvas.drawText(hintText, width / 2f, hintY, hintTextPaint)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {

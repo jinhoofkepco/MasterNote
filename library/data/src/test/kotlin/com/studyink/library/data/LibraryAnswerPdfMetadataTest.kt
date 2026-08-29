@@ -1,6 +1,7 @@
 package com.studyink.library.data
 
 import com.studyink.core.model.Book
+import com.studyink.core.model.AnswerPdfCrop
 import com.studyink.core.model.AnswerPdfViewport
 import org.json.JSONArray
 import org.json.JSONObject
@@ -20,6 +21,8 @@ class LibraryAnswerPdfMetadataTest {
         assertEquals(emptyMap<Int, Int>(), book.answerPageMappings)
         assertEquals(0, book.lastViewedAnswerPage)
         assertEquals(emptyMap<Int, AnswerPdfViewport>(), book.answerViewportMappings)
+        assertEquals(emptyMap<Int, AnswerPdfCrop>(), book.answerCropMappings)
+        assertNull(book.lastAnswerPdfViewport)
     }
 
     @Test
@@ -31,6 +34,8 @@ class LibraryAnswerPdfMetadataTest {
         ).toCatalogJson().apply {
             // This field did not exist in the already deployed page-only catalog.
             remove("answerViewportMappings")
+            remove("answerCropMappings")
+            remove("lastAnswerPdfViewport")
         }
 
         val restored = encoded.toCatalogBook()
@@ -50,6 +55,16 @@ class LibraryAnswerPdfMetadataTest {
                 7 to AnswerPdfViewport(answerPage = 5, pdfX = 320.5f, pdfY = 480.25f, zoomScale = 2.5f),
                 1 to AnswerPdfViewport(answerPage = 2, pdfX = 100f, pdfY = 200f, zoomScale = 1.25f),
             ),
+            answerCropMappings = linkedMapOf(
+                4 to AnswerPdfCrop(answerPage = 3, left = 40f, top = 50f, right = 300f, bottom = 450f),
+                1 to AnswerPdfCrop(answerPage = 2, left = 10f, top = 20f, right = 110f, bottom = 220f),
+            ),
+            lastAnswerPdfViewport = AnswerPdfViewport(
+                answerPage = 6,
+                pdfX = 500f,
+                pdfY = 700f,
+                zoomScale = 1.8f,
+            ),
         )
 
         val encoded = book.toCatalogJson()
@@ -57,10 +72,13 @@ class LibraryAnswerPdfMetadataTest {
         assertEquals(listOf(1, 4, 7), List(rows.length()) { rows.getJSONObject(it).getInt("problemPage") })
         val viewportRows = encoded.getJSONArray("answerViewportMappings")
         assertEquals(listOf(1, 7), List(viewportRows.length()) { viewportRows.getJSONObject(it).getInt("problemPage") })
+        val cropRows = encoded.getJSONArray("answerCropMappings")
+        assertEquals(listOf(1, 4), List(cropRows.length()) { cropRows.getJSONObject(it).getInt("problemPage") })
         assertEquals(
             book.copy(
                 answerPageMappings = book.answerPageMappings.toSortedMap(),
                 answerViewportMappings = book.answerViewportMappings.toSortedMap(),
+                answerCropMappings = book.answerCropMappings.toSortedMap(),
             ),
             encoded.toCatalogBook(),
         )
@@ -90,6 +108,35 @@ class LibraryAnswerPdfMetadataTest {
         assertThrows(IllegalArgumentException::class.java) { baseBook().withAnswerPageMapping(0, 0) }
         assertThrows(IllegalArgumentException::class.java) {
             book.withAnswerViewportMapping(0, viewport.copy(answerPage = 3))
+        }
+
+        val crop = AnswerPdfCrop(answerPage = 1, left = 10f, top = 20f, right = 110f, bottom = 220f)
+        val cropMapped = viewportMapped.withAnswerCropMapping(problemPage = 8, crop = crop)
+        assertEquals(1, cropMapped.answerPageMappings[8])
+        assertEquals(crop, cropMapped.answerCropMappings[8])
+        assertEquals(viewport, cropMapped.answerViewportMappings[8])
+        assertNull(cropMapped.withAnswerPageMapping(8, 2).answerCropMappings[8])
+        assertThrows(IllegalArgumentException::class.java) {
+            book.withAnswerCropMapping(0, crop.copy(answerPage = 3))
+        }
+    }
+
+    @Test
+    fun lastExactViewportUpdatesAndRemainsCompatibleWithPageOnlyState() {
+        val book = baseBook().copy(
+            answerPdfRelativePath = "book-1/answer.pdf",
+            answerPdfPageCount = 3,
+        )
+        val viewport = AnswerPdfViewport(answerPage = 2, pdfX = 130f, pdfY = 240f, zoomScale = 2f)
+
+        val exact = book.withLastAnswerPdfViewport(viewport)
+        assertEquals(2, exact.lastViewedAnswerPage)
+        assertEquals(viewport, exact.lastAnswerPdfViewport)
+        assertEquals(viewport, exact.withLastViewedAnswerPage(2).lastAnswerPdfViewport)
+        assertNull(exact.withLastViewedAnswerPage(1).lastAnswerPdfViewport)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            book.withLastAnswerPdfViewport(viewport.copy(answerPage = 3))
         }
     }
 
@@ -131,6 +178,8 @@ class LibraryAnswerPdfMetadataTest {
             answerPageMappings = mapOf(4 to 6),
             lastViewedAnswerPage = 6,
             answerViewportMappings = mapOf(4 to AnswerPdfViewport(6, 10f, 20f, 2f)),
+            answerCropMappings = mapOf(4 to AnswerPdfCrop(6, 10f, 20f, 100f, 200f)),
+            lastAnswerPdfViewport = AnswerPdfViewport(6, 10f, 20f, 2f),
         )
 
         val replaced = previous.withImportedAnswerPdf("book-1/answer-new.pdf", 3)
@@ -140,6 +189,28 @@ class LibraryAnswerPdfMetadataTest {
         assertEquals(emptyMap<Int, Int>(), replaced.answerPageMappings)
         assertEquals(0, replaced.lastViewedAnswerPage)
         assertEquals(emptyMap<Int, AnswerPdfViewport>(), replaced.answerViewportMappings)
+        assertEquals(emptyMap<Int, AnswerPdfCrop>(), replaced.answerCropMappings)
+        assertNull(replaced.lastAnswerPdfViewport)
+    }
+
+    @Test
+    fun decoderRejectsInvalidCropGeometryPageOrMappingMismatch() {
+        val encoded = baseBook().copy(
+            answerPdfRelativePath = "book-1/answer.pdf",
+            answerPdfPageCount = 2,
+            answerPageMappings = mapOf(1 to 0),
+            answerCropMappings = mapOf(1 to AnswerPdfCrop(0, 10f, 20f, 100f, 200f)),
+        ).toCatalogJson()
+        val crop = encoded.getJSONArray("answerCropMappings").getJSONObject(0)
+
+        crop.put("right", 10)
+        assertThrows(IllegalArgumentException::class.java) { encoded.toCatalogBook() }
+
+        crop.put("right", 100).put("answerPage", 2)
+        assertThrows(IllegalArgumentException::class.java) { encoded.toCatalogBook() }
+
+        crop.put("answerPage", 1)
+        assertThrows(IllegalArgumentException::class.java) { encoded.toCatalogBook() }
     }
 
     @Test

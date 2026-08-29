@@ -31,6 +31,25 @@ data class AnswerPdfViewport(
     }
 }
 
+/** One rectangular answer region, expressed in coordinates on a single zero-based PDF page. */
+data class AnswerPdfCrop(
+    val answerPage: Int,
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float,
+) {
+    init {
+        require(answerPage >= 0) { "답안 페이지는 음수일 수 없습니다." }
+        require(left.isFinite() && top.isFinite() && right.isFinite() && bottom.isFinite()) {
+            "답안 PDF 영역 좌표가 올바르지 않습니다."
+        }
+        require(left >= 0f && top >= 0f && right > left && bottom > top) {
+            "답안 PDF 영역의 크기가 올바르지 않습니다."
+        }
+    }
+}
+
 data class Book(
     val id: String = UUID.randomUUID().toString(),
     val studentId: String,
@@ -53,6 +72,10 @@ data class Book(
     val lastViewedAnswerPage: Int = 0,
     /** Exact answer-PDF viewport by zero-based problem page; page-only mappings remain separate. */
     val answerViewportMappings: Map<Int, AnswerPdfViewport> = emptyMap(),
+    /** Cropped answer region by zero-based problem page. */
+    val answerCropMappings: Map<Int, AnswerPdfCrop> = emptyMap(),
+    /** Last exact viewport of the full answer PDF, independent of problem-page mappings. */
+    val lastAnswerPdfViewport: AnswerPdfViewport? = null,
 )
 
 data class AnswerSource(

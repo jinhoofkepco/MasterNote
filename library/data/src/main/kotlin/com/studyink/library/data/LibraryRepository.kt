@@ -8,6 +8,7 @@ import android.provider.OpenableColumns
 import android.util.AtomicFile
 import com.studyink.core.model.Attempt
 import com.studyink.core.model.AnswerItem
+import com.studyink.core.model.AnswerPdfCrop
 import com.studyink.core.model.AnswerPdfViewport
 import com.studyink.core.model.AnswerSource
 import com.studyink.core.model.Book
@@ -280,6 +281,13 @@ class LibraryRepository private constructor(private val context: Context) {
     }
 
     @Synchronized
+    fun answerCropForProblem(bookId: String, problemPage: Int): AnswerPdfCrop? {
+        val book = book(bookId)
+        require(problemPage in 0 until book.pageCount) { "문제 페이지가 교재 범위를 벗어납니다." }
+        return book.answerCropMappings[problemPage]
+    }
+
+    @Synchronized
     fun saveAnswerPageMapping(bookId: String, problemPage: Int, answerPage: Int) {
         val current = book(bookId)
         val updated = current.withAnswerPageMapping(problemPage, answerPage)
@@ -308,12 +316,52 @@ class LibraryRepository private constructor(private val context: Context) {
     }
 
     @Synchronized
+    fun saveAnswerCropMapping(
+        bookId: String,
+        problemPage: Int,
+        answerPage: Int,
+        left: Float,
+        top: Float,
+        right: Float,
+        bottom: Float,
+    ) {
+        val current = book(bookId)
+        val updated = current.withAnswerCropMapping(
+            problemPage = problemPage,
+            crop = AnswerPdfCrop(answerPage, left, top, right, bottom),
+        )
+        if (updated == current) return
+        catalog = catalog.copy(books = catalog.books.map { if (it.id == bookId) updated else it })
+        persist()
+    }
+
+    @Synchronized
     fun lastViewedAnswerPage(bookId: String): Int = book(bookId).lastViewedAnswerPage
+
+    @Synchronized
+    fun lastAnswerPdfViewport(bookId: String): AnswerPdfViewport? = book(bookId).lastAnswerPdfViewport
 
     @Synchronized
     fun saveLastViewedAnswerPage(bookId: String, answerPage: Int) {
         val current = book(bookId)
         val updated = current.withLastViewedAnswerPage(answerPage)
+        if (updated == current) return
+        catalog = catalog.copy(books = catalog.books.map { if (it.id == bookId) updated else it })
+        persist()
+    }
+
+    @Synchronized
+    fun saveLastAnswerPdfViewport(
+        bookId: String,
+        answerPage: Int,
+        pdfX: Float,
+        pdfY: Float,
+        zoomScale: Float,
+    ) {
+        val current = book(bookId)
+        val updated = current.withLastAnswerPdfViewport(
+            AnswerPdfViewport(answerPage, pdfX, pdfY, zoomScale),
+        )
         if (updated == current) return
         catalog = catalog.copy(books = catalog.books.map { if (it.id == bookId) updated else it })
         persist()
@@ -831,10 +879,14 @@ internal fun Book.withAnswerPageMapping(problemPage: Int, answerPage: Int): Book
     val retainedViewports = answerViewportMappings.takeIf {
         it[problemPage]?.answerPage == answerPage
     } ?: (answerViewportMappings - problemPage).toSortedMap()
+    val retainedCrops = answerCropMappings.takeIf {
+        it[problemPage]?.answerPage == answerPage
+    } ?: (answerCropMappings - problemPage).toSortedMap()
     return copy(
         answerPageMappings = (answerPageMappings + (problemPage to answerPage)).toSortedMap(),
         // Coordinates remain valid only when the page-only mapping still points at the same page.
         answerViewportMappings = retainedViewports,
+        answerCropMappings = retainedCrops,
     )
 }
 
@@ -847,6 +899,8 @@ internal fun Book.withImportedAnswerPdf(relativePath: String, pageCount: Int): B
         answerPageMappings = emptyMap(),
         lastViewedAnswerPage = 0,
         answerViewportMappings = emptyMap(),
+        answerCropMappings = emptyMap(),
+        lastAnswerPdfViewport = null,
     )
 }
 
@@ -857,16 +911,49 @@ internal fun Book.withAnswerViewportMapping(
     require(problemPage in 0 until pageCount) { "문제 페이지가 교재 범위를 벗어납니다." }
     require(answerPdfRelativePath != null && answerPdfPageCount > 0) { "연결된 답안 PDF가 없습니다." }
     require(viewport.answerPage in 0 until answerPdfPageCount) { "답안 페이지가 답안 PDF 범위를 벗어납니다." }
+    val retainedCrops = answerCropMappings.takeIf {
+        it[problemPage]?.answerPage == viewport.answerPage
+    } ?: (answerCropMappings - problemPage).toSortedMap()
     return copy(
         answerPageMappings = (answerPageMappings + (problemPage to viewport.answerPage)).toSortedMap(),
         answerViewportMappings = (answerViewportMappings + (problemPage to viewport)).toSortedMap(),
+        answerCropMappings = retainedCrops,
+    )
+}
+
+internal fun Book.withAnswerCropMapping(
+    problemPage: Int,
+    crop: AnswerPdfCrop,
+): Book {
+    require(problemPage in 0 until pageCount) { "문제 페이지가 교재 범위를 벗어납니다." }
+    require(answerPdfRelativePath != null && answerPdfPageCount > 0) { "연결된 답안 PDF가 없습니다." }
+    require(crop.answerPage in 0 until answerPdfPageCount) { "답안 페이지가 답안 PDF 범위를 벗어납니다." }
+    val retainedViewports = answerViewportMappings.takeIf {
+        it[problemPage]?.answerPage == crop.answerPage
+    } ?: (answerViewportMappings - problemPage).toSortedMap()
+    return copy(
+        answerPageMappings = (answerPageMappings + (problemPage to crop.answerPage)).toSortedMap(),
+        answerViewportMappings = retainedViewports,
+        answerCropMappings = (answerCropMappings + (problemPage to crop)).toSortedMap(),
     )
 }
 
 internal fun Book.withLastViewedAnswerPage(answerPage: Int): Book {
     require(answerPdfRelativePath != null && answerPdfPageCount > 0) { "연결된 답안 PDF가 없습니다." }
     require(answerPage in 0 until answerPdfPageCount) { "답안 페이지가 답안 PDF 범위를 벗어납니다." }
-    return copy(lastViewedAnswerPage = answerPage)
+    return copy(
+        lastViewedAnswerPage = answerPage,
+        lastAnswerPdfViewport = lastAnswerPdfViewport?.takeIf { it.answerPage == answerPage },
+    )
+}
+
+internal fun Book.withLastAnswerPdfViewport(viewport: AnswerPdfViewport): Book {
+    require(answerPdfRelativePath != null && answerPdfPageCount > 0) { "연결된 답안 PDF가 없습니다." }
+    require(viewport.answerPage in 0 until answerPdfPageCount) { "답안 페이지가 답안 PDF 범위를 벗어납니다." }
+    return copy(
+        lastViewedAnswerPage = viewport.answerPage,
+        lastAnswerPdfViewport = viewport,
+    )
 }
 
 internal fun isValidMarkAttemptTarget(
@@ -1234,7 +1321,30 @@ internal fun Book.toCatalogJson() = JSONObject().put("id", id).put("studentId", 
             )
         }
     })
+    .put("answerCropMappings", JSONArray().apply {
+        answerCropMappings.toSortedMap().forEach { (problemPage, crop) ->
+            put(
+                JSONObject()
+                    .put("problemPage", problemPage)
+                    .put("answerPage", crop.answerPage)
+                    .put("left", crop.left)
+                    .put("top", crop.top)
+                    .put("right", crop.right)
+                    .put("bottom", crop.bottom)
+            )
+        }
+    })
     .put("lastViewedAnswerPage", lastViewedAnswerPage)
+    .put(
+        "lastAnswerPdfViewport",
+        lastAnswerPdfViewport?.let { viewport ->
+            JSONObject()
+                .put("answerPage", viewport.answerPage)
+                .put("pdfX", viewport.pdfX)
+                .put("pdfY", viewport.pdfY)
+                .put("zoomScale", viewport.zoomScale)
+        } ?: JSONObject.NULL,
+    )
     .put("createdAt", createdAtEpochMillis).put("hiddenAt", hiddenAtEpochMillis ?: JSONObject.NULL)
 private fun Attempt.toJson() = JSONObject().put("bookId", bookId).put("page", pageNumber)
     .put("attemptNo", attemptNo).put("locked", locked).put("startedAt", startedAtEpochMillis)
@@ -1292,10 +1402,32 @@ internal fun JSONObject.toCatalogBook(): Book {
         )
         require(viewportMappings.put(problemPage, viewport) == null) { "답안 화면 연결이 중복됩니다." }
     }
+    val cropMappings = linkedMapOf<Int, AnswerPdfCrop>()
+    val encodedCrops = optJSONArray("answerCropMappings") ?: JSONArray()
+    for (index in 0 until encodedCrops.length()) {
+        val row = encodedCrops.getJSONObject(index)
+        val problemPage = row.getInt("problemPage")
+        val crop = AnswerPdfCrop(
+            answerPage = row.getInt("answerPage"),
+            left = row.getDouble("left").toFloat(),
+            top = row.getDouble("top").toFloat(),
+            right = row.getDouble("right").toFloat(),
+            bottom = row.getDouble("bottom").toFloat(),
+        )
+        require(cropMappings.put(problemPage, crop) == null) { "답안 영역 연결이 중복됩니다." }
+    }
+    val lastAnswerPdfViewport = optJSONObject("lastAnswerPdfViewport")?.let { viewport ->
+        AnswerPdfViewport(
+            answerPage = viewport.getInt("answerPage"),
+            pdfX = viewport.getDouble("pdfX").toFloat(),
+            pdfY = viewport.getDouble("pdfY").toFloat(),
+            zoomScale = viewport.getDouble("zoomScale").toFloat(),
+        )
+    }
     if (answerPdfPath == null) {
         require(
             answerPdfPageCount == 0 && mappings.isEmpty() && viewportMappings.isEmpty() &&
-                lastViewedAnswerPage == 0
+                cropMappings.isEmpty() && lastViewedAnswerPage == 0 && lastAnswerPdfViewport == null
         ) {
             "답안 PDF가 없는데 답안 페이지 정보가 남아 있습니다."
         }
@@ -1310,7 +1442,18 @@ internal fun JSONObject.toCatalogBook(): Book {
         require(viewportMappings.all { (problemPage, viewport) ->
             mappings[problemPage] == viewport.answerPage
         }) { "답안 페이지 연결과 화면 연결이 일치하지 않습니다." }
+        require(cropMappings.all { (problemPage, crop) ->
+            problemPage in 0 until bookPageCount && crop.answerPage in 0 until answerPdfPageCount
+        }) { "답안 영역 연결이 PDF 범위를 벗어납니다." }
+        require(cropMappings.all { (problemPage, crop) ->
+            mappings[problemPage] == crop.answerPage
+        }) { "답안 페이지 연결과 영역 연결이 일치하지 않습니다." }
         require(lastViewedAnswerPage in 0 until answerPdfPageCount) { "마지막 답안 페이지가 PDF 범위를 벗어납니다." }
+        require(
+            lastAnswerPdfViewport == null ||
+                lastAnswerPdfViewport.answerPage in 0 until answerPdfPageCount &&
+                lastAnswerPdfViewport.answerPage == lastViewedAnswerPage
+        ) { "마지막 답안 PDF 화면이 페이지 정보와 일치하지 않습니다." }
     }
     return Book(
         id = getString("id"),
@@ -1327,6 +1470,8 @@ internal fun JSONObject.toCatalogBook(): Book {
         answerPageMappings = mappings.toSortedMap(),
         lastViewedAnswerPage = lastViewedAnswerPage,
         answerViewportMappings = viewportMappings.toSortedMap(),
+        answerCropMappings = cropMappings.toSortedMap(),
+        lastAnswerPdfViewport = lastAnswerPdfViewport,
     )
 }
 
