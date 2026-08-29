@@ -10,6 +10,8 @@ import android.util.AttributeSet
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 
 /**
  * Full-screen, in-app rectangular selector. The host supplies an optional active-page limit and
@@ -71,6 +73,7 @@ class PageRegionSelectionView @JvmOverloads constructor(
     private var gesture = Gesture.NONE
     private val cancelButton = RectF()
     private val confirmButton = RectF()
+    private var safeTopInset = 0f
 
     init {
         visibility = GONE
@@ -78,6 +81,17 @@ class PageRegionSelectionView @JvmOverloads constructor(
         isFocusableInTouchMode = true
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
         contentDescription = "문제 영역 선택"
+        ViewCompat.setOnApplyWindowInsetsListener(this) { _, insets ->
+            val safe = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            if (safeTopInset != safe.top.toFloat()) {
+                safeTopInset = safe.top.toFloat()
+                updateButtonBounds(width)
+                invalidate()
+            }
+            insets
+        }
     }
 
     /** Makes the selector visible and clears any previous gesture state. */
@@ -92,6 +106,7 @@ class PageRegionSelectionView @JvmOverloads constructor(
         }
         resetGesture()
         visibility = VISIBLE
+        ViewCompat.requestApplyInsets(this)
         requestFocus()
         publishSelection()
         invalidate()
@@ -129,8 +144,15 @@ class PageRegionSelectionView @JvmOverloads constructor(
 
     override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
         super.onSizeChanged(width, height, oldWidth, oldHeight)
+        updateButtonBounds(width)
+        selection = selection?.let { current ->
+            intersect(current.toRectF(), resolvedLimit())?.toAssistantRect()
+        }
+    }
+
+    private fun updateButtonBounds(width: Int) {
         val horizontalMargin = dp(16f)
-        val top = dp(16f)
+        val top = safeTopInset + dp(16f)
         val buttonWidth = dp(84f)
         val buttonHeight = dp(48f)
         cancelButton.set(horizontalMargin, top, horizontalMargin + buttonWidth, top + buttonHeight)
@@ -140,9 +162,6 @@ class PageRegionSelectionView @JvmOverloads constructor(
             width - horizontalMargin,
             top + buttonHeight,
         )
-        selection = selection?.let { current ->
-            intersect(current.toRectF(), resolvedLimit())?.toAssistantRect()
-        }
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -348,7 +367,7 @@ class PageRegionSelectionView @JvmOverloads constructor(
     private enum class Gesture { NONE, DRAW, RESIZE, CANCEL_BUTTON, CONFIRM_BUTTON, BLOCKING }
 
     private companion object {
-        const val MINIMUM_SELECTION_DP = 24f
+        const val MINIMUM_SELECTION_DP = 8f
         const val HANDLE_RADIUS_DP = 7f
         const val HANDLE_HIT_RADIUS_DP = 22f
     }

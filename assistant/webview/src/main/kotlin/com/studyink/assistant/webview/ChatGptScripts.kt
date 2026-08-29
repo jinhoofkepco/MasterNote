@@ -42,8 +42,8 @@ internal object ChatGptScripts {
 
     fun inject(prompt: String, imageBase64: String?, token: String): String =
         PINNED_INJECTION_TEMPLATE
-            .replace("%INPUT%", INPUT)
-            .replace("%SEND%", SEND)
+            .replace("%INPUT%", JSONObject.quote(INPUT))
+            .replace("%SEND%", JSONObject.quote(SEND))
             .replace("%TOKEN%", JSONObject.quote(token))
             .replace("%B64%", imageBase64?.let(JSONObject::quote) ?: "null")
             .replace("%PROMPT%", JSONObject.quote(prompt))
@@ -218,7 +218,7 @@ internal object ChatGptScripts {
             });
             return nodes.size;
           }
-          const composer = pick('%INPUT%');
+          const composer = pick(%INPUT%);
           if (!composer) { fail('composer not found'); return 'composer-not-found'; }
           composer.focus();
           const attachmentBaseline = b64 ? attachmentEvidence() : 0;
@@ -240,9 +240,9 @@ internal object ChatGptScripts {
           let tries = 0;
           const timer = setInterval(function() {
             if (window.__studyInkGptGateway !== state) { clearInterval(timer); return; }
-            const activeComposer = pick('%INPUT%');
+            const activeComposer = pick(%INPUT%);
             if (activeComposer && !hasPrompt(activeComposer)) putPrompt(activeComposer);
-            const btn = pick('%SEND%');
+            const btn = pick(%SEND%);
             const imageConfirmed = !b64 || attachmentEvidence() > attachmentBaseline;
             if (btn && !btn.disabled && activeComposer && hasPrompt(activeComposer) && imageConfirmed) {
               clearInterval(timer); btn.click(); state.status = 'sent';
