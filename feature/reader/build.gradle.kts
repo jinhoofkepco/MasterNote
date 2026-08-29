@@ -20,6 +20,8 @@ kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarg
 
 dependencies {
     api(project(":document:pdf-androidx"))
+    implementation(project(":assistant:core"))
+    implementation(project(":assistant:webview"))
     implementation(project(":annotation:storage"))
     implementation(project(":library:data"))
     implementation(project(":sync:lan"))

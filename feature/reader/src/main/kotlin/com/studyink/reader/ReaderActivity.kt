@@ -4,20 +4,28 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.RenderEffect
 import android.graphics.Shader
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.InputDevice
 import android.view.MotionEvent
+import android.view.PixelCopy
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -38,7 +46,13 @@ import androidx.ink.strokes.Stroke
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.studyink.assistant.core.AssistantPageKey
+import com.studyink.assistant.core.AssistantRepositoryProvider
+import com.studyink.assistant.core.StudentExplanationLayer
+import com.studyink.assistant.core.StudentExplanationLayerBus
+import com.studyink.assistant.core.StudentExplanationTarget
 import com.studyink.core.model.MarkColor
+import com.studyink.core.model.PageBounds
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.document.pdf.PdfViewportAdapter
@@ -65,10 +79,20 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
+import kotlin.math.ceil
+import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private val viewModel: ReaderViewModel by viewModels()
     private val viewport = PdfViewportAdapter()
+    private val assistantRepository by lazy { AssistantRepositoryProvider.get(this) }
+    private lateinit var rootHost: FrameLayout
     private lateinit var pdfContainer: FragmentContainerView
     private lateinit var dryInkView: DryInkView
     private lateinit var wetInkView: InProgressStrokesView
@@ -76,6 +100,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private lateinit var pdfFragment: ReaderPdfFragment
     private lateinit var topChrome: ComposeView
     private lateinit var stylusMenuOverlay: StylusMenuOverlayView
+    private lateinit var pageRegionSelectionView: PageRegionSelectionView
+    private lateinit var studentExplanationOverlay: StudentExplanationOverlayView
     private lateinit var messageOverlayHost: LinearLayout
     private lateinit var parentMessageOverlay: ParentMessageOverlayView
     private lateinit var studentStatusOverlay: ParentMessageOverlayView
@@ -85,6 +111,37 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private lateinit var peerChatAnnouncementStore: PeerChatAnnouncementStore
     private lateinit var bookId: String
     private lateinit var teacherAccess: TeacherAccessController
+
+    private val gptAssistantLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode != RESULT_OK || isFinishing) return@registerForActivityResult
+        val savedBookId = result.data?.getStringExtra(GptAssistantActivity.EXTRA_SAVED_BOOK_ID)
+        val savedPageNumber = result.data?.getIntExtra(
+            GptAssistantActivity.EXTRA_SAVED_PAGE_NUMBER,
+            -1,
+        ) ?: -1
+        if (savedBookId == latestState.bookId && savedPageNumber == latestState.pageNumber) {
+            openTeacherGptResources()
+        } else if (savedPageNumber >= 0) {
+            Toast.makeText(
+                this,
+                "GPT 답변은 ${savedPageNumber + 1}쪽에 저장했습니다.",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+
+    private val studentExplanationListener = object : StudentExplanationLayerBus.Listener {
+        override fun onRemoteLayerApplied(layer: StudentExplanationLayer) {
+            runOnUiThread {
+                if (readerStarted && layer.target == currentStudentExplanationTarget(latestState)) {
+                    refreshStudentExplanationLayer(force = true)
+                    studentStatusOverlay.showMessage("선생님 설명이 도착했어요.")
+                }
+            }
+        }
+    }
 
     private var selectedTool by mutableStateOf(ReaderTool.PEN)
     private var selectedPenColor by mutableStateOf(0xFF17233C.toInt())
@@ -133,9 +190,16 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var studentStatusIsProgress = false
     private var studentMessageExpectedChatId: Long? = null
     private var systemBarInsets: Insets = Insets.NONE
+    private var teacherResourcesDialog: TeacherPageResourcesDialogController? = null
+    private var pendingPromptChoice: TeacherPromptChoice? = null
+    private var displayedExplanationTarget: StudentExplanationTarget? = null
+    private var loadingExplanationTarget: StudentExplanationTarget? = null
+    private var explanationLoadGeneration = 0L
+    private var assistantCaptureInProgress = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pruneStaleGptCaptures()
         bookId = intent.getStringExtra(EXTRA_BOOK_ID) ?: run { finish(); return }
         initialPage = intent.getIntExtra(EXTRA_PAGE_NUMBER, 0)
         initialAttemptNo = if (intent.hasExtra(EXTRA_ATTEMPT_NUMBER)) {
@@ -171,9 +235,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         ensureS23StripStartsExpanded()
 
         val readerBackgroundColor = ReaderPaperBackdropDrawable.NAVIGATION_BAR_COLOR
-        val root = FrameLayout(this).apply {
+        rootHost = FrameLayout(this).apply {
             background = ReaderPaperBackdropDrawable(resources.displayMetrics.density)
         }
+        val root = rootHost
         setContentView(root)
         @Suppress("DEPRECATION")
         window.navigationBarColor = readerBackgroundColor
@@ -192,7 +257,18 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             it.viewport = viewport
             root.addView(it, FrameLayout.LayoutParams(MATCH, MATCH))
         }
-        viewport.onViewportChanged = { dryInkView.postInvalidateOnAnimation() }
+        viewport.onViewportChanged = {
+            dryInkView.postInvalidateOnAnimation()
+            if (::studentExplanationOverlay.isInitialized) {
+                studentExplanationOverlay.setContentBoundsInView(viewport.activePageBounds())
+                studentExplanationOverlay.notifyViewportChanged()
+            }
+            if (::pageRegionSelectionView.isInitialized &&
+                pageRegionSelectionView.visibility == View.VISIBLE
+            ) {
+                pageRegionSelectionView.updateSelectionLimit(viewport.activePageBounds())
+            }
+        }
         wetInkView = InProgressStrokesView(this).also {
             it.eagerInit()
             it.addFinishedStrokesListener(object : InProgressStrokesFinishedListener {
@@ -272,6 +348,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             root.addView(input, FrameLayout.LayoutParams(MATCH, MATCH))
         }
 
+        studentExplanationOverlay = StudentExplanationOverlayView(this).also { overlay ->
+            overlay.viewportAdapter = viewport
+            root.addView(overlay, FrameLayout.LayoutParams(MATCH, MATCH))
+        }
+
         messageOverlayHost = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -331,6 +412,14 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             overlay.visibility = View.INVISIBLE
             root.addView(overlay, FrameLayout.LayoutParams(MATCH, MATCH))
         }
+        pageRegionSelectionView = PageRegionSelectionView(this).also { selector ->
+            selector.onSelectionConfirmed =(::onGptRegionSelected)
+            selector.onSelectionCancelled = {
+                pendingPromptChoice = null
+                updateReaderInputEnabled()
+            }
+            root.addView(selector, FrameLayout.LayoutParams(MATCH, MATCH))
+        }
         applySystemBarInsets(root, fragmentContainer)
         renderChrome()
 
@@ -373,10 +462,15 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                     dryInkView.markGroups = state.marks
                     applySubmittedBlur(state.currentAttemptSubmitted)
                     if (!state.capabilities.canGrade && selectedTool == ReaderTool.GRADE) selectTool(ReaderTool.PEN)
-                    inputView.isEnabled = state.documentReady &&
-                        state.capabilities.canWrite &&
-                        state.storageAvailable &&
-                        !state.submissionInProgress
+                    pendingPromptChoice?.let { pending ->
+                        if (pending.target.page.bookId != state.bookId ||
+                            pending.target.page.pageNumber != state.pageNumber
+                        ) {
+                            pageRegionSelectionView.cancelSelection()
+                        }
+                    }
+                    updateReaderInputEnabled()
+                    refreshStudentExplanationLayer()
                     publishStudentPresence(state)
                     updateStudentVoiceEnabled()
                     ReaderDebugSessionStore.save(this@ReaderActivity, state)
@@ -575,6 +669,415 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         inputView.tool = ReaderTool.PEN
     }
 
+    private fun updateReaderInputEnabled() {
+        if (!::inputView.isInitialized) return
+        val state = latestState
+        val selectingAssistantRegion = ::pageRegionSelectionView.isInitialized &&
+            pageRegionSelectionView.visibility == View.VISIBLE
+        inputView.isEnabled = state.documentReady &&
+            state.capabilities.canWrite &&
+            state.storageAvailable &&
+            !state.submissionInProgress &&
+            !selectingAssistantRegion &&
+            !assistantCaptureInProgress
+    }
+
+    private fun currentStudentExplanationTarget(
+        state: ReaderUiState,
+    ): StudentExplanationTarget? {
+        if (state.role != ReaderRole.STUDENT || !state.documentReady ||
+            state.bookId.isBlank() || state.attemptNo <= TEACHER_PAGE_REVIEW_ATTEMPT_NO
+        ) {
+            return null
+        }
+        return StudentExplanationTarget(
+            page = AssistantPageKey(state.bookId, state.pageNumber),
+            attemptNo = state.attemptNo,
+        )
+    }
+
+    private fun refreshStudentExplanationLayer(force: Boolean = false) {
+        if (!::studentExplanationOverlay.isInitialized) return
+        val target = currentStudentExplanationTarget(latestState)
+        if (target == null) {
+            explanationLoadGeneration += 1L
+            displayedExplanationTarget = null
+            loadingExplanationTarget = null
+            studentExplanationOverlay.clearLayer()
+            return
+        }
+        if (!force && (displayedExplanationTarget == target || loadingExplanationTarget == target)) return
+        loadingExplanationTarget = target
+        val generation = ++explanationLoadGeneration
+        lifecycleScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    assistantRepository.studentExplanationLayer(target)
+                }
+            }
+            if (generation != explanationLoadGeneration ||
+                target != currentStudentExplanationTarget(latestState)
+            ) {
+                return@launch
+            }
+            loadingExplanationTarget = null
+            result.onSuccess { layer ->
+                displayedExplanationTarget = target
+                studentExplanationOverlay.setContentBoundsInView(viewport.activePageBounds())
+                studentExplanationOverlay.showLayer(target, layer)
+            }.onFailure { error ->
+                displayedExplanationTarget = null
+                Log.w(GPT_ASSISTANT_LOG_TAG, "Unable to load student explanation layer", error)
+            }
+        }
+    }
+
+    private fun openTeacherGptResources() {
+        val state = latestState
+        if (state.role == ReaderRole.STUDENT || !state.documentReady || state.bookId.isBlank()) {
+            Toast.makeText(this, "선생님 문제집 화면에서 사용할 수 있어요.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val target = TeacherPageAssistantTarget(
+            page = AssistantPageKey(state.bookId, state.pageNumber),
+            studentAttemptNo = state.attemptNo.takeIf { it > TEACHER_PAGE_REVIEW_ATTEMPT_NO },
+        )
+        lifecycleScope.launch {
+            val content = runCatching {
+                withContext(Dispatchers.IO) {
+                    val prompts = assistantRepository.promptSlots()
+                    val resources = assistantRepository.listTeacherResources(target.page)
+                        .mapNotNull { summary ->
+                            assistantRepository.teacherResource(target.page, summary.resourceId)
+                        }
+                    prompts to resources
+                }
+            }
+            if (target.page.bookId != latestState.bookId ||
+                target.page.pageNumber != latestState.pageNumber || isFinishing
+            ) {
+                return@launch
+            }
+            content.onSuccess { (prompts, resources) ->
+                val controller = teacherResourcesDialog ?: TeacherPageResourcesDialogController(
+                    context = this@ReaderActivity,
+                    onPromptSelected =(::beginGptRegionSelection),
+                    onSend =(::publishStudentExplanation),
+                ).also { teacherResourcesDialog = it }
+                controller.show(target, prompts, resources)
+            }.onFailure { error ->
+                Log.w(GPT_ASSISTANT_LOG_TAG, "Unable to load page resources", error)
+                Toast.makeText(
+                    this@ReaderActivity,
+                    "GPT 페이지 자료를 불러오지 못했습니다.",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
+    }
+
+    private fun beginGptRegionSelection(choice: TeacherPromptChoice) {
+        if (choice.target.page.bookId != latestState.bookId ||
+            choice.target.page.pageNumber != latestState.pageNumber
+        ) {
+            Toast.makeText(this, "페이지가 바뀌어 다시 선택해야 합니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val pageBounds = viewport.activePageBounds()
+        if (pageBounds == null || pageBounds.width() < 2f || pageBounds.height() < 2f) {
+            Toast.makeText(this, "페이지가 표시된 뒤 다시 시도해 주세요.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        teacherResourcesDialog?.dismiss()
+        if (stylusMenuExpanded) closeStylusMenu()
+        pendingPromptChoice = choice
+        pageRegionSelectionView.beginSelection(pageBounds)
+        updateReaderInputEnabled()
+    }
+
+    private fun onGptRegionSelected(selectionInRoot: RectF) {
+        val choice = pendingPromptChoice
+        pendingPromptChoice = null
+        if (choice == null || choice.target.page.bookId != latestState.bookId ||
+            choice.target.page.pageNumber != latestState.pageNumber
+        ) {
+            updateReaderInputEnabled()
+            Toast.makeText(this, "선택 대상이 바뀌어 취소했습니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val canonicalBounds = canonicalBoundsForSelection(
+            expectedPage = choice.target.page.pageNumber,
+            selection = selectionInRoot,
+        )
+        if (canonicalBounds == null) {
+            updateReaderInputEnabled()
+            Toast.makeText(this, "문제 영역을 페이지 안에서 다시 선택해 주세요.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        captureGptRegion(choice, selectionInRoot, canonicalBounds)
+    }
+
+    private fun canonicalBoundsForSelection(
+        expectedPage: Int,
+        selection: RectF,
+    ): PageBounds? {
+        val insetX = min(0.75f, selection.width() / 4f)
+        val insetY = min(0.75f, selection.height() / 4f)
+        val points = listOf(
+            viewport.viewToCanonical(selection.left + insetX, selection.top + insetY),
+            viewport.viewToCanonical(selection.right - insetX, selection.bottom - insetY),
+        )
+        if (points.any { it == null || it.pageNumber != expectedPage }) return null
+        val first = checkNotNull(points[0]).point
+        val second = checkNotNull(points[1]).point
+        val left = min(first.x, second.x)
+        val top = min(first.y, second.y)
+        val right = max(first.x, second.x)
+        val bottom = max(first.y, second.y)
+        if (!left.isFinite() || !top.isFinite() || !right.isFinite() || !bottom.isFinite() ||
+            right - left <= 0.1f || bottom - top <= 0.1f
+        ) {
+            return null
+        }
+        return PageBounds(left, top, right, bottom)
+    }
+
+    private fun captureGptRegion(
+        choice: TeacherPromptChoice,
+        selectionInRoot: RectF,
+        canonicalBounds: PageBounds,
+    ) {
+        if (assistantCaptureInProgress) return
+        val rootLocation = IntArray(2).also(rootHost::getLocationInWindow)
+        val windowWidth = window.decorView.width
+        val windowHeight = window.decorView.height
+        val source = Rect(
+            (rootLocation[0] + floor(selectionInRoot.left).toInt()).coerceIn(0, windowWidth),
+            (rootLocation[1] + floor(selectionInRoot.top).toInt()).coerceIn(0, windowHeight),
+            (rootLocation[0] + ceil(selectionInRoot.right).toInt()).coerceIn(0, windowWidth),
+            (rootLocation[1] + ceil(selectionInRoot.bottom).toInt()).coerceIn(0, windowHeight),
+        )
+        if (source.width() < 2 || source.height() < 2) {
+            updateReaderInputEnabled()
+            Toast.makeText(this, "선택 영역이 너무 작습니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val scale = min(1f, GPT_CAPTURE_MAX_EDGE_PX.toFloat() / max(source.width(), source.height()))
+        val bitmap = runCatching {
+            Bitmap.createBitmap(
+                max(2, (source.width() * scale).roundToInt()),
+                max(2, (source.height() * scale).roundToInt()),
+                Bitmap.Config.ARGB_8888,
+            )
+        }.getOrElse { error ->
+            Log.w(GPT_ASSISTANT_LOG_TAG, "Unable to allocate capture bitmap", error)
+            Toast.makeText(this, "화면 캡처 메모리가 부족합니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        assistantCaptureInProgress = true
+        updateReaderInputEnabled()
+        val temporarilyHidden = listOf(
+            topChrome,
+            messageOverlayHost,
+            stylusMenuOverlay,
+            studentExplanationOverlay,
+            pageRegionSelectionView,
+        ).map { view -> view to view.visibility }
+        temporarilyHidden.forEach { (view, _) -> view.visibility = View.INVISIBLE }
+
+        // PixelCopy reads the window surface, not the View tree. Wait through one complete draw so
+        // the hidden selector/chrome cannot remain in the captured surface from the previous frame.
+        rootHost.postOnAnimation {
+            rootHost.postOnAnimation {
+                val restoreUi = {
+                    temporarilyHidden.forEach { (view, visibility) -> view.visibility = visibility }
+                    assistantCaptureInProgress = false
+                    updateReaderInputEnabled()
+                }
+                try {
+                    PixelCopy.request(
+                        window,
+                        source,
+                        bitmap,
+                        { result ->
+                            restoreUi()
+                            if (result != PixelCopy.SUCCESS) {
+                                bitmap.recycle()
+                                Log.w(GPT_ASSISTANT_LOG_TAG, "PixelCopy failed: $result")
+                                Toast.makeText(
+                                    this@ReaderActivity,
+                                    "문제 영역을 캡처하지 못했습니다.",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                                return@request
+                            }
+                            if (isDestroyed || isFinishing) {
+                                bitmap.recycle()
+                                return@request
+                            }
+                            persistCaptureAndLaunch(choice, canonicalBounds, bitmap)
+                        },
+                        Handler(Looper.getMainLooper()),
+                    )
+                } catch (error: Throwable) {
+                    restoreUi()
+                    bitmap.recycle()
+                    Log.w(GPT_ASSISTANT_LOG_TAG, "PixelCopy request failed", error)
+                    Toast.makeText(
+                        this@ReaderActivity,
+                        "문제 영역을 캡처하지 못했습니다.",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun persistCaptureAndLaunch(
+        choice: TeacherPromptChoice,
+        canonicalBounds: PageBounds,
+        bitmap: Bitmap,
+    ) {
+        lifecycleScope.launch {
+            val imageFile = runCatching {
+                withContext(Dispatchers.IO) {
+                    try {
+                        val directory = File(cacheDir, GPT_CAPTURE_CACHE_DIRECTORY)
+                        check(directory.exists() || directory.mkdirs()) { "캡처 폴더를 만들 수 없습니다." }
+                        val file = File(directory, "${UUID.randomUUID()}.png")
+                        try {
+                            FileOutputStream(file).use { output ->
+                                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                                    "캡처 이미지를 저장할 수 없습니다."
+                                }
+                                output.flush()
+                                output.fd.sync()
+                            }
+                            check(file.length() in 1L..GPT_CAPTURE_MAX_BYTES) {
+                                "선택 영역 이미지가 너무 큽니다."
+                            }
+                            file
+                        } catch (error: Throwable) {
+                            file.delete()
+                            throw error
+                        }
+                    } finally {
+                        bitmap.recycle()
+                    }
+                }
+            }
+            imageFile.onSuccess { file ->
+                val request = GptAssistantRequest(
+                    bookId = choice.target.page.bookId,
+                    pageNumber = choice.target.page.pageNumber,
+                    promptSlotNumber = choice.prompt.slotNumber,
+                    promptTitle = choice.prompt.title,
+                    promptBody = choice.prompt.body,
+                    selectionBounds = canonicalBounds,
+                    imagePath = file.absolutePath,
+                )
+                runCatching {
+                    gptAssistantLauncher.launch(GptAssistantActivity.intent(this@ReaderActivity, request))
+                }.onFailure { error ->
+                    file.delete()
+                    Log.w(GPT_ASSISTANT_LOG_TAG, "Unable to open GPT activity", error)
+                    Toast.makeText(
+                        this@ReaderActivity,
+                        "GPT 화면을 열지 못했습니다.",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }.onFailure { error ->
+                Log.w(GPT_ASSISTANT_LOG_TAG, "Unable to persist capture", error)
+                Toast.makeText(
+                    this@ReaderActivity,
+                    error.message ?: "선택 영역을 저장하지 못했습니다.",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
+    }
+
+    private fun pruneStaleGptCaptures() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val directory = File(cacheDir, GPT_CAPTURE_CACHE_DIRECTORY)
+            val cutoff = System.currentTimeMillis() - GPT_CAPTURE_MAX_AGE_MS
+            directory.listFiles().orEmpty().asSequence()
+                .filter(File::isFile)
+                .filter { file ->
+                    file.extension.equals("png", ignoreCase = true) && file.lastModified() in 1L until cutoff
+                }
+                .forEach { file -> runCatching { file.delete() } }
+        }
+    }
+
+    private fun publishStudentExplanation(draft: TeacherExplanationSendDraft) {
+        lifecycleScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val current = assistantRepository.studentExplanationLayer(draft.target)
+                    val existing = current.cards.firstOrNull {
+                        it.sourceResourceId == draft.sourceResourceId
+                    }
+                    val card = if (existing == null) {
+                        assistantRepository.newStudentExplanationCard(
+                            page = draft.target.page,
+                            sourceResourceId = draft.sourceResourceId,
+                            sourceResourceRevisionId = draft.sourceResourceRevisionId,
+                            title = draft.title,
+                            text = draft.text,
+                            anchorBounds = draft.anchorBounds,
+                        )
+                    } else if (
+                        existing.sourceResourceRevisionId == draft.sourceResourceRevisionId &&
+                        existing.title == draft.title && existing.text == draft.text &&
+                        existing.anchorBounds == draft.anchorBounds
+                    ) {
+                        existing
+                    } else {
+                        existing.copy(
+                            sourceResourceRevisionId = draft.sourceResourceRevisionId,
+                            title = draft.title,
+                            text = draft.text,
+                            anchorBounds = draft.anchorBounds,
+                            updatedAtEpochMillis = max(
+                                System.currentTimeMillis(),
+                                existing.updatedAtEpochMillis + 1L,
+                            ),
+                        )
+                    }
+                    val nextCards = if (existing == null) {
+                        current.cards + card
+                    } else {
+                        current.cards.map { prior -> if (prior.cardId == existing.cardId) card else prior }
+                    }
+                    val layer = assistantRepository.replaceStudentExplanationCards(
+                        target = draft.target,
+                        cards = nextCards,
+                        expectedRevision = current.revision,
+                    )
+                    layer to (layer.revision != current.revision)
+                }
+            }
+            result.onSuccess { (layer, changed) ->
+                if (changed) StudentExplanationLayerBus.localLayerPublished(layer)
+                Toast.makeText(
+                    this@ReaderActivity,
+                    if (changed) "학생 설명을 전송 대기열에 저장했습니다." else "같은 설명이 이미 저장되어 있습니다.",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }.onFailure { error ->
+                Log.w(GPT_ASSISTANT_LOG_TAG, "Unable to publish student explanation", error)
+                Toast.makeText(
+                    this@ReaderActivity,
+                    "학생 설명을 저장하지 못했습니다.",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
+    }
+
     private fun renderChrome() {
         topChrome.setContent {
             ReaderTopChrome(
@@ -603,6 +1106,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 onShowStudentActivity = { studentActivityVisible = true },
                 onResumeStudentFollow = viewModel::resumeStudentFollow,
                 onOpenRemoteMonitor =(::openRemoteMonitorSetup),
+                onOpenGptAssistant =(::openTeacherGptResources),
             )
             if (studentActivityVisible && latestState.capabilities.showsStudentLocation) {
                 StudentActivityDialog(
@@ -1067,6 +1571,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     override fun onStart() {
         super.onStart()
         readerStarted = true
+        StudentExplanationLayerBus.addListener(studentExplanationListener)
+        refreshStudentExplanationLayer(force = true)
         remoteMonitorPreferences = remoteMonitorGateway.preferences()
         parentMessageSubscription?.close()
         parentMessageSubscription = remoteMonitorGateway.subscribeParentMessages { message ->
@@ -1120,6 +1626,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     override fun onStop() {
         readerStarted = false
+        StudentExplanationLayerBus.removeListener(studentExplanationListener)
         publishInactiveStudentPresence()
         parentMessageSubscription?.close()
         parentMessageSubscription = null
@@ -1135,6 +1642,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     override fun onDestroy() {
+        explanationLoadGeneration += 1L
+        teacherResourcesDialog?.dismiss()
+        teacherResourcesDialog = null
         parentMessageSubscription?.close()
         preferenceSubscription?.close()
         peerChatSubscription?.close()
@@ -1258,7 +1768,13 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 topMargin = bars.top
                 bottomMargin = bars.bottom
             }
-            listOf(fragmentContainer, dryInkView, wetInkView, inputView).forEach { view ->
+            listOf(
+                fragmentContainer,
+                dryInkView,
+                wetInkView,
+                inputView,
+                studentExplanationOverlay,
+            ).forEach { view ->
                 view.updateFrameLayoutParams { bottomMargin = bars.bottom }
             }
             updateMessageOverlayPosition(root.height)
@@ -1318,6 +1834,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         private const val SUBMITTED_BLUR_RADIUS_DP = 5f
         private const val PEN_INPUT_LOG_TAG = "MasterNotePenInput"
         private const val REMOTE_MONITOR_LOG_TAG = "MasterNoteRemoteMonitor"
+        private const val GPT_ASSISTANT_LOG_TAG = "MasterNoteGptAssistant"
+        private const val GPT_CAPTURE_CACHE_DIRECTORY = "gpt-assistant"
+        private const val GPT_CAPTURE_MAX_EDGE_PX = 1_800
+        private const val GPT_CAPTURE_MAX_BYTES = 8L * 1024L * 1024L
+        private const val GPT_CAPTURE_MAX_AGE_MS = 24L * 60L * 60L * 1_000L
         private const val REMOTE_REVIEW_SETUP_ACTIVITY_CLASS =
             "com.studyink.app.RemoteReviewSetupActivity"
         private const val REMOTE_CHAT_ACTIVITY_CLASS = "com.studyink.app.RemotePeerChatActivity"

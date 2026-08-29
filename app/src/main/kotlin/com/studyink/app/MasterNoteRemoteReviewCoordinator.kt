@@ -2,9 +2,15 @@ package com.studyink.app
 
 import android.app.Application
 import android.os.SystemClock
+import com.studyink.assistant.core.AssistantRepositoryProvider
+import com.studyink.assistant.core.PendingStudentExplanationPublication
+import com.studyink.assistant.core.StudentExplanationLayer
+import com.studyink.assistant.core.StudentExplanationLayerBus
+import com.studyink.assistant.core.StudentLayerApplyStatus
 import com.studyink.annotation.engine.AnnotationChange
 import com.studyink.annotation.storage.PageOperationLogStore
 import com.studyink.core.model.ANNOTATION_FORMAT_VERSION
+import com.studyink.core.model.Attempt
 import com.studyink.core.model.AnnotationSnapshot
 import com.studyink.core.model.AssetOperation
 import com.studyink.core.model.CANONICAL_PAGE_WIDTH
@@ -17,6 +23,7 @@ import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeId
 import com.studyink.core.model.StrokeTool
 import com.studyink.library.data.LibraryRepository
+import com.studyink.library.data.LibraryAttemptBus
 import com.studyink.monitor.core.NormalizedTeacherPoint
 import com.studyink.monitor.core.NormalizedTeacherStroke
 import com.studyink.monitor.core.NormalizedGradeAnchor
@@ -29,6 +36,8 @@ import com.studyink.monitor.core.HybridLinkStateMachine
 import com.studyink.monitor.core.HybridLinkStatus
 import com.studyink.monitor.core.HybridLinkStatusBus
 import com.studyink.monitor.core.HybridLinkTransport
+import com.studyink.monitor.core.GptExplanationLayerEnvelope
+import com.studyink.monitor.core.REMOTE_LEGACY_EXPLANATION_AUTHORITY
 import com.studyink.monitor.core.ChatMessageEnvelope
 import com.studyink.monitor.core.DecodedRemoteReviewDocument
 import com.studyink.monitor.core.PageSnapshotEnvelope
@@ -103,6 +112,8 @@ private val RETIRED_LEGACY_REMOTE_REVIEW_PAYLOAD_TYPES = setOf(
     RemoteReviewEnvelopeType.TEACHER_FEEDBACK.name,
     RemoteReviewEnvelopeType.REMOTE_GRADE.name,
 )
+
+internal const val LAN_CATCH_UP_GRACE_MS = 4_000L
 
 /**
  * Application boundary for the optional Telegram remote-review path.
@@ -245,6 +256,7 @@ private class RemoteReviewRuntime(
     private val gateway = RemoteMonitorGateway.get(application)
     private val library = LibraryRepository.get(application)
     private val annotationStore = PageOperationLogStore.get(application)
+    private val assistantRepository = AssistantRepositoryProvider.get(application)
     private val ledger = RemoteReviewLedger(
         File(application.noBackupFilesDir, "remote-review/exchange-ledger"),
     )
@@ -328,6 +340,9 @@ private class RemoteReviewRuntime(
     private var hybridBookId: String? = null
     private var hybridDecision: HybridLinkDecision? = null
     private var pageSyncTransportRoute = GlobalPageSyncTransportRoute.TELEGRAM
+    private var lanCatchUpBookId: String? = null
+    private var lanCatchUpStartedAtElapsedMs: Long? = null
+    private var lanCatchUpYieldRequested = false
     private var telegramStatus: RemoteMonitorStatus = gateway.status()
     private var telegramPeerLinkState: TelegramPeerLinkState = gateway.peerLinkState()
     private var observedSession: ConnectedRemoteReviewSession? = null
@@ -338,6 +353,13 @@ private class RemoteReviewRuntime(
     private var telegramPeerLinkSubscription: AutoCloseable? = null
     private var teacherReviewSubscription: AutoCloseable? = null
     private var teacherReviewProvenanceSubscription: AutoCloseable? = null
+    private val assistantLayerListener = object : StudentExplanationLayerBus.Listener {
+        override fun onLocalLayerPublished(layer: StudentExplanationLayer) {
+            execute { publishGptExplanationLayer(layer) }
+        }
+    }
+    /** Retry timestamps only; the sidecar journal and layer files remain authoritative. */
+    private val gptPublicationAttemptsAtElapsedMs = linkedMapOf<String, Long>()
     /**
      * Rendered snapshots and their separate feedback/grade replies had no ordering relation with
      * page sync. Keep retrying durable cancellation until the outbox proves all three types empty;
@@ -352,7 +374,12 @@ private class RemoteReviewRuntime(
         }
 
         override fun onConnectionStateChanged(bookId: String, state: LanConnectionState) {
-            execute { updateHybridLink(bookId) }
+            execute {
+                // Use the transition carried by the callback, not just the latest sticky state.
+                // A fast same-book reconnect must always receive a fresh four-second lease.
+                if (state != LanConnectionState.CONNECTED) resetLanCatchUpLease(bookId)
+                updateHybridLink(bookId)
+            }
         }
 
         override fun onSessionPhaseChanged(bookId: String, phase: LanSessionPhase) {
@@ -369,6 +396,11 @@ private class RemoteReviewRuntime(
             execute { pageSync.onLanTeacherReviewAcknowledged(publication) }
         }
     }
+    private val attemptListener = object : LibraryAttemptBus.Listener {
+        override fun onLocalAttemptChanged(attempt: Attempt) {
+            execute { pageSync.onLocalOperation(attempt.bookId, attempt.pageNumber) }
+        }
+    }
 
     @Volatile
     private var closed = false
@@ -380,6 +412,8 @@ private class RemoteReviewRuntime(
 
     fun start() {
         LanSyncBus.addListener(lanListener)
+        LibraryAttemptBus.addListener(attemptListener)
+        StudentExplanationLayerBus.addListener(assistantLayerListener)
         teacherReviewProvenanceSubscription = TeacherReviewPublicationProvenanceBus.install { target ->
             synchronized(operationLock) {
                 if (closed || pausedForMaintenance) null else {
@@ -718,6 +752,7 @@ private class RemoteReviewRuntime(
             captureState.reset()
             pageSync.onDataRootReplaced()
             observedSession = null
+            gptPublicationAttemptsAtElapsedMs.clear()
             gateway.cancelPendingPeerDocumentTransfers(
                 setOf(
                     RemoteReviewEnvelopeType.PAGE_SNAPSHOT.name,
@@ -725,6 +760,7 @@ private class RemoteReviewRuntime(
                     RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST.name,
                     RemoteReviewEnvelopeType.PAGE_ANNOTATION.name,
                     RemoteReviewEnvelopeType.PAGE_SYNC_ACK.name,
+                    RemoteReviewEnvelopeType.GPT_EXPLANATION_LAYER.name,
                 ),
             )
             ledger.clearStudentExchangeState()
@@ -762,7 +798,9 @@ private class RemoteReviewRuntime(
 
     private fun tick() {
         if (closed) return
-        refreshSession() ?: return
+        // LAN can be the only configured transport. Durable GPT intents must still be replayed
+        // after process restart even when no Telegram peer session exists.
+        refreshSession()
         retireLegacyRenderedPageTransport()
         val previousPeerRecent = telegramPeerLinkState.peerRecent
         telegramPeerLinkState = gateway.maintainPeerLink()
@@ -788,10 +826,18 @@ private class RemoteReviewRuntime(
             pendingById[updateId]?.let(::processIncoming)
         }
         pageSync.tick()
+        retryPendingGptExplanationPublications()
     }
 
     private fun updateHybridLink(bookId: String) {
-        updateHybridLink(bookId, LanSyncBus.sessionSnapshot(bookId))
+        val activeLan = LanSyncBus.activeSessionSnapshot()
+        if (activeLan != null) {
+            // Keep one grace history for the service's real socket. A Reader event from another
+            // workbook must not reset that clock and shorten an established LAN loss episode.
+            updateHybridLink(activeLan.bookId, activeLan.session)
+        } else {
+            updateHybridLink(bookId, LanSyncBus.sessionSnapshot(bookId))
+        }
     }
 
     private fun updateHybridLink(bookId: String, lanSnapshot: LanSessionSnapshot) {
@@ -844,7 +890,8 @@ private class RemoteReviewRuntime(
         // presence update. Re-evaluating here also lets the four-second loss grace expire on the
         // coordinator's one-second tick without requiring another socket callback.
         activeLan?.let { evaluateHybridLink(it.bookId, it.session) }
-        val route = globalPageSyncTransportRoute(activeLan?.session, hybridDecision)
+        refreshLanCatchUpYield(activeLan)
+        val route = globalPageSyncTransportRoute(activeLan?.session)
         val previousRoute = pageSyncTransportRoute
         pageSyncTransportRoute = route
         val fallbackDecision = hybridDecision
@@ -869,8 +916,56 @@ private class RemoteReviewRuntime(
             lanOwnsData = route == GlobalPageSyncTransportRoute.LAN_OWNS,
         )
         if (route == GlobalPageSyncTransportRoute.LAN_OWNS && previousRoute != route) {
+            // Rotate durably before cancellation. A crash between these calls can leave an old
+            // ciphertext, but it can never acknowledge the new current transport attempt.
+            rotatePendingGptTelegramTransfers()
             suspendTelegramPageCaptureWhileLanIsReady()
         }
+        if (shouldClearGptPublicationRetryGate(previousRoute, route)) {
+            // LAN_GRACE may have stamped the in-memory retry clock without ever delivering. Once
+            // Telegram becomes the owner it must get an immediate attempt, not wait up to 30 s.
+            gptPublicationAttemptsAtElapsedMs.clear()
+        }
+    }
+
+    /**
+     * Give every connected socket one bounded chance to finish catch-up. At expiry, yield only when
+     * Telegram is genuinely ready; otherwise the LAN watchdog remains responsible for recovery.
+     * readLoop's subsequent DISCONNECTED publication is still the ownership barrier before send.
+     */
+    private fun refreshLanCatchUpYield(activeLan: com.studyink.sync.lan.LanActiveSessionSnapshot?) {
+        val unreadyConnected = activeLan?.takeIf { active ->
+            active.session.connectionState == LanConnectionState.CONNECTED &&
+                active.session.phase != LanSessionPhase.READY
+        }
+        if (unreadyConnected == null) {
+            resetLanCatchUpLease()
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (lanCatchUpBookId != unreadyConnected.bookId || lanCatchUpStartedAtElapsedMs == null) {
+            lanCatchUpBookId = unreadyConnected.bookId
+            lanCatchUpStartedAtElapsedMs = now
+            lanCatchUpYieldRequested = false
+        }
+        if (shouldRequestLanCatchUpYield(
+                activeLanSession = unreadyConnected.session,
+                decision = hybridDecision,
+                startedAtElapsedMs = requireNotNull(lanCatchUpStartedAtElapsedMs),
+                nowElapsedMs = now,
+                alreadyRequested = lanCatchUpYieldRequested,
+            )
+        ) {
+            lanCatchUpYieldRequested = true
+            LanSyncBus.requestCatchUpYield(unreadyConnected.bookId)
+        }
+    }
+
+    private fun resetLanCatchUpLease(bookId: String? = null) {
+        if (bookId != null && lanCatchUpBookId != bookId) return
+        lanCatchUpBookId = null
+        lanCatchUpStartedAtElapsedMs = null
+        lanCatchUpYieldRequested = false
     }
 
     private fun allowsTelegramUserActionNow(): Boolean {
@@ -878,7 +973,6 @@ private class RemoteReviewRuntime(
         activeLanSession?.let { updateHybridLink(it.bookId, it.session) }
         return globalPageSyncTransportRoute(
             activeLanSession?.session,
-            hybridDecision,
         ) == GlobalPageSyncTransportRoute.TELEGRAM
     }
 
@@ -889,6 +983,7 @@ private class RemoteReviewRuntime(
                 RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST.name,
                 RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST.name,
                 RemoteReviewEnvelopeType.PAGE_ANNOTATION.name,
+                RemoteReviewEnvelopeType.GPT_EXPLANATION_LAYER.name,
             ),
         )
         pageSync.setTransportState(
@@ -910,6 +1005,12 @@ private class RemoteReviewRuntime(
     private fun refreshSession(): ConnectedRemoteReviewSession? {
         val current = connectedSession()
         if (current == observedSession) return current
+        if (observedSession != null) {
+            rotatePendingGptTelegramTransfers()
+            gateway.cancelPendingPeerDocumentTransfers(
+                setOf(RemoteReviewEnvelopeType.GPT_EXPLANATION_LAYER.name),
+            )
+        }
         pageSync.bindSession(current?.let { RemotePageSyncSession(it.role, it.pairId) })
         observedSession = current
         telegramPeerLinkState = gateway.peerLinkState()
@@ -1114,6 +1215,170 @@ private class RemoteReviewRuntime(
         }
     }
 
+    private fun publishGptExplanationLayer(layer: StudentExplanationLayer) {
+        if (closed || pausedForMaintenance || layer.revision <= 0L) return
+        val pending = assistantRepository.pendingStudentExplanationPublications().firstOrNull {
+            it.target == layer.target && it.revision == layer.revision &&
+                it.digestSha256 == layer.digestSha256
+        } ?: return
+        publishPendingGptExplanation(pending, force = true)
+    }
+
+    private fun retryPendingGptExplanationPublications() {
+        val pending = assistantRepository.pendingStudentExplanationPublications()
+        gptPublicationAttemptsAtElapsedMs.keys.retainAll(
+            pending.mapTo(hashSetOf(), PendingStudentExplanationPublication::publicationId),
+        )
+        val nowElapsed = SystemClock.elapsedRealtime()
+        pending.firstOrNull { publication ->
+            val lastAttempt = gptPublicationAttemptsAtElapsedMs[publication.publicationId]
+            lastAttempt == null || nowElapsed - lastAttempt >= GPT_PUBLICATION_RETRY_MS
+        }?.let { publishPendingGptExplanation(it, force = false) }
+    }
+
+    private fun publishPendingGptExplanation(
+        pending: PendingStudentExplanationPublication,
+        force: Boolean,
+    ) {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val lastAttempt = gptPublicationAttemptsAtElapsedMs[pending.publicationId]
+        if (!force && lastAttempt != null && nowElapsed - lastAttempt < GPT_PUBLICATION_RETRY_MS) return
+        gptPublicationAttemptsAtElapsedMs[pending.publicationId] = nowElapsed
+
+        val target = pending.target
+        val localBookId = target.page.bookId
+        val pageNumber = target.page.pageNumber
+        val attemptNo = target.attemptNo
+        val exactAttempt = runCatching {
+            library.attempts(localBookId, pageNumber).singleOrNull {
+                it.bookId == localBookId && it.pageNumber == pageNumber && it.attemptNo == attemptNo
+            }
+        }.getOrNull() ?: return
+        if (exactAttempt.attemptNo != attemptNo) return
+        val authorityEpoch = runCatching { assistantRepository.teacherAuthorityEpoch() }
+            .getOrNull() ?: return
+        val frozen = runCatching {
+            assistantRepository.layerForPendingPublication(pending.publicationId, authorityEpoch)
+        }.getOrNull() ?: return
+
+        LanSyncBus.withActiveSessionLease { activeLan ->
+            when (globalPageSyncTransportRoute(activeLan?.session)) {
+                GlobalPageSyncTransportRoute.LAN_GRACE,
+                GlobalPageSyncTransportRoute.LAN_OWNS,
+                -> {
+                    // The LAN service re-reads this exact durable intent and resolves it only on
+                    // an application ACK from the authenticated student.
+                    LanSyncBus.gptExplanationLayerPublished(frozen)
+                }
+                GlobalPageSyncTransportRoute.TELEGRAM -> {
+                    publishPendingGptExplanationOverTelegram(pending, frozen, nowElapsed)
+                }
+            }
+        }
+    }
+
+    private fun publishPendingGptExplanationOverTelegram(
+        pending: PendingStudentExplanationPublication,
+        frozen: StudentExplanationLayer,
+        nowElapsed: Long,
+    ) {
+        val session = refreshSession()?.takeIf { it.role == RemoteReviewRole.TEACHER } ?: return
+        val localBookId = pending.target.page.bookId
+        val pageNumber = pending.target.page.pageNumber
+        val page = pageSyncStore.teacherPageForLocalTarget(localBookId, pageNumber) ?: return
+        val localHash = runCatching { library.book(localBookId).contentSha256.lowercase() }.getOrNull()
+            ?: return
+        // Local existence is not remote provenance. The current manifest must authorize this
+        // exact open or submitted attempt before any text can be attached remotely.
+        if (!page.authorizesGptExplanation(localBookId, pageNumber, pending.target.attemptNo, localHash)) return
+
+        val transferId = gptTelegramTransferId(pending, session.pairId, page.pageToken)
+        val receipt = gateway.peerDeliveryReceipt(transferId)
+        if (receipt?.acknowledgedAtEpochMs != null) {
+            assistantRepository.resolvePendingStudentExplanationPublication(
+                pending.publicationId,
+                pending.target,
+                pending.revision,
+                pending.digestSha256,
+            )
+            gptPublicationAttemptsAtElapsedMs.remove(pending.publicationId)
+            return
+        }
+        if (receipt != null || gateway.pendingPeerDocumentTransfers(
+                setOf(RemoteReviewEnvelopeType.GPT_EXPLANATION_LAYER.name),
+            ).any { it.transferId == transferId }
+        ) return
+        if (gateway.deadLetters().any { it.entry.peerTransferId == transferId }) {
+            assistantRepository.advancePendingStudentExplanationDeliveryAttempt(pending.publicationId)
+            gptPublicationAttemptsAtElapsedMs.remove(pending.publicationId)
+            return
+        }
+
+        val envelope = runCatching {
+            frozen.toRemoteEnvelope(
+                pageToken = page.pageToken,
+                transferId = transferId,
+                createdAtEpochMs = pending.queuedAtEpochMillis,
+                authorityEpoch = frozen.authorityEpoch,
+            )
+        }.getOrNull() ?: return
+        gptPublicationAttemptsAtElapsedMs[pending.publicationId] = nowElapsed
+        val result = enqueuePageSyncEnvelope(envelope)
+        if (result == TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED) {
+            assistantRepository.advancePendingStudentExplanationDeliveryAttempt(pending.publicationId)
+            gptPublicationAttemptsAtElapsedMs.remove(pending.publicationId)
+        }
+    }
+
+    private fun rotatePendingGptTelegramTransfers() {
+        runCatching { assistantRepository.advanceAllPendingStudentExplanationDeliveryAttempts() }
+        gptPublicationAttemptsAtElapsedMs.clear()
+    }
+
+    private fun receiveGptExplanationLayer(
+        envelope: GptExplanationLayerEnvelope,
+    ): RemotePageSyncIncomingResult {
+        val session = connectedSession()?.takeIf { it.role == RemoteReviewRole.STUDENT }
+            ?: return RemotePageSyncIncomingResult.RETAIN
+        if (session != observedSession) return RemotePageSyncIncomingResult.RETAIN
+        if (envelope.authorityEpoch == REMOTE_LEGACY_EXPLANATION_AUTHORITY) {
+            return RemotePageSyncIncomingResult.RETAIN
+        }
+        val page = pageSyncStore.studentPage(envelope.pageToken)
+            ?: return RemotePageSyncIncomingResult.RETAIN
+        if (page.pageNumber + 1 != envelope.pageNumber) return RemotePageSyncIncomingResult.RETAIN
+        val localBook = runCatching { library.book(page.bookId) }.getOrNull()
+            ?: return RemotePageSyncIncomingResult.RETAIN
+        if (localBook.contentSha256 != page.contentSha256 ||
+            envelope.pageNumber !in 1..localBook.pageCount
+        ) return RemotePageSyncIncomingResult.RETAIN
+        val exactAttemptExists = runCatching {
+            library.attempts(page.bookId, page.pageNumber).any {
+                it.bookId == page.bookId && it.pageNumber == page.pageNumber &&
+                    it.attemptNo == envelope.attemptNo
+            }
+        }.getOrDefault(false)
+        if (!exactAttemptExists) return RemotePageSyncIncomingResult.RETAIN
+
+        val incoming = runCatching { envelope.toLocalLayer(page.bookId) }.getOrNull()
+            ?: return RemotePageSyncIncomingResult.RETAIN
+        val result = runCatching {
+            assistantRepository.applyStudentExplanationLayer(incoming.target, incoming)
+        }.getOrElse { return RemotePageSyncIncomingResult.RETAIN }
+        return when (result.status) {
+            StudentLayerApplyStatus.APPLIED -> {
+                StudentExplanationLayerBus.remoteLayerApplied(result.current)
+                RemotePageSyncIncomingResult.ACKNOWLEDGE
+            }
+            StudentLayerApplyStatus.ALREADY_CURRENT,
+            StudentLayerApplyStatus.STALE,
+            -> RemotePageSyncIncomingResult.ACKNOWLEDGE
+            // Same-authority/same-revision different content is corruption, not success. Keep the
+            // application document unacknowledged so the durable sender intent is never erased.
+            StudentLayerApplyStatus.CONFLICT -> RemotePageSyncIncomingResult.RETAIN
+        }
+    }
+
     private fun enqueuePageSyncEnvelope(
         envelope: com.studyink.monitor.core.RemoteReviewEnvelope,
     ): TelegramEnqueueResult {
@@ -1199,6 +1464,18 @@ private class RemoteReviewRuntime(
                     processPageSyncIncoming(pending) { pageSync.receiveAck(envelope) }
                 }
             }
+            is GptExplanationLayerEnvelope -> {
+                if (pending.payloadType != RemoteReviewEnvelopeType.GPT_EXPLANATION_LAYER.name) {
+                    dropIncoming(pending)
+                } else {
+                    // Unlike ordinary recoverable page data, this document is the sender's only
+                    // durable explicit-publish proof. LAN ownership retains it rather than issuing
+                    // a false semantic success ACK before LAN has applied the same publication.
+                    processPageSyncIncoming(pending, dropWhenLanOwns = false) {
+                        receiveGptExplanationLayer(envelope)
+                    }
+                }
+            }
             is PageSnapshotEnvelope -> {
                 // Retained only in the codec for historical readability. The pre-decode gate
                 // normally catches this; keep a decoded defense for mismatched/crafted metadata.
@@ -1243,10 +1520,11 @@ private class RemoteReviewRuntime(
      */
     private inline fun processPageSyncIncoming(
         pending: PendingTelegramPeerDocument,
+        dropWhenLanOwns: Boolean = true,
         crossinline apply: () -> RemotePageSyncIncomingResult,
     ) {
         val (route, result) = LanSyncBus.withActiveSessionLease { activeLan ->
-            val currentRoute = globalPageSyncTransportRoute(activeLan?.session, hybridDecision)
+            val currentRoute = globalPageSyncTransportRoute(activeLan?.session)
             currentRoute to if (currentRoute == GlobalPageSyncTransportRoute.TELEGRAM) {
                 apply()
             } else {
@@ -1254,7 +1532,7 @@ private class RemoteReviewRuntime(
             }
         }
         when (route) {
-            GlobalPageSyncTransportRoute.LAN_OWNS -> dropIncoming(pending)
+            GlobalPageSyncTransportRoute.LAN_OWNS -> if (dropWhenLanOwns) dropIncoming(pending)
             GlobalPageSyncTransportRoute.LAN_GRACE -> Unit
             GlobalPageSyncTransportRoute.TELEGRAM -> settlePageSyncIncoming(
                 pending,
@@ -1274,7 +1552,7 @@ private class RemoteReviewRuntime(
         crossinline apply: () -> Unit,
     ) {
         val route = LanSyncBus.withActiveSessionLease { activeLan ->
-            globalPageSyncTransportRoute(activeLan?.session, hybridDecision).also { currentRoute ->
+            globalPageSyncTransportRoute(activeLan?.session).also { currentRoute ->
                 if (currentRoute == GlobalPageSyncTransportRoute.TELEGRAM) apply()
             }
         }
@@ -1525,6 +1803,8 @@ private class RemoteReviewRuntime(
         pausedForMaintenance = true
         workGeneration.incrementAndGet()
         LanSyncBus.removeListener(lanListener)
+        LibraryAttemptBus.removeListener(attemptListener)
+        StudentExplanationLayerBus.removeListener(assistantLayerListener)
         presenceSubscription?.close()
         heartbeatSubscription?.close()
         peerDocumentSubscription?.close()
@@ -1549,10 +1829,40 @@ private class RemoteReviewRuntime(
     private companion object {
         const val TICK_MILLIS = 1_000L
         const val MAX_INBOX_DOCUMENTS_PER_TICK = 8
+        const val GPT_PUBLICATION_RETRY_MS = 30_000L
     }
 }
 
 internal enum class GlobalPageSyncTransportRoute { TELEGRAM, LAN_GRACE, LAN_OWNS }
+
+internal fun shouldClearGptPublicationRetryGate(
+    previous: GlobalPageSyncTransportRoute,
+    current: GlobalPageSyncTransportRoute,
+): Boolean = current == GlobalPageSyncTransportRoute.TELEGRAM && previous != current
+
+internal fun TeacherPageSyncRecord.authorizesGptExplanation(
+    localBookId: String,
+    pageNumber: Int,
+    attemptNo: Int,
+    contentSha256: String,
+): Boolean = syncGeneration > 0L && !mappingRequired && this.localBookId == localBookId &&
+    this.pageNumber == pageNumber && this.contentSha256 == contentSha256 && attemptNo in attemptNos
+
+internal fun gptTelegramTransferId(
+    pending: PendingStudentExplanationPublication,
+    pairId: String,
+    pageToken: String,
+): String {
+    val seed = buildString {
+        append(pending.publicationId).append('|')
+        append(pending.deliveryAttempt).append('|')
+        append(pairId).append('|')
+        append(pageToken)
+    }.toByteArray(StandardCharsets.UTF_8)
+    return "gpt_" + MessageDigest.getInstance("SHA-256")
+        .digest(seed)
+        .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+}
 
 /** Legacy rendered-page messages have no shared revision order with the page-sync stream. */
 internal fun isRetiredLegacyRemoteReviewPayloadType(payloadType: String): Boolean =
@@ -1582,18 +1892,31 @@ internal fun globalHybridDisplayDecision(
 /**
  * Page deltas are application-global, while the Reader's hybrid indicator is book-scoped. Route
  * from the LAN service's one real session so opening another book cannot accidentally enable both
- * transports. A connected session retains Telegram input until READY; a definitively disconnected
- * record immediately hands ownership back to Telegram.
+ * transports. A connected pre-READY session keeps Telegram paused; the four-second policy asks the
+ * socket to yield, and only its definitive DISCONNECTED publication hands ownership to Telegram.
  */
 internal fun globalPageSyncTransportRoute(
     activeLanSession: LanSessionSnapshot?,
-    @Suppress("UNUSED_PARAMETER")
-    hybridDecision: HybridLinkDecision? = null,
 ): GlobalPageSyncTransportRoute = when {
     activeLanSession == null || isLanTransportDefinitelyDisconnected(activeLanSession.connectionState) ->
         GlobalPageSyncTransportRoute.TELEGRAM
     activeLanSession.phase == LanSessionPhase.READY -> GlobalPageSyncTransportRoute.LAN_OWNS
     else -> GlobalPageSyncTransportRoute.LAN_GRACE
+}
+
+internal fun shouldRequestLanCatchUpYield(
+    activeLanSession: LanSessionSnapshot?,
+    decision: HybridLinkDecision?,
+    startedAtElapsedMs: Long,
+    nowElapsedMs: Long,
+    alreadyRequested: Boolean,
+): Boolean {
+    require(startedAtElapsedMs >= 0L && nowElapsedMs >= startedAtElapsedMs)
+    return !alreadyRequested &&
+        nowElapsedMs - startedAtElapsedMs >= LAN_CATCH_UP_GRACE_MS &&
+        activeLanSession?.connectionState == LanConnectionState.CONNECTED &&
+        activeLanSession.phase != LanSessionPhase.READY &&
+        decision?.activeTransport == HybridLinkTransport.TELEGRAM
 }
 
 internal fun isLanTransportDefinitelyDisconnected(connectionState: LanConnectionState): Boolean =

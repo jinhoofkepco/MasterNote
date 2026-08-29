@@ -10,6 +10,7 @@ import android.provider.MediaStore
 import android.provider.Settings
 import com.studyink.annotation.storage.PageOperationLogStore
 import com.studyink.core.model.MasterNoteDataRootBus
+import com.studyink.core.model.MasterNoteOptionalDataRootGuard
 import com.studyink.library.data.LibraryRepository
 import java.io.File
 import java.io.FileInputStream
@@ -94,8 +95,10 @@ class MasterNoteBackupManager private constructor(context: Context) {
             val annotationStore = PageOperationLogStore.get(context)
             val sourceDeviceId = library.withStableDataRoot { liveRoot ->
                 annotationStore.withStableDataRoot {
-                    copyStableDataRoot(liveRoot, dataRoot)
-                    library.deviceId
+                    MasterNoteOptionalDataRootGuard.withStableDataRoot(liveRoot) {
+                        copyStableDataRoot(liveRoot, dataRoot)
+                        library.deviceId
+                    }
                 }
             }
             BackupArchive.populateMissingCatalogHashes(dataRoot)
@@ -180,33 +183,35 @@ class MasterNoteBackupManager private constructor(context: Context) {
             val annotationStore = PageOperationLogStore.get(context)
             library.withStableDataRoot { liveRoot ->
                 annotationStore.withStableDataRoot {
-                    val expectedRoot = File(context.filesDir, "masternote").canonicalFile
-                    check(liveRoot.canonicalFile == expectedRoot) { "예상하지 못한 데이터 경로입니다." }
-                    try {
-                        check(liveRoot.renameTo(rollbackRoot)) { "기존 데이터를 복원 대기 폴더로 옮기지 못했습니다." }
-                        oldRootMoved = true
-                        check(incomingRoot.renameTo(liveRoot)) { "복원 데이터를 확정하지 못했습니다." }
-                        newRootInstalled = true
-                        if (fingerprintMatches) {
-                            check(preferences.edit().putString(DEVICE_ID_KEY, validated.identity.deviceId).commit()) {
-                                "복원 기기 정보를 저장하지 못했습니다."
+                    MasterNoteOptionalDataRootGuard.withStableDataRoot(liveRoot) {
+                        val expectedRoot = File(context.filesDir, "masternote").canonicalFile
+                        check(liveRoot.canonicalFile == expectedRoot) { "예상하지 못한 데이터 경로입니다." }
+                        try {
+                            check(liveRoot.renameTo(rollbackRoot)) { "기존 데이터를 복원 대기 폴더로 옮기지 못했습니다." }
+                            oldRootMoved = true
+                            check(incomingRoot.renameTo(liveRoot)) { "복원 데이터를 확정하지 못했습니다." }
+                            newRootInstalled = true
+                            if (fingerprintMatches) {
+                                check(preferences.edit().putString(DEVICE_ID_KEY, validated.identity.deviceId).commit()) {
+                                    "복원 기기 정보를 저장하지 못했습니다."
+                                }
                             }
+                            // Drop all in-memory catalogs and annotation indexes before the old locks
+                            // are released. New callers will therefore open the newly installed root.
+                            PageOperationLogStore.resetForRestore()
+                            LibraryRepository.resetForRestore()
+                            MasterNoteDataRootBus.dataRootReplaced()
+                        } catch (error: Throwable) {
+                            if (newRootInstalled && liveRoot.exists()) deleteTreeChecked(liveRoot, context.filesDir)
+                            if (oldRootMoved && rollbackRoot.exists()) {
+                                check(rollbackRoot.renameTo(liveRoot)) { "복원 실패 후 기존 데이터도 되돌리지 못했습니다." }
+                            }
+                            restorePreviousDeviceId(preferences, previousDeviceId)
+                            PageOperationLogStore.resetForRestore()
+                            LibraryRepository.resetForRestore()
+                            MasterNoteDataRootBus.dataRootReplaced()
+                            throw error
                         }
-                        // Drop all in-memory catalogs and annotation indexes before the old locks
-                        // are released. New callers will therefore open the newly installed root.
-                        PageOperationLogStore.resetForRestore()
-                        LibraryRepository.resetForRestore()
-                        MasterNoteDataRootBus.dataRootReplaced()
-                    } catch (error: Throwable) {
-                        if (newRootInstalled && liveRoot.exists()) deleteTreeChecked(liveRoot, context.filesDir)
-                        if (oldRootMoved && rollbackRoot.exists()) {
-                            check(rollbackRoot.renameTo(liveRoot)) { "복원 실패 후 기존 데이터도 되돌리지 못했습니다." }
-                        }
-                        restorePreviousDeviceId(preferences, previousDeviceId)
-                        PageOperationLogStore.resetForRestore()
-                        LibraryRepository.resetForRestore()
-                        MasterNoteDataRootBus.dataRootReplaced()
-                        throw error
                     }
                 }
             }

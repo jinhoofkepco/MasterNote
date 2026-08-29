@@ -13,6 +13,8 @@ import com.studyink.monitor.core.HybridLinkDecision
 import com.studyink.monitor.core.HybridLinkHealth
 import com.studyink.monitor.core.HybridLinkLabel
 import com.studyink.monitor.core.HybridLinkMode
+import com.studyink.monitor.core.HybridLinkSignals
+import com.studyink.monitor.core.HybridLinkStateMachine
 import com.studyink.monitor.core.HybridLinkTransport
 import com.studyink.monitor.core.PageSnapshotEnvelope
 import com.studyink.monitor.core.RemoteGradeEnvelope
@@ -113,14 +115,7 @@ class MasterNoteRemoteReviewCoordinatorTest {
         assertEquals(HybridLinkTransport.LAN, displayed.activeTransport)
     }
 
-    @Test fun connectedLanCatchUpRetainsGlobalTelegramPageDocuments() {
-        val staleTelegramDecision = HybridLinkDecision(
-            mode = HybridLinkMode.TELEGRAM_FALLBACK,
-            label = HybridLinkLabel.TELEGRAM,
-            health = HybridLinkHealth.READY,
-            activeTransport = HybridLinkTransport.TELEGRAM,
-            enteredTelegramFallback = true,
-        )
+    @Test fun connectedLanCatchUpRetainsGlobalTelegramPageDocumentsUntilSocketYields() {
         listOf(
             LanSessionPhase.SOCKET_CONNECTED,
             LanSessionPhase.HANDSHAKE_COMPLETE,
@@ -130,10 +125,53 @@ class MasterNoteRemoteReviewCoordinatorTest {
                 GlobalPageSyncTransportRoute.LAN_GRACE,
                 globalPageSyncTransportRoute(
                     LanSessionSnapshot(LanConnectionState.CONNECTED, phase),
-                    staleTelegramDecision,
                 ),
             )
         }
+    }
+
+    @Test fun initiallyUnreadyLanGetsFourSecondsThenYieldsWhenTelegramIsReady() {
+        val decision = HybridLinkStateMachine().update(
+            hybridSignals(nowElapsedMs = 100L, lanReady = false, telegramReady = true),
+        )
+
+        assertEquals(HybridLinkMode.TELEGRAM_FALLBACK, decision.mode)
+        assertFalse(shouldYield(UNREADY_LAN, decision, nowElapsedMs = 4_099L))
+        assertTrue(shouldYield(UNREADY_LAN, decision, nowElapsedMs = 4_100L))
+        assertFalse(shouldYield(UNREADY_LAN, decision, nowElapsedMs = 4_101L, alreadyRequested = true))
+    }
+
+    @Test fun establishedLanYieldsOnlyWhenStateMachineGraceExpires() {
+        val stateMachine = HybridLinkStateMachine()
+        stateMachine.update(hybridSignals(nowElapsedMs = 100L, lanReady = true, telegramReady = true))
+        stateMachine.update(hybridSignals(nowElapsedMs = 101L, lanReady = false, telegramReady = true))
+        val beforeBoundary = stateMachine.update(
+            hybridSignals(nowElapsedMs = 4_100L, lanReady = false, telegramReady = true),
+        )
+        val atBoundary = stateMachine.update(
+            hybridSignals(nowElapsedMs = 4_101L, lanReady = false, telegramReady = true),
+        )
+
+        assertEquals(HybridLinkMode.LAN_GRACE, beforeBoundary.mode)
+        assertFalse(shouldYield(UNREADY_LAN, beforeBoundary, nowElapsedMs = 4_100L))
+        assertEquals(HybridLinkMode.TELEGRAM_FALLBACK, atBoundary.mode)
+        assertTrue(shouldYield(UNREADY_LAN, atBoundary, nowElapsedMs = 4_101L))
+    }
+
+    @Test fun readyLanOrUnavailableTelegramNeverGetsYielded() {
+        val decision = HybridLinkStateMachine().update(
+            hybridSignals(nowElapsedMs = 30_000L, lanReady = false, telegramReady = false),
+        )
+
+        assertEquals(HybridLinkMode.OFFLINE_QUEUEING, decision.mode)
+        assertFalse(shouldYield(UNREADY_LAN, decision, nowElapsedMs = 30_000L))
+        assertFalse(
+            shouldYield(
+                UNREADY_LAN.copy(phase = LanSessionPhase.READY),
+                TELEGRAM_DECISION,
+                nowElapsedMs = 30_000L,
+            ),
+        )
     }
 
     @Test fun absentOrDisconnectedLanSessionAllowsGlobalTelegramFallback() {
@@ -583,6 +621,33 @@ class MasterNoteRemoteReviewCoordinatorTest {
     private fun heartbeat(kind: StudentWorkKind) =
         StudentWorkHeartbeat(0L, kind, "book-id", 1)
 
+    private fun hybridSignals(
+        nowElapsedMs: Long,
+        lanReady: Boolean,
+        telegramReady: Boolean,
+    ) = HybridLinkSignals(
+        lanSocketConnected = true,
+        lanHandshakeComplete = true,
+        lanPageCatchUpComplete = lanReady,
+        telegramConfigured = telegramReady,
+        telegramApiHealthy = telegramReady,
+        telegramPeerRecent = telegramReady,
+        nowElapsedMs = nowElapsedMs,
+    )
+
+    private fun shouldYield(
+        lan: LanSessionSnapshot,
+        decision: HybridLinkDecision,
+        nowElapsedMs: Long,
+        alreadyRequested: Boolean = false,
+    ): Boolean = shouldRequestLanCatchUpYield(
+        activeLanSession = lan,
+        decision = decision,
+        startedAtElapsedMs = 100L,
+        nowElapsedMs = nowElapsedMs,
+        alreadyRequested = alreadyRequested,
+    )
+
     private fun feedback(
         sourceRevision: Long = 7L,
         width: Int = 1_000,
@@ -637,6 +702,17 @@ class MasterNoteRemoteReviewCoordinatorTest {
     )
 
     private companion object {
+        val UNREADY_LAN = LanSessionSnapshot(
+            connectionState = LanConnectionState.CONNECTED,
+            phase = LanSessionPhase.PAGE_CATCHING_UP,
+        )
+        val TELEGRAM_DECISION = HybridLinkDecision(
+            mode = HybridLinkMode.TELEGRAM_FALLBACK,
+            label = HybridLinkLabel.TELEGRAM,
+            health = HybridLinkHealth.READY,
+            activeTransport = HybridLinkTransport.TELEGRAM,
+            enteredTelegramFallback = true,
+        )
         val PAGE_ONE = RemoteReviewCaptureTarget("book-id", 0, 1)
         val PAGE_TWO = RemoteReviewCaptureTarget("book-id", 1, 1)
         const val PAGE_TOKEN = "page_token_00000001"

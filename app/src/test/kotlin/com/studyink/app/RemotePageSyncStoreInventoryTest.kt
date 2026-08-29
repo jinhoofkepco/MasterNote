@@ -4,6 +4,7 @@ import java.io.File
 import kotlin.io.path.createTempDirectory
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -73,6 +74,40 @@ class RemotePageSyncStoreInventoryTest {
                     advancesInventoryWindow = true,
                 )
                 assertEquals(1L, nextInventory.windowOrdinal)
+            }
+        }
+
+    @Test
+    fun recoveredOpenGenerationIsDurablyFencedBeforeTheNewRuntimeUsesIt() =
+        withStoreFile { file ->
+            val oldGeneration = RemotePageSyncStore(file).run {
+                bindPair(PAIR_ID)
+                beginStudentGeneration().also { generation ->
+                    reserveStudentManifest(
+                        transferId = "manifest_before_process_death",
+                        createdAtEpochMs = 1L,
+                        advancesInventoryWindow = true,
+                    )
+                    assertTrue(
+                        recordTeacherReviewApplied(
+                            pageToken = "old_page_token",
+                            attemptNo = 1,
+                            sourceRevision = generation,
+                            payloadSha256 = "a".repeat(64),
+                            resultLayerSha256 = "b".repeat(64),
+                        ),
+                    )
+                }
+            }
+
+            RemotePageSyncStore(file).apply {
+                assertEquals(oldGeneration, studentGeneration())
+                assertTrue(fenceRecoveredStudentGeneration())
+                assertEquals(0L, studentGeneration())
+                assertNull(outstandingStudentManifest())
+                assertEquals(0L, appliedTeacherReviewRevision("old_page_token", 1))
+                assertFalse(fenceRecoveredStudentGeneration())
+                assertTrue(beginStudentGeneration() > oldGeneration)
             }
         }
 
@@ -313,6 +348,259 @@ class RemotePageSyncStoreInventoryTest {
                 )
                 assertEquals(49, teacherDiscoveredInventoryPageCount())
                 assertTrue(teacherInventoryComplete())
+            }
+        }
+
+    @Test
+    fun lanParkKeepsOnlyExactStudentLayerEvidenceAcrossGenerationAndRestart() =
+        withStoreFile { file ->
+            val old = teacherPages(syncGeneration = 7L, count = 2).map { page ->
+                page.copy(
+                    sourceRevision = 99L,
+                    appliedRevision = 99L,
+                    appliedStudentLayerSha256 = page.studentLayerSha256,
+                )
+            }
+            RemotePageSyncStore(file).apply {
+                bindPair(PAIR_ID)
+                assertEquals(
+                    TeacherManifestInstallResult.APPLIED,
+                    replaceTeacherManifest(7L, 1L, old, null, old.size),
+                )
+                clearTeacherManifestPagesForLan()
+                assertTrue(teacherPages().isEmpty())
+                assertEquals(7L, teacherManifestGeneration())
+                assertEquals(
+                    old.first().studentLayerSha256,
+                    teacherStudentLayerEvidence(
+                        old.first().workbookToken,
+                        old.first().contentSha256,
+                        old.first().localBookId,
+                        old.first().pageNumber,
+                    )?.studentLayerSha256,
+                )
+                assertEquals(
+                    null,
+                    teacherStudentLayerEvidence(
+                        old.first().workbookToken,
+                        old.first().contentSha256,
+                        old.first().localBookId,
+                        old.first().pageNumber + 100,
+                    ),
+                )
+            }
+
+            RemotePageSyncStore(file).apply {
+                val evidence = requireNotNull(
+                    teacherStudentLayerEvidence(
+                        old.first().workbookToken,
+                        old.first().contentSha256,
+                        old.first().localBookId,
+                        old.first().pageNumber,
+                    ),
+                )
+                val next = old.first().copy(
+                    syncGeneration = 8L,
+                    pageToken = "generation_8_page_00000",
+                    sourceRevision = 1L,
+                    manifestRevision = 1L,
+                    appliedRevision = 0L,
+                    appliedStudentLayerSha256 = evidence.studentLayerSha256,
+                    verificationPending = true,
+                )
+                assertEquals(
+                    TeacherManifestInstallResult.APPLIED,
+                    replaceTeacherManifest(8L, 1L, listOf(next), null, 1),
+                )
+                assertTrue(pendingTeacherPages().isEmpty())
+                assertEquals(
+                    null,
+                    reserveTeacherRequest(next.pageToken, "request_blocked_by_verify", 1L, 1L, 0L, true)
+                        ?.requestTransferId,
+                )
+                assertTrue(
+                    verifyTeacherPage(
+                        pageToken = next.pageToken,
+                        expectedSyncGeneration = 8L,
+                        expectedSourceRevision = 1L,
+                        expectedStudentLayerSha256 = next.studentLayerSha256,
+                        observedLocalStudentLayerSha256 = next.studentLayerSha256,
+                    ),
+                )
+                val verified = requireNotNull(teacherPage(next.pageToken))
+                assertFalse(verified.verificationPending)
+                assertEquals(1L, verified.appliedRevision)
+                assertFalse(verified.pending)
+            }
+        }
+
+    @Test
+    fun boundedVerificationMismatchExposesOnlyTheChangedPageAsPending() =
+        withStoreFile { file ->
+            val pages = teacherPages(syncGeneration = 3L, count = 2).map { page ->
+                page.copy(
+                    appliedRevision = page.sourceRevision,
+                    appliedStudentLayerSha256 = page.studentLayerSha256,
+                )
+            }
+            RemotePageSyncStore(file).apply {
+                bindPair(PAIR_ID)
+                replaceTeacherManifest(3L, 1L, pages, null, pages.size)
+                val marked = markTeacherPagesForVerification()
+                assertEquals(2, marked.size)
+                assertTrue(pendingTeacherPages().isEmpty())
+
+                assertTrue(
+                    verifyTeacherPage(
+                        pageToken = pages.first().pageToken,
+                        expectedSyncGeneration = 3L,
+                        expectedSourceRevision = pages.first().sourceRevision,
+                        expectedStudentLayerSha256 = pages.first().studentLayerSha256,
+                        observedLocalStudentLayerSha256 = "locally_changed_layer",
+                    ),
+                )
+                assertEquals(listOf(pages.first().pageToken), pendingTeacherPages().map { it.pageToken })
+                assertTrue(requireNotNull(teacherPage(pages.last().pageToken)).verificationPending)
+            }
+        }
+
+    @Test
+    fun unreadableVerificationBecomesActionableAndDoesNotStarveTheNextPage() =
+        withStoreFile { file ->
+            val pages = teacherPages(syncGeneration = 6L, count = 2).map { page ->
+                page.copy(
+                    appliedRevision = page.sourceRevision,
+                    appliedStudentLayerSha256 = page.studentLayerSha256,
+                )
+            }
+            RemotePageSyncStore(file).apply {
+                bindPair(PAIR_ID)
+                replaceTeacherManifest(6L, 1L, pages, null, pages.size)
+                markTeacherPagesForVerification()
+
+                assertTrue(
+                    verifyTeacherPage(
+                        pageToken = pages.first().pageToken,
+                        expectedSyncGeneration = 6L,
+                        expectedSourceRevision = pages.first().sourceRevision,
+                        expectedStudentLayerSha256 = pages.first().studentLayerSha256,
+                        observedLocalStudentLayerSha256 = null,
+                    ),
+                )
+                val failed = requireNotNull(teacherPage(pages.first().pageToken))
+                assertFalse(failed.verificationPending)
+                assertTrue(failed.pending)
+                assertTrue(failed.forceCheckpoint)
+
+                assertTrue(
+                    verifyTeacherPage(
+                        pageToken = pages.last().pageToken,
+                        expectedSyncGeneration = 6L,
+                        expectedSourceRevision = pages.last().sourceRevision,
+                        expectedStudentLayerSha256 = pages.last().studentLayerSha256,
+                        observedLocalStudentLayerSha256 = pages.last().studentLayerSha256,
+                    ),
+                )
+                assertFalse(requireNotNull(teacherPage(pages.last().pageToken)).pending)
+                assertTrue(teacherPages().none(TeacherPageSyncRecord::verificationPending))
+            }
+        }
+
+    @Test
+    fun pairChangeClearsParkedStudentLayerEvidence() =
+        withStoreFile { file ->
+            val page = teacherPages(syncGeneration = 2L, count = 1).single().let { value ->
+                value.copy(
+                    appliedRevision = value.sourceRevision,
+                    appliedStudentLayerSha256 = value.studentLayerSha256,
+                )
+            }
+            RemotePageSyncStore(file).apply {
+                bindPair(PAIR_ID)
+                replaceTeacherManifest(2L, 1L, listOf(page), null, 1)
+                clearTeacherManifestPagesForLan()
+                bindPair("pair_inventory_0002")
+                assertEquals(
+                    null,
+                    teacherStudentLayerEvidence(
+                        page.workbookToken,
+                        page.contentSha256,
+                        page.localBookId,
+                        page.pageNumber,
+                    ),
+                )
+            }
+        }
+
+    @Test
+    fun versionFourJournalMigratesWithEvidenceUnknownUntilBoundedCapture() =
+        withStoreFile { file ->
+            val page = teacherPages(syncGeneration = 4L, count = 1).single().let { value ->
+                value.copy(
+                    appliedRevision = value.sourceRevision,
+                    appliedStudentLayerSha256 = value.studentLayerSha256,
+                )
+            }
+            RemotePageSyncStore(file).apply {
+                bindPair(PAIR_ID)
+                assertEquals(1L, beginStudentGeneration())
+                rememberWorkbookMapping(
+                    page.workbookToken,
+                    requireNotNull(page.localBookId),
+                    page.contentSha256,
+                )
+                replaceTeacherManifest(4L, 1L, listOf(page), null, 1)
+            }
+            val v5 = file.readText(Charsets.UTF_8)
+            file.writeText(v5.replaceFirst("\"version\":5", "\"version\":4"), Charsets.UTF_8)
+
+            RemotePageSyncStore(file).apply {
+                assertEquals(PAIR_ID, currentPairId())
+                assertEquals(1L, studentGeneration())
+                assertEquals(
+                    page.localBookId,
+                    mappedLocalBookId(page.workbookToken, page.contentSha256),
+                )
+                val migrated = requireNotNull(teacherPage(page.pageToken))
+                assertFalse(migrated.verificationPending)
+                assertEquals(page.appliedRevision, migrated.appliedRevision)
+                assertEquals(
+                    null,
+                    teacherStudentLayerEvidence(
+                        page.workbookToken,
+                        page.contentSha256,
+                        page.localBookId,
+                        page.pageNumber,
+                    ),
+                )
+                assertEquals(1, markTeacherPagesForVerification().size)
+                assertTrue(
+                    verifyTeacherPage(
+                        pageToken = page.pageToken,
+                        expectedSyncGeneration = page.syncGeneration,
+                        expectedSourceRevision = page.sourceRevision,
+                        expectedStudentLayerSha256 = page.studentLayerSha256,
+                        observedLocalStudentLayerSha256 = page.studentLayerSha256,
+                    ),
+                )
+            }
+            assertTrue(file.readText(Charsets.UTF_8).contains("\"version\":5"))
+
+            RemotePageSyncStore(file).apply {
+                assertEquals(1L, studentGeneration())
+                assertEquals(
+                    page.localBookId,
+                    mappedLocalBookId(page.workbookToken, page.contentSha256),
+                )
+                assertEquals(
+                    page.studentLayerSha256,
+                    teacherStudentLayerEvidence(
+                        page.workbookToken,
+                        page.contentSha256,
+                        page.localBookId,
+                        page.pageNumber,
+                    )?.studentLayerSha256,
+                )
             }
         }
 

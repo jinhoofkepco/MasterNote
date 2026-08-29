@@ -80,7 +80,7 @@ import kotlin.math.roundToInt
 
 internal const val S23_ULTRA_MODEL_PREFIX = "SM-S918"
 internal const val S23_STRIP_CELL_COUNT = 10
-internal const val S23_STRIP_HISTORY_CELL_COUNT = 4
+internal const val S23_STRIP_HISTORY_CELL_COUNT = 3
 
 /** S Pen taps belong exclusively to the parent drag/tap interop path. */
 internal fun s23AttemptCellHandlesDirectPointer(pointerType: PointerType): Boolean =
@@ -244,7 +244,7 @@ internal fun shouldUseS23UltraTopStrip(role: ReaderRole): Boolean =
         role = role,
     )
 
-/** Same attempt-window policy as the shared chrome, with four physical cells reserved for it. */
+/** Same attempt-window policy as the shared chrome, with three physical cells reserved for it. */
 internal fun s23VisibleAttemptBundles(
     bundles: List<ReaderAttemptMarkBundle>,
     selectedAttemptNo: Int,
@@ -278,6 +278,7 @@ internal fun S23UltraTopStrip(
     onSelectAttempt: (Int) -> Unit,
     onShowStudentActivity: () -> Unit,
     onResumeStudentFollow: () -> Unit,
+    onOpenGptAssistant: () -> Unit = {},
     transportCellModel: S23TransportCellModel =
         s23TransportCellModelForLan(state.liveConnection),
     onTransportClick: (S23TransportMode) -> Unit = { mode ->
@@ -356,6 +357,21 @@ internal fun S23UltraTopStrip(
                         forceHovered = previewHoveredDescription == "학생 필기량 보기" ||
                             previewHoveredDescription?.startsWith("학생 현재 페이지") == true,
                     )
+                    S23StripButton(
+                        description = "GPT 페이지 설명",
+                        onAction = onOpenGptAssistant,
+                        enabled = state.role != ReaderRole.STUDENT && state.documentReady,
+                        role = state.role,
+                        cellWidth = cellWidth,
+                        forceHovered = previewHoveredDescription == "GPT 페이지 설명",
+                    ) {
+                        Text(
+                            text = "GPT",
+                            color = tokens.paletteBlue,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Black,
+                        )
+                    }
                     if (markHistoryContent != null) {
                         Box(
                             modifier = Modifier

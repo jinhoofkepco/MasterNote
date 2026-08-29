@@ -66,6 +66,7 @@ class RemotePageSyncPolicyTest {
         assertEquals(2, requiredManifestBatchCount(48))
         assertEquals(2, requiredManifestBatchCount(49))
         assertEquals(11, requiredManifestBatchCount(512))
+        assertEquals(64, requiredManifestBatchCount(3_000))
 
         val tokens = (0 until 95).map { "page-${it.toString().padStart(3, '0')}" }
         val covered = (0 until requiredManifestBatchCount(tokens.size)).flatMap { ordinal ->
@@ -78,6 +79,14 @@ class RemotePageSyncPolicyTest {
             selectManifestPageTokens(tokens, tokens[0], 1L).takeLast(47),
         )
         assertTrue(selectManifestPageTokens(tokens, tokens.last(), 0L).size <= 48)
+
+        val large = (0 until 3_000).map { "large-page-$it" }
+        val largeCovered = (0 until requiredManifestBatchCount(large.size)).flatMap { ordinal ->
+            selectManifestPageTokens(large, null, ordinal.toLong()).also { window ->
+                assertTrue(window.size <= 47)
+            }
+        }.toSet()
+        assertEquals(large.toSet(), largeCovered)
     }
 
     @Test fun slowManifestAckCannotEraseInventoryChangesDiscoveredWhileItWasInFlight() {
@@ -312,7 +321,7 @@ class RemotePageSyncPolicyTest {
         assertEquals(37, effectiveStudentInventoryPageCount(37, 36))
     }
 
-    @Test fun reconnectGenerationReusesOnlyTheExactDurableLocalPageDigest() {
+    @Test fun reconnectGenerationTreatsTheExactDurableDigestAsVerificationCandidateOnly() {
         val previouslyApplied = teacherPage(
             token = "old-generation-token",
             sourceRevision = 7L,
@@ -332,12 +341,86 @@ class RemotePageSyncPolicyTest {
             token = "new-generation-token",
             sourceRevision = 1L,
             layerSha = SHA_B,
-            appliedRevision = if (reused == SHA_B) 1L else 0L,
+            appliedRevision = 0L,
             appliedLayerSha = reused,
-        ).copy(syncGeneration = 2L)
+        ).copy(syncGeneration = 2L, verificationPending = reused == SHA_B)
 
         assertEquals(SHA_B, reused)
         assertFalse(reconnected.pending)
+        assertTrue(reconnected.verificationPending)
+        assertEquals(0L, reconnected.appliedRevision)
+    }
+
+    @Test fun everyNewMappedManifestRowIsLocallyVerifiedBeforeRequesting() {
+        assertTrue(
+            shouldVerifyTeacherManifestPage(
+                hasMappedLocalPage = true,
+                generationChanged = true,
+                previousVerificationPending = false,
+                previousDigest = null,
+                evidenceDigest = SHA_A,
+            ),
+        )
+        // LAN may already have applied B even though the only parked Telegram evidence is old A.
+        assertTrue(
+            shouldVerifyTeacherManifestPage(
+                hasMappedLocalPage = true,
+                generationChanged = false,
+                previousVerificationPending = false,
+                previousDigest = null,
+                evidenceDigest = SHA_A,
+            ),
+        )
+        assertFalse(
+            shouldVerifyTeacherManifestPage(
+                hasMappedLocalPage = true,
+                generationChanged = false,
+                previousVerificationPending = false,
+                previousDigest = SHA_B,
+                evidenceDigest = SHA_B,
+            ),
+        )
+        assertTrue(
+            shouldVerifyTeacherManifestPage(
+                hasMappedLocalPage = true,
+                generationChanged = false,
+                previousVerificationPending = false,
+                previousDigest = SHA_B,
+                evidenceDigest = SHA_A,
+            ),
+        )
+        assertFalse(
+            shouldVerifyTeacherManifestPage(
+                hasMappedLocalPage = false,
+                generationChanged = true,
+                previousVerificationPending = false,
+                previousDigest = null,
+                evidenceDigest = null,
+            ),
+        )
+    }
+
+    @Test fun compactAuditRefreshesOnlyForLogGrowthOrNewAttemptMetadata() {
+        fun changed(
+            logBytes: Long = 100L,
+            attempts: List<Int> = listOf(1, 2),
+            submitted: List<Int> = listOf(1),
+        ) = studentPageNeedsRefreshAfterCompactAudit(
+            observedLogBytes = logBytes,
+            capturedApproximateBytes = 100L,
+            observedCatalogAttemptNos = attempts,
+            capturedAttemptNos = listOf(1, 2),
+            observedSubmittedAttemptNos = submitted,
+            capturedSubmittedAttemptNos = listOf(1),
+        )
+
+        assertFalse(changed())
+        assertTrue(changed(logBytes = 101L))
+        assertTrue(changed(attempts = listOf(1, 2, 3)))
+        assertTrue(changed(submitted = listOf(1, 2)))
+        // A captured stroke may preserve an attempt number whose catalog row is absent. It is not
+        // evidence of a new mutation and must not cause a permanent audit loop.
+        assertFalse(changed(attempts = listOf(1)))
     }
 
     @Test fun unknownOrMismatchedLocalPageStaysPendingWithoutGuessingADigest() {

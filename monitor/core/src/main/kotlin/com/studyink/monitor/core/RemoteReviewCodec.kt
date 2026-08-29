@@ -311,6 +311,32 @@ object RemoteReviewDocumentCodec {
                     output.writeByte(envelope.disposition.wireCode())
                     output.writeNullableString(envelope.reasonCode)
                 }
+
+                is GptExplanationLayerEnvelope -> {
+                    output.writeBoundedString(envelope.pageToken)
+                    output.writeInt(envelope.pageNumber)
+                    output.writeInt(envelope.attemptNo)
+                    output.writeLong(envelope.layerRevision)
+                    output.writeBoundedString(envelope.layerDigestSha256)
+                    output.writeInt(envelope.cards.size)
+                    envelope.cards.forEach { card ->
+                        output.writeBoundedString(card.cardId)
+                        output.writeBoundedString(card.sourceResourceId)
+                        output.writeBoundedString(card.sourceResourceRevisionId)
+                        output.writeBoundedString(card.title)
+                        output.writeBoundedString(card.text)
+                        output.writeFloat(card.anchor.left)
+                        output.writeFloat(card.anchor.top)
+                        output.writeFloat(card.anchor.right)
+                        output.writeFloat(card.anchor.bottom)
+                        output.writeLong(card.createdAtEpochMs)
+                        output.writeLong(card.updatedAtEpochMs)
+                    }
+                    if (envelope.authorityEpoch != REMOTE_LEGACY_EXPLANATION_AUTHORITY) {
+                        output.writeByte(GPT_AUTHORITY_EPOCH_EXTENSION_VERSION)
+                        output.writeBoundedString(envelope.authorityEpoch)
+                    }
+                }
             }
         }
         return bytes.toByteArray()
@@ -590,6 +616,66 @@ object RemoteReviewDocumentCodec {
                 disposition = pageSyncAckDispositionFromWire(input.readUnsignedByte()),
                 reasonCode = input.readNullableString(MAX_DETAIL_CODE_BYTES),
             )
+
+            RemoteReviewEnvelopeType.GPT_EXPLANATION_LAYER -> {
+                val pageToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES)
+                val pageNumber = input.readInt()
+                val attemptNo = input.readInt()
+                val layerRevision = input.readLong()
+                val layerDigest = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES)
+                val cardCount = input.readBoundedCount(
+                    RemoteReviewLimits.MAX_GPT_EXPLANATION_CARDS,
+                    "GPT explanation card",
+                )
+                val cards = ArrayList<RemoteExplanationCard>(cardCount)
+                repeat(cardCount) {
+                    cards += RemoteExplanationCard(
+                        cardId = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                        sourceResourceId = input.readBoundedString(
+                            RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES,
+                        ),
+                        sourceResourceRevisionId = input.readBoundedString(
+                            RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES,
+                        ),
+                        title = input.readBoundedString(
+                            RemoteReviewLimits.MAX_GPT_CARD_TITLE_UTF8_BYTES,
+                        ),
+                        text = input.readBoundedString(
+                            RemoteReviewLimits.MAX_GPT_CARD_TEXT_UTF8_BYTES,
+                        ),
+                        anchor = RemoteExplanationBounds(
+                            left = input.readFloat(),
+                            top = input.readFloat(),
+                            right = input.readFloat(),
+                            bottom = input.readFloat(),
+                        ),
+                        createdAtEpochMs = input.readLong(),
+                        updatedAtEpochMs = input.readLong(),
+                    )
+                }
+                val authorityEpoch = if (input.available() == 0) {
+                    REMOTE_LEGACY_EXPLANATION_AUTHORITY
+                } else {
+                    val extensionVersion = input.readUnsignedByte()
+                    if (extensionVersion != GPT_AUTHORITY_EPOCH_EXTENSION_VERSION) {
+                        fail(RemoteReviewCodecError.MALFORMED_PAYLOAD) {
+                            "Unknown GPT authority extension $extensionVersion."
+                        }
+                    }
+                    input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES)
+                }
+                GptExplanationLayerEnvelope(
+                    transferId = transferId,
+                    createdAtEpochMs = createdAtEpochMs,
+                    pageToken = pageToken,
+                    pageNumber = pageNumber,
+                    attemptNo = attemptNo,
+                    layerRevision = layerRevision,
+                    layerDigestSha256 = layerDigest,
+                    cards = cards,
+                    authorityEpoch = authorityEpoch,
+                )
+            }
         }
         if (input.available() != 0) {
             fail(RemoteReviewCodecError.INVALID_LENGTH) {
@@ -714,6 +800,7 @@ object RemoteReviewDocumentCodec {
         RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST -> 7
         RemoteReviewEnvelopeType.PAGE_ANNOTATION -> 8
         RemoteReviewEnvelopeType.PAGE_SYNC_ACK -> 9
+        RemoteReviewEnvelopeType.GPT_EXPLANATION_LAYER -> 10
     }
 
     private fun envelopeTypeFromWire(code: Int): RemoteReviewEnvelopeType = when (code) {
@@ -726,6 +813,7 @@ object RemoteReviewDocumentCodec {
         7 -> RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST
         8 -> RemoteReviewEnvelopeType.PAGE_ANNOTATION
         9 -> RemoteReviewEnvelopeType.PAGE_SYNC_ACK
+        10 -> RemoteReviewEnvelopeType.GPT_EXPLANATION_LAYER
         else -> fail(RemoteReviewCodecError.UNKNOWN_TYPE) { "Unknown envelope type $code." }
     }
 
@@ -1025,6 +1113,7 @@ object RemoteReviewDocumentCodec {
     private const val FRAME_BYTES: Int = 4 + 1 + 1 + 4 + SHA256_BYTES
     private const val MAX_DETAIL_CODE_BYTES: Int = 64
     private const val PAGE_ANNOTATION_CHUNK_EXTENSION_VERSION: Int = 1
+    private const val GPT_AUTHORITY_EPOCH_EXTENSION_VERSION: Int = 1
     private const val PNG_CHUNK_OVERHEAD_BYTES: Int = 12
     private const val PNG_IHDR_DATA_BYTES: Int = 13
     private val SNAPSHOT_DIGEST_HEX = Regex("[0-9a-f]{${RemoteReviewLimits.SHA256_HEX_BYTES}}")

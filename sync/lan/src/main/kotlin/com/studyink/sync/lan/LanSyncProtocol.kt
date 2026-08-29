@@ -1,6 +1,8 @@
 package com.studyink.sync.lan
 
 import android.net.Uri
+import com.studyink.assistant.core.StudentExplanationLayer
+import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
@@ -141,9 +143,28 @@ enum class LanSessionPhase {
 }
 
 internal const val LAN_AUTH_VERSION = 2
+/** V2 adds durable publication IDs, authority epochs, and exact digest ACKs. */
+internal const val LAN_CAPABILITY_GPT_EXPLANATION_V2 = "GPT_EXPLANATION_V2"
 private val LAN_SHA256_HEX = Regex("[0-9a-f]{64}")
 
 internal fun isValidLanSha256(value: String): Boolean = LAN_SHA256_HEX.matches(value)
+
+internal fun isExactLanGptExplanationAck(
+    expectedPublicationId: String,
+    expectedPageNumber: Int,
+    expectedAttemptNo: Int,
+    expectedRevision: Long,
+    expectedDigestSha256: String,
+    expectedAuthorityEpoch: String,
+    publicationId: String,
+    pageNumber: Int,
+    attemptNo: Int,
+    revision: Long,
+    digestSha256: String,
+    authorityEpoch: String,
+): Boolean = expectedPublicationId == publicationId && expectedPageNumber == pageNumber &&
+    expectedAttemptNo == attemptNo && expectedRevision == revision &&
+    expectedDigestSha256 == digestSha256 && expectedAuthorityEpoch == authorityEpoch
 
 internal fun newLanSecretHex(): String = ByteArray(32).also(SecureRandom()::nextBytes).toHex()
 
@@ -158,6 +179,7 @@ internal fun lanHelloMessage(
     lanHelloPublicFields(deviceId, role, bookId, documentSha256, nonceHex).forEach { (key, value) ->
         put(key, value)
     }
+    put("capabilities", JSONArray().put(LAN_CAPABILITY_GPT_EXPLANATION_V2))
 }
 
 internal fun lanHelloPublicFields(
@@ -288,6 +310,10 @@ object LanSyncBus {
         }
         fun onLocalTeacherReviewPublished(publication: LanTeacherReviewPublication) {}
         fun onTeacherReviewAcknowledged(publication: LanTeacherReviewPublication) {}
+        fun onLocalGptExplanationLayerPublished(layer: StudentExplanationLayer) {}
+        fun onRemoteGptExplanationLayerApplied(layer: StudentExplanationLayer) {}
+        /** The four-second catch-up lease expired; close only the still-current unready socket. */
+        fun onCatchUpYieldRequested(bookId: String) {}
         fun onPairingReady(bookId: String, pairingUri: String) {}
         fun onSessionIssue(message: String) {}
     }
@@ -426,12 +452,28 @@ object LanSyncBus {
         it.onLocalOperation(bookId, pageNumber)
     }
 
+    /**
+     * Requests an ownership handoff without publishing a false disconnect. The socket reader owns
+     * the DISCONNECTED transition after every already-read LAN frame has finished applying.
+     */
+    fun requestCatchUpYield(bookId: String) {
+        if (bookId.isBlank()) return
+        listenerSnapshot().forEach { it.onCatchUpYieldRequested(bookId) }
+    }
+
     fun teacherReviewPublished(publication: LanTeacherReviewPublication) = listenerSnapshot().forEach {
         it.onLocalTeacherReviewPublished(publication)
     }
 
     internal fun teacherReviewAcknowledged(publication: LanTeacherReviewPublication) =
         listenerSnapshot().forEach { it.onTeacherReviewAcknowledged(publication) }
+
+    fun gptExplanationLayerPublished(layer: StudentExplanationLayer) = listenerSnapshot().forEach {
+        it.onLocalGptExplanationLayerPublished(layer)
+    }
+
+    internal fun remoteGptExplanationLayerApplied(layer: StudentExplanationLayer) =
+        listenerSnapshot().forEach { it.onRemoteGptExplanationLayerApplied(layer) }
 
     fun pageChanged(
         bookId: String,

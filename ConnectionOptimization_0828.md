@@ -310,7 +310,22 @@ git diff --check
 
 UI는 대기 중인 automatic 행을 일반 목록에서 숨기고 현재 active 한 건만 별도로 보여준다. 따라서 최적화 검증에서는 “최종 수렴”과 “사용자가 중간에 보는 대기 상태”를 구분한다. 자동 대상 3쪽 각각의 대기/요청/수신/적용/ACK 단계와 예상 다음 요청 시각을 UI 또는 익명화 로그로 관찰할 수 있게 하는 것은 안전한 개선 후보지만, 이 사례만 보고 병렬 전송이나 ACK 선처리를 도입하면 안 된다.
 
-아직 해결됐다고 간주하면 안 되는 별도 위험도 있다. `LAN_GRACE`에서는 Telegram page ownership이 비활성이라 학생 `onLocalOperation`이 즉시 반환하고, 같은 open generation의 기존 student row는 reconnect inventory가 `alreadyPresent`로 건너뛸 수 있다. 그 사이 현재 페이지가 아닌 기존 페이지를 수정하면 durable `operations.log`보다 page-sync row가 뒤처질 가능성이 있다. 이번 97~99쪽은 원본 revision/hash와 row가 일치해 이 경우가 아니었지만, 다음 최적화 작업은 반드시 `LAN_GRACE 중 비현재 기존 페이지 수정 → LAN 실패 → Telegram fallback`을 재현해 stale row 여부를 검증해야 한다. 안전한 수정은 dirty page를 명시적으로 예약하거나 reconnect scan에서 durable revision을 bounded하게 재검증하는 방향이며, 무제한 전체 책 재스캔으로 해결하지 않는다.
+2026-08-29에 위 `LAN_GRACE` stale-row 위험과 LAN 성공 뒤 전체 목록 재등장 문제를 다음의 보수적 구조로 수정했다.
+
+- 학생의 local operation·presence·heartbeat·회차 변경은 `LAN_GRACE`에서도 해당 한 페이지 row를 즉시 갱신한다. Telegram manifest 예약/송신만 transport ownership으로 막는다. `LAN_OWNS`에서는 기존 generation fence를 유지한다.
+- callback 직후 process death가 난 작은 틈은 기존 durable row만 최근 순서로 한 쪽/틱 검증한다. 비교값은 append-only operation log 길이와 회차/제출 번호이며, 불일치한 쪽만 실제 page replay와 SHA 계산을 한다. 검증 전 row는 manifest에서 제외하고 inventory total도 확정하지 않는다. PDF의 모든 페이지를 한꺼번에 열거나 hash하지 않는다. 읽기·재생 실패한 한 쪽은 검증되지 않은 채 60초 backoff로 다시 시도하되, 이미 발견·검증된 다른 수동 페이지의 요청을 막지는 않는다. 실패한 쪽이 남아 있는 동안 inventory 완료 표시는 거짓으로 유지한다.
+- 재시작 때 journal에 열린 학생 generation이 발견되면 새 runtime이 그것을 재사용하지 않는다. 먼저 redundant generation high-water를 한 칸 올려 저장하고 열린 generation, 예약 manifest, 이전 generation의 teacher-review 적용 기록을 닫은 뒤에만 새 generation을 연다. 따라서 LAN READY 직후 process death가 나도 지연 도착한 이전 Telegram 작업이 다시 현재 세대로 인정되지 않는다.
+- 선생은 LAN 진입 전에 실제 적용돼 있던 학생 layer SHA만 `(workbookToken, contentSha256, localBookId, pageNumber)` exact identity로 보존한다. generation/page token/revision/request/grade는 이 evidence에 섞지 않는다.
+- 새 Telegram generation/처음 발견한 mapped row는 evidence 유무나 SHA 일치 여부만으로 적용 완료 또는 요청 대상으로 확정하지 않는다. `verificationPending`으로 숨긴 뒤 로컬 student layer를 한 쪽/틱 계산하고, generation/token/revision/SHA가 여전히 정확히 같을 때만 새 generation의 `appliedRevision`으로 승격한다. LAN에서 이미 해결된 쪽은 요청하지 않고, 실제로 다른 쪽만 동기화 필요가 된다. 로컬 읽기 실패는 그 행을 즉시 CHECKPOINT 요청 가능 상태로 내려 다음 검증 행을 막지 않는다.
+- 연결된 각 pre-READY LAN socket에는 4초 catch-up 기회를 준다. 4초 뒤에도 READY가 아니고 Telegram peer가 실제 사용 가능할 때만 현재 socket generation에 yield를 요청한다. Telegram이 불가능하면 유일한 복구 후보인 LAN을 일부러 끊지 않고 기존 30초 watchdog에 맡긴다. READY 전이와 yield 예약은 같은 service monitor로 직렬화하며, socket reader가 이미 읽은 frame 적용을 끝내고 `DISCONNECTED`를 publish한 뒤에만 Telegram이 소유한다. 따라서 두 writer는 겹치지 않는다.
+- teacher review/채점 publication ledger와 generation fence는 그대로 유지한다. GPT 설명/teaching-resource lane은 현재 HEAD에 없으므로 page evidence에 가짜 필드를 추가하지 않았다. 나중에 합칠 때도 독립 resource identity/revision/digest lane으로 다룬다.
+
+구조 근거는 Kubernetes client-go workqueue의 dirty/processing 재삽입 불변식, Git fsmonitor의 key별 invalidation, Syncthing의 connection 수명과 semantic progress 분리 방식을 참고했다. 범용 queue·전역 DB sequence·full invalidation은 가져오지 않고 현재 단일 worker와 bounded window에 필요한 불변식만 적용했다.
+
+- Kubernetes client-go: <https://github.com/kubernetes/client-go/blob/ff4057d4927d4407c0db43974714e33f3b5e0dac/util/workqueue/queue.go#L190-L302>
+- Git fsmonitor: <https://github.com/git/git/blob/f78ce2f7b6df702f93d40b85d6bda92a3f65da79/fsmonitor.c#L587-L725>
+- Syncthing index resume/batch: <https://github.com/syncthing/syncthing/blob/9af3c75f377c51a7e3f285704025385104d8f428/lib/model/indexhandler.go#L33-L137>
+- Kafka stale-generation completion fence: <https://github.com/apache/kafka/blob/be1813e3f85b8c3ad263a68c544cc09f3ac6332c/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java#L1230-L1283>
 
 ## 9. Git 및 롤백 규칙
 

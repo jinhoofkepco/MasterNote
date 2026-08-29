@@ -11,7 +11,7 @@
     <application
         android:name=".MasterNoteApplication"
         android:allowBackup="true"
-        android:label="MasterNote"
+        android:label="${appLabel}"
         android:supportsRtl="true"
         android:theme="@style/Theme.StudyInk">
         <service

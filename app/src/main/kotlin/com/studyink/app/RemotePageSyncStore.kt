@@ -94,11 +94,29 @@ internal data class TeacherPageSyncRecord(
     val forceCheckpoint: Boolean = false,
     val lastCompletedRequestTransferId: String? = null,
     val lastCompletedAnnotationTransferId: String? = null,
+    /** A local digest check is in flight; do not request or report this row pending meanwhile. */
+    val verificationPending: Boolean = false,
 ) {
     val mappingRequired: Boolean get() = localBookId == null
-    val pending: Boolean get() = !mappingRequired &&
+    val pending: Boolean get() = !verificationPending && !mappingRequired &&
         (sourceRevision > appliedRevision || studentLayerSha256 != appliedStudentLayerSha256)
 }
+
+/** Pair-scoped, transport-independent proof of the student layer installed in one local page. */
+internal data class TeacherStudentLayerEvidence(
+    val workbookToken: String,
+    val contentSha256: String,
+    val localBookId: String,
+    val pageNumber: Int,
+    val studentLayerSha256: String,
+)
+
+private data class TeacherStudentLayerEvidenceIdentity(
+    val workbookToken: String,
+    val contentSha256: String,
+    val localBookId: String,
+    val pageNumber: Int,
+)
 
 internal data class TeacherPageSyncCursorRecord(
     val syncGeneration: Long,
@@ -191,6 +209,8 @@ internal class RemotePageSyncStore(
 
     private var studentGenerationCounter = 0L
     private var studentOpenGeneration = 0L
+    /** Runtime-only: an open epoch loaded from disk is never trusted across process ownership. */
+    private var recoveredOpenStudentGeneration = false
     private var studentManifestSequence = 0L
     private var studentManifestWindowOrdinal = 0L
     private var outstandingStudentManifest: StudentManifestReservation? = null
@@ -200,6 +220,8 @@ internal class RemotePageSyncStore(
     private var teacherManifestSequence = 0L
     private var teacherInventoryPageCount: Int? = null
     private val teacherPages = linkedMapOf<String, TeacherPageSyncRecord>()
+    private val teacherStudentLayerEvidence =
+        linkedMapOf<TeacherStudentLayerEvidenceIdentity, TeacherStudentLayerEvidence>()
     private var teacherCursor: TeacherPageSyncCursorRecord? = null
     private val workbookMappings = linkedMapOf<String, WorkbookMappingRecord>()
     private val explicitWorkbookMappingRequirements =
@@ -226,6 +248,28 @@ internal class RemotePageSyncStore(
 
     @Synchronized fun currentPairId(): String? = pairId
 
+    /**
+     * A process may have died after LAN became READY but before the coordinator durably closed the
+     * Telegram generation. Fence every recovered open epoch before binding it to the new runtime.
+     * The redundant high-water is committed first, so another crash cannot resurrect that epoch.
+     */
+    @Synchronized
+    fun fenceRecoveredStudentGeneration(): Boolean {
+        if (!recoveredOpenStudentGeneration) return false
+        val fencedHighWater = safeIncrement(studentGenerationCounter)
+        persistGenerationHighWater(fencedHighWater)
+        studentGenerationCounter = fencedHighWater
+        studentOpenGeneration = 0L
+        studentManifestSequence = 0L
+        studentManifestWindowOrdinal = 0L
+        outstandingStudentManifest = null
+        studentPages.clear()
+        appliedTeacherReviews.clear()
+        recoveredOpenStudentGeneration = false
+        persist()
+        return true
+    }
+
     @Synchronized
     fun resetCurrentPair() {
         val retainedCounter = safeIncrement(studentGenerationCounter)
@@ -244,6 +288,7 @@ internal class RemotePageSyncStore(
         persistGenerationHighWater(nextGeneration)
         studentGenerationCounter = nextGeneration
         studentOpenGeneration = studentGenerationCounter
+        recoveredOpenStudentGeneration = false
         studentManifestSequence = 0L
         studentManifestWindowOrdinal = 0L
         outstandingStudentManifest = null
@@ -257,6 +302,7 @@ internal class RemotePageSyncStore(
     fun closeStudentGeneration() {
         if (studentOpenGeneration == 0L && studentPages.isEmpty()) return
         studentOpenGeneration = 0L
+        recoveredOpenStudentGeneration = false
         studentManifestSequence = 0L
         studentManifestWindowOrdinal = 0L
         outstandingStudentManifest = null
@@ -648,6 +694,9 @@ internal class RemotePageSyncStore(
         require(workbookToken.isNotBlank() && contentSha256.isNotBlank())
         val requirement = ExplicitWorkbookMappingRequirement(workbookToken, contentSha256)
         var changed = explicitWorkbookMappingRequirements.add(requirement)
+        changed = teacherStudentLayerEvidence.entries.removeAll { (_, evidence) ->
+            evidence.workbookToken == workbookToken && evidence.contentSha256 == contentSha256
+        } || changed
         val mapping = workbookMappings[workbookToken]
             ?.takeIf { it.contentSha256 == contentSha256 }
         if (mapping != null) {
@@ -671,6 +720,7 @@ internal class RemotePageSyncStore(
                     forceCheckpoint = false,
                     lastCompletedRequestTransferId = null,
                     lastCompletedAnnotationTransferId = null,
+                    verificationPending = false,
                 )
             }
         }
@@ -683,6 +733,9 @@ internal class RemotePageSyncStore(
         if (requiresExplicitWorkbookMapping(workbookToken, contentSha256)) return
         val next = WorkbookMappingRecord(workbookToken, localBookId, contentSha256)
         if (workbookMappings[workbookToken] == next) return
+        teacherStudentLayerEvidence.entries.removeAll { (_, evidence) ->
+            evidence.workbookToken == workbookToken
+        }
         workbookMappings[workbookToken] = next
         persist()
     }
@@ -727,7 +780,12 @@ internal class RemotePageSyncStore(
                 forceCheckpoint = localLayerSha256 != page.studentLayerSha256,
                 lastCompletedRequestTransferId = null,
                 lastCompletedAnnotationTransferId = null,
+                verificationPending = false,
             )
+        }
+        teacherStudentLayerEvidence.entries.removeAll { (_, evidence) ->
+            evidence.workbookToken == workbookToken && evidence.contentSha256 == contentSha256 ||
+                evidence.localBookId == localBookId && evidence.contentSha256 == contentSha256
         }
         workbookMappings.entries.removeAll { (_, mapping) ->
             mapping.workbookToken != workbookToken && mapping.localBookId == localBookId &&
@@ -759,9 +817,13 @@ internal class RemotePageSyncStore(
                 forceCheckpoint = false,
                 lastCompletedRequestTransferId = null,
                 lastCompletedAnnotationTransferId = null,
+                verificationPending = false,
             )
         }
-        rebound.forEach { teacherPages[it.pageToken] = it }
+        rebound.forEach {
+            teacherPages[it.pageToken] = it
+            putTeacherStudentLayerEvidence(it, requireNotNull(it.appliedStudentLayerSha256))
+        }
         persist()
         return rebound
     }
@@ -857,15 +919,40 @@ internal class RemotePageSyncStore(
     @Synchronized fun teacherExpectedInventoryPageCount(): Int? = teacherInventoryPageCount
     @Synchronized fun teacherDiscoveredInventoryPageCount(): Int = teacherPages.size
 
-    /** LAN READY invalidates page ownership but keeps high-waters that reject delayed old manifests. */
+    /** LAN READY invalidates generation ownership but retains exact, generation-neutral page proof. */
     @Synchronized
     fun clearTeacherManifestPagesForLan() {
         clearAllTeacherPageChunks()
-        if (teacherPages.isEmpty() && teacherCursor == null && teacherInventoryPageCount == null) return
-        teacherPages.clear()
-        teacherCursor = null
-        teacherInventoryPageCount = null
-        persist()
+        var changed = false
+        teacherPages.values
+            .mapNotNull { page -> page.teacherStudentLayerEvidenceIdentity()?.let { it to page } }
+            .groupBy({ it.first }, { it.second })
+            .forEach { (identity, pages) ->
+                val appliedSha256 = pages.asSequence()
+                    .mapNotNull(TeacherPageSyncRecord::appliedStudentLayerSha256)
+                    .distinct()
+                    .singleOrNull()
+                if (appliedSha256 == null) {
+                    changed = teacherStudentLayerEvidence.remove(identity) != null || changed
+                } else {
+                    changed = putTeacherStudentLayerEvidence(
+                        TeacherStudentLayerEvidence(
+                            workbookToken = identity.workbookToken,
+                            contentSha256 = identity.contentSha256,
+                            localBookId = identity.localBookId,
+                            pageNumber = identity.pageNumber,
+                            studentLayerSha256 = appliedSha256,
+                        ),
+                    ) || changed
+                }
+            }
+        if (teacherPages.isNotEmpty() || teacherCursor != null || teacherInventoryPageCount != null) {
+            teacherPages.clear()
+            teacherCursor = null
+            teacherInventoryPageCount = null
+            changed = true
+        }
+        if (changed) persist()
     }
 
     @Synchronized
@@ -876,7 +963,84 @@ internal class RemotePageSyncStore(
 
     @Synchronized fun pendingTeacherPages(): List<TeacherPageSyncRecord> = teacherPages().filter { it.pending || it.mappingRequired }
     @Synchronized fun teacherPage(pageToken: String): TeacherPageSyncRecord? = teacherPages[pageToken]
+    /** Never guesses between duplicate imports or stale remote identities. */
+    @Synchronized
+    fun teacherPageForLocalTarget(localBookId: String, pageNumber: Int): TeacherPageSyncRecord? =
+        teacherPages.values.filter {
+            it.syncGeneration == teacherManifestGeneration &&
+                it.localBookId == localBookId && it.pageNumber == pageNumber
+        }.singleOrNull()
     @Synchronized fun teacherCursor(): TeacherPageSyncCursorRecord? = teacherCursor
+
+    @Synchronized
+    fun teacherStudentLayerEvidence(
+        workbookToken: String,
+        contentSha256: String,
+        localBookId: String?,
+        pageNumber: Int,
+    ): TeacherStudentLayerEvidence? {
+        if (workbookToken.isBlank() || contentSha256.isBlank() || localBookId.isNullOrBlank() || pageNumber < 0) {
+            return null
+        }
+        return teacherStudentLayerEvidence[
+            TeacherStudentLayerEvidenceIdentity(workbookToken, contentSha256, localBookId, pageNumber)
+        ]
+    }
+
+    /** Marks only rows with a known local digest and returns every still-unverified row for retry. */
+    @Synchronized
+    fun markTeacherPagesForVerification(): List<TeacherPageSyncRecord> {
+        var changed = false
+        teacherPages.values.toList().forEach { current ->
+            if (current.localBookId == null || current.appliedStudentLayerSha256 == null ||
+                current.verificationPending
+            ) return@forEach
+            teacherPages[current.pageToken] = current.copy(verificationPending = true)
+            changed = true
+        }
+        if (changed) persist()
+        return teacherPages().filter(TeacherPageSyncRecord::verificationPending)
+    }
+
+    /** Accepts a local digest only while the exact manifest row being checked is still current. */
+    @Synchronized
+    fun verifyTeacherPage(
+        pageToken: String,
+        expectedSyncGeneration: Long,
+        expectedSourceRevision: Long,
+        expectedStudentLayerSha256: String,
+        observedLocalStudentLayerSha256: String?,
+    ): Boolean {
+        val current = teacherPages[pageToken] ?: return false
+        if (!current.verificationPending || current.syncGeneration != expectedSyncGeneration ||
+            current.sourceRevision != expectedSourceRevision ||
+            current.studentLayerSha256 != expectedStudentLayerSha256
+        ) return false
+        val observed = observedLocalStudentLayerSha256?.takeIf(String::isNotBlank)
+        val next = if (observed == null) {
+            current.copy(
+                appliedRevision = 0L,
+                appliedStudentLayerSha256 = null,
+                forceCheckpoint = true,
+                verificationPending = false,
+            )
+        } else {
+            current.copy(
+                appliedRevision = if (observed == expectedStudentLayerSha256) current.sourceRevision else 0L,
+                appliedStudentLayerSha256 = observed,
+                verificationPending = false,
+            )
+        }
+        teacherPages[pageToken] = next
+        val evidenceIdentity = current.teacherStudentLayerEvidenceIdentity()
+        if (observed == null) {
+            evidenceIdentity?.let(teacherStudentLayerEvidence::remove)
+        } else {
+            putTeacherStudentLayerEvidence(next, observed)
+        }
+        persist()
+        return true
+    }
 
     @Synchronized
     fun reserveTeacherRequest(
@@ -888,7 +1052,9 @@ internal class RemotePageSyncStore(
         requestWasAutomatic: Boolean,
     ): TeacherPageSyncRecord? {
         val current = teacherPages[pageToken] ?: return null
-        if (current.mappingRequired || current.requestTransferId != null) return current
+        if (current.mappingRequired || current.verificationPending || current.requestTransferId != null) {
+            return current
+        }
         return current.copy(
             requestTransferId = transferId,
             requestCreatedAtEpochMs = createdAtEpochMs,
@@ -968,9 +1134,11 @@ internal class RemotePageSyncStore(
             forceCheckpoint = false,
             lastCompletedRequestTransferId = requestTransferId,
             lastCompletedAnnotationTransferId = annotationTransferId,
+            verificationPending = false,
         )
-        if (next == current) return false
-        teacherPages[pageToken] = next
+        val evidenceChanged = putTeacherStudentLayerEvidence(next, resultLayerSha256)
+        if (next == current && !evidenceChanged) return false
+        if (next != current) teacherPages[pageToken] = next
         persist()
         return true
     }
@@ -1223,10 +1391,35 @@ internal class RemotePageSyncStore(
         transportAcknowledgedAtEpochMs = null,
     )
 
+    private fun putTeacherStudentLayerEvidence(
+        page: TeacherPageSyncRecord,
+        studentLayerSha256: String,
+    ): Boolean {
+        val localBookId = page.localBookId ?: return false
+        if (studentLayerSha256.isBlank() || page.pageNumber < 0) return false
+        return putTeacherStudentLayerEvidence(
+            TeacherStudentLayerEvidence(
+                workbookToken = page.workbookToken,
+                contentSha256 = page.contentSha256,
+                localBookId = localBookId,
+                pageNumber = page.pageNumber,
+                studentLayerSha256 = studentLayerSha256,
+            ),
+        )
+    }
+
+    private fun putTeacherStudentLayerEvidence(value: TeacherStudentLayerEvidence): Boolean {
+        val identity = value.identity()
+        if (teacherStudentLayerEvidence[identity] == value) return false
+        teacherStudentLayerEvidence[identity] = value
+        return true
+    }
+
     private fun clearPairState(resetGenerationCounter: Boolean, clearChunkFiles: Boolean = true) {
         if (clearChunkFiles) clearAllTeacherPageChunks()
         if (resetGenerationCounter) studentGenerationCounter = 0L
         studentOpenGeneration = 0L
+        recoveredOpenStudentGeneration = false
         studentManifestSequence = 0L
         studentManifestWindowOrdinal = 0L
         outstandingStudentManifest = null
@@ -1235,6 +1428,7 @@ internal class RemotePageSyncStore(
         teacherManifestSequence = 0L
         teacherInventoryPageCount = null
         teacherPages.clear()
+        teacherStudentLayerEvidence.clear()
         teacherCursor = null
         workbookMappings.clear()
         explicitWorkbookMappingRequirements.clear()
@@ -1344,6 +1538,22 @@ internal class RemotePageSyncStore(
             teacherInventoryPageCount = root.optNullableInt("teacherInventoryPageCount")
             root.optJSONArray("studentPages")?.forEachObject { decodeStudent(it)?.let { row -> studentPages[row.pageToken] = row } }
             root.optJSONArray("teacherPages")?.forEachObject { decodeTeacher(it)?.let { row -> teacherPages[row.pageToken] = row } }
+            if (version >= 5) {
+                val conflictingEvidence = linkedSetOf<TeacherStudentLayerEvidenceIdentity>()
+                root.optJSONArray("teacherStudentLayerEvidence")?.forEachObject { encoded ->
+                    decodeTeacherStudentLayerEvidence(encoded)?.let { evidence ->
+                        val identity = evidence.identity()
+                        if (identity in conflictingEvidence) return@let
+                        val previous = teacherStudentLayerEvidence[identity]
+                        if (previous == null || previous == evidence) {
+                            teacherStudentLayerEvidence[identity] = evidence
+                        } else {
+                            teacherStudentLayerEvidence.remove(identity)
+                            conflictingEvidence += identity
+                        }
+                    }
+                }
+            }
             teacherCursor = root.optJSONObject("teacherCursor")?.let(::decodeCursor)
             root.optJSONArray("workbookMappings")?.forEachObject { decodeMapping(it)?.let { row -> workbookMappings[row.workbookToken] = row } }
             root.optJSONArray("explicitWorkbookMappingRequirements")?.forEachObject { value ->
@@ -1401,6 +1611,7 @@ internal class RemotePageSyncStore(
                     outstandingStudentManifest = null
                 }
             }
+            recoveredOpenStudentGeneration = studentOpenGeneration > 0L
             if (journalGenerationCounter > durableGenerationHighWater) {
                 runCatching { persistGenerationHighWater(journalGenerationCounter) }
             }
@@ -1443,6 +1654,9 @@ internal class RemotePageSyncStore(
             .put("teacherManifestSequence", teacherManifestSequence)
             .put("teacherInventoryPageCount", teacherInventoryPageCount ?: JSONObject.NULL)
             .put("teacherPages", JSONArray().apply { teacherPages.values.forEach { put(encode(it)) } })
+            .put("teacherStudentLayerEvidence", JSONArray().apply {
+                teacherStudentLayerEvidence.values.forEach { put(encode(it)) }
+            })
             .put("teacherCursor", teacherCursor?.let(::encode) ?: JSONObject.NULL)
             .put("workbookMappings", JSONArray().apply { workbookMappings.values.forEach { put(encode(it)) } })
             .put("explicitWorkbookMappingRequirements", JSONArray().apply {
@@ -1487,6 +1701,7 @@ internal class RemotePageSyncStore(
     private fun resetInMemoryState() {
         pairId = null
         studentGenerationCounter = 0L
+        recoveredOpenStudentGeneration = false
         clearPairState(resetGenerationCounter = false, clearChunkFiles = false)
     }
 
@@ -1536,6 +1751,14 @@ internal class RemotePageSyncStore(
         .put("forceCheckpoint", v.forceCheckpoint)
         .put("lastCompletedRequestTransferId", v.lastCompletedRequestTransferId ?: JSONObject.NULL)
         .put("lastCompletedAnnotationTransferId", v.lastCompletedAnnotationTransferId ?: JSONObject.NULL)
+        .put("verificationPending", v.verificationPending)
+
+    private fun encode(v: TeacherStudentLayerEvidence) = JSONObject()
+        .put("workbookToken", v.workbookToken)
+        .put("contentSha256", v.contentSha256)
+        .put("localBookId", v.localBookId)
+        .put("pageNumber", v.pageNumber)
+        .put("studentLayerSha256", v.studentLayerSha256)
 
     private fun encode(v: TeacherPageSyncCursorRecord) = JSONObject()
         .put("generation", v.syncGeneration).put("sequence", v.sequence)
@@ -1613,7 +1836,26 @@ internal class RemotePageSyncStore(
         forceCheckpoint = v.optBoolean("forceCheckpoint"),
         lastCompletedRequestTransferId = v.optNullableString("lastCompletedRequestTransferId"),
         lastCompletedAnnotationTransferId = v.optNullableString("lastCompletedAnnotationTransferId"),
+        verificationPending = v.optBoolean("verificationPending"),
     ) }.getOrNull()
+
+    private fun decodeTeacherStudentLayerEvidence(
+        v: JSONObject,
+    ): TeacherStudentLayerEvidence? = runCatching {
+        TeacherStudentLayerEvidence(
+            workbookToken = v.getString("workbookToken"),
+            contentSha256 = v.getString("contentSha256"),
+            localBookId = v.getString("localBookId"),
+            pageNumber = v.getInt("pageNumber"),
+            studentLayerSha256 = v.getString("studentLayerSha256"),
+        ).also { evidence ->
+            require(evidence.workbookToken.isNotBlank())
+            require(evidence.contentSha256.isNotBlank())
+            require(evidence.localBookId.isNotBlank())
+            require(evidence.pageNumber >= 0)
+            require(evidence.studentLayerSha256.isNotBlank())
+        }
+    }.getOrNull()
 
     private fun decodeCursor(v: JSONObject): TeacherPageSyncCursorRecord? = runCatching { TeacherPageSyncCursorRecord(
         v.getLong("generation"), v.getLong("sequence"), v.getString("pageToken"), v.getString("workbookToken"),
@@ -1669,7 +1911,7 @@ internal class RemotePageSyncStore(
 
     private companion object {
         const val MIN_SUPPORTED_VERSION = 2
-        const val VERSION = 4
+        const val VERSION = 5
         const val MAX_COMPLETED_TEACHER_PUBLICATIONS = 1_024
         const val MAX_TEACHER_PAGE_CHUNKS = 8
         const val MAX_TEACHER_PAGE_CHUNK_BYTES = 2 * 1024 * 1024 - 32 * 1024
@@ -1763,6 +2005,7 @@ internal fun mergeTeacherPageFromManifest(
         forceCheckpoint = previous.forceCheckpoint,
         lastCompletedRequestTransferId = previous.lastCompletedRequestTransferId,
         lastCompletedAnnotationTransferId = previous.lastCompletedAnnotationTransferId,
+        verificationPending = incoming.verificationPending || previous.verificationPending,
     )
 }
 
@@ -1775,6 +2018,26 @@ internal fun hasSameTeacherPageIdentity(
     previous.contentSha256 == incoming.contentSha256 &&
     previous.pageNumber == incoming.pageNumber &&
     previous.localBookId == incoming.localBookId
+
+private fun TeacherStudentLayerEvidence.identity() = TeacherStudentLayerEvidenceIdentity(
+    workbookToken = workbookToken,
+    contentSha256 = contentSha256,
+    localBookId = localBookId,
+    pageNumber = pageNumber,
+)
+
+private fun TeacherPageSyncRecord.teacherStudentLayerEvidenceIdentity(): TeacherStudentLayerEvidenceIdentity? {
+    val localBookId = localBookId ?: return null
+    if (workbookToken.isBlank() || contentSha256.isBlank() || localBookId.isBlank() || pageNumber < 0) {
+        return null
+    }
+    return TeacherStudentLayerEvidenceIdentity(
+        workbookToken = workbookToken,
+        contentSha256 = contentSha256,
+        localBookId = localBookId,
+        pageNumber = pageNumber,
+    )
+}
 
 internal fun shouldDiscardRecoveredStudentGeneration(
     durableHighWater: Long,

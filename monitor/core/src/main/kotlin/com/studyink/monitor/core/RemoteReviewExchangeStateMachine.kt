@@ -93,6 +93,7 @@ enum class RemoteReviewIncomingAction {
     APPLY_PAGE_SYNC_MANIFEST,
     APPLY_PAGE_SYNC_REQUEST,
     APPLY_PAGE_ANNOTATION,
+    APPLY_GPT_EXPLANATION_LAYER,
     COMPLETE_OUTBOX,
     IGNORE_DUPLICATE,
     IGNORE_SUPERSEDED,
@@ -249,6 +250,10 @@ object RemoteReviewExchangeStateMachine {
                     ),
                 ),
             )
+            is GptExplanationLayerEnvelope -> planPeerArtifact(
+                envelope = envelope,
+                action = RemoteReviewIncomingAction.APPLY_GPT_EXPLANATION_LAYER,
+            )
         }
     }
 
@@ -264,6 +269,8 @@ object RemoteReviewExchangeStateMachine {
         is PageSyncRequestEnvelope -> null
         is PageAnnotationEnvelope -> null
         is PageSyncAckEnvelope -> null
+        is GptExplanationLayerEnvelope ->
+            "GPT_LAYER:${envelope.pageToken}:${envelope.attemptNo}"
     }
 
     /**

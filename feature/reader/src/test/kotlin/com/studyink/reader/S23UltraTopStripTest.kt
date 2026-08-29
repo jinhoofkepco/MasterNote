@@ -82,10 +82,10 @@ class S23UltraTopStripTest {
     }
 
     @Test
-    fun stripStillReservesExactlyTenCellsIncludingFourAttemptCells() {
+    fun stripStillReservesExactlyTenCellsIncludingThreeAttemptCells() {
         assertEquals(10, S23_STRIP_CELL_COUNT)
-        assertEquals(4, S23_STRIP_HISTORY_CELL_COUNT)
-        assertEquals(6, S23_STRIP_CELL_COUNT - S23_STRIP_HISTORY_CELL_COUNT)
+        assertEquals(3, S23_STRIP_HISTORY_CELL_COUNT)
+        assertEquals(7, S23_STRIP_CELL_COUNT - S23_STRIP_HISTORY_CELL_COUNT)
     }
 
     @Test
@@ -129,12 +129,12 @@ class S23UltraTopStripTest {
     }
 
     @Test
-    fun attemptLaneKeepsCurrentAndThreeEarlierFramesWhenAvailable() {
+    fun attemptLaneKeepsCurrentAndTwoEarlierFramesWhenAvailable() {
         val bundles = (1..8).map { ReaderAttemptMarkBundle(it, emptyList()) }
 
-        assertEquals(listOf(1, 2, 3, 4), s23VisibleAttemptBundles(bundles, 1).map { it.attemptNo })
-        assertEquals(listOf(1, 2, 3, 4), s23VisibleAttemptBundles(bundles, 4).map { it.attemptNo })
-        assertEquals(listOf(5, 6, 7, 8), s23VisibleAttemptBundles(bundles, 8).map { it.attemptNo })
+        assertEquals(listOf(1, 2, 3), s23VisibleAttemptBundles(bundles, 1).map { it.attemptNo })
+        assertEquals(listOf(2, 3, 4), s23VisibleAttemptBundles(bundles, 4).map { it.attemptNo })
+        assertEquals(listOf(6, 7, 8), s23VisibleAttemptBundles(bundles, 8).map { it.attemptNo })
     }
 
     @Test

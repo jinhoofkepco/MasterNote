@@ -31,6 +31,7 @@ android {
         targetSdk = 36
         versionCode = masterNoteVersionCode ?: 1
         versionName = masterNoteVersionName ?: "0.0.0-dev"
+        manifestPlaceholders["appLabel"] = "MasterNote"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -51,11 +52,13 @@ android {
             // fixed-signature APK downloaded from GitHub Releases.
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            manifestPlaceholders["appLabel"] = "MasterNote DEV"
             isMinifyEnabled = false
             isShrinkResources = false
         }
         release {
             signingConfig = signingConfigs.getByName("debug")
+            manifestPlaceholders["appLabel"] = "MasterNote"
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -72,6 +75,7 @@ kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarg
 
 dependencies {
     implementation(project(":feature:library"))
+    implementation(project(":assistant:core"))
     implementation(project(":monitor:core"))
     implementation(project(":monitor:telegram"))
     implementation(project(":monitor:render"))

@@ -75,6 +75,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
@@ -717,6 +718,7 @@ fun ReaderTopChrome(
     onShowStudentActivity: () -> Unit = {},
     onResumeStudentFollow: () -> Unit = {},
     onOpenRemoteMonitor: () -> Unit = {},
+    onOpenGptAssistant: () -> Unit = {},
     previewHoveredDescription: String? = null,
     /**
      * Optional compact, one-line page/attempt history. The caller owns its data and gestures so
@@ -738,6 +740,7 @@ fun ReaderTopChrome(
             onSelectAttempt = onSelectAttempt,
             onShowStudentActivity = onShowStudentActivity,
             onResumeStudentFollow = onResumeStudentFollow,
+            onOpenGptAssistant = onOpenGptAssistant,
             transportCellModel = s23TransportCellModelForHybrid(
                 decision = state.hybridLink,
                 legacyLanConnection = state.liveConnection,
@@ -909,6 +912,23 @@ fun ReaderTopChrome(
                                     forceHoveredForPreview =
                                         previewHoveredDescription == "Telegram 연결 및 설정",
                                 )
+                            }
+                            if (state.role != ReaderRole.STUDENT) {
+                                IconPenButton(
+                                    description = "GPT 페이지 설명",
+                                    iconRes = null,
+                                    onAction = onOpenGptAssistant,
+                                    role = state.role,
+                                    enabled = state.documentReady,
+                                    visualSize = tokens.generalButtonSize,
+                                ) {
+                                    Text(
+                                        text = "GPT",
+                                        color = tokens.paletteBlue,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Black,
+                                    )
+                                }
                             }
                             if (state.capabilities.showsStudentLocation) {
                                 IconPenButton(

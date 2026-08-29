@@ -22,6 +22,14 @@ import android.os.Build
 import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
+import com.studyink.assistant.core.AssistantPageKey
+import com.studyink.assistant.core.AssistantPublicationLimits
+import com.studyink.assistant.core.AssistantRepositoryProvider
+import com.studyink.assistant.core.StudentExplanationLayer
+import com.studyink.assistant.core.StudentExplanationLayerBus
+import com.studyink.assistant.core.StudentExplanationTarget
+import com.studyink.assistant.core.StudentLayerApplyStatus
+import com.studyink.assistant.core.remapTo
 import com.studyink.annotation.storage.PageOperationLogStore
 import com.studyink.core.model.Attempt
 import com.studyink.core.model.MarkGroup
@@ -60,6 +68,7 @@ class LanSyncService : Service(),
     private val handler = Handler(Looper.getMainLooper())
     private val store by lazy { PageOperationLogStore.get(this) }
     private val library by lazy { LibraryRepository.get(this) }
+    private val assistantRepository by lazy { AssistantRepositoryProvider.get(this) }
     private val pairingPreferences by lazy { getSharedPreferences("masternote-lan-pairs", MODE_PRIVATE) }
     private val nsd by lazy { getSystemService(NsdManager::class.java) }
     private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
@@ -94,11 +103,13 @@ class LanSyncService : Service(),
     @Volatile private var pendingPeerBookId: String = ""
     @Volatile private var pendingPeerDeviceId: String = ""
     @Volatile private var pendingPeerRole: LanPeerRole? = null
+    @Volatile private var peerSupportsGptExplanation = false
     /** True only for a session that is visibly offering/consuming a QR pairing payload. */
     @Volatile private var explicitPairingWindow = false
     @Volatile private var subscribedPage = -1
     private val peerReceivedClocks = PageOperationWatermarks()
     private val pendingTeacherReviewAcks = linkedMapOf<String, PendingLanTeacherReviewAck>()
+    private val pendingGptExplanationAcks = linkedMapOf<String, PendingLanGptExplanationAck>()
     @Volatile private var pendingPage = -1
     @Volatile private var pendingSince = 0L
     @Volatile private var lastFlushAt = 0L
@@ -111,6 +122,7 @@ class LanSyncService : Service(),
     @Volatile private var cachedPageCount = 0
     private val connectionEpoch = MonotonicLanConnectionEpoch()
     private val connectionGeneration: Long get() = connectionEpoch.current
+    @Volatile private var catchUpYieldRequestedGeneration = -1L
     @Volatile private var lastPeerReceiveAtElapsedMs = 0L
     /** Non-zero only while an authenticated socket still owes a PAGE_SYNCED transition. */
     @Volatile private var readyDeadlineAtElapsedMs = 0L
@@ -518,6 +530,11 @@ class LanSyncService : Service(),
                     "Peer identity is missing"
                 }
                 val announcedRole = LanPeerRole.valueOf(message.getString("role"))
+                val announcedCapabilities = message.optJSONArray("capabilities")
+                peerSupportsGptExplanation = announcedCapabilities != null &&
+                    (0 until announcedCapabilities.length()).any { index ->
+                        announcedCapabilities.optString(index) == LAN_CAPABILITY_GPT_EXPLANATION_V2
+                    }
                 require(
                     role == LanPeerRole.STUDENT_SERVER && announcedRole == LanPeerRole.TEACHER_CLIENT ||
                     role == LanPeerRole.TEACHER_CLIENT && announcedRole == LanPeerRole.STUDENT_SERVER
@@ -606,10 +623,12 @@ class LanSyncService : Service(),
                 sendMetadataSnapshot()
                 if (role == LanPeerRole.STUDENT_SERVER) sendStudentPageState("hello")
                 repairTeacherConnection()
+                repairGptExplanationConnection()
             }
             "HELLO_OK" -> {
                 LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.HANDSHAKE_COMPLETE)
                 repairTeacherConnection()
+                repairGptExplanationConnection()
             }
             "SUBSCRIBE" -> {
                 require(
@@ -630,10 +649,7 @@ class LanSyncService : Service(),
                 sendStudentPageState("subscription")
                 if (flushPage(subscribedPage)) {
                     if (pendingPage == subscribedPage) pendingPage = -1
-                    if (sendPageSynced(subscribedPage)) {
-                        readyDeadlineAtElapsedMs = 0L
-                        LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.READY)
-                    }
+                    sendPageSyncedAndPublishReady(subscribedPage, attachedGeneration)
                 }
             }
             "OPERATION" -> {
@@ -655,6 +671,8 @@ class LanSyncService : Service(),
                 })
             }
             "TEACHER_REVIEW_CHUNK" -> receiveTeacherReviewChunk(message)
+            "GPT_EXPLANATION_LAYER" -> receiveGptExplanationLayer(message)
+            "GPT_EXPLANATION_ACK" -> receiveGptExplanationAck(message)
             "TEACHER_REVIEW_ACK" -> {
                 require(
                     role == LanPeerRole.TEACHER_CLIENT && peerRole == LanPeerRole.STUDENT_SERVER
@@ -719,8 +737,7 @@ class LanSyncService : Service(),
                 val page = message.getInt("page")
                 require(isPageInBook(page)) { "Synchronized page is outside the book" }
                 if (page == subscribedPage) {
-                    readyDeadlineAtElapsedMs = 0L
-                    LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.READY)
+                    publishReadyIfCurrent(attachedGeneration)
                 }
             }
             "ATTEMPT_UPSERT" -> {
@@ -766,9 +783,44 @@ class LanSyncService : Service(),
         handler.post { scheduleLocalFlush(bookId, pageNumber) }
     }
 
+    override fun onCatchUpYieldRequested(bookId: String) {
+        val request = synchronized(this) {
+            if (this.bookId != bookId ||
+                LanSyncBus.connectionState(bookId) != LanConnectionState.CONNECTED ||
+                LanSyncBus.sessionPhase(bookId) == LanSessionPhase.READY
+            ) return
+            val target = socket ?: return
+            val generation = connectionGeneration
+            if (catchUpYieldRequestedGeneration == generation) return
+            // This flag and both READY publications share this service monitor. Whichever commits
+            // first wins: READY rejects the yield, while a committed yield forbids phantom READY.
+            catchUpYieldRequestedGeneration = generation
+            target to generation
+        }
+        val (target, generation) = request
+        io.execute {
+            val stillUnready = synchronized(this) {
+                this.bookId == bookId && socket === target && connectionGeneration == generation &&
+                    catchUpYieldRequestedGeneration == generation &&
+                    LanSyncBus.connectionState(bookId) == LanConnectionState.CONNECTED &&
+                    LanSyncBus.sessionPhase(bookId) != LanSessionPhase.READY
+            }
+            if (stillUnready) {
+                // readLoop.finally publishes DISCONNECTED only after any frame already being
+                // handled has completed. That publication, not this request, transfers ownership.
+                runCatching { target.close() }
+            }
+        }
+    }
+
     override fun onLocalTeacherReviewPublished(publication: LanTeacherReviewPublication) {
         if (role != LanPeerRole.TEACHER_CLIENT || bookId != publication.bookId) return
         teacherReviewIo.execute { queueTeacherReviewPublication(publication) }
+    }
+
+    override fun onLocalGptExplanationLayerPublished(layer: StudentExplanationLayer) {
+        if (role != LanPeerRole.TEACHER_CLIENT || bookId != layer.target.page.bookId) return
+        teacherReviewIo.execute { queueGptExplanationLayer(layer) }
     }
 
     private fun scheduleLocalFlush(bookId: String, pageNumber: Int) {
@@ -920,6 +972,27 @@ class LanSyncService : Service(),
         }
     }
 
+    /** Atomically chooses READY over a concurrent catch-up yield, including the peer notification. */
+    @Synchronized
+    private fun sendPageSyncedAndPublishReady(page: Int, attachedGeneration: Long): Boolean {
+        if (!canPublishLanReady(attachedGeneration, connectionGeneration, catchUpYieldRequestedGeneration) ||
+            socket == null
+        ) return false
+        if (!sendPageSynced(page)) return false
+        return publishReadyIfCurrent(attachedGeneration)
+    }
+
+    /** Both READY receive paths use the same monitor as [onCatchUpYieldRequested]. */
+    @Synchronized
+    private fun publishReadyIfCurrent(attachedGeneration: Long): Boolean {
+        if (!canPublishLanReady(attachedGeneration, connectionGeneration, catchUpYieldRequestedGeneration) ||
+            socket == null
+        ) return false
+        readyDeadlineAtElapsedMs = 0L
+        LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.READY)
+        return true
+    }
+
     private fun bootstrapLocalPresence() {
         val presence = LanSyncBus.localPagePresence(bookId)
             ?.takeIf { isPageInBook(it.pageNumber) }
@@ -1041,6 +1114,202 @@ class LanSyncService : Service(),
             return
         }
         if (flushPage(page)) pendingPage = -1
+    }
+
+    private fun queueGptExplanationLayer(eventLayer: StudentExplanationLayer) {
+        if (role != LanPeerRole.TEACHER_CLIENT || eventLayer.target.page.bookId != bookId ||
+            !isPageInBook(eventLayer.target.page.pageNumber)
+        ) return
+        val publication = assistantRepository.pendingStudentExplanationPublications().firstOrNull {
+            it.target == eventLayer.target && it.revision == eventLayer.revision &&
+                it.digestSha256 == eventLayer.digestSha256
+        } ?: return
+        val authorityEpoch = runCatching { assistantRepository.teacherAuthorityEpoch() }
+            .getOrNull() ?: return
+        val checkpoint = runCatching {
+            assistantRepository.exportPendingStudentExplanationPublication(
+                publication.publicationId,
+                authorityEpoch,
+            )
+        }.getOrNull() ?: return
+        if (checkpoint.isEmpty() || checkpoint.size > MAX_GPT_EXPLANATION_PAYLOAD_BYTES) return
+        val frozen = runCatching {
+            assistantRepository.decodeStudentExplanationLayer(checkpoint)
+        }.getOrNull() ?: return
+        if (frozen.target != eventLayer.target || frozen.revision < eventLayer.revision) return
+        val exactAttempt = library.attempts(bookId, frozen.target.page.pageNumber).any {
+            it.bookId == bookId && it.pageNumber == frozen.target.page.pageNumber &&
+                it.attemptNo == frozen.target.attemptNo
+        }
+        if (!exactAttempt) return
+        val pending = PendingLanGptExplanationAck(
+            publicationId = publication.publicationId,
+            layer = frozen,
+            checkpointBytes = checkpoint.copyOf(),
+            payloadSha256 = sha256Hex(checkpoint),
+        )
+        synchronized(pendingGptExplanationAcks) {
+            pendingGptExplanationAcks.entries.removeAll { (_, prior) ->
+                prior.layer.target == frozen.target && prior.publicationId != publication.publicationId
+            }
+            pendingGptExplanationAcks[publication.publicationId] = pending
+        }
+        val generation = connectionGeneration
+        if (sendGptExplanationLayer(pending, generation)) {
+            scheduleGptExplanationRetry(publication.publicationId, generation)
+        }
+    }
+
+    private fun sendGptExplanationLayer(
+        pending: PendingLanGptExplanationAck,
+        expectedGeneration: Long,
+    ): Boolean {
+        val layer = pending.layer
+        if (role != LanPeerRole.TEACHER_CLIENT || writer == null ||
+            authenticatedConnectionGeneration != expectedGeneration ||
+            connectionGeneration != expectedGeneration || !peerSupportsGptExplanation ||
+            layer.target.page.bookId != bookId || !isPageInBook(layer.target.page.pageNumber)
+        ) return false
+        return send(LanWire.message("GPT_EXPLANATION_LAYER") {
+            put("publicationId", pending.publicationId)
+            put("page", layer.target.page.pageNumber)
+            put("attemptNo", layer.target.attemptNo)
+            put("revision", layer.revision)
+            put("sourceDigestSha256", layer.digestSha256)
+            put("payloadSha256", pending.payloadSha256)
+            put("payloadSize", pending.checkpointBytes.size)
+            put("payload", Base64.encodeToString(pending.checkpointBytes, Base64.NO_WRAP))
+        })
+    }
+
+    private fun scheduleGptExplanationRetry(publicationId: String, generation: Long) {
+        teacherReviewIo.schedule({
+            val pending = synchronized(pendingGptExplanationAcks) {
+                pendingGptExplanationAcks[publicationId]
+            } ?: return@schedule
+            if (connectionGeneration != generation || role != LanPeerRole.TEACHER_CLIENT ||
+                pending.layer.target.page.bookId != bookId
+            ) return@schedule
+            if (sendGptExplanationLayer(pending, generation)) {
+                scheduleGptExplanationRetry(publicationId, generation)
+            }
+        }, LAN_GPT_EXPLANATION_RETRY_MS, TimeUnit.MILLISECONDS)
+    }
+
+    private fun repairGptExplanationConnection() {
+        if (role != LanPeerRole.TEACHER_CLIENT || !peerSupportsGptExplanation || writer == null) return
+        val generation = connectionGeneration
+        teacherReviewIo.execute {
+            synchronized(pendingGptExplanationAcks) {
+                pendingGptExplanationAcks.values.toList()
+            }.forEach { pending ->
+                if (sendGptExplanationLayer(pending, generation)) {
+                    scheduleGptExplanationRetry(pending.publicationId, generation)
+                }
+            }
+        }
+    }
+
+    private fun receiveGptExplanationLayer(message: JSONObject) {
+        require(
+            role == LanPeerRole.STUDENT_SERVER && peerRole == LanPeerRole.TEACHER_CLIENT &&
+                peerSupportsGptExplanation
+        ) { "Only a capable teacher peer may publish GPT explanations" }
+        val publicationId = message.getString("publicationId")
+        val page = message.getInt("page")
+        val attemptNo = message.getInt("attemptNo")
+        val revision = message.getLong("revision")
+        val sourceDigest = message.getString("sourceDigestSha256")
+        val payloadSha256 = message.getString("payloadSha256")
+        val payloadSize = message.getInt("payloadSize")
+        require(publicationId.matches(SHA256_HEX) && sourceDigest.matches(SHA256_HEX) &&
+            payloadSha256.matches(SHA256_HEX) && isPageInBook(page) && attemptNo > 0 && revision > 0L
+        )
+        require(payloadSize in 1..MAX_GPT_EXPLANATION_PAYLOAD_BYTES)
+        val payload = Base64.decode(message.getString("payload"), Base64.NO_WRAP)
+        require(payload.size == payloadSize && sha256Hex(payload) == payloadSha256)
+        val sourceLayer = assistantRepository.decodeStudentExplanationLayer(payload)
+        require(
+            sourceLayer.target.page.pageNumber == page &&
+                sourceLayer.target.attemptNo == attemptNo && sourceLayer.revision == revision &&
+                sourceLayer.digestSha256 == sourceDigest && sourceLayer.authorityEpoch.matches(SHA256_HEX)
+        ) { "GPT explanation checkpoint identity mismatch" }
+        if (!isExactLanTeacherReviewAttempt(
+                attempts = library.attempts(bookId, page),
+                bookId = bookId,
+                pageNumber = page,
+                attemptNo = attemptNo,
+            )
+        ) {
+            // Attempt metadata can legitimately arrive just after this layer. Keep the sender's
+            // durable intent unresolved and let its bounded retry apply once the exact attempt exists.
+            return
+        }
+        val target = StudentExplanationTarget(AssistantPageKey(bookId, page), attemptNo)
+        val localLayer = sourceLayer.remapTo(target)
+        val result = assistantRepository.applyStudentExplanationLayer(target, localLayer)
+        when (result.status) {
+            StudentLayerApplyStatus.APPLIED -> {
+                StudentExplanationLayerBus.remoteLayerApplied(result.current)
+                LanSyncBus.remoteGptExplanationLayerApplied(result.current)
+            }
+            StudentLayerApplyStatus.CONFLICT -> {
+                // Same authority and revision with different content is corruption. Do not let a
+                // success ACK erase the teacher's durable publication journal.
+                return
+            }
+            StudentLayerApplyStatus.ALREADY_CURRENT,
+            StudentLayerApplyStatus.STALE,
+            -> Unit
+        }
+        send(LanWire.message("GPT_EXPLANATION_ACK") {
+            put("publicationId", publicationId)
+            put("page", page)
+            put("attemptNo", attemptNo)
+            put("revision", revision)
+            put("sourceDigestSha256", sourceDigest)
+            put("authorityEpoch", sourceLayer.authorityEpoch)
+        })
+    }
+
+    private fun receiveGptExplanationAck(message: JSONObject) {
+        require(
+            role == LanPeerRole.TEACHER_CLIENT && peerRole == LanPeerRole.STUDENT_SERVER
+        ) { "Only a student peer may acknowledge GPT explanations" }
+        val publicationId = message.getString("publicationId")
+        require(publicationId.matches(SHA256_HEX))
+        val page = message.getInt("page")
+        val attemptNo = message.getInt("attemptNo")
+        val revision = message.getLong("revision")
+        val sourceDigest = message.getString("sourceDigestSha256")
+        val authorityEpoch = message.getString("authorityEpoch")
+        require(sourceDigest.matches(SHA256_HEX) && authorityEpoch.matches(SHA256_HEX))
+        synchronized(pendingGptExplanationAcks) {
+            pendingGptExplanationAcks[publicationId]?.takeIf { pending ->
+                isExactLanGptExplanationAck(
+                    expectedPublicationId = pending.publicationId,
+                    expectedPageNumber = pending.layer.target.page.pageNumber,
+                    expectedAttemptNo = pending.layer.target.attemptNo,
+                    expectedRevision = pending.layer.revision,
+                    expectedDigestSha256 = pending.layer.digestSha256,
+                    expectedAuthorityEpoch = pending.layer.authorityEpoch,
+                    publicationId = publicationId,
+                    pageNumber = page,
+                    attemptNo = attemptNo,
+                    revision = revision,
+                    digestSha256 = sourceDigest,
+                    authorityEpoch = authorityEpoch,
+                )
+            }?.let { pending ->
+                assistantRepository.resolvePendingStudentExplanationPublication(
+                    publicationId = publicationId,
+                    target = pending.layer.target,
+                    revision = pending.layer.revision,
+                    digestSha256 = pending.layer.digestSha256,
+                )
+                pendingGptExplanationAcks.remove(publicationId)
+            }
+        }
     }
 
     private fun sendTeacherReviewPublication(publication: LanTeacherReviewPublication): Boolean {
@@ -1414,6 +1683,7 @@ class LanSyncService : Service(),
         peerBookId = ""
         reconnectPeerBookId = ""
         peerRole = null
+        peerSupportsGptExplanation = false
         authenticatedConnectionGeneration = 0L
         peerDeviceId = ""
         peerHost = ""
@@ -1429,12 +1699,14 @@ class LanSyncService : Service(),
         lastFlushAt = 0L
         lastPeerReceiveAtElapsedMs = 0L
         readyDeadlineAtElapsedMs = 0L
+        catchUpYieldRequestedGeneration = -1L
         lastSubscriptionGeneration = -1L
         lastSubscriptionPage = -1
         lastTeacherRepairGeneration = -1L
         lastTeacherPublicationRepairGeneration = -1L
         synchronized(incomingTeacherReviewChunks) { incomingTeacherReviewChunks.clear() }
         synchronized(pendingTeacherReviewAcks) { pendingTeacherReviewAcks.clear() }
+        synchronized(pendingGptExplanationAcks) { pendingGptExplanationAcks.clear() }
         peerReceivedClocks.clear()
     }
 
@@ -1442,6 +1714,7 @@ class LanSyncService : Service(),
         authenticatedConnectionGeneration = 0L
         peerBookId = ""
         peerRole = null
+        peerSupportsGptExplanation = false
         peerDeviceId = ""
         localAuthNonce = ""
         pendingPeerHelloGeneration = 0L
@@ -1591,6 +1864,8 @@ class LanSyncService : Service(),
         private const val LAN_HANDSHAKE_TIMEOUT_MS = 5_000L
         private const val LAN_READY_TIMEOUT_MS = 30_000L
         private const val LAN_TEACHER_REVIEW_RETRY_MS = 30_000L
+        private const val LAN_GPT_EXPLANATION_RETRY_MS = 30_000L
+        private const val MAX_GPT_EXPLANATION_PAYLOAD_BYTES = AssistantPublicationLimits.MAX_CHECKPOINT_BYTES
         private const val TEACHER_REVIEW_CHUNK_BYTES = 384 * 1024
         private const val MAX_TEACHER_REVIEW_CHUNKS = 8
         private const val MAX_INCOMING_TEACHER_REVIEWS = 4
@@ -1673,9 +1948,23 @@ internal class MonotonicLanConnectionEpoch {
     }
 }
 
+internal fun canPublishLanReady(
+    attachedGeneration: Long,
+    currentGeneration: Long,
+    catchUpYieldRequestedGeneration: Long,
+): Boolean = attachedGeneration == currentGeneration &&
+    catchUpYieldRequestedGeneration != attachedGeneration
+
 private data class PendingLanTeacherReviewAck(
     val publication: LanTeacherReviewPublication,
     val connectionGeneration: Long,
+)
+
+private data class PendingLanGptExplanationAck(
+    val publicationId: String,
+    val layer: StudentExplanationLayer,
+    val checkpointBytes: ByteArray,
+    val payloadSha256: String,
 )
 
 private data class IncomingTeacherReviewChunks(

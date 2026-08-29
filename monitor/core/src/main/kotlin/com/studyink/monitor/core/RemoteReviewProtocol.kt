@@ -1,6 +1,9 @@
 package com.studyink.monitor.core
 
 import com.studyink.core.model.TeacherReviewPublicationLimits
+import com.studyink.core.model.CANONICAL_PAGE_WIDTH
+import java.nio.ByteBuffer
+import java.security.MessageDigest
 
 /** Wire and allocation limits for the deliberately small remote-review exchange. */
 object RemoteReviewLimits {
@@ -20,6 +23,10 @@ object RemoteReviewLimits {
     const val MAX_TOTAL_POINTS: Int = 120_000
     const val MAX_NOTE_UTF8_BYTES: Int = 2_000
     const val MAX_CHAT_TEXT_UTF8_BYTES: Int = 4_096
+    const val MAX_GPT_EXPLANATION_CARDS: Int = 128
+    const val MAX_GPT_CARD_TITLE_UTF8_BYTES: Int = 1_024
+    const val MAX_GPT_CARD_TEXT_UTF8_BYTES: Int = 256 * 1024
+    const val MAX_GPT_LAYER_TEXT_UTF8_BYTES: Int = 512 * 1024
     const val MAX_CHAT_STATE_MESSAGES: Int = 64
     const val MAX_TOKEN_UTF8_BYTES: Int = 128
     const val MAX_WORKBOOK_LABEL_UTF8_BYTES: Int = 160
@@ -70,6 +77,7 @@ enum class RemoteReviewEnvelopeType {
     PAGE_SYNC_REQUEST,
     PAGE_ANNOTATION,
     PAGE_SYNC_ACK,
+    GPT_EXPLANATION_LAYER,
 }
 
 sealed interface RemoteReviewEnvelope {
@@ -77,6 +85,180 @@ sealed interface RemoteReviewEnvelope {
     val transferId: String
     val createdAtEpochMs: Long
 }
+
+/** Canonical PDF coordinates; unlike screen pixels these remain stable across paired devices. */
+data class RemoteExplanationBounds(
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float,
+) {
+    init {
+        listOf(left, top, right, bottom).forEachIndexed { index, value ->
+            checkProtocol(value.isFinite(), "card.anchor[$index]") { "must be finite" }
+        }
+        checkProtocol(left in 0f..CANONICAL_PAGE_WIDTH && right in 0f..CANONICAL_PAGE_WIDTH, "card.anchor") {
+            "must be within the canonical page width"
+        }
+        checkProtocol(top in 0f..1_000_000f && bottom in 0f..1_000_000f, "card.anchor") {
+            "must be within the canonical page height limit"
+        }
+        checkProtocol(right > left && bottom > top, "card.anchor") {
+            "must have positive width and height"
+        }
+    }
+}
+
+/** One teacher-edited, read-only explanation copied into an exact student attempt. */
+data class RemoteExplanationCard(
+    val cardId: String,
+    val sourceResourceId: String,
+    val sourceResourceRevisionId: String,
+    val title: String,
+    val text: String,
+    val anchor: RemoteExplanationBounds,
+    val createdAtEpochMs: Long,
+    val updatedAtEpochMs: Long,
+) {
+    init {
+        validateOpaqueToken(cardId, "card.cardId")
+        validateOpaqueToken(sourceResourceId, "card.sourceResourceId")
+        validateOpaqueToken(sourceResourceRevisionId, "card.sourceResourceRevisionId")
+        validateDisplayLabel(
+            title,
+            RemoteReviewLimits.MAX_GPT_CARD_TITLE_UTF8_BYTES,
+            "card.title",
+        )
+        checkProtocol(text.isNotBlank(), "card.text") { "must not be blank" }
+        checkProtocol(
+            text.utf8Size() <= RemoteReviewLimits.MAX_GPT_CARD_TEXT_UTF8_BYTES,
+            "card.text",
+        ) { "exceeds ${RemoteReviewLimits.MAX_GPT_CARD_TEXT_UTF8_BYTES} UTF-8 bytes" }
+        checkProtocol(text.hasWellFormedSurrogatePairs(), "card.text") {
+            "contains malformed Unicode"
+        }
+        checkProtocol(
+            text.none { it.isISOControl() && it != '\n' && it != '\r' && it != '\t' },
+            "card.text",
+        ) { "contains an unsupported control character" }
+        checkProtocol(createdAtEpochMs >= 0L, "card.createdAtEpochMs") {
+            "must not be negative"
+        }
+        checkProtocol(updatedAtEpochMs >= createdAtEpochMs, "card.updatedAtEpochMs") {
+            "must not precede creation"
+        }
+    }
+}
+
+/**
+ * A complete card layer for one opaque remote page and one exact attempt.
+ *
+ * Full-state replacement plus a monotonic revision/digest makes retries idempotent and prevents a
+ * delayed Telegram document from attaching text to the student's current (different) attempt.
+ */
+data class GptExplanationLayerEnvelope(
+    override val transferId: String,
+    override val createdAtEpochMs: Long,
+    val pageToken: String,
+    /** One-based on the wire; local stores remain zero-based. */
+    val pageNumber: Int,
+    val attemptNo: Int,
+    val layerRevision: Long,
+    val layerDigestSha256: String,
+    val cards: List<RemoteExplanationCard>,
+    val authorityEpoch: String = REMOTE_LEGACY_EXPLANATION_AUTHORITY,
+) : RemoteReviewEnvelope {
+    override val type: RemoteReviewEnvelopeType = RemoteReviewEnvelopeType.GPT_EXPLANATION_LAYER
+
+    init {
+        validateCommonEnvelope(transferId, createdAtEpochMs)
+        validateOpaqueToken(pageToken, "pageToken")
+        checkProtocol(pageNumber > 0, "pageNumber") { "must be one-based" }
+        checkProtocol(attemptNo > 0, "attemptNo") { "must be one-based" }
+        checkProtocol(layerRevision >= 1L, "layerRevision") { "must be at least 1" }
+        validateOpaqueToken(authorityEpoch, "authorityEpoch")
+        checkProtocol(SHA256_HEX.matches(layerDigestSha256), "layerDigestSha256") {
+            "must be exactly ${RemoteReviewLimits.SHA256_HEX_BYTES} lower-case hexadecimal characters"
+        }
+        checkProtocol(cards.size <= RemoteReviewLimits.MAX_GPT_EXPLANATION_CARDS, "cards") {
+            "exceeds ${RemoteReviewLimits.MAX_GPT_EXPLANATION_CARDS} cards"
+        }
+        checkProtocol(cards.map(RemoteExplanationCard::cardId).distinct().size == cards.size, "cards") {
+            "contains duplicate card ids"
+        }
+        checkProtocol(cards == cards.sortedBy(RemoteExplanationCard::cardId), "cards") {
+            "must be ordered by card id"
+        }
+        var totalTextBytes = 0L
+        cards.forEach { card ->
+            totalTextBytes += card.text.utf8Size().toLong()
+            checkProtocol(totalTextBytes <= RemoteReviewLimits.MAX_GPT_LAYER_TEXT_UTF8_BYTES, "cards") {
+                "exceeds ${RemoteReviewLimits.MAX_GPT_LAYER_TEXT_UTF8_BYTES} UTF-8 text bytes"
+            }
+        }
+        checkProtocol(
+            layerDigestSha256 == remoteExplanationLayerDigestSha256(
+                pageToken = pageToken,
+                pageNumber = pageNumber,
+                attemptNo = attemptNo,
+                cards = cards,
+                authorityEpoch = authorityEpoch,
+            ),
+            "layerDigestSha256",
+        ) { "does not match the explanation payload" }
+    }
+}
+
+/** Stable across devices because local book UUIDs and the monotonic revision are excluded. */
+fun remoteExplanationLayerDigestSha256(
+    pageToken: String,
+    pageNumber: Int,
+    attemptNo: Int,
+    cards: List<RemoteExplanationCard>,
+    authorityEpoch: String = REMOTE_LEGACY_EXPLANATION_AUTHORITY,
+): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    val legacy = authorityEpoch == REMOTE_LEGACY_EXPLANATION_AUTHORITY
+    digest.putRemoteText(if (legacy) "masternote-gpt-explanation-layer-v1" else "masternote-gpt-explanation-layer-v2")
+    if (!legacy) digest.putRemoteText(authorityEpoch)
+    digest.putRemoteText(pageToken)
+    digest.putRemoteInt(pageNumber)
+    digest.putRemoteInt(attemptNo)
+    val ordered = cards.sortedBy(RemoteExplanationCard::cardId)
+    digest.putRemoteInt(ordered.size)
+    ordered.forEach { card ->
+        digest.putRemoteText(card.cardId)
+        digest.putRemoteText(card.sourceResourceId)
+        digest.putRemoteText(card.sourceResourceRevisionId)
+        digest.putRemoteText(card.title)
+        digest.putRemoteText(card.text)
+        digest.putRemoteFloat(card.anchor.left)
+        digest.putRemoteFloat(card.anchor.top)
+        digest.putRemoteFloat(card.anchor.right)
+        digest.putRemoteFloat(card.anchor.bottom)
+        digest.putRemoteLong(card.createdAtEpochMs)
+        digest.putRemoteLong(card.updatedAtEpochMs)
+    }
+    return digest.digest().joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+}
+
+const val REMOTE_LEGACY_EXPLANATION_AUTHORITY: String = "legacy-v1"
+
+private fun MessageDigest.putRemoteText(value: String) {
+    val bytes = value.toByteArray(Charsets.UTF_8)
+    putRemoteInt(bytes.size)
+    update(bytes)
+}
+
+private fun MessageDigest.putRemoteInt(value: Int) {
+    update(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(value).array())
+}
+
+private fun MessageDigest.putRemoteLong(value: Long) {
+    update(ByteBuffer.allocate(Long.SIZE_BYTES).putLong(value).array())
+}
+
+private fun MessageDigest.putRemoteFloat(value: Float) = putRemoteInt(value.toRawBits())
 
 data class ReviewCanvasDimensions(
     val widthPx: Int,

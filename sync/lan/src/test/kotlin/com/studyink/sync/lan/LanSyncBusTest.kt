@@ -22,6 +22,32 @@ import org.junit.Test
 class LanSyncBusTest {
 
     @Test
+    fun gptAckMustMatchEveryDurablePublicationIdentityField() {
+        val expected = arrayOf(
+            "a".repeat(64), "b".repeat(64), "c".repeat(64),
+        )
+        fun matches(
+            publicationId: String = expected[0],
+            page: Int = 93,
+            attempt: Int = 4,
+            revision: Long = 7L,
+            digest: String = expected[1],
+            authority: String = expected[2],
+        ) = isExactLanGptExplanationAck(
+            expected[0], 93, 4, 7L, expected[1], expected[2],
+            publicationId, page, attempt, revision, digest, authority,
+        )
+
+        assertTrue(matches())
+        assertFalse(matches(publicationId = "d".repeat(64)))
+        assertFalse(matches(page = 94))
+        assertFalse(matches(attempt = 3))
+        assertFalse(matches(revision = 8L))
+        assertFalse(matches(digest = "e".repeat(64)))
+        assertFalse(matches(authority = "f".repeat(64)))
+    }
+
+    @Test
     fun publishedReviewTargetsExactOpenOrSubmittedAttempt() {
         val open = Attempt("book-a", pageNumber = 93, attemptNo = 4, locked = false)
 
@@ -449,6 +475,45 @@ class LanSyncBusTest {
         } finally {
             LanSyncBus.removeListener(listener)
         }
+    }
+
+    @Test
+    fun catchUpYieldRequestIsExactAndRunsOutsideTheBusMonitor() {
+        val bookId = "book-${UUID.randomUUID()}"
+        var receivedBookId: String? = null
+        var anotherThreadCouldReadState = false
+        val listener = object : LanSyncBus.Listener {
+            override fun onCatchUpYieldRequested(bookId: String) {
+                receivedBookId = bookId
+                val completed = CountDownLatch(1)
+                val executor = Executors.newSingleThreadExecutor()
+                try {
+                    executor.execute {
+                        LanSyncBus.sessionSnapshot(bookId)
+                        completed.countDown()
+                    }
+                    anotherThreadCouldReadState = completed.await(2, TimeUnit.SECONDS)
+                } finally {
+                    executor.shutdownNow()
+                }
+            }
+        }
+        LanSyncBus.addListener(listener)
+        try {
+            LanSyncBus.requestCatchUpYield(bookId)
+            assertEquals(bookId, receivedBookId)
+            assertTrue(anotherThreadCouldReadState)
+        } finally {
+            LanSyncBus.removeListener(listener)
+        }
+    }
+
+    @Test
+    fun readyPublicationLosesToCommittedYieldAndRejectsOldSocketGeneration() {
+        assertTrue(canPublishLanReady(7L, 7L, -1L))
+        assertFalse(canPublishLanReady(7L, 7L, 7L))
+        assertFalse(canPublishLanReady(6L, 7L, -1L))
+        assertTrue(canPublishLanReady(8L, 8L, 7L))
     }
 
     @Test

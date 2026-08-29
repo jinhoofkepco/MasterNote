@@ -21,6 +21,8 @@ include(
     ":annotation:engine",
     ":annotation:storage",
     ":backup:storage",
+    ":assistant:core",
+    ":assistant:webview",
     ":library:data",
     ":monitor:core",
     ":monitor:telegram",

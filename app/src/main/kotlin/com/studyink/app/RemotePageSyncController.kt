@@ -125,6 +125,15 @@ internal class RemotePageSyncController(
     private val queuedStudentInventoryKeys = linkedSetOf<String>()
     private val failedStudentInventoryPages = linkedMapOf<String, Long>()
     private val failedStudentInventoryPageTargets = linkedMapOf<String, StudentInventoryPage>()
+    /**
+     * A reconnect never trusts row existence as proof of freshness. Existing compact rows are
+     * checked one page per tick using only the append-log length and attempt metadata; only a
+     * mismatch pays for a page replay/digest. Explicit local events remove their page immediately.
+     */
+    private val queuedStudentPageAudits = ArrayDeque<StudentInventoryPage>()
+    private val queuedStudentPageAuditKeys = linkedSetOf<String>()
+    private val unverifiedStudentPageKeys = linkedSetOf<String>()
+    private val failedStudentPageAuditRetryAt = linkedMapOf<String, Long>()
     private var manualRunning = false
     private var intervalSeconds = DEFAULT_REMOTE_PAGE_SYNC_INTERVAL_SECONDS
     private var requestCooldownUntilElapsedMs = 0L
@@ -144,8 +153,9 @@ internal class RemotePageSyncController(
         // coordinator tick can retry safely.
         next?.let {
             store.bindPair(it.pairId)
-            if (it.role == RemoteReviewRole.STUDENT && telegramActive) {
-                store.beginStudentGeneration()
+            if (it.role == RemoteReviewRole.STUDENT) {
+                store.fenceRecoveredStudentGeneration()
+                if (telegramActive) store.beginStudentGeneration()
             }
         }
         session = next
@@ -167,9 +177,14 @@ internal class RemotePageSyncController(
         failedTeacherReviewKeys.clear()
         nextTeacherReviewSendAtElapsedMs = 0L
         if (next?.role == RemoteReviewRole.STUDENT && telegramActive) {
+            // Transport callbacks may arrive before the peer session is bound on process start.
+            // Reconstruct the bounded crash-gap audit here as well as on a live fallback edge.
+            scheduleStudentPageAudits()
             scheduleAllStudentBooks()
             inventoryManifestDueAtElapsedMs = nowElapsedMs()
             manifestBatchesRemaining = requiredManifestBatchCount(expectedStudentInventoryPageCount())
+        } else if (next?.role == RemoteReviewRole.TEACHER && telegramActive) {
+            store.markTeacherPagesForVerification()
         }
         RemoteStudentCursorBus.clear(RemoteStudentCursorTransport.TELEGRAM)
         notifyUiChanged()
@@ -187,9 +202,12 @@ internal class RemotePageSyncController(
                     store.beginStudentGeneration()
                     if (enteredFallback) {
                         clearStudentInventoryScan()
-                        currentPresence?.takeIf(StudentStudyPresence::active)?.let { presence ->
-                            refreshStudentPage(requireNotNull(presence.bookId), requireNotNull(presence.pageNumber) - 1)
+                        val freshPage = currentPresence?.takeIf(StudentStudyPresence::active)?.let { presence ->
+                            val bookId = requireNotNull(presence.bookId)
+                            val pageNumber = requireNotNull(presence.pageNumber) - 1
+                            refreshStudentPage(bookId, pageNumber)?.let { bookId to pageNumber }
                         }
+                        scheduleStudentPageAudits(freshPage)
                         scheduleAllStudentBooks()
                         inventoryManifestDueAtElapsedMs = nowElapsedMs()
                         interactiveManifestDueAtElapsedMs = Long.MAX_VALUE
@@ -215,7 +233,13 @@ internal class RemotePageSyncController(
                     // without losing the correction.
                     drainTeacherPublishIntents()
                 }
-                if (enteredFallback) publishTeacherCursor()
+                if (enteredFallback) {
+                    // LAN catch-up may have changed the local student layer without changing the
+                    // still-installed Telegram row. Hide those rows from the request queue until
+                    // one bounded local digest check proves which pages really differ.
+                    store.markTeacherPagesForVerification()
+                    publishTeacherCursor()
+                }
             }
             null -> Unit
         }
@@ -271,31 +295,33 @@ internal class RemotePageSyncController(
             return
         }
         currentPresence = presence
-        if (telegramActive && presence.active) {
+        if (!lanOwnsData && presence.active) {
             val bookId = requireNotNull(presence.bookId)
             refreshStudentPage(bookId, requireNotNull(presence.pageNumber) - 1)
-            seedStudentBook(bookId)
-            scheduleInteractiveManifest()
+            if (telegramActive) {
+                seedStudentBook(bookId)
+                scheduleInteractiveManifest()
+            }
         }
     }
 
     @Synchronized
     fun onStudentHeartbeat(heartbeat: StudentWorkHeartbeat) {
-        if (session?.role != RemoteReviewRole.STUDENT || !telegramActive) return
+        if (session?.role != RemoteReviewRole.STUDENT || lanOwnsData) return
         val presence = currentPresence?.takeIf(StudentStudyPresence::active)
         val bookId = heartbeat.bookId ?: presence?.bookId ?: return
         val oneBasedPage = heartbeat.pageNumber ?: presence?.pageNumber ?: return
         if (!isVisibleStudentBook(bookId)) return
         refreshStudentPage(bookId, oneBasedPage - 1)
-        scheduleInteractiveManifest()
+        if (telegramActive) scheduleInteractiveManifest()
     }
 
     @Synchronized
     fun onLocalOperation(bookId: String, pageNumber: Int) {
-        if (session?.role != RemoteReviewRole.STUDENT || !telegramActive) return
+        if (session?.role != RemoteReviewRole.STUDENT || lanOwnsData) return
         if (!isVisibleStudentBook(bookId)) return
         refreshStudentPage(bookId, pageNumber)
-        scheduleInteractiveManifest()
+        if (telegramActive) scheduleInteractiveManifest()
     }
 
     @Synchronized
@@ -363,8 +389,10 @@ internal class RemotePageSyncController(
     }
 
     fun tick() {
+        processOneStudentPageAudit()
         synchronized(this) { tickLocked() }
         processOneStudentInventoryPage()
+        processOneTeacherPageVerification()
     }
 
     private fun tickLocked() {
@@ -396,12 +424,11 @@ internal class RemotePageSyncController(
                 TeacherManifestInstallResult.STALE -> return RemotePageSyncIncomingResult.ACKNOWLEDGE
                 else -> Unit
             }
-            // This durable state is the only safe cheap description of the local student layer.
-            // Replaying a cold annotation log for every row in every manifest can take tens of
-            // seconds and used to hold this controller's UI monitor for the whole replay. LAN
-            // ownership and data-root replacement clear these rows, so an empty/mismatched prior
-            // state deliberately stays pending until the exact page is requested and applied.
+            // Durable rows and parked LAN evidence are cheap candidates, not cross-generation
+            // proof. New/handoff rows that appear equal are installed as verification-pending and
+            // checked one page per tick outside this controller monitor.
             val previouslyInstalledPages = store.teacherPages()
+            val generationChanged = envelope.syncGeneration != store.teacherManifestGeneration()
             val requiresExplicitMapping = envelope.entries.asSequence()
                 .map { it.workbookToken to it.contentSha256 }
                 .distinct()
@@ -431,12 +458,33 @@ internal class RemotePageSyncController(
                 if (localBook != null) pendingMappings[entry.workbookToken] = localBook.id
                 val localPage = entry.pageNumber - 1
                 val validBook = localBook?.takeIf { localPage in 0 until it.pageCount }
-                val localDigest = reusableTeacherStudentLayerSha256(
+                val previousDigest = reusableTeacherStudentLayerSha256(
                     previouslyInstalledPages = previouslyInstalledPages,
                     workbookToken = entry.workbookToken,
                     contentSha256 = entry.contentSha256,
                     localBookId = validBook?.id,
                     pageNumber = localPage,
+                )
+                val evidenceDigest = store.teacherStudentLayerEvidence(
+                    workbookToken = entry.workbookToken,
+                    contentSha256 = entry.contentSha256,
+                    localBookId = validBook?.id,
+                    pageNumber = localPage,
+                )?.studentLayerSha256
+                val localDigest = listOfNotNull(previousDigest, evidenceDigest).distinct().singleOrNull()
+                val previousNeedsVerification = previouslyInstalledPages.any { previous ->
+                    previous.workbookToken == entry.workbookToken &&
+                        previous.contentSha256 == entry.contentSha256 &&
+                        previous.localBookId == validBook?.id &&
+                        previous.pageNumber == localPage && previous.verificationPending
+                }
+                val digestMatches = localDigest == entry.studentLayerSha256
+                val verificationPending = shouldVerifyTeacherManifestPage(
+                    hasMappedLocalPage = validBook != null,
+                    generationChanged = generationChanged,
+                    previousVerificationPending = previousNeedsVerification,
+                    previousDigest = previousDigest,
+                    evidenceDigest = evidenceDigest,
                 )
                 TeacherPageSyncRecord(
                     syncGeneration = envelope.syncGeneration,
@@ -450,8 +498,9 @@ internal class RemotePageSyncController(
                     attemptNos = entry.attemptNos,
                     submittedAttemptNos = entry.submittedAttemptNos,
                     sourceRevision = entry.revision,
-                    appliedRevision = if (localDigest == entry.studentLayerSha256) entry.revision else 0L,
+                    appliedRevision = if (digestMatches && !verificationPending) entry.revision else 0L,
                     appliedStudentLayerSha256 = localDigest,
+                    verificationPending = verificationPending,
                     lastChangedAtEpochMs = entry.lastChangedEpochMs,
                     approximateBytes = entry.approxBytes,
                 )
@@ -974,7 +1023,11 @@ internal class RemotePageSyncController(
                 reservation.syncGeneration,
             )
         }
-        val pagesByToken = store.studentPages().associateBy(StudentPageSyncRecord::pageToken)
+        // A durable row can outlive the callback that should have refreshed it. During fallback,
+        // advertise only rows whose cheap bounded audit (or an exact local event) has completed.
+        val pagesByToken = store.studentPages()
+            .filterNot { it.pageToken in unverifiedStudentPageKeys }
+            .associateBy(StudentPageSyncRecord::pageToken)
         val selectedTokens = if (reservation.advancesInventoryWindow) {
             selectManifestPageTokens(
                 pagesByToken.keys,
@@ -1020,7 +1073,7 @@ internal class RemotePageSyncController(
             },
             entries = entries,
             inventoryPageCount = expectedStudentInventoryPageCount().takeIf {
-                studentInventoryCatalogComplete()
+                studentInventoryCatalogComplete() && unverifiedStudentPageKeys.isEmpty()
             },
         )
     }
@@ -1068,11 +1121,12 @@ internal class RemotePageSyncController(
             return
         }
         val automaticTokens = automaticPageTokens()
-        val inventoryComplete = store.teacherInventoryComplete()
         val next = selectNextTeacherPage(
             pending,
             automaticTokens,
-            manualRunning && inventoryComplete,
+            // A corrupt/unreadable inventory row must not block explicitly requested work on
+            // already-discovered pages. Completion still remains false until the row is repaired.
+            manualRunning,
             failedPageTokens,
             lastRequestedPageToken,
             preferManualPageNext,
@@ -1751,7 +1805,7 @@ internal class RemotePageSyncController(
             nowEpochMs = nowEpochMs(),
         )
         if (!synchronized(this) { session == currentSession && store.studentGeneration() == generation }) return null
-        return store.updateStudentPage(
+        val refreshed = store.updateStudentPage(
             expectedSyncGeneration = generation,
             pageToken = token,
             workbookToken = workbookToken(currentSession.pairId, bookId),
@@ -1766,6 +1820,161 @@ internal class RemotePageSyncController(
             lastChangedAtEpochMs = changedAt,
             approximateBytes = stats.logByteCount.coerceAtLeast(stats.pendingEncodedByteCount),
         )
+        synchronized(this) {
+            if (session == currentSession && store.studentGeneration() == generation) {
+                markStudentPageAuditComplete(
+                    StudentInventoryPage(currentSession.pairId, generation, bookId, pageNumber),
+                )
+            }
+        }
+        return refreshed
+    }
+
+    /**
+     * Builds a compact verification queue from rows already known to this generation. This never
+     * walks PDF pages or decodes handwriting. The currently refreshed page is already proven fresh.
+     */
+    private fun scheduleStudentPageAudits(freshPage: Pair<String, Int>? = null) {
+        val current = session?.takeIf { it.role == RemoteReviewRole.STUDENT } ?: return
+        val generation = store.studentGeneration().takeIf { it > 0L } ?: return
+        store.studentPages().forEach { page ->
+            if (page.syncGeneration != generation ||
+                freshPage?.let { (bookId, pageNumber) ->
+                    page.bookId == bookId && page.pageNumber == pageNumber
+                } == true
+            ) return@forEach
+            val target = StudentInventoryPage(current.pairId, generation, page.bookId, page.pageNumber)
+            if (queuedStudentPageAuditKeys.add(target.key)) queuedStudentPageAudits.addLast(target)
+            unverifiedStudentPageKeys += page.pageToken
+        }
+    }
+
+    /**
+     * Verifies at most one existing row. File length and catalog metadata are the compact compare;
+     * only a mismatch invokes [refreshStudentPage] and its page-scoped digest calculation.
+     */
+    private fun processOneStudentPageAudit() {
+        val target = synchronized(this) {
+            if (session?.role != RemoteReviewRole.STUDENT || !telegramActive) return
+            val now = nowElapsedMs()
+            repeat(queuedStudentPageAudits.size) {
+                val candidate = queuedStudentPageAudits.removeFirst()
+                queuedStudentPageAuditKeys -= candidate.key
+                if (candidate.pairId != session?.pairId ||
+                    candidate.syncGeneration != store.studentGeneration()
+                ) {
+                    failedStudentPageAuditRetryAt -= candidate.key
+                    return@repeat
+                }
+                val retryAt = failedStudentPageAuditRetryAt[candidate.key]
+                if (retryAt != null && retryAt > now) {
+                    if (queuedStudentPageAuditKeys.add(candidate.key)) {
+                        queuedStudentPageAudits.addLast(candidate)
+                    }
+                    return@repeat
+                }
+                failedStudentPageAuditRetryAt -= candidate.key
+                return@synchronized candidate
+            }
+            return
+        }
+        val token = pageToken(target.pairId, target.bookId, target.pageNumber, target.syncGeneration)
+        val expected = store.studentPage(token) ?: run {
+            synchronized(this) { markStudentPageAuditComplete(target) }
+            return
+        }
+        val check = runCatching {
+            val logBytes = annotationStore.operationLogFile(target.bookId, target.pageNumber)
+                .takeIf(java.io.File::isFile)?.length() ?: 0L
+            val attempts = library.attempts(target.bookId, target.pageNumber)
+            val catalogAttemptNos = attempts.map(Attempt::attemptNo).distinct().sorted()
+            val submittedAttemptNos = attempts.asSequence()
+                .filter(Attempt::locked)
+                .map(Attempt::attemptNo)
+                .filter { it in expected.attemptNos }
+                .distinct()
+                .sorted()
+                .toList()
+            studentPageNeedsRefreshAfterCompactAudit(
+                observedLogBytes = logBytes,
+                capturedApproximateBytes = expected.approximateBytes,
+                observedCatalogAttemptNos = catalogAttemptNos,
+                capturedAttemptNos = expected.attemptNos,
+                observedSubmittedAttemptNos = submittedAttemptNos,
+                capturedSubmittedAttemptNos = expected.submittedAttemptNos,
+            )
+        }
+        if (check.isFailure) {
+            synchronized(this) { retryStudentPageAudit(target) }
+            return
+        }
+        if (check.getOrThrow()) {
+            val refreshed = runCatching {
+                refreshStudentPage(target.bookId, target.pageNumber)
+            }.getOrNull()
+            if (refreshed == null) {
+                synchronized(this) { retryStudentPageAudit(target) }
+                return
+            }
+        }
+        synchronized(this) {
+            val current = store.studentPage(token)
+            // A concurrent exact event has already installed a newer row; either result is fresh.
+            if (current != null && current.syncGeneration == target.syncGeneration) {
+                markStudentPageAuditComplete(target)
+                scheduleManifestAtRateBoundary()
+            }
+        }
+    }
+
+    private fun markStudentPageAuditComplete(target: StudentInventoryPage) {
+        queuedStudentPageAuditKeys -= target.key
+        queuedStudentPageAudits.removeAll { it.key == target.key }
+        failedStudentPageAuditRetryAt -= target.key
+        unverifiedStudentPageKeys -= pageToken(
+            target.pairId,
+            target.bookId,
+            target.pageNumber,
+            target.syncGeneration,
+        )
+    }
+
+    private fun retryStudentPageAudit(target: StudentInventoryPage) {
+        if (target.pairId != session?.pairId || target.syncGeneration != store.studentGeneration()) return
+        failedStudentPageAuditRetryAt[target.key] = safeAdd(nowElapsedMs(), INVENTORY_PAGE_RETRY_MS)
+        if (queuedStudentPageAuditKeys.add(target.key)) queuedStudentPageAudits.addLast(target)
+    }
+
+    /**
+     * A parked LAN digest is only a candidate, never proof. Recalculate one mapped page per tick
+     * outside the controller monitor, then commit only if generation, token, revision and digest
+     * are still the exact manifest state that selected the work.
+     */
+    private fun processOneTeacherPageVerification() {
+        val target = synchronized(this) {
+            if (session?.role != RemoteReviewRole.TEACHER || !telegramActive) return
+            store.teacherPages().firstOrNull { it.verificationPending && it.localBookId != null }
+                ?: return
+        }
+        val localBookId = requireNotNull(target.localBookId)
+        val observed = runCatching {
+            annotationStore.studentLayerSha256(localBookId, target.pageNumber)
+        }.getOrNull()
+        val changed = store.verifyTeacherPage(
+            pageToken = target.pageToken,
+            expectedSyncGeneration = target.syncGeneration,
+            expectedSourceRevision = target.sourceRevision,
+            expectedStudentLayerSha256 = target.studentLayerSha256,
+            observedLocalStudentLayerSha256 = observed,
+        )
+        if (!changed) return
+        synchronized(this) {
+            if (session?.role == RemoteReviewRole.TEACHER && telegramActive) {
+                publishTeacherCursor()
+                tickLocked()
+                notifyUiChanged()
+            }
+        }
     }
 
     private fun seedStudentBook(bookId: String) {
@@ -1952,6 +2161,10 @@ internal class RemotePageSyncController(
         queuedStudentInventoryKeys.clear()
         failedStudentInventoryPages.clear()
         failedStudentInventoryPageTargets.clear()
+        queuedStudentPageAudits.clear()
+        queuedStudentPageAuditKeys.clear()
+        unverifiedStudentPageKeys.clear()
+        failedStudentPageAuditRetryAt.clear()
     }
 
     private fun expectedStudentInventoryPageCount(): Int = effectiveStudentInventoryPageCount(
@@ -1966,7 +2179,7 @@ internal class RemotePageSyncController(
         failedPageKeys = failedStudentInventoryPages.keys,
         discoveredBookIds = discoveredStudentBooks,
         seededBookIds = seededStudentBooks,
-    )
+    ) && queuedStudentPageAuditKeys.isEmpty() && unverifiedStudentPageKeys.isEmpty()
 
     private fun retryFailedStudentInventoryPages() {
         val current = session?.takeIf { it.role == RemoteReviewRole.STUDENT } ?: return
@@ -2590,6 +2803,22 @@ internal fun reusableTeacherStudentLayerSha256(
         .singleOrNull()
 }
 
+/**
+ * A mapped row first seen in this runtime/generation is checked locally before any network request.
+ * This lets LAN-applied changes converge without reviving a whole Telegram request list, including
+ * pages that had no previously-applied Telegram digest to park.
+ */
+internal fun shouldVerifyTeacherManifestPage(
+    hasMappedLocalPage: Boolean,
+    generationChanged: Boolean,
+    previousVerificationPending: Boolean,
+    previousDigest: String?,
+    evidenceDigest: String?,
+): Boolean = hasMappedLocalPage && (
+    generationChanged || previousVerificationPending || previousDigest == null ||
+        evidenceDigest != null && evidenceDigest != previousDigest
+    )
+
 /** A total may be advertised only after every discovered page has actually been indexed. */
 internal fun isStudentInventoryCatalogComplete(
     queuedBookKeys: Set<String>,
@@ -2615,6 +2844,24 @@ internal fun effectiveStudentInventoryPageCount(
 ): Int {
     require(discoveredPageCount >= 0 && durablePageCount >= 0)
     return maxOf(discoveredPageCount, durablePageCount)
+}
+
+/**
+ * Cheap crash-gap detector. Extra captured attempt numbers may come from surviving student strokes
+ * whose catalog row was repaired later, so only newly observed catalog attempts force a replay.
+ */
+internal fun studentPageNeedsRefreshAfterCompactAudit(
+    observedLogBytes: Long,
+    capturedApproximateBytes: Long,
+    observedCatalogAttemptNos: List<Int>,
+    capturedAttemptNos: List<Int>,
+    observedSubmittedAttemptNos: List<Int>,
+    capturedSubmittedAttemptNos: List<Int>,
+): Boolean {
+    require(observedLogBytes >= 0L && capturedApproximateBytes >= 0L)
+    return observedLogBytes != capturedApproximateBytes ||
+        !capturedAttemptNos.containsAll(observedCatalogAttemptNos) ||
+        observedSubmittedAttemptNos != capturedSubmittedAttemptNos
 }
 
 internal fun splitPageCheckpointPayload(payload: ByteArray, maxChunkBytes: Int): List<ByteArray> {
