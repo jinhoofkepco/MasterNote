@@ -24,5 +24,6 @@ class AnswerPdfBookTest {
         assertEquals(0, book.answerPdfPageCount)
         assertEquals(emptyMap<Int, Int>(), book.answerPageMappings)
         assertEquals(0, book.lastViewedAnswerPage)
+        assertEquals(emptyMap<Int, AnswerPdfViewport>(), book.answerViewportMappings)
     }
 }

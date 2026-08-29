@@ -82,10 +82,10 @@ class S23UltraTopStripTest {
     }
 
     @Test
-    fun stripStillReservesExactlyTenCellsIncludingThreeAttemptCells() {
-        assertEquals(10, S23_STRIP_CELL_COUNT)
+    fun stripKeepsSeparateGptAndAnswerCellsAlongsideThreeAttemptCells() {
+        assertEquals(11, S23_STRIP_CELL_COUNT)
         assertEquals(3, S23_STRIP_HISTORY_CELL_COUNT)
-        assertEquals(7, S23_STRIP_CELL_COUNT - S23_STRIP_HISTORY_CELL_COUNT)
+        assertEquals(8, S23_STRIP_CELL_COUNT - S23_STRIP_HISTORY_CELL_COUNT)
     }
 
     @Test

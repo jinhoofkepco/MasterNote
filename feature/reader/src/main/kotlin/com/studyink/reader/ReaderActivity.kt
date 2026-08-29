@@ -1,6 +1,7 @@
 package com.studyink.reader
 
 import android.Manifest
+import android.app.ActivityOptions
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -792,7 +793,12 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             ).show()
             return
         }
-        startActivity(AnswerPdfActivity.intent(this, state.bookId, state.pageNumber))
+        val answerIntent = AnswerPdfActivity.intent(this, state.bookId, state.pageNumber)
+            .addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+        startActivity(
+            answerIntent,
+            ActivityOptions.makeCustomAnimation(this, 0, 0).toBundle(),
+        )
     }
 
     private fun beginGptRegionSelection(choice: TeacherPromptChoice) {

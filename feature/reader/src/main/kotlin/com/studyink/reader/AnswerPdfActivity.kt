@@ -16,17 +16,22 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.addCallback
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
+import androidx.pdf.PdfPoint
 import androidx.pdf.view.PdfView
+import com.studyink.core.model.AnswerPdfViewport
 import com.studyink.document.pdf.ReaderPdfFragment
 import com.studyink.library.data.LibraryRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /** Read-only answer PDF. Browsing never changes a problem mapping until the teacher confirms it. */
 class AnswerPdfActivity : FragmentActivity(), ReaderPdfFragment.Listener {
@@ -40,6 +45,12 @@ class AnswerPdfActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var answerPageCount = 0
     private var currentAnswerPage = 0
     private var initialAnswerPage = 0
+    private var initialViewport: AnswerPdfViewport? = null
+    private var pendingInitialPage: Int? = null
+    private var pendingViewportRestore: AnswerPdfViewport? = null
+    private var initialRestoreApplied = false
+    private var restoreCommandIssued = false
+    private var visiblePageLocations = SparseArray<RectF>()
     private var lastViewedSaveJob: Job? = null
 
     private val viewportListener = object : PdfView.OnViewportChangedListener {
@@ -50,11 +61,20 @@ class AnswerPdfActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             zoomLevel: Float,
         ) {
             val view = pdfView ?: return
+            visiblePageLocations = SparseArray<RectF>(pageLocations.size()).also { copy ->
+                for (index in 0 until pageLocations.size()) {
+                    copy.put(pageLocations.keyAt(index), RectF(pageLocations.valueAt(index)))
+                }
+            }
+            if (pendingInitialPage != null) {
+                applyPendingInitialPosition(view, pageLocations)
+                if (pendingInitialPage != null) return
+            }
             val viewportCenterY = view.height / 2f
             val visibleEnd = firstVisiblePage + visiblePagesCount
             val nearest = (firstVisiblePage until visibleEnd)
                 .filter { pageLocations[it] != null }
-                .minByOrNull { page -> kotlin.math.abs(pageLocations[page].centerY() - viewportCenterY) }
+                .minByOrNull { page -> abs(pageLocations[page].centerY() - viewportCenterY) }
                 ?: firstVisiblePage
             updateCurrentAnswerPage(nearest)
         }
@@ -67,7 +87,7 @@ class AnswerPdfActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         val book = runCatching { repository.book(bookId) }.getOrNull()
         if (book == null || problemPage !in 0 until book.pageCount) {
             Toast.makeText(this, "문제 페이지를 찾을 수 없습니다.", Toast.LENGTH_LONG).show()
-            finish()
+            closeWithoutAnimation()
             return
         }
         val answerFile = runCatching { repository.answerPdfFile(book) }.getOrElse { error ->
@@ -76,11 +96,14 @@ class AnswerPdfActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 error.message ?: "교재 화면에서 답안 PDF를 먼저 연결하세요.",
                 Toast.LENGTH_LONG,
             ).show()
-            finish()
+            closeWithoutAnimation()
             return
         }
-        initialAnswerPage = repository.answerPageForProblem(bookId, problemPage)
+        initialViewport = repository.answerViewportForProblem(bookId, problemPage)
+        initialAnswerPage = initialViewport?.answerPage
+            ?: repository.answerPageForProblem(bookId, problemPage)
             ?: repository.lastViewedAnswerPage(bookId)
+        onBackPressedDispatcher.addCallback(this) { closeWithoutAnimation() }
         buildUi()
         pdfFragment = supportFragmentManager.findFragmentByTag(PDF_TAG) as? ReaderPdfFragment
             ?: ReaderPdfFragment().also { fragment ->
@@ -94,6 +117,7 @@ class AnswerPdfActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         } else {
             currentAnswerPage = savedInstanceState.getInt(STATE_ANSWER_PAGE, initialAnswerPage)
             initialAnswerPage = currentAnswerPage
+            initialViewport = null
         }
     }
 
@@ -110,8 +134,7 @@ class AnswerPdfActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             setPadding(dp(6), dp(4), dp(6), dp(4))
             setBackgroundColor(Color.rgb(250, 248, 242))
         }
-        bar.addView(button("닫기") { finish() }, LinearLayout.LayoutParams(dp(62), dp(48)))
-        bar.addView(button("‹") { showPage(currentAnswerPage - 1) }, LinearLayout.LayoutParams(dp(46), dp(48)))
+        bar.addView(button("닫기", ::closeWithoutAnimation), LinearLayout.LayoutParams(dp(62), dp(48)))
         val labels = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -129,8 +152,7 @@ class AnswerPdfActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         labels.addView(pageLabel, LinearLayout.LayoutParams(MATCH, 0, 1f))
         labels.addView(mappingLabel, LinearLayout.LayoutParams(MATCH, ViewGroup.LayoutParams.WRAP_CONTENT))
         bar.addView(labels, LinearLayout.LayoutParams(0, MATCH, 1f))
-        bar.addView(button("›") { showPage(currentAnswerPage + 1) }, LinearLayout.LayoutParams(dp(46), dp(48)))
-        bar.addView(button("연결") { saveMapping() }, LinearLayout.LayoutParams(dp(68), dp(48)))
+        bar.addView(button("연결") { saveMapping() }, LinearLayout.LayoutParams(dp(82), dp(48)))
         root.addView(bar, FrameLayout.LayoutParams(MATCH, dp(76), Gravity.TOP))
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
             val safe = insets.getInsets(
@@ -157,8 +179,9 @@ class AnswerPdfActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         view.pagesPerRow = PdfView.SINGLE_PAGE
         view.verticalAlignment = PdfView.VERTICAL_ALIGNMENT_CENTER
         view.overScrollMode = View.OVER_SCROLL_NEVER
+        view.isEnabled = false
         view.addOnViewportChangedListener(viewportListener)
-        if (answerPageCount > 0) view.post { showPage(initialAnswerPage) }
+        restoreInitialPositionWhenReady()
     }
 
     override fun onDocumentReady(uri: Uri, pageWidths: Map<Int, Float>, pageCount: Int) {
@@ -166,19 +189,52 @@ class AnswerPdfActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         initialAnswerPage = initialAnswerPage.coerceIn(0, (pageCount - 1).coerceAtLeast(0))
         currentAnswerPage = initialAnswerPage
         updateLabels()
-        pdfView?.post { showPage(initialAnswerPage) }
+        restoreInitialPositionWhenReady()
     }
 
     override fun onDocumentError(error: Throwable) {
         Toast.makeText(this, "답안 PDF를 열 수 없습니다: ${error.message}", Toast.LENGTH_LONG).show()
-        finish()
+        closeWithoutAnimation()
     }
 
-    private fun showPage(page: Int) {
-        if (answerPageCount <= 0) return
-        val target = page.coerceIn(0, answerPageCount - 1)
-        updateCurrentAnswerPage(target)
-        pdfView?.scrollToPage(target)
+    private fun restoreInitialPositionWhenReady() {
+        val view = pdfView ?: return
+        if (answerPageCount <= 0 || initialRestoreApplied) return
+        initialRestoreApplied = true
+        val targetPage = initialAnswerPage.coerceIn(0, answerPageCount - 1)
+        currentAnswerPage = targetPage
+        pendingInitialPage = targetPage
+        pendingViewportRestore = initialViewport?.copy(answerPage = targetPage)
+        view.post {
+            pendingViewportRestore?.let { saved ->
+                view.zoom = saved.zoomScale.coerceIn(view.minZoom, view.maxZoom)
+            }
+            visiblePageLocations.clear()
+            restoreCommandIssued = true
+            view.scrollToPage(targetPage)
+        }
+    }
+
+    private fun applyPendingInitialPosition(view: PdfView, pageLocations: SparseArray<RectF>) {
+        if (!restoreCommandIssued) return
+        val targetPage = pendingInitialPage ?: return
+        if (pageLocations[targetPage] == null) return
+        val saved = pendingViewportRestore
+        if (saved == null) {
+            pendingInitialPage = null
+            view.isEnabled = true
+            return
+        }
+        val point = view.pdfToViewPoint(PdfPoint(saved.answerPage, saved.pdfX, saved.pdfY)) ?: return
+        pendingInitialPage = null
+        pendingViewportRestore = null
+        view.post {
+            view.scrollBy(
+                (point.x - view.width / 2f).roundToInt(),
+                (point.y - view.height / 2f).roundToInt(),
+            )
+            view.isEnabled = true
+        }
     }
 
     private fun updateCurrentAnswerPage(page: Int) {
@@ -206,19 +262,55 @@ class AnswerPdfActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun saveMapping() {
         if (answerPageCount <= 0) return
+        val viewport = captureCurrentViewport()
+        if (viewport == null) {
+            Toast.makeText(this, "답안 페이지가 화면에 보일 때 연결해 주세요.", Toast.LENGTH_SHORT).show()
+            return
+        }
         runCatching {
-            repository.saveAnswerPageMapping(bookId, problemPage, currentAnswerPage)
-            repository.saveLastViewedAnswerPage(bookId, currentAnswerPage)
+            repository.saveAnswerViewportMapping(
+                bookId = bookId,
+                problemPage = problemPage,
+                answerPage = viewport.answerPage,
+                pdfX = viewport.pdfX,
+                pdfY = viewport.pdfY,
+                zoomScale = viewport.zoomScale,
+            )
+            repository.saveLastViewedAnswerPage(bookId, viewport.answerPage)
         }.onSuccess {
+            currentAnswerPage = viewport.answerPage
             updateLabels()
             Toast.makeText(
                 this,
-                "문제 ${problemPage + 1}쪽을 답안 ${currentAnswerPage + 1}쪽에 연결했습니다.",
+                "문제 ${problemPage + 1}쪽의 답안 위치와 확대 상태를 저장했습니다.",
                 Toast.LENGTH_SHORT,
             ).show()
         }.onFailure { error ->
             Toast.makeText(this, error.message ?: "답안 페이지를 연결하지 못했습니다.", Toast.LENGTH_LONG).show()
         }
+    }
+
+    private fun captureCurrentViewport(): AnswerPdfViewport? {
+        val view = pdfView ?: return null
+        val pageBounds = visiblePageLocations[currentAnswerPage] ?: return null
+        if (pageBounds.width() <= 0f || pageBounds.height() <= 0f) return null
+        val insetX = minOf(1f, pageBounds.width() / 4f)
+        val insetY = minOf(1f, pageBounds.height() / 4f)
+        val viewX = (view.width / 2f).coerceIn(pageBounds.left + insetX, pageBounds.right - insetX)
+        val viewY = (view.height / 2f).coerceIn(pageBounds.top + insetY, pageBounds.bottom - insetY)
+        val point = view.viewToPdfPoint(viewX, viewY) ?: return null
+        return AnswerPdfViewport(
+            answerPage = point.pageNum,
+            pdfX = point.x,
+            pdfY = point.y,
+            zoomScale = view.zoom,
+        )
+    }
+
+    @Suppress("DEPRECATION")
+    private fun closeWithoutAnimation() {
+        finish()
+        overridePendingTransition(0, 0)
     }
 
     private fun scheduleLastViewedSave() {

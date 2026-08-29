@@ -28,7 +28,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.getValue
@@ -80,7 +79,7 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 internal const val S23_ULTRA_MODEL_PREFIX = "SM-S918"
-internal const val S23_STRIP_CELL_COUNT = 10
+internal const val S23_STRIP_CELL_COUNT = 11
 internal const val S23_STRIP_HISTORY_CELL_COUNT = 3
 
 /** S Pen taps belong exclusively to the parent drag/tap interop path. */
@@ -263,7 +262,7 @@ internal fun s23VisibleAttemptBundles(
 }
 
 /**
- * Galaxy S23 Ultra portrait-only reader chrome. The ten cells are structural, so every action
+ * Galaxy S23 Ultra portrait-only reader chrome. The cells are structural, so every action
  * keeps the same rectangular hit target and the attempt lane can never be squeezed by its peers.
  */
 @Composable
@@ -290,12 +289,10 @@ internal fun S23UltraTopStrip(
     markHistoryContent: (@Composable () -> Unit)? = null,
 ) {
     MaterialTheme {
-        var referenceMenuVisible by remember(state.bookId) { mutableStateOf(false) }
         val tokens = readerChromeTokens(state.role)
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-            // At the S23 Ultra's normal 412dp portrait width this is exactly 10 x 40dp, leaving
-            // six dp on either side. Display zoom can narrow the window, so scale all ten cells
-            // together rather than clipping the last page button.
+            // Display zoom can narrow the window, so scale every cell together rather than
+            // clipping the last page button. GPT and answer remain separate direct actions.
             val cellWidth = minOf(40.dp, maxWidth / S23_STRIP_CELL_COUNT.toFloat())
             val stripWidth = cellWidth * S23_STRIP_CELL_COUNT
             val stripHeight = 48.dp
@@ -361,18 +358,32 @@ internal fun S23UltraTopStrip(
                             previewHoveredDescription?.startsWith("학생 현재 페이지") == true,
                     )
                     S23StripButton(
-                        description = "GPT 또는 답안 열기",
-                        onAction = { referenceMenuVisible = true },
+                        description = "GPT 페이지 설명",
+                        onAction = onOpenGptAssistant,
                         enabled = state.role != ReaderRole.STUDENT && state.documentReady,
                         role = state.role,
                         cellWidth = cellWidth,
-                        forceHovered = previewHoveredDescription == "GPT 페이지 설명" ||
-                            previewHoveredDescription == "답안 PDF 열기",
+                        forceHovered = previewHoveredDescription == "GPT 페이지 설명",
                     ) {
                         Text(
-                            text = "GPT·답",
+                            text = "GPT",
                             color = tokens.paletteBlue,
-                            fontSize = 9.sp,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Black,
+                        )
+                    }
+                    S23StripButton(
+                        description = "답안 PDF 열기",
+                        onAction = onOpenAnswerPdf,
+                        enabled = state.role != ReaderRole.STUDENT && state.documentReady,
+                        role = state.role,
+                        cellWidth = cellWidth,
+                        forceHovered = previewHoveredDescription == "답안 PDF 열기",
+                    ) {
+                        Text(
+                            text = "답",
+                            color = tokens.paletteBlue,
+                            fontSize = 11.sp,
                             fontWeight = FontWeight.Black,
                         )
                     }
@@ -414,26 +425,6 @@ internal fun S23UltraTopStrip(
                     )
                 }
             }
-        }
-
-        if (referenceMenuVisible) {
-            AlertDialog(
-                onDismissRequest = { referenceMenuVisible = false },
-                title = { Text("자료 열기") },
-                text = { Text("현재 문제 페이지에서 볼 자료를 선택하세요.") },
-                confirmButton = {
-                    TextButton(onClick = {
-                        referenceMenuVisible = false
-                        onOpenAnswerPdf()
-                    }) { Text("답안") }
-                },
-                dismissButton = {
-                    TextButton(onClick = {
-                        referenceMenuVisible = false
-                        onOpenGptAssistant()
-                    }) { Text("GPT") }
-                },
-            )
         }
 
         state.dataError?.let { message ->

@@ -15,6 +15,22 @@ data class Student(
     val hiddenAtEpochMillis: Long? = null,
 )
 
+/** Exact viewport in the answer PDF, expressed in zero-based PDF page coordinates. */
+data class AnswerPdfViewport(
+    val answerPage: Int,
+    val pdfX: Float,
+    val pdfY: Float,
+    val zoomScale: Float,
+) {
+    init {
+        require(answerPage >= 0) { "답안 페이지는 음수일 수 없습니다." }
+        require(pdfX.isFinite() && pdfX >= 0f && pdfY.isFinite() && pdfY >= 0f) {
+            "답안 PDF 좌표가 올바르지 않습니다."
+        }
+        require(zoomScale.isFinite() && zoomScale > 0f) { "답안 PDF 확대 배율이 올바르지 않습니다." }
+    }
+}
+
 data class Book(
     val id: String = UUID.randomUUID().toString(),
     val studentId: String,
@@ -35,6 +51,8 @@ data class Book(
     val answerPageMappings: Map<Int, Int> = emptyMap(),
     /** Zero-based page restored when the answer PDF is opened again. */
     val lastViewedAnswerPage: Int = 0,
+    /** Exact answer-PDF viewport by zero-based problem page; page-only mappings remain separate. */
+    val answerViewportMappings: Map<Int, AnswerPdfViewport> = emptyMap(),
 )
 
 data class AnswerSource(
