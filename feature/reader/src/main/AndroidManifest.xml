@@ -9,7 +9,8 @@
             android:name="com.studyink.reader.GptAssistantActivity"
             android:configChanges="keyboardHidden|orientation|screenSize"
             android:exported="false"
-            android:screenOrientation="fullSensor" />
+            android:screenOrientation="fullSensor"
+            android:windowSoftInputMode="adjustResize" />
         <activity
             android:name="com.studyink.reader.ReaderActivity"
             android:configChanges="keyboardHidden|orientation|screenSize"

@@ -59,7 +59,8 @@ internal object ChatGptScripts {
         })(${JSONObject.quote(token)});
         """.trimIndent()
 
-    val responseSnapshot: String =
+    val responseSnapshot: String
+        get() =
         """
         (function() {
           function visible(el) {
@@ -107,9 +108,27 @@ internal object ChatGptScripts {
         })();
         """.trimIndent()
 
-    val latestResponseHtml: String =
+    val latestResponseMarkdown: String
+        get() =
         """
         (function() {
+          $RESPONSE_EXTRACTION_HELPERS
+          function norm(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
+          const direct = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"))
+            .filter(function(el) { return norm(el.innerText || el.textContent).length > 0; });
+          const articles = direct.length ? [] : Array.from(document.querySelectorAll("main article"))
+            .filter(function(el) { return norm(el.innerText || el.textContent).length > 0; });
+          const assistants = direct.length ? direct : articles;
+          const last = assistants.length ? assistants[assistants.length - 1] : null;
+          return extractStudyInkMarkdown(last);
+        })();
+        """.trimIndent()
+
+    val latestResponseHtml: String
+        get() =
+        """
+        (function() {
+          $RESPONSE_EXTRACTION_HELPERS
           function norm(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
           const direct = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"))
             .filter(function(el) { return norm(el.innerText || el.textContent).length > 0; });
@@ -118,28 +137,335 @@ internal object ChatGptScripts {
           const assistants = direct.length ? direct : articles;
           const last = assistants.length ? assistants[assistants.length - 1] : null;
           if (!last) return "";
-          const selector = ".markdown, .prose, [class*='markdown'], [class*='prose']";
-          const content = (last.matches && last.matches(selector)) ? last :
-            (last.querySelector(selector) || last);
-          const clone = content.cloneNode(true);
-          clone.querySelectorAll("script,style,button,svg,canvas,form,input,textarea,select,iframe,object,embed,img,picture,source,audio,video,link,meta").forEach(function(el) {
-            el.remove();
-          });
-          clone.querySelectorAll("*").forEach(function(el) {
-            const safeHref = el.tagName === "A" && /^https:\/\//i.test(
-              String(el.getAttribute("href") || "")
-            ) ? String(el.getAttribute("href")) : "";
-            Array.from(el.attributes || []).forEach(function(attr) {
-              el.removeAttribute(attr.name);
-            });
-            if (safeHref) {
-              el.setAttribute("href", safeHref);
-              el.setAttribute("target", "_blank");
-              el.setAttribute("rel", "noopener noreferrer");
-            }
-          });
-          return clone.innerHTML || "";
+          return extractStudyInkHtml(last);
         })();
+        """.trimIndent()
+
+    /**
+     * Kept in the evaluated page instead of depending on ChatGPT's CSS or JavaScript. The page's
+     * rendered KaTeX/MathML is reduced to one TeX source before hidden accessibility nodes are
+     * removed, then the remaining semantic DOM is converted to portable Markdown.
+     */
+    private val RESPONSE_EXTRACTION_HELPERS =
+        """
+          const STUDYINK_DOLLAR = String.fromCharCode(36);
+          const STUDYINK_CONTENT_SELECTOR =
+            ".markdown, .prose, [class*='markdown'], [class*='prose']";
+          const STUDYINK_MATH_SELECTOR =
+            ".katex-display, .katex, mjx-container, math";
+
+          function cleanStudyInkCharacters(value) {
+            return String(value || "")
+              .replace(/\r\n?/g, "\n")
+              .replace(/[\u00a0\u2028\u2029]/g, function(ch) {
+                return ch === "\u00a0" ? " " : "\n";
+              })
+              .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u00ad\u200b-\u200d\u202a-\u202e\u2060\u2066-\u2069\ufeff\ufffd]/g, "");
+          }
+
+          // Text nodes are prose, not Markdown source. Escape only inline punctuation that our
+          // portable renderer could otherwise reinterpret (for example x_1 or ${'$'}5~${'$'}10).
+          function escapeStudyInkMarkdownText(value) {
+            return cleanStudyInkCharacters(value).replace(
+              /([\\*_\[\]~\x24\x60])/g,
+              function(marker) { return "\\" + marker; }
+            ).replace(
+              /(^|\n)([ \t]{0,3})(#{1,6}|>)(?=\s|${'$'})/g,
+              function(_, line, indent, marker) { return line + indent + "\\" + marker; }
+            ).replace(
+              /(^|\n)([ \t]*)([-+])(?=\s)/g,
+              function(_, line, indent, marker) { return line + indent + "\\" + marker; }
+            ).replace(
+              /(^|\n)([ \t]*)(\d+)([.)])(?=\s)/g,
+              function(_, line, indent, number, marker) {
+                return line + indent + number + "\\" + marker;
+              }
+            );
+          }
+
+          function studyInkContentRoot(message) {
+            if (!message) return null;
+            return (message.matches && message.matches(STUDYINK_CONTENT_SELECTOR)) ? message :
+              (message.querySelector(STUDYINK_CONTENT_SELECTOR) || message);
+          }
+
+          function stripStudyInkMathDelimiters(value) {
+            let text = cleanStudyInkCharacters(value).trim();
+            if (text.startsWith("\\[") && text.endsWith("\\]")) {
+              return text.slice(2, -2).trim();
+            }
+            if (text.startsWith("\\(") && text.endsWith("\\)")) {
+              return text.slice(2, -2).trim();
+            }
+            const doubled = STUDYINK_DOLLAR + STUDYINK_DOLLAR;
+            if (text.startsWith(doubled) && text.endsWith(doubled) && text.length >= 4) {
+              return text.slice(2, -2).trim();
+            }
+            if (text.startsWith(STUDYINK_DOLLAR) &&
+                text.endsWith(STUDYINK_DOLLAR) && text.length >= 2) {
+              return text.slice(1, -1).trim();
+            }
+            return text;
+          }
+
+          function studyInkMathSource(node) {
+            if (!node) return "";
+            const annotation = node.matches &&
+                node.matches("annotation[encoding='application/x-tex'], annotation[encoding='application/x-latex']")
+              ? node
+              : node.querySelector(
+                  "annotation[encoding='application/x-tex'], annotation[encoding='application/x-latex']"
+                );
+            if (annotation) {
+              const annotated = stripStudyInkMathDelimiters(annotation.textContent);
+              if (annotated) return annotated;
+            }
+            const sourceNode = (node.matches &&
+                node.matches("[data-tex],[data-latex],[data-math],[data-formula]"))
+              ? node
+              : node.querySelector("[data-tex],[data-latex],[data-math],[data-formula]");
+            if (sourceNode) {
+              const names = ["data-tex", "data-latex", "data-math", "data-formula"];
+              for (const name of names) {
+                const source = stripStudyInkMathDelimiters(sourceNode.getAttribute(name));
+                if (source) return source;
+              }
+            }
+            // MathML textContent/aria-label is not TeX (it may be spoken text or flattened
+            // glyphs). Without an explicit TeX annotation/data field, leave the node intact so
+            // the semantic/plain fallback remains readable instead of feeding bogus TeX to KaTeX.
+            return "";
+          }
+
+          function isStudyInkDisplayMath(node) {
+            if (!node) return false;
+            if (node.classList && node.classList.contains("katex-display")) return true;
+            const tag = String(node.tagName || "").toLowerCase();
+            const display = String(node.getAttribute && node.getAttribute("display") || "")
+              .toLowerCase();
+            return display === "block" || display === "true" ||
+              (tag === "math" && display === "block");
+          }
+
+          function replaceStudyInkMath(root) {
+            if (!root || !root.querySelectorAll) return;
+            Array.from(root.querySelectorAll(STUDYINK_MATH_SELECTOR)).forEach(function(node) {
+              if (!root.contains(node) || node.closest("pre,code")) return;
+              let ancestor = node.parentElement;
+              while (ancestor && ancestor !== root) {
+                if (ancestor.matches && ancestor.matches(STUDYINK_MATH_SELECTOR)) return;
+                ancestor = ancestor.parentElement;
+              }
+              const tex = studyInkMathSource(node);
+              if (!tex) return;
+              const display = isStudyInkDisplayMath(node);
+              const marker = display
+                ? "\n\n" + STUDYINK_DOLLAR + STUDYINK_DOLLAR + "\n" + tex +
+                  "\n" + STUDYINK_DOLLAR + STUDYINK_DOLLAR + "\n\n"
+                : STUDYINK_DOLLAR + tex + STUDYINK_DOLLAR;
+              const replacement = document.createElement(display ? "div" : "span");
+              replacement.setAttribute("data-studyink-math", display ? "display" : "inline");
+              replacement.setAttribute("data-studyink-tex", tex);
+              // HTML fallback remains readable after attributes are stripped.
+              replacement.textContent = marker;
+              node.replaceWith(replacement);
+            });
+          }
+
+          function removeStudyInkArtifacts(root) {
+            if (!root || !root.querySelectorAll) return;
+            root.querySelectorAll(
+              "script,style,button,svg,canvas,form,input,textarea,select,iframe,object,embed," +
+              "img,picture,source,audio,video,link,meta,[hidden],[aria-hidden='true']," +
+              ".sr-only,.visually-hidden,[data-testid*='copy-turn'],[data-testid*='feedback']," +
+              "[data-testid*='citation']"
+            ).forEach(function(el) { el.remove(); });
+          }
+
+          function prepareStudyInkClone(message) {
+            const source = studyInkContentRoot(message);
+            if (!source) return null;
+            const clone = source.cloneNode(true);
+            replaceStudyInkMath(clone);
+            removeStudyInkArtifacts(clone);
+            return clone;
+          }
+
+          function studyInkChildren(node, context) {
+            return Array.from(node.childNodes || []).map(function(child) {
+              return studyInkNodeToMarkdown(child, context || {});
+            }).join("");
+          }
+
+          function studyInkInline(value) {
+            return cleanStudyInkCharacters(value)
+              .replace(/[\t\f\v ]+/g, " ")
+              .replace(/ *\n+ */g, " ")
+              .trim();
+          }
+
+          function studyInkFence(value) {
+            const matches = String(value || "").match(/`+/g) || [];
+            let longest = 0;
+            matches.forEach(function(item) { longest = Math.max(longest, item.length); });
+            return "`".repeat(Math.max(3, longest + 1));
+          }
+
+          function studyInkList(list, depth) {
+            const ordered = String(list.tagName || "").toLowerCase() === "ol";
+            let number = parseInt(list.getAttribute("start") || "1", 10);
+            if (!Number.isFinite(number)) number = 1;
+            const indent = "  ".repeat(depth || 0);
+            const lines = [];
+            Array.from(list.children || []).filter(function(child) {
+              return String(child.tagName || "").toLowerCase() === "li";
+            }).forEach(function(item) {
+              const nested = [];
+              const body = Array.from(item.childNodes || []).map(function(child) {
+                if (child.nodeType === 1 && /^(ul|ol)$/i.test(child.tagName)) {
+                  nested.push(child);
+                  return "";
+                }
+                return studyInkNodeToMarkdown(child, {listDepth:(depth || 0) + 1});
+              }).join("");
+              const prefix = ordered ? String(number++) + ". " : "- ";
+              const compact = studyInkInline(body);
+              const continuation = compact.split("\n").join("\n" + indent + "  ");
+              lines.push(indent + prefix + continuation);
+              nested.forEach(function(childList) {
+                lines.push(studyInkList(childList, (depth || 0) + 1).trimEnd());
+              });
+            });
+            return "\n\n" + lines.join("\n") + "\n\n";
+          }
+
+          function studyInkTable(table) {
+            const rows = Array.from(table.querySelectorAll("tr")).map(function(row) {
+              return Array.from(row.children || []).filter(function(cell) {
+                return /^(th|td)$/i.test(cell.tagName);
+              }).map(function(cell) {
+                return studyInkInline(studyInkChildren(cell, {}))
+                  .replace(/\|/g, "\\|");
+              });
+            }).filter(function(row) { return row.length > 0; });
+            if (!rows.length) return "";
+            const width = rows.reduce(function(maximum, row) {
+              return Math.max(maximum, row.length);
+            }, 0);
+            rows.forEach(function(row) {
+              while (row.length < width) row.push("");
+            });
+            const line = function(row) { return "| " + row.join(" | ") + " |"; };
+            const output = [line(rows[0]), line(rows[0].map(function() { return "---"; }))];
+            rows.slice(1).forEach(function(row) { output.push(line(row)); });
+            return "\n\n" + output.join("\n") + "\n\n";
+          }
+
+          function studyInkNodeToMarkdown(node, context) {
+            if (!node) return "";
+            if (node.nodeType === 3) {
+              return escapeStudyInkMarkdownText(node.nodeValue).replace(/[\t\f\v ]+/g, " ");
+            }
+            if (node.nodeType !== 1) return "";
+            const tag = String(node.tagName || "").toLowerCase();
+            const mathKind = String(node.getAttribute("data-studyink-math") || "");
+            if (mathKind) {
+              const tex = String(node.getAttribute("data-studyink-tex") || "").trim();
+              if (!tex) return "";
+              return mathKind === "display"
+                ? "\n\n" + STUDYINK_DOLLAR + STUDYINK_DOLLAR + "\n" + tex + "\n" +
+                  STUDYINK_DOLLAR + STUDYINK_DOLLAR + "\n\n"
+                : STUDYINK_DOLLAR + tex + STUDYINK_DOLLAR;
+            }
+            if (tag === "br") return "\n";
+            if (/^h[1-6]$/.test(tag)) {
+              const level = parseInt(tag.slice(1), 10);
+              return "\n\n" + "#".repeat(level) + " " +
+                studyInkInline(studyInkChildren(node, context)) + "\n\n";
+            }
+            if (tag === "ul" || tag === "ol") {
+              return studyInkList(node, Number(context && context.listDepth || 0));
+            }
+            if (tag === "table") return studyInkTable(node);
+            if (tag === "pre") {
+              const raw = cleanStudyInkCharacters(node.textContent).replace(/\n+$/g, "");
+              const code = node.querySelector("code");
+              const classes = String(code && code.className || "");
+              const language = (classes.match(/(?:^|\s)language-([\w+-]+)/) || [])[1] || "";
+              const fence = studyInkFence(raw);
+              return "\n\n" + fence + language + "\n" + raw + "\n" + fence + "\n\n";
+            }
+            const body = studyInkChildren(node, context);
+            if (tag === "code") {
+              const value = studyInkInline(body);
+              if (!value) return "";
+              const fence = studyInkFence(value);
+              return fence + (value.startsWith("`") || value.endsWith("`") ? " " : "") +
+                value + (value.startsWith("`") || value.endsWith("`") ? " " : "") + fence;
+            }
+            if (tag === "strong" || tag === "b") {
+              const value = studyInkInline(body);
+              return value ? "**" + value + "**" : "";
+            }
+            if (tag === "em" || tag === "i") {
+              const value = studyInkInline(body);
+              return value ? "*" + value + "*" : "";
+            }
+            if (tag === "del" || tag === "s" || tag === "strike") {
+              const value = studyInkInline(body);
+              return value ? "~~" + value + "~~" : "";
+            }
+            if (tag === "a") {
+              const label = studyInkInline(body);
+              const href = String(node.getAttribute("href") || "");
+              return label && /^https:\/\//i.test(href) ? "[" + label + "](" + href + ")" : label;
+            }
+            if (tag === "blockquote") {
+              const value = cleanStudyInkCharacters(body).trim();
+              return value ? "\n\n" + value.split("\n").map(function(line) {
+                return "> " + line;
+              }).join("\n") + "\n\n" : "";
+            }
+            if (tag === "hr") return "\n\n---\n\n";
+            if (tag === "p" || tag === "div" || tag === "section" || tag === "article" ||
+                tag === "header" || tag === "footer" || tag === "details" || tag === "summary" ||
+                tag === "dl" || tag === "dt" || tag === "dd" || tag === "figure" ||
+                tag === "figcaption") {
+              const value = cleanStudyInkCharacters(body).trim();
+              return value ? "\n\n" + value + "\n\n" : "";
+            }
+            return body;
+          }
+
+          function finishStudyInkMarkdown(value) {
+            // Do not globally collapse blank lines or trailing spaces: they may belong to a
+            // fenced code block. Markdown renderers already collapse surplus block spacing.
+            return cleanStudyInkCharacters(value).trim();
+          }
+
+          function extractStudyInkMarkdown(message) {
+            const clone = prepareStudyInkClone(message);
+            return clone ? finishStudyInkMarkdown(studyInkChildren(clone, {})) : "";
+          }
+
+          function extractStudyInkHtml(message) {
+            const clone = prepareStudyInkClone(message);
+            if (!clone) return "";
+            clone.querySelectorAll("*").forEach(function(el) {
+              const safeHref = String(el.tagName || "").toLowerCase() === "a" &&
+                  /^https:\/\//i.test(String(el.getAttribute("href") || ""))
+                ? String(el.getAttribute("href")) : "";
+              Array.from(el.attributes || []).forEach(function(attr) {
+                el.removeAttribute(attr.name);
+              });
+              if (safeHref) {
+                el.setAttribute("href", safeHref);
+                el.setAttribute("target", "_blank");
+                el.setAttribute("rel", "noopener noreferrer");
+              }
+            });
+            return cleanStudyInkCharacters(clone.innerHTML || "").trim();
+          }
         """.trimIndent()
 
     private val PINNED_INJECTION_TEMPLATE =

@@ -1,0 +1,283 @@
+:root {
+  color-scheme: light dark;
+  --answer-background: #fffdf8;
+  --answer-foreground: #20211f;
+  --answer-muted: #62655f;
+  --answer-accent: #1f6650;
+  --answer-border: #deded5;
+  --answer-soft: #f3f2eb;
+  --answer-code: #ecece4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --answer-background: #171916;
+    --answer-foreground: #eef0e9;
+    --answer-muted: #b9bdb4;
+    --answer-accent: #8ed7ba;
+    --answer-border: #41453e;
+    --answer-soft: #22251f;
+    --answer-code: #292c26;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  background: var(--answer-background);
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  min-height: 100%;
+  margin: 0;
+  color: var(--answer-foreground);
+  background: var(--answer-background);
+}
+
+.answer {
+  width: min(100%, 54rem);
+  margin: 0 auto;
+  padding: clamp(1rem, 3.5vw, 2rem) clamp(1rem, 4.5vw, 2.5rem) 3.5rem;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+  font-size: clamp(1.05rem, 1rem + 0.15vw, 1.16rem);
+  font-weight: 400;
+  line-height: 1.72;
+  letter-spacing: -0.012em;
+  overflow-wrap: anywhere;
+  word-break: keep-all;
+}
+
+.answer > :first-child {
+  margin-top: 0;
+}
+
+.answer > :last-child {
+  margin-bottom: 0;
+}
+
+.plain-answer {
+  white-space: pre-wrap;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin: 1.75em 0 0.62em;
+  color: var(--answer-foreground);
+  font-weight: 720;
+  line-height: 1.34;
+  letter-spacing: -0.025em;
+}
+
+h1 {
+  font-size: 1.58em;
+}
+
+h2 {
+  padding-bottom: 0.28em;
+  border-bottom: 1px solid var(--answer-border);
+  font-size: 1.34em;
+}
+
+h3 {
+  font-size: 1.17em;
+}
+
+h4,
+h5,
+h6 {
+  font-size: 1.04em;
+}
+
+p {
+  margin: 0.92em 0;
+}
+
+strong {
+  color: color-mix(in srgb, var(--answer-foreground) 88%, var(--answer-accent));
+  font-weight: 720;
+}
+
+em {
+  color: color-mix(in srgb, var(--answer-foreground) 82%, var(--answer-accent));
+}
+
+ul,
+ol {
+  margin: 0.85em 0;
+  padding-inline-start: 1.45em;
+}
+
+li {
+  margin: 0.35em 0;
+  padding-inline-start: 0.18em;
+}
+
+li::marker {
+  color: var(--answer-accent);
+  font-weight: 700;
+}
+
+blockquote {
+  margin: 1.1em 0;
+  padding: 0.12em 0 0.12em 1em;
+  color: var(--answer-muted);
+  border-inline-start: 0.22rem solid var(--answer-accent);
+}
+
+blockquote p {
+  margin: 0.5em 0;
+}
+
+code {
+  padding: 0.12em 0.34em;
+  border-radius: 0.28em;
+  background: var(--answer-code);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 0.9em;
+  word-break: break-word;
+}
+
+pre {
+  max-width: 100%;
+  margin: 1.1em 0;
+  padding: 0.9em 1em;
+  overflow-x: auto;
+  border: 1px solid var(--answer-border);
+  border-radius: 0.55rem;
+  background: var(--answer-soft);
+  line-height: 1.55;
+  overscroll-behavior-x: contain;
+}
+
+pre code {
+  padding: 0;
+  background: transparent;
+  white-space: pre;
+  word-break: normal;
+}
+
+.table-scroll {
+  max-width: 100%;
+  margin: 1.1em 0;
+  overflow-x: auto;
+  border: 1px solid var(--answer-border);
+  border-radius: 0.55rem;
+  overscroll-behavior-x: contain;
+}
+
+table {
+  width: 100%;
+  min-width: 24rem;
+  border-collapse: collapse;
+  font-size: 0.94em;
+  line-height: 1.55;
+}
+
+th,
+td {
+  padding: 0.62em 0.72em;
+  text-align: start;
+  vertical-align: top;
+  border-bottom: 1px solid var(--answer-border);
+}
+
+th {
+  background: var(--answer-soft);
+  font-weight: 700;
+}
+
+tr:last-child td {
+  border-bottom: 0;
+}
+
+hr {
+  height: 1px;
+  margin: 1.6em 0;
+  border: 0;
+  background: var(--answer-border);
+}
+
+.math-inline {
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: -0.12em;
+}
+
+.math-inline .katex {
+  font-size: 1.03em;
+}
+
+.math-display {
+  max-width: 100%;
+  margin: 1.15em 0;
+  padding: 0.66em 0.18em;
+  overflow-x: auto;
+  text-align: center;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.math-display .katex-display {
+  margin: 0;
+}
+
+.math-fallback {
+  color: var(--answer-muted);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 0.9em;
+  white-space: pre-wrap;
+}
+
+.answer-empty,
+.answer-note {
+  color: var(--answer-muted);
+}
+
+.answer-note {
+  margin-top: 1.5em;
+  padding: 0.7em 0.85em;
+  border: 1px solid var(--answer-border);
+  border-radius: 0.5rem;
+  background: var(--answer-soft);
+  font-size: 0.88em;
+}
+
+::selection {
+  color: var(--answer-foreground);
+  background: color-mix(in srgb, var(--answer-accent) 28%, transparent);
+}
+
+@media (max-width: 30rem) {
+  .answer {
+    padding-inline: 1rem;
+    font-size: 1.04rem;
+    line-height: 1.68;
+  }
+
+  h1 {
+    font-size: 1.42em;
+  }
+
+  h2 {
+    font-size: 1.25em;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

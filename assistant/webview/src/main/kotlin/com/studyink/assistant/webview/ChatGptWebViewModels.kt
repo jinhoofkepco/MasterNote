@@ -15,7 +15,13 @@ data class ChatGptResult(
     val html: String? = null,
     val assistantMessageCount: Int,
     val completion: ChatGptCompletion,
+    val textFormat: ChatGptTextFormat = ChatGptTextFormat.PLAIN_TEXT,
 )
+
+enum class ChatGptTextFormat {
+    PLAIN_TEXT,
+    MARKDOWN_TEX,
+}
 
 enum class ChatGptCompletion {
     ACTIONS_READY,

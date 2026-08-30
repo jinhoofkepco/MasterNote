@@ -191,6 +191,7 @@ internal object AssistantJsonCodec {
         .put("answerHtml", value.answerHtml ?: JSONObject.NULL)
         .put("providerName", value.providerName ?: JSONObject.NULL)
         .put("createdAtEpochMillis", value.createdAtEpochMillis)
+        .put("answerFormat", value.answerFormat.name)
 
     private fun resourceFromJson(
         value: JSONObject,
@@ -223,7 +224,17 @@ internal object AssistantJsonCodec {
             answerHtml = value.nullableString("answerHtml"),
             providerName = value.nullableString("providerName"),
             createdAtEpochMillis = value.getLong("createdAtEpochMillis"),
+            answerFormat = answerFormatFromJson(value),
         )
+
+    /** Missing means a pre-format-field file; present values are strict to expose corruption. */
+    private fun answerFormatFromJson(value: JSONObject): TeacherGptAnswerFormat {
+        if (!value.has("answerFormat")) return TeacherGptAnswerFormat.PLAIN_TEXT
+        require(!value.isNull("answerFormat")) { "Teacher GPT answer format is null" }
+        val encoded = value.getString("answerFormat")
+        return TeacherGptAnswerFormat.entries.firstOrNull { it.name == encoded }
+            ?: throw IllegalArgumentException("Unknown teacher GPT answer format: $encoded")
+    }
 
     private fun cardToJson(value: StudentExplanationCard): JSONObject = JSONObject()
         .put("cardId", value.cardId)

@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -81,6 +82,12 @@ import kotlin.math.roundToInt
 internal const val S23_ULTRA_MODEL_PREFIX = "SM-S918"
 internal const val S23_STRIP_CELL_COUNT = 11
 internal const val S23_STRIP_HISTORY_CELL_COUNT = 3
+
+// The visible paper is deliberately much thinner than the interaction lane. Keeping the latter
+// at 48dp preserves reliable finger/S Pen hover and taps while the workbook remains visible behind
+// the lower, transparent part of the lane.
+private val S23_STRIP_TOUCH_HEIGHT = 48.dp
+private val S23_STRIP_VISUAL_HEIGHT = 30.dp
 
 /** S Pen taps belong exclusively to the parent drag/tap interop path. */
 internal fun s23AttemptCellHandlesDirectPointer(pointerType: PointerType): Boolean =
@@ -295,30 +302,38 @@ internal fun S23UltraTopStrip(
             // clipping the last page button. GPT and answer remain separate direct actions.
             val cellWidth = minOf(40.dp, maxWidth / S23_STRIP_CELL_COUNT.toFloat())
             val stripWidth = cellWidth * S23_STRIP_CELL_COUNT
-            val stripHeight = 48.dp
+            val stripHeight = S23_STRIP_TOUCH_HEIGHT
             Box(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .offset(y = 4.dp)
                     .width(stripWidth)
-                    .height(stripHeight)
-                    // Only the paper strip is translucent. Icons and result cells remain opaque.
-                    .background(tokens.paperSurface.copy(alpha = 0.15f), RectangleShape)
-                    .border(
-                        width = 0.5.dp,
-                        color = tokens.paperStroke.copy(alpha = 0.25f),
-                        shape = RectangleShape,
-                    ),
+                    .height(stripHeight),
             ) {
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    val step = size.width / S23_STRIP_CELL_COUNT
-                    for (index in 1 until S23_STRIP_CELL_COUNT) {
-                        drawLine(
-                            color = tokens.paperStroke.copy(alpha = 0.22f),
-                            start = Offset(step * index, 0f),
-                            end = Offset(step * index, size.height),
-                            strokeWidth = 0.5.dp.toPx(),
-                        )
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .width(stripWidth)
+                        .height(S23_STRIP_VISUAL_HEIGHT)
+                        // Only the slim paper strip is visible. The transparent remainder is the
+                        // generous input target and does not cover the workbook.
+                        .background(tokens.paperSurface.copy(alpha = 0.15f), RectangleShape)
+                        .border(
+                            width = 0.5.dp,
+                            color = tokens.paperStroke.copy(alpha = 0.25f),
+                            shape = RectangleShape,
+                        ),
+                ) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val step = size.width / S23_STRIP_CELL_COUNT
+                        for (index in 1 until S23_STRIP_CELL_COUNT) {
+                            drawLine(
+                                color = tokens.paperStroke.copy(alpha = 0.22f),
+                                start = Offset(step * index, 0f),
+                                end = Offset(step * index, size.height),
+                                strokeWidth = 0.5.dp.toPx(),
+                            )
+                        }
                     }
                 }
                 Row(modifier = Modifier.fillMaxSize()) {
@@ -368,7 +383,8 @@ internal fun S23UltraTopStrip(
                         Text(
                             text = "GPT",
                             color = tokens.paletteBlue,
-                            fontSize = 10.sp,
+                            fontSize = 9.sp,
+                            lineHeight = 10.sp,
                             fontWeight = FontWeight.Black,
                         )
                     }
@@ -383,7 +399,8 @@ internal fun S23UltraTopStrip(
                         Text(
                             text = "답",
                             color = tokens.paletteBlue,
-                            fontSize = 11.sp,
+                            fontSize = 10.sp,
+                            lineHeight = 11.sp,
                             fontWeight = FontWeight.Black,
                         )
                     }
@@ -394,7 +411,15 @@ internal fun S23UltraTopStrip(
                                 .fillMaxHeight(),
                             contentAlignment = Alignment.Center,
                         ) {
-                            markHistoryContent()
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopCenter)
+                                    .width(cellWidth * S23_STRIP_HISTORY_CELL_COUNT)
+                                    .height(S23_STRIP_VISUAL_HEIGHT),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                markHistoryContent()
+                            }
                         }
                     } else {
                         S23AttemptHistory(
@@ -484,13 +509,14 @@ private fun S23StudentPageOrActivityCell(
             Text(
                 text = bookLabel?.let { "${it.take(3)}·$pageLabel" } ?: pageLabel.toString(),
                 color = if (state.studentPageReady) tokens.paletteGreen else tokens.statusForeground,
-                fontSize = 13.sp,
+                fontSize = 12.sp,
+                lineHeight = 13.sp,
                 fontWeight = FontWeight.Black,
             )
             attemptLabel?.let { label ->
                 Text(
                     text = label,
-                    modifier = Modifier.align(Alignment.TopEnd).padding(top = 3.dp, end = 2.dp),
+                    modifier = Modifier.align(Alignment.TopEnd).padding(top = 1.dp, end = 2.dp),
                     color = tokens.statusForeground,
                     fontSize = 7.sp,
                     lineHeight = 8.sp,
@@ -539,7 +565,7 @@ private fun S23StripIconButton(
         Image(
             painter = painterResource(iconRes),
             contentDescription = null,
-            modifier = Modifier.size(21.dp),
+            modifier = Modifier.size(17.dp),
             // Disabled actions keep full information opacity; colour, not alpha, carries state.
             colorFilter = ColorFilter.tint(
                 if (enabled) tokens.buttonForeground else tokens.statusForeground,
@@ -580,7 +606,11 @@ private fun S23StripButton(
             label = "s23-strip-cell-overlay",
         )
         Box(
-            modifier = Modifier.fillMaxSize().background(overlay, RectangleShape),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .height(S23_STRIP_VISUAL_HEIGHT)
+                .background(overlay, RectangleShape),
             contentAlignment = Alignment.Center,
             content = content,
         )
@@ -636,7 +666,8 @@ private fun S23TransportCell(
         Text(
             text = model.label,
             color = foreground,
-            fontSize = 14.sp,
+            fontSize = 12.sp,
+            lineHeight = 13.sp,
             fontWeight = FontWeight.Black,
         )
         // Old Telegram unread state must not make the live-owned cell look like a second active
@@ -647,8 +678,8 @@ private fun S23TransportCell(
             Box(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
-                    .offset(x = (-2).dp, y = 3.dp)
-                    .defaultMinSize(minWidth = 15.dp, minHeight = 15.dp)
+                    .offset(x = (-2).dp, y = 1.dp)
+                    .defaultMinSize(minWidth = 13.dp, minHeight = 13.dp)
                     .background(tokens.palettePink, RoundedCornerShape(50))
                     .padding(horizontal = 2.dp),
                 contentAlignment = Alignment.Center,
@@ -656,8 +687,8 @@ private fun S23TransportCell(
                 Text(
                     text = badge,
                     color = tokens.paletteCream,
-                    fontSize = 8.sp,
-                    lineHeight = 8.sp,
+                    fontSize = 7.sp,
+                    lineHeight = 7.sp,
                     fontWeight = FontWeight.Bold,
                 )
             }
@@ -667,7 +698,7 @@ private fun S23TransportCell(
 
 @Composable
 private fun S23ActivityBars(color: Color) {
-    Canvas(modifier = Modifier.size(19.dp)) {
+    Canvas(modifier = Modifier.size(17.dp)) {
         val gap = size.width * 0.16f
         val barWidth = (size.width - gap * 2f) / 3f
         listOf(0.45f, 1f, 0.7f).forEachIndexed { index, scale ->
@@ -756,6 +787,7 @@ private fun S23AttemptHistory(
     ) {
         Row(
             modifier = Modifier
+                .align(Alignment.TopCenter)
                 .fillMaxSize()
                 .offset {
                     IntOffset(stylusDragOffset.coerceIn(-20f, 20f).roundToInt(), 0)
@@ -801,27 +833,34 @@ private fun S23AttemptHistory(
                                 disabled()
                             }
                         },
-                    contentAlignment = Alignment.Center,
+                    contentAlignment = Alignment.TopCenter,
                 ) {
                     Box(
                         modifier = Modifier
-                            .border(
-                                width = if (selected) 2.dp else 1.dp,
-                                color = if (selected) {
-                                    tokens.markPendingHighlight
-                                } else {
-                                    tokens.markPendingBorder
-                                },
-                                shape = RoundedCornerShape(3.dp),
-                            )
-                            .defaultMinSize(minWidth = 18.dp, minHeight = 18.dp)
-                            .padding(horizontal = 2.dp, vertical = 2.dp),
+                            .fillMaxWidth()
+                            .height(S23_STRIP_VISUAL_HEIGHT),
                         contentAlignment = Alignment.Center,
                     ) {
-                        S23AttemptMarkMicroGrid(
-                            colors = bundle.colors,
-                            alpha = if (selected) 1f else tokens.markBundleDimAlpha,
-                        )
+                        Box(
+                            modifier = Modifier
+                                .border(
+                                    width = if (selected) 2.dp else 1.dp,
+                                    color = if (selected) {
+                                        tokens.markPendingHighlight
+                                    } else {
+                                        tokens.markPendingBorder
+                                    },
+                                    shape = RoundedCornerShape(3.dp),
+                                )
+                                .defaultMinSize(minWidth = 18.dp, minHeight = 18.dp)
+                                .padding(horizontal = 2.dp, vertical = 2.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            S23AttemptMarkMicroGrid(
+                                colors = bundle.colors,
+                                alpha = if (selected) 1f else tokens.markBundleDimAlpha,
+                            )
+                        }
                     }
                 }
             }

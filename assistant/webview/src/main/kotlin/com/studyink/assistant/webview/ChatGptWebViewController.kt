@@ -56,6 +56,7 @@ class ChatGptWebViewController(
     private val cookieManager = CookieManager.getInstance()
     private var webView: WebView? = null
     private var currentState = ChatGptWebViewState.IDLE
+    private var stateBeforeHide = ChatGptWebViewState.IDLE
     private var initialLoadRequested = false
     private var rendererGeneration = 0L
     private var queryInProgress = false
@@ -73,6 +74,7 @@ class ChatGptWebViewController(
     fun hide() {
         runOnMain {
             if (destroyed) return@runOnMain
+            if (currentState != ChatGptWebViewState.HIDDEN) stateBeforeHide = currentState
             webView?.onPause()
             view.visibility = View.GONE
             cookieManager.flush()
@@ -202,13 +204,20 @@ class ChatGptWebViewController(
                         stableMs = RESPONSE_STABLE_MS,
                     )
                     if (completion != null) {
-                        val html = readLatestResponseHtml().orEmpty().ifBlank { null }
+                        val markdown = readLatestResponseMarkdown().orEmpty()
                         setState(ChatGptWebViewState.READY)
                         return@withContext ChatGptResult(
-                            text = snapshot.text,
-                            html = html,
+                            text = markdown.ifBlank { snapshot.text },
+                            // The reader stores canonical text only. Avoid cloning and crossing the
+                            // full response DOM a second time for an HTML value no caller uses.
+                            html = null,
                             assistantMessageCount = snapshot.assistantCount,
                             completion = completion,
+                            textFormat = if (markdown.isNotBlank()) {
+                                ChatGptTextFormat.MARKDOWN_TEX
+                            } else {
+                                ChatGptTextFormat.PLAIN_TEXT
+                            },
                         )
                     }
                 }
@@ -282,6 +291,12 @@ class ChatGptWebViewController(
             initialLoadRequested = true
             setState(ChatGptWebViewState.LOADING)
             current.loadUrl(CHATGPT_URL)
+        } else if (currentState == ChatGptWebViewState.HIDDEN) {
+            val restored = stateBeforeHide.takeUnless {
+                it == ChatGptWebViewState.IDLE || it == ChatGptWebViewState.HIDDEN ||
+                    it == ChatGptWebViewState.DESTROYED
+            } ?: if (isAutomationOrigin()) ChatGptWebViewState.READY else ChatGptWebViewState.LOADING
+            setState(restored)
         }
     }
 
@@ -504,9 +519,9 @@ class ChatGptWebViewController(
         }.getOrNull()
     }
 
-    private suspend fun readLatestResponseHtml(): String? {
+    private suspend fun readLatestResponseMarkdown(): String? {
         ensureAutomationOrigin()
-        return decodeJavascriptString(evaluateJavascript(ChatGptScripts.latestResponseHtml))
+        return decodeJavascriptString(evaluateJavascript(ChatGptScripts.latestResponseMarkdown))
     }
 
     private suspend fun evaluateJavascript(script: String): String? =

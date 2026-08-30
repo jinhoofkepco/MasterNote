@@ -8,6 +8,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -88,6 +89,88 @@ class AssistantRepositoryTest {
         )
         assertTrue(repository.listTeacherResources(otherPage).isEmpty())
         assertNull(repository.teacherResource(otherPage, resource.resourceId))
+    }
+
+    @Test
+    fun answerFormatIsCallerSelectableAndSurvivesReload() {
+        val root = temporaryFolder.newFolder("teacher-answer-format")
+        val repository = repository(root)
+        val page = AssistantPageKey("book", 94)
+
+        val markdownResource = repository.createTeacherResource(
+            page = page,
+            title = "수식 풀이",
+            selectionBounds = bounds(),
+            promptSlotNumber = 3,
+            answerText = "## 풀이\n\n\$x^2\$",
+            answerFormat = TeacherGptAnswerFormat.MARKDOWN_TEX,
+        )
+        assertEquals(TeacherGptAnswerFormat.MARKDOWN_TEX, markdownResource.currentRevision.answerFormat)
+
+        val edited = repository.appendTeacherResourceRevision(
+            page = page,
+            resourceId = markdownResource.resourceId,
+            selectionBounds = bounds(),
+            promptSlotNumber = 3,
+            answerText = "## 수정 풀이\n\n\$x = 2\$",
+            answerFormat = TeacherGptAnswerFormat.MARKDOWN_TEX,
+        )
+        assertEquals(TeacherGptAnswerFormat.MARKDOWN_TEX, edited.answerFormat)
+        assertEquals(
+            TeacherGptAnswerFormat.MARKDOWN_TEX,
+            repository(root).teacherResource(page, markdownResource.resourceId)?.currentRevision?.answerFormat,
+        )
+
+        val legacyDefault = repository.createTeacherResource(page, "일반 메모", bounds(), 1, "일반 답변")
+        assertEquals(TeacherGptAnswerFormat.PLAIN_TEXT, legacyDefault.currentRevision.answerFormat)
+    }
+
+    @Test
+    fun missingAnswerFormatInLegacyJsonDecodesAsPlainText() {
+        val root = temporaryFolder.newFolder("legacy-answer-format")
+        val repository = repository(root)
+        val page = AssistantPageKey("book", 95)
+        val resource = repository.createTeacherResource(
+            page = page,
+            title = "예전 답변",
+            selectionBounds = bounds(),
+            promptSlotNumber = 1,
+            answerText = "저장된 답변",
+            answerFormat = TeacherGptAnswerFormat.MARKDOWN_TEX,
+        )
+        val file = repository.teacherPageFileForTest(page)
+        val legacyJson = JSONObject(file.readText(Charsets.UTF_8)).also { rootJson ->
+            rootJson.getJSONArray("resources")
+                .getJSONObject(0)
+                .getJSONArray("revisions")
+                .getJSONObject(0)
+                .remove("answerFormat")
+        }
+        file.writeText(legacyJson.toString(), Charsets.UTF_8)
+
+        assertEquals(
+            TeacherGptAnswerFormat.PLAIN_TEXT,
+            repository(root).teacherResource(page, resource.resourceId)?.currentRevision?.answerFormat,
+        )
+    }
+
+    @Test
+    fun unknownStoredAnswerFormatIsRejected() {
+        val root = temporaryFolder.newFolder("invalid-answer-format")
+        val repository = repository(root)
+        val page = AssistantPageKey("book", 96)
+        repository.createTeacherResource(page, "답변", bounds(), 1, "내용")
+        val encoded = JSONObject(repository.teacherPageFileForTest(page).readText(Charsets.UTF_8)).also {
+            it.getJSONArray("resources")
+                .getJSONObject(0)
+                .getJSONArray("revisions")
+                .getJSONObject(0)
+                .put("answerFormat", "UNKNOWN_FORMAT")
+        }.toString().toByteArray(Charsets.UTF_8)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            AssistantJsonCodec.decodeTeacherPage(encoded, page, AssistantStorageLimits())
+        }
     }
 
     @Test

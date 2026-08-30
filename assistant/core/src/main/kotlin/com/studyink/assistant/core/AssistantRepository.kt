@@ -118,6 +118,7 @@ class AssistantRepository(
         providerName: String? = null,
         promptTitleSnapshot: String? = null,
         promptBodySnapshot: String? = null,
+        answerFormat: TeacherGptAnswerFormat = TeacherGptAnswerFormat.PLAIN_TEXT,
     ): TeacherGptResource = locked {
         requireSlotNumber(promptSlotNumber)
         require((promptTitleSnapshot == null) == (promptBodySnapshot == null)) {
@@ -156,6 +157,7 @@ class AssistantRepository(
             answerHtml = cleanHtml,
             providerName = cleanProvider,
             createdAtEpochMillis = timestamp,
+            answerFormat = answerFormat,
         )
         val resource = TeacherGptResource(
             resourceId = resourceId,
@@ -180,6 +182,7 @@ class AssistantRepository(
         answerText: String,
         answerHtml: String? = null,
         providerName: String? = null,
+        answerFormat: TeacherGptAnswerFormat = TeacherGptAnswerFormat.PLAIN_TEXT,
     ): TeacherGptResourceRevision = locked {
         requireSlotNumber(promptSlotNumber)
         AssistantValidation.id(resourceId, "resourceId")
@@ -206,6 +209,7 @@ class AssistantRepository(
             answerHtml = answerHtml?.trim()?.takeIf(String::isNotEmpty),
             providerName = providerName?.trim()?.takeIf(String::isNotEmpty),
             createdAtEpochMillis = monotonicNow(prior.currentRevision.createdAtEpochMillis),
+            answerFormat = answerFormat,
         )
         val updated = prior.copy(
             currentRevisionId = revision.revisionId,

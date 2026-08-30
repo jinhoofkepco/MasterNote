@@ -99,6 +99,15 @@ import kotlin.math.sin
 
 enum class PenButtonSurfaceStyle { DEFAULT, FILLED, GHOST }
 
+// Reader chrome should identify actions without becoming a second content panel. The visible
+// controls stay slim, while their surrounding interaction targets remain the accessibility-safe
+// 48dp defined by ReaderChromeTokens.minimumTouchSize.
+private val TOP_CHROME_VISUAL_HEIGHT = 30.dp
+private val TOP_CHROME_ICON_VISUAL_SIZE = 30.dp
+private val TOP_CHROME_NAV_VISUAL_SIZE = 34.dp
+private val TOP_CHROME_MENU_VISUAL_SIZE = 28.dp
+private val TOP_CHROME_TEXT_MIN_WIDTH = 48.dp
+
 /**
  * Resting opacity override for pen buttons. The top chrome deliberately sits faint over the page
  * until the pen hovers it; a menu the user popped open has no reason to hide, so it provides
@@ -764,7 +773,7 @@ fun ReaderTopChrome(
         Box(
             Modifier.fillMaxSize().padding(
                 horizontal = tokens.chromeHorizontalPadding,
-                vertical = tokens.chromeVerticalPadding,
+                vertical = 2.dp,
             )
         ) {
             IconPenButton(
@@ -773,7 +782,7 @@ fun ReaderTopChrome(
                 onAction = onPrevious,
                 enabled = state.documentReady && state.pageNumber > 0,
                 modifier = Modifier.align(Alignment.TopStart),
-                visualSize = tokens.navigationButtonSize,
+                visualSize = TOP_CHROME_NAV_VISUAL_SIZE,
                 role = state.role,
                 forceHoveredForPreview = previewHoveredDescription == "이전 페이지",
             )
@@ -783,7 +792,7 @@ fun ReaderTopChrome(
                 onAction = onNext,
                 enabled = state.documentReady && state.pageNumber + 1 < state.pageCount,
                 modifier = Modifier.align(Alignment.TopEnd),
-                visualSize = tokens.navigationButtonSize,
+                visualSize = TOP_CHROME_NAV_VISUAL_SIZE,
                 role = state.role,
                 forceHoveredForPreview = previewHoveredDescription == "다음 페이지",
             )
@@ -794,7 +803,7 @@ fun ReaderTopChrome(
                     iconRes = R.drawable.ic_menu_open,
                     onAction = onToggleExpanded,
                     modifier = Modifier.align(Alignment.TopCenter),
-                    visualSize = tokens.menuOpenButtonSize,
+                    visualSize = TOP_CHROME_MENU_VISUAL_SIZE,
                     role = state.role,
                     forceHoveredForPreview = previewHoveredDescription == "상단 메뉴 열기",
                 )
@@ -844,7 +853,7 @@ fun ReaderTopChrome(
                                 iconRes = R.drawable.ic_back_shelf,
                                 onAction = onExitToLibrary,
                                 role = state.role,
-                                visualSize = tokens.generalButtonSize,
+                                visualSize = TOP_CHROME_ICON_VISUAL_SIZE,
                                 forceHoveredForPreview =
                                     previewHoveredDescription == "교재 페이지로 돌아가기",
                             )
@@ -895,13 +904,13 @@ fun ReaderTopChrome(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             if (state.capabilities.canSubmit) {
-                                PrimaryPenButton(
+                                TopChromeTextButton(
                                     text = "제출",
                                     description = "현재 페이지 제출",
-                                    iconRes = R.drawable.ic_submit,
                                     onAction = onSubmit,
                                     role = state.role,
                                     enabled = state.canSubmitNow,
+                                    filled = true,
                                 )
                             }
                             if (state.role == ReaderRole.STUDENT) {
@@ -910,42 +919,26 @@ fun ReaderTopChrome(
                                     iconRes = R.drawable.ic_publish,
                                     onAction = onOpenRemoteMonitor,
                                     role = state.role,
-                                    visualSize = tokens.generalButtonSize,
+                                    visualSize = TOP_CHROME_ICON_VISUAL_SIZE,
                                     forceHoveredForPreview =
                                         previewHoveredDescription == "Telegram 연결 및 설정",
                                 )
                             }
                             if (state.role != ReaderRole.STUDENT) {
-                                IconPenButton(
+                                TopChromeTextButton(
+                                    text = "GPT",
                                     description = "GPT 페이지 설명",
-                                    iconRes = null,
                                     onAction = onOpenGptAssistant,
                                     role = state.role,
                                     enabled = state.documentReady,
-                                    visualSize = tokens.generalButtonSize,
-                                ) {
-                                    Text(
-                                        text = "GPT",
-                                        color = tokens.paletteBlue,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.Black,
-                                    )
-                                }
-                                IconPenButton(
+                                )
+                                TopChromeTextButton(
+                                    text = "답",
                                     description = "답안 PDF 열기",
-                                    iconRes = null,
                                     onAction = onOpenAnswerPdf,
                                     role = state.role,
                                     enabled = state.documentReady,
-                                    visualSize = tokens.generalButtonSize,
-                                ) {
-                                    Text(
-                                        text = "답",
-                                        color = tokens.paletteBlue,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.Black,
-                                    )
-                                }
+                                )
                             }
                             if (state.capabilities.showsStudentLocation) {
                                 IconPenButton(
@@ -953,12 +946,12 @@ fun ReaderTopChrome(
                                     iconRes = null,
                                     onAction = onShowStudentActivity,
                                     role = state.role,
-                                    visualSize = tokens.generalButtonSize,
+                                    visualSize = TOP_CHROME_ICON_VISUAL_SIZE,
                                 ) {
                                     // No bar-chart asset exists in the icon set, and slicing one
                                     // would have to match the rest of the sheet. Three bars drawn
                                     // here stay crisp at any size and follow the chrome colours.
-                                    Canvas(modifier = Modifier.size(tokens.generalButtonSize * 0.5f)) {
+                                    Canvas(modifier = Modifier.size(TOP_CHROME_ICON_VISUAL_SIZE * 0.5f)) {
                                         val gap = size.width * 0.16f
                                         val barWidth = (size.width - gap * 2f) / 3f
                                         listOf(0.45f, 1f, 0.7f).forEachIndexed { index, scale ->
@@ -976,20 +969,20 @@ fun ReaderTopChrome(
                                 }
                             }
                             if (state.capabilities.canPublishTeacherInk) {
-                                PrimaryPenButton(
+                                TopChromeTextButton(
                                     text = "발행",
                                     description = "첨삭 발행",
-                                    iconRes = R.drawable.ic_publish,
                                     onAction = onPublish,
                                     role = state.role,
                                     enabled = state.canPublishTeacherInkNow,
+                                    filled = true,
                                 )
                             }
                             IconPenButton(
                                 description = "상단 메뉴 닫기",
                                 iconRes = R.drawable.ic_menu_close,
                                 onAction = onToggleExpanded,
-                                visualSize = tokens.menuOpenButtonSize,
+                                visualSize = TOP_CHROME_MENU_VISUAL_SIZE,
                                 role = state.role,
                                 style = PenButtonSurfaceStyle.GHOST,
                             )
@@ -1067,7 +1060,7 @@ private fun LiveMonitorBadge(
     }
     Row(
         modifier = Modifier
-            .height(tokens.generalButtonSize)
+            .height(TOP_CHROME_VISUAL_HEIGHT)
             .semantics { contentDescription = label },
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -1107,6 +1100,54 @@ private fun LiveMonitorBadge(
     }
 }
 
+/** A short, single-line top-chrome action with a slim surface and a full-size input target. */
+@Composable
+private fun TopChromeTextButton(
+    text: String,
+    description: String,
+    onAction: () -> Unit,
+    role: ReaderRole,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    filled: Boolean = false,
+    forceHoveredForPreview: Boolean = false,
+) {
+    val tokens = readerChromeTokens(role)
+    PenInteractionTarget(
+        description = description,
+        onAction = onAction,
+        enabled = enabled,
+        modifier = modifier
+            .widthIn(min = TOP_CHROME_TEXT_MIN_WIDTH)
+            .height(tokens.minimumTouchSize),
+        forceHoveredForPreview = forceHoveredForPreview,
+    ) { hovered, pressed ->
+        AnimatedPenSurface(
+            hovered = hovered,
+            pressed = pressed,
+            enabled = enabled,
+            selected = false,
+            role = role,
+            visualWidth = null,
+            visualHeight = TOP_CHROME_VISUAL_HEIGHT,
+            shape = RoundedCornerShape(9.dp),
+            style = if (filled) PenButtonSurfaceStyle.FILLED else PenButtonSurfaceStyle.DEFAULT,
+            minVisualWidth = TOP_CHROME_TEXT_MIN_WIDTH,
+            textureSeed = description.hashCode(),
+        ) {
+            Text(
+                text = text,
+                modifier = Modifier.padding(horizontal = 7.dp),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+                color = tokens.buttonForeground,
+            )
+        }
+    }
+}
+
 /**
  * Manual page navigation only pauses the cursor-following part of LIVE_MONITOR. Keep the last
  * received student page visible here so returning to the live cursor is one deliberate S Pen tap.
@@ -1133,10 +1174,10 @@ private fun ResumeStudentFollowChip(
             selected = false,
             role = role,
             visualWidth = null,
-            visualHeight = tokens.generalButtonSize,
-            shape = RoundedCornerShape(tokens.cornerRadius),
+            visualHeight = TOP_CHROME_VISUAL_HEIGHT,
+            shape = RoundedCornerShape(9.dp),
             style = PenButtonSurfaceStyle.FILLED,
-            minVisualWidth = if (compact) tokens.generalButtonSize else tokens.primaryMinWidth,
+            minVisualWidth = if (compact) TOP_CHROME_TEXT_MIN_WIDTH else tokens.primaryMinWidth,
             textureSeed = pageLabel.hashCode(),
         ) {
             Text(
@@ -1178,8 +1219,8 @@ private fun ReaderTitleButton(
             selected = false,
             role = role,
             visualWidth = null,
-            visualHeight = tokens.generalButtonSize,
-            shape = RoundedCornerShape(tokens.cornerRadius),
+            visualHeight = TOP_CHROME_VISUAL_HEIGHT,
+            shape = RoundedCornerShape(9.dp),
             style = PenButtonSurfaceStyle.DEFAULT,
             modifier = Modifier.fillMaxWidth(),
             textureSeed = title.hashCode(),

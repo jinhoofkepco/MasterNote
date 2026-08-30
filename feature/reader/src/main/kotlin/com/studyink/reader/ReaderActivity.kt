@@ -144,7 +144,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             -1,
         ) ?: -1
         if (savedBookId == latestState.bookId && savedPageNumber == latestState.pageNumber) {
-            openTeacherGptResources()
+            openTeacherGptResources(openLibrary = true)
         } else if (savedPageNumber >= 0) {
             Toast.makeText(
                 this,
@@ -765,7 +765,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         }
     }
 
-    private fun openTeacherGptResources() {
+    private fun openTeacherGptResources(openLibrary: Boolean = false) {
         val state = latestState
         if (state.role == ReaderRole.STUDENT || !state.documentReady || state.bookId.isBlank()) {
             Toast.makeText(this, "선생님 문제집 화면에서 사용할 수 있어요.", Toast.LENGTH_SHORT).show()
@@ -786,18 +786,30 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                     prompts to resources
                 }
             }
-            if (target.page.bookId != latestState.bookId ||
-                target.page.pageNumber != latestState.pageNumber || isFinishing
+            val currentState = latestState
+            if (currentState.role == ReaderRole.STUDENT || !currentState.documentReady ||
+                currentState.bookId.isBlank() || isFinishing
             ) {
+                return@launch
+            }
+            val currentTarget = TeacherPageAssistantTarget(
+                page = AssistantPageKey(currentState.bookId, currentState.pageNumber),
+                studentAttemptNo = currentState.attemptNo.takeIf {
+                    it > TEACHER_PAGE_REVIEW_ATTEMPT_NO
+                },
+            )
+            if (target != currentTarget) {
                 return@launch
             }
             content.onSuccess { (prompts, resources) ->
                 val controller = teacherResourcesDialog ?: TeacherPageResourcesDialogController(
                     context = this@ReaderActivity,
                     onPromptSelected =(::beginGptRegionSelection),
-                    onSend =(::publishStudentExplanation),
+                    onSend = { draft, completion ->
+                        publishStudentExplanation(draft, completion)
+                    },
                 ).also { teacherResourcesDialog = it }
-                controller.show(target, prompts, resources)
+                controller.show(target, prompts, resources, openLibrary = openLibrary)
             }.onFailure { error ->
                 Log.w(GPT_ASSISTANT_LOG_TAG, "Unable to load page resources", error)
                 Toast.makeText(
@@ -1227,7 +1239,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         }
     }
 
-    private fun publishStudentExplanation(draft: TeacherExplanationSendDraft) {
+    private fun publishStudentExplanation(
+        draft: TeacherExplanationSendDraft,
+        completion: (Result<Unit>) -> Unit,
+    ) {
         lifecycleScope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
@@ -1282,6 +1297,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                     if (changed) "학생 설명을 전송 대기열에 저장했습니다." else "같은 설명이 이미 저장되어 있습니다.",
                     Toast.LENGTH_SHORT,
                 ).show()
+                completion(Result.success(Unit))
             }.onFailure { error ->
                 Log.w(GPT_ASSISTANT_LOG_TAG, "Unable to publish student explanation", error)
                 Toast.makeText(
@@ -1289,6 +1305,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                     "학생 설명을 저장하지 못했습니다.",
                     Toast.LENGTH_SHORT,
                 ).show()
+                completion(Result.failure(error))
             }
         }
     }
@@ -1787,6 +1804,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     override fun onConfigurationChanged(newConfig: Configuration) {
         dismissAnswerCropPopup()
         super.onConfigurationChanged(newConfig)
+        teacherResourcesDialog?.onHostConfigurationChanged()
     }
 
     override fun onStart() {

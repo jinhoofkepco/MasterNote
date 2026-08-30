@@ -23,6 +23,15 @@ data class AssistantPromptSlot(
     val updatedAtEpochMillis: Long,
 )
 
+/** Storage/rendering contract for one saved teacher answer revision. */
+enum class TeacherGptAnswerFormat {
+    /** Legacy answers and callers that do not opt in to richer formatting. */
+    PLAIN_TEXT,
+
+    /** Markdown text that may also contain TeX math delimiters. */
+    MARKDOWN_TEX,
+}
+
 /** A saved GPT response revision. Old revisions remain readable after a new one is appended. */
 data class TeacherGptResourceRevision(
     val revisionId: String,
@@ -36,6 +45,8 @@ data class TeacherGptResourceRevision(
     val answerHtml: String?,
     val providerName: String?,
     val createdAtEpochMillis: Long,
+    /** Defaults to the legacy behavior so existing Kotlin construction remains source-compatible. */
+    val answerFormat: TeacherGptAnswerFormat = TeacherGptAnswerFormat.PLAIN_TEXT,
 )
 
 data class TeacherGptResource(
