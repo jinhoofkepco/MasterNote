@@ -490,7 +490,7 @@ internal fun peerAcknowledgementExpired(createdAtEpochMs: Long, nowEpochMs: Long
 }
 
 internal const val PEER_ACK_RETENTION_MS = 24L * 60L * 60L * 1_000L
-private const val PEER_ACK_WAIT_REASON = "원격 기기 수신 확인 대기"
+internal const val PEER_ACK_WAIT_REASON = "원격 기기 수신 확인 대기"
 
 internal class TelegramOutboxWorker(
     private val outbox: TelegramOutbox,

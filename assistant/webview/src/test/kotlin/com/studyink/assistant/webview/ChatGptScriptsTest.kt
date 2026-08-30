@@ -43,8 +43,12 @@ class ChatGptScriptsTest {
     fun responseExtractionPrefersTexBeforeRemovingHiddenMathMarkup() {
         val script = ChatGptScripts.latestResponseMarkdown
 
-        assertTrue(script.contains("annotation[encoding='application/x-tex']"))
-        assertTrue(script.contains("[data-tex],[data-latex],[data-math],[data-formula]"))
+        assertTrue(script.contains("node.matches(\"annotation\")"))
+        assertTrue(script.contains("/tex|latex/i.test"))
+        assertTrue(script.contains("[data-tex],[data-latex],[data-math],[data-formula],[data-expression]"))
+        assertTrue(script.contains("node.querySelector(\"[alttext]\")"))
+        assertTrue(script.contains("studyInkMathFallback(node)"))
+        assertTrue(script.contains("data-studyink-math-fallback"))
         assertTrue(script.indexOf("replaceStudyInkMath(clone)") < script.indexOf("removeStudyInkArtifacts(clone)"))
         assertTrue(script.contains("STUDYINK_DOLLAR + STUDYINK_DOLLAR"))
         assertTrue(script.contains("node.closest(\"pre,code\")"))
@@ -80,7 +84,7 @@ class ChatGptScriptsTest {
         assertTrue(script.contains("data-studyink-math"))
         assertTrue(script.contains("data-studyink-tex"))
         assertTrue(script.contains("Text nodes are prose, not Markdown source"))
-        assertTrue(script.contains("MathML textContent/aria-label is not TeX"))
+        assertTrue(script.contains("generic MathML aria-label may be spoken prose"))
         assertTrue(!script.contains("getAttribute(\"data-mathml\")"))
     }
 

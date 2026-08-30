@@ -1,17 +1,28 @@
 package com.studyink.annotation.storage
 
+import com.studyink.annotation.engine.AnnotationChange
 import com.studyink.annotation.engine.AnnotationDocument
 import com.studyink.core.model.AnnotationSnapshot
+import com.studyink.core.model.AssetOperation
 import com.studyink.core.model.MasterNoteDataCommitBus
+import com.studyink.core.model.Mark
+import com.studyink.core.model.MarkColor
+import com.studyink.core.model.MarkGroup
+import com.studyink.core.model.OperationId
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeId
 import com.studyink.core.model.StrokeTool
+import com.studyink.core.model.teacherReviewMarkGroupsSha256
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -141,6 +152,204 @@ class PageOperationLogStoreTest {
                 ),
             )
             assertFalse(before == store.studentLayerSha256(BOOK_ID, 0))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun publishedTeacherDigestCacheUsesExactLayerStructureAcrossStudentWritesAndRestore() {
+        val root = Files.createTempDirectory("masternote-published-teacher-digest-cache").toFile()
+        try {
+            val store = PageOperationLogStore(root, checkpointInterval = 10_000)
+            val teacher = AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE))
+            store.append(teacher.addStroke(
+                stroke("teacher-device").copy(authorId = "teacher", attemptNo = 1),
+            ))
+            store.append(requireNotNull(teacher.publishTeacherDrafts(1, "teacher-device")))
+
+            val before = store.publishedTeacherLayerDigestMaterializationCount()
+            val first = store.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1)
+            assertEquals(before + 1L, store.publishedTeacherLayerDigestMaterializationCount())
+            assertEquals(first, store.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1))
+            assertEquals(before + 1L, store.publishedTeacherLayerDigestMaterializationCount())
+
+            // The digest cache must answer before touching the much smaller decoded-page LRU.
+            (1..PageOperationLogStore.MAX_CACHED_PAGE_INDEXES).forEach { offset ->
+                val otherPage = PAGE + offset
+                store.loadPage(BOOK_ID, otherPage)
+            }
+            assertFalse(store.isPageIndexCached(BOOK_ID, PAGE))
+            assertEquals(first, store.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1))
+            assertFalse(store.isPageIndexCached(BOOK_ID, PAGE))
+            assertEquals(before + 1L, store.publishedTeacherLayerDigestMaterializationCount())
+
+            val student = AnnotationDocument(store.loadPage(BOOK_ID, PAGE))
+            store.append(student.addStroke(
+                stroke("student-device").copy(
+                    authorId = "student",
+                    attemptNo = 1,
+                    points = listOf(PagePoint(30f, 30f), PagePoint(40f, 40f)),
+                ),
+            ))
+            assertEquals(first, store.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1))
+            assertEquals(before + 1L, store.publishedTeacherLayerDigestMaterializationCount())
+
+            val laterTeacher = AnnotationDocument(store.loadPage(BOOK_ID, PAGE))
+            store.append(laterTeacher.addStroke(
+                stroke("teacher-device").copy(
+                    authorId = "teacher",
+                    attemptNo = 1,
+                    points = listOf(PagePoint(50f, 50f), PagePoint(60f, 60f)),
+                ),
+            ))
+            store.append(requireNotNull(laterTeacher.publishTeacherDrafts(1, "teacher-device")))
+            val changed = store.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1)
+            assertNotEquals(first, changed)
+            assertEquals(before + 2L, store.publishedTeacherLayerDigestMaterializationCount())
+
+            store.resetCachedStateAfterRestore()
+            assertEquals(0, store.cachedPublishedTeacherLayerDigestCount())
+            assertEquals(changed, store.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1))
+            assertEquals(before + 3L, store.publishedTeacherLayerDigestMaterializationCount())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun genericReplicaAndPublishedCheckpointInvalidateStructuralTeacherDigestButStudentCheckpointDoesNot() {
+        val sourceRoot = Files.createTempDirectory("masternote-published-cache-source").toFile()
+        val targetRoot = Files.createTempDirectory("masternote-published-cache-target").toFile()
+        val studentRoot = Files.createTempDirectory("masternote-published-cache-student").toFile()
+        try {
+            val source = PageOperationLogStore(sourceRoot, checkpointInterval = 10_000)
+            val document = AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE))
+            source.append(document.addStroke(
+                stroke("teacher-device").copy(authorId = "teacher", attemptNo = 1),
+            ))
+            source.append(requireNotNull(document.publishTeacherDrafts(1, "teacher-device")))
+            val expected = source.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1)
+
+            val target = PageOperationLogStore(targetRoot, checkpointInterval = 10_000)
+            val empty = target.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1)
+            val beforeReplica = target.publishedTeacherLayerDigestMaterializationCount()
+            source.encodedOperationsAfter(BOOK_ID, PAGE, 0L).forEach { encoded ->
+                target.appendEncodedOperation(BOOK_ID, PAGE, encoded)
+            }
+            assertEquals(expected, target.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1))
+            assertNotEquals(empty, expected)
+            assertEquals(
+                beforeReplica + 1L,
+                target.publishedTeacherLayerDigestMaterializationCount(),
+            )
+
+            val checkpointRoot =
+                Files.createTempDirectory("masternote-published-cache-checkpoint").toFile()
+            val checkpointTarget = PageOperationLogStore(checkpointRoot, checkpointInterval = 10_000)
+            try {
+                val checkpointEmpty = checkpointTarget.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1)
+                val export = source.exportPublishedTeacherLayerCheckpoint(BOOK_ID, PAGE, 1)
+                checkpointTarget.applyPublishedTeacherLayerCheckpoint(
+                    BOOK_ID,
+                    PAGE,
+                    1,
+                    export.copyCheckpointBytes(),
+                    export.layerSha256,
+                )
+                assertNotEquals(checkpointEmpty, checkpointTarget.publishedTeacherLayerSha256(
+                    BOOK_ID, PAGE, 1,
+                ))
+            } finally {
+                checkpointRoot.deleteRecursively()
+            }
+
+            val studentSource = PageOperationLogStore(studentRoot, checkpointInterval = 10_000)
+            studentSource.append(
+                AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE)).addStroke(
+                    stroke("student-device").copy(authorId = "student", attemptNo = 1),
+                ),
+            )
+            val studentCheckpoint = studentSource.exportStudentLayerCheckpoint(
+                BOOK_ID,
+                PAGE,
+                "student-device",
+            )
+            val beforeStudent = target.publishedTeacherLayerDigestMaterializationCount()
+            target.applyStudentLayerCheckpoint(
+                BOOK_ID,
+                PAGE,
+                studentCheckpoint.copyCheckpointBytes(),
+                studentCheckpoint.layerSha256,
+                listOf(1),
+            )
+            assertEquals(expected, target.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1))
+            assertEquals(beforeStudent, target.publishedTeacherLayerDigestMaterializationCount())
+        } finally {
+            sourceRoot.deleteRecursively()
+            targetRoot.deleteRecursively()
+            studentRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun publishedTeacherDigestStructuralCacheIsBounded() {
+        val root = Files.createTempDirectory("masternote-published-teacher-digest-lru").toFile()
+        try {
+            val store = PageOperationLogStore(root, checkpointInterval = 10_000)
+            repeat(PageOperationLogStore.MAX_CACHED_PUBLISHED_TEACHER_LAYER_DIGESTS + 1) { page ->
+                store.publishedTeacherLayerSha256(BOOK_ID, page, 1)
+            }
+            assertEquals(
+                PageOperationLogStore.MAX_CACHED_PUBLISHED_TEACHER_LAYER_DIGESTS,
+                store.cachedPublishedTeacherLayerDigestCount(),
+            )
+            assertEquals(
+                PageOperationLogStore.MAX_CACHED_PUBLISHED_TEACHER_LAYER_DIGESTS,
+                store.cachedPublishedTeacherLayerGenerationCount(),
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun changingUnpublishedAncestorInvalidatesPublishedTeacherDigest() {
+        val root = Files.createTempDirectory("masternote-published-teacher-parent-cache").toFile()
+        try {
+            val store = PageOperationLogStore(root, checkpointInterval = 10_000)
+            val document = AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE))
+            store.append(document.addStroke(
+                stroke("teacher-device").copy(authorId = "teacher", attemptNo = 1),
+            ))
+            store.append(requireNotNull(document.publishTeacherDrafts(1, "teacher-device")))
+            val snapshot = store.loadPage(BOOK_ID, PAGE)
+            val published = snapshot.activeStrokeIds.asSequence()
+                .mapNotNull(snapshot.assets::get)
+                .single { it.authorId == "teacher" && it.publishedAtEpochMillis != null }
+            val parent = requireNotNull(published.parentStrokeId).let { requireNotNull(snapshot.assets[it]) }
+            assertEquals(null, parent.publishedAtEpochMillis)
+            val beforeDigest = store.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1)
+            val beforeCount = store.publishedTeacherLayerDigestMaterializationCount()
+            val replacementClock = maxOf(parent.logicalClock + 1L, published.logicalClock + 1L)
+            val replacement = parent.copy(
+                points = listOf(PagePoint(70f, 70f), PagePoint(80f, 80f)),
+                logicalClock = replacementClock,
+            )
+            store.append(AnnotationChange(
+                snapshot = snapshot,
+                operation = AssetOperation(
+                    id = OperationId("replace-unpublished-teacher-parent"),
+                    removedStrokeIds = emptySet(),
+                    addedStrokeIds = setOf(parent.id),
+                    logicalClock = replacementClock,
+                    deviceId = "teacher-device",
+                ),
+                addedAssets = listOf(replacement),
+            ))
+
+            assertNotEquals(beforeDigest, store.publishedTeacherLayerSha256(BOOK_ID, PAGE, 1))
+            assertEquals(beforeCount + 1L, store.publishedTeacherLayerDigestMaterializationCount())
         } finally {
             root.deleteRecursively()
         }
@@ -1461,7 +1670,7 @@ class PageOperationLogStoreTest {
             val intents = persisted.teacherReviewPublishIntents()
             // Every explicit publish is a new delivery intent, even when its immutable bytes are
             // unchanged. Call order wins; wall-clock rollback cannot resurrect the older press.
-            assertEquals(listOf(90L, 110L), intents.map { it.updatedAtEpochMillis })
+            assertEquals(listOf(90L, 121L), intents.map { it.updatedAtEpochMillis })
             assertEquals(listOf(2, 1), intents.map { it.attemptNo })
             assertTrue(firstPublication.publicationId != repeatedPublication.publicationId)
             assertTrue(repeatedPublication.publicationId != latestPublication.publicationId)
@@ -1488,6 +1697,57 @@ class PageOperationLogStoreTest {
             assertTrue(root.listFiles().orEmpty().any {
                 it.name.startsWith("teacher-review-publish-intents.json.corrupt-")
             })
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun sharedTeacherReviewGradeDigestTracksAttemptMarksNotCrossAttemptMetadata() {
+        val root = Files.createTempDirectory("masternote-teacher-grade-digest").toFile()
+        try {
+            val store = PageOperationLogStore(root)
+            val groups = listOf(
+                MarkGroup(
+                    id = "grade_group_b",
+                    bookId = BOOK_ID,
+                    pageNumber = PAGE,
+                    anchor = PagePoint(21.5f, 44.25f, 0.8f),
+                    marks = listOf(
+                        Mark(1, MarkColor.RED, 801L),
+                        Mark(1, MarkColor.GRAY, 802L, hiddenAtEpochMillis = 803L),
+                    ),
+                    createdAtEpochMillis = 700L,
+                    hiddenAtEpochMillis = 900L,
+                    syncRevision = 5L,
+                    lastModifiedByDeviceId = "teacher_device",
+                ),
+                MarkGroup(
+                    id = "grade_group_a",
+                    bookId = BOOK_ID,
+                    pageNumber = PAGE,
+                    anchor = PagePoint(1f, 2f),
+                    marks = listOf(Mark(1, MarkColor.BLUE, 600L)),
+                    createdAtEpochMillis = 500L,
+                ),
+            )
+            store.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(BOOK_ID, PAGE, 1, 1_000L),
+                groups,
+            )
+            val baseline = teacherReviewMarkGroupsSha256(groups)
+            assertEquals(baseline, store.teacherReviewMarkGroupsStateSha256(groups))
+            assertEquals(
+                baseline,
+                teacherReviewMarkGroupsSha256(groups.map { group ->
+                    group.copy(
+                        anchor = PagePoint(900f, 800f),
+                        hiddenAtEpochMillis = 1_500L,
+                        syncRevision = group.syncRevision + 10L,
+                        lastModifiedByDeviceId = "another-attempt-writer",
+                    )
+                }),
+            )
         } finally {
             root.deleteRecursively()
         }
@@ -1588,6 +1848,908 @@ class PageOperationLogStoreTest {
         }
     }
 
+    @Test
+    fun acknowledgedTeacherAuthorityRetainsExactArtifactAndNeverRebuildsFromLaterDraft() {
+        val root = Files.createTempDirectory("masternote-teacher-authority").toFile()
+        try {
+            val store = PageOperationLogStore(root)
+            val document = AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE))
+            store.append(document.addStroke(
+                stroke("teacher-device").copy(authorId = "teacher", attemptNo = 1),
+            ))
+            store.append(requireNotNull(document.publishTeacherDrafts(1, "teacher-device")))
+            val published = store.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(
+                    bookId = BOOK_ID,
+                    pageNumber = PAGE,
+                    attemptNo = 1,
+                    updatedAtEpochMillis = 1_000L,
+                    remotePairId = "pair_student_one",
+                ),
+            )
+            val frozenBytes = requireNotNull(store.teacherReviewPublicationArtifact(
+                BOOK_ID,
+                PAGE,
+                1,
+                published.publicationId,
+            )).copyCheckpointBytes()
+
+            assertTrue(store.removeTeacherReviewPublishIntent(
+                BOOK_ID,
+                PAGE,
+                1,
+                published.publicationId,
+            ))
+            assertTrue(store.teacherReviewPublishIntents().isEmpty())
+
+            // This is a new local draft after the publish/ACK boundary and must never enter repair.
+            val later = AnnotationDocument(
+                initial = store.loadPageState(BOOK_ID, PAGE).snapshot,
+                operationClockHighWater = store.loadPageState(BOOK_ID, PAGE).operationClockHighWater,
+            )
+            store.append(later.addStroke(
+                stroke("teacher-device").copy(
+                    authorId = "teacher",
+                    attemptNo = 1,
+                    points = listOf(PagePoint(80f, 80f), PagePoint(90f, 90f)),
+                ),
+            ))
+
+            val restarted = PageOperationLogStore(root)
+            assertEquals(
+                listOf(published.publicationId),
+                restarted.teacherReviewAuthorityEvidence(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                ).map { it.publicationId },
+            )
+            // A retained legacy authority has no workbook provenance. It remains available to
+            // legacy callers, but must never contaminate an exact-workbook metadata digest.
+            assertTrue(restarted.teacherReviewAuthorityIntents(
+                BOOK_ID,
+                PAGE,
+                "pair_student_one",
+                "workbook_one",
+            ).isEmpty())
+            assertTrue(restarted.teacherReviewAuthorityEvidence(
+                BOOK_ID,
+                PAGE,
+                "pair_student_one",
+                "workbook_one",
+                setOf(1),
+            ).isEmpty())
+            assertTrue(restarted.requeueTeacherReviewAuthorities(
+                BOOK_ID,
+                PAGE,
+                "pair_student_one",
+                setOf(1),
+                "workbook_one",
+            ).isEmpty())
+            assertArrayEquals(
+                frozenBytes,
+                requireNotNull(restarted.teacherReviewPublicationArtifact(
+                    BOOK_ID,
+                    PAGE,
+                    1,
+                    published.publicationId,
+                )).copyCheckpointBytes(),
+            )
+            assertEquals(
+                listOf(published.publicationId),
+                restarted.requeueTeacherReviewAuthorities(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                    setOf(1),
+                ).map { it.publicationId },
+            )
+            assertTrue(restarted.requeueTeacherReviewAuthorities(
+                BOOK_ID,
+                PAGE,
+                "pair_student_one",
+                setOf(2),
+            ).isEmpty())
+            assertThrows(IllegalArgumentException::class.java) {
+                restarted.requeueTeacherReviewAuthorities(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                    emptySet(),
+                )
+            }
+            // Keep returning an already-present authority: after a crash the app tombstone may be
+            // committed even though this outbox deletion was not, and it still needs exact repair.
+            assertEquals(
+                listOf(published.publicationId),
+                restarted.requeueTeacherReviewAuthorities(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                    setOf(1),
+                ).map { it.publicationId },
+            )
+            // A restore invalidates both in-memory ledgers. An ACK through this older holder must
+            // reload the authority before deciding whether the immutable artifact is unreferenced.
+            restarted.resetCachedStateAfterRestore()
+            assertTrue(restarted.removeTeacherReviewPublishIntent(
+                BOOK_ID,
+                PAGE,
+                1,
+                published.publicationId,
+            ))
+            assertArrayEquals(
+                frozenBytes,
+                requireNotNull(restarted.teacherReviewPublicationArtifact(
+                    BOOK_ID,
+                    PAGE,
+                    1,
+                    published.publicationId,
+                )).copyCheckpointBytes(),
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun missingTeacherReviewStateMigratesLegacyOutboxBeforeManifestAndRetainsAuthorityAfterAck() {
+        val root = Files.createTempDirectory("masternote-teacher-authority-missing-state").toFile()
+        try {
+            val original = PageOperationLogStore(root)
+            val published = original.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(
+                    bookId = BOOK_ID,
+                    pageNumber = PAGE,
+                    attemptNo = 1,
+                    updatedAtEpochMillis = 1_000L,
+                    remotePairId = "pair_student_one",
+                    remoteWorkbookToken = "workbook_one",
+                ),
+                listOf(teacherReviewRecoveryMarkGroup()),
+            )
+            deleteTeacherReviewStateJournal(root)
+            original.resetCachedStateAfterRestore()
+
+            // Restore invalidates both ledgers. A manifest/authority read can then be the first
+            // operation, before any ordinary outbox poll reloads the legacy migration source.
+            val manifestFirst = original
+            assertEquals(
+                listOf(published.publicationId),
+                manifestFirst.teacherReviewAuthorityEvidence(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                    "workbook_one",
+                ).map { it.publicationId },
+            )
+            assertTrue(manifestFirst.removeTeacherReviewPublishIntent(
+                BOOK_ID,
+                PAGE,
+                1,
+                published.publicationId,
+            ))
+
+            val afterAck = PageOperationLogStore(root)
+            assertTrue(afterAck.teacherReviewPublishIntents().isEmpty())
+            assertEquals(
+                listOf(published.publicationId),
+                afterAck.teacherReviewAuthorityIntents(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                    "workbook_one",
+                ).map { it.publicationId },
+            )
+            assertTrue(afterAck.teacherReviewPublicationArtifact(
+                BOOK_ID,
+                PAGE,
+                1,
+                published.publicationId,
+            ) != null)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun corruptTeacherReviewStateMigratesLegacyOutboxBeforeManifestAndRetainsAuthorityAfterAck() {
+        val root = Files.createTempDirectory("masternote-teacher-authority-corrupt-state").toFile()
+        try {
+            val original = PageOperationLogStore(root)
+            val published = original.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(
+                    bookId = BOOK_ID,
+                    pageNumber = PAGE,
+                    attemptNo = 1,
+                    updatedAtEpochMillis = 1_000L,
+                    remotePairId = "pair_student_one",
+                    remoteWorkbookToken = "workbook_one",
+                ),
+                listOf(teacherReviewRecoveryMarkGroup()),
+            )
+            deleteTeacherReviewStateJournal(root)
+            root.resolve("teacher-review-state-v1.json").writeText("{broken", Charsets.UTF_8)
+            original.resetCachedStateAfterRestore()
+
+            val manifestFirst = original
+            assertEquals(
+                listOf(published.publicationId),
+                manifestFirst.teacherReviewAuthorityEvidence(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                    "workbook_one",
+                ).map { it.publicationId },
+            )
+            assertTrue(root.listFiles().orEmpty().any {
+                it.name.startsWith("teacher-review-state-v1.json.corrupt-")
+            })
+            assertTrue(manifestFirst.removeTeacherReviewPublishIntent(
+                BOOK_ID,
+                PAGE,
+                1,
+                published.publicationId,
+            ))
+
+            val afterAck = PageOperationLogStore(root)
+            assertTrue(afterAck.teacherReviewPublishIntents().isEmpty())
+            assertEquals(
+                listOf(published.publicationId),
+                afterAck.teacherReviewAuthorityIntents(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                    "workbook_one",
+                ).map { it.publicationId },
+            )
+            assertTrue(afterAck.teacherReviewPublicationArtifact(
+                BOOK_ID,
+                PAGE,
+                1,
+                published.publicationId,
+            ) != null)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun deferredAuthorityWorkbookBindingIsExactAndRepairsAuthorityFirstCrash() {
+        val root = Files.createTempDirectory("masternote-teacher-authority-binding").toFile()
+        try {
+            val interrupted = PageOperationLogStore(
+                root,
+                beforeTeacherReviewWorkbookOutboxPersist = { error("simulated crash") },
+            )
+            val group = MarkGroup(
+                id = "grade-binding",
+                bookId = BOOK_ID,
+                pageNumber = PAGE,
+                anchor = PagePoint(10f, 20f),
+                marks = listOf(Mark(1, MarkColor.BLUE, 2_000L)),
+                createdAtEpochMillis = 1_900L,
+                syncRevision = 1L,
+                lastModifiedByDeviceId = "teacher-device",
+            )
+            val publication = interrupted.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(
+                    BOOK_ID,
+                    PAGE,
+                    1,
+                    2_100L,
+                    remotePairId = "pair_student_one",
+                    remoteManifestGeneration = 7L,
+                    remoteManifestSequence = 9L,
+                ),
+                listOf(group),
+            )
+            assertEquals(null, interrupted.bindTeacherReviewAuthorityWorkbook(
+                BOOK_ID,
+                PAGE,
+                1,
+                "0".repeat(64),
+                "pair_student_one",
+                "workbook_one",
+            ))
+            assertEquals(null, interrupted.bindTeacherReviewAuthorityWorkbook(
+                BOOK_ID,
+                PAGE,
+                1,
+                publication.publicationId,
+                "another_pair",
+                "workbook_one",
+            ))
+            assertThrows(IllegalStateException::class.java) {
+                interrupted.bindTeacherReviewAuthorityWorkbook(
+                    BOOK_ID,
+                    PAGE,
+                    1,
+                    publication.publicationId,
+                    "pair_student_one",
+                    "workbook_one",
+                )
+            }
+            // The authority is already durable, while the simulated second-journal write did not run.
+            assertEquals(
+                "workbook_one",
+                interrupted.teacherReviewAuthorityIntents(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                    "workbook_one",
+                ).single().remoteWorkbookToken,
+            )
+            assertEquals(null, interrupted.teacherReviewPublishIntents().single().remoteWorkbookToken)
+
+            val restarted = PageOperationLogStore(root)
+            assertEquals(
+                "workbook_one",
+                restarted.teacherReviewPublishIntents().single().remoteWorkbookToken,
+            )
+            assertEquals(
+                "workbook_one",
+                requireNotNull(restarted.bindTeacherReviewAuthorityWorkbook(
+                    BOOK_ID,
+                    PAGE,
+                    1,
+                    publication.publicationId,
+                    "pair_student_one",
+                    "workbook_one",
+                )).remoteWorkbookToken,
+            )
+            assertEquals(null, restarted.bindTeacherReviewAuthorityWorkbook(
+                BOOK_ID,
+                PAGE,
+                1,
+                publication.publicationId,
+                "pair_student_one",
+                "another_workbook",
+            ))
+
+            val pairless = restarted.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(BOOK_ID, PAGE, 2, 3_100L),
+                listOf(group.copy(marks = listOf(Mark(2, MarkColor.RED, 3_000L)))),
+            )
+            assertEquals(null, restarted.bindTeacherReviewAuthorityWorkbook(
+                BOOK_ID,
+                PAGE,
+                2,
+                pairless.publicationId,
+                "pair_student_one",
+                "workbook_one",
+            ))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun teacherReviewPublicationOrderSurvivesWallClockRollbackPerExactTarget() {
+        val root = Files.createTempDirectory("masternote-teacher-publication-order").toFile()
+        try {
+            val store = PageOperationLogStore(root)
+            val group = MarkGroup(
+                id = "grade-order",
+                bookId = BOOK_ID,
+                pageNumber = PAGE,
+                anchor = PagePoint(10f, 20f),
+                marks = listOf(Mark(1, MarkColor.BLUE, 2_000L)),
+                createdAtEpochMillis = 1_900L,
+                syncRevision = 1L,
+                lastModifiedByDeviceId = "teacher-device",
+            )
+            val first = store.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(BOOK_ID, PAGE, 1, 5_000L),
+                listOf(group),
+            )
+            val second = store.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(BOOK_ID, PAGE, 1, 100L),
+                listOf(group.copy(anchor = PagePoint(30f, 40f), syncRevision = 2L)),
+            )
+            val independentAttempt = store.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(BOOK_ID, PAGE, 2, 100L),
+                listOf(group.copy(
+                    marks = listOf(Mark(2, MarkColor.RED, 3_000L)),
+                    syncRevision = 3L,
+                )),
+            )
+
+            assertEquals(5_000L, first.updatedAtEpochMillis)
+            assertEquals(5_001L, second.updatedAtEpochMillis)
+            assertEquals(100L, independentAttempt.updatedAtEpochMillis)
+            assertEquals(
+                5_001L,
+                PageOperationLogStore(root).teacherReviewAuthorityIntents(BOOK_ID, PAGE)
+                    .single { it.attemptNo == 1 }
+                    .updatedAtEpochMillis,
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun teacherReviewPublicationOrderUsesEveryCrashBoundaryWitness() {
+        assertEquals(101L, nextTeacherReviewPublicationTimestamp(
+            requestedEpochMillis = 100L,
+            authorityEpochMillis = null,
+            outboxEpochMillis = null,
+            preparationEpochMillis = 100L,
+        ))
+        assertEquals(121L, nextTeacherReviewPublicationTimestamp(
+            requestedEpochMillis = 90L,
+            authorityEpochMillis = null,
+            outboxEpochMillis = 120L,
+            preparationEpochMillis = null,
+        ))
+        assertEquals(141L, nextTeacherReviewPublicationTimestamp(
+            requestedEpochMillis = 80L,
+            authorityEpochMillis = 140L,
+            outboxEpochMillis = null,
+            preparationEpochMillis = null,
+        ))
+        assertEquals(301L, nextTeacherReviewPublicationTimestamp(
+            requestedEpochMillis = 300L,
+            authorityEpochMillis = 200L,
+            outboxEpochMillis = 250L,
+            preparationEpochMillis = 300L,
+        ))
+        assertThrows(IllegalArgumentException::class.java) {
+            nextTeacherReviewPublicationTimestamp(
+                requestedEpochMillis = 0L,
+                authorityEpochMillis = Long.MAX_VALUE,
+                outboxEpochMillis = null,
+                preparationEpochMillis = null,
+            )
+        }
+    }
+
+    @Test
+    fun appliedTeacherReceiptPersistsPublicationOrderAndReplayCannotRewriteIt() {
+        val root = Files.createTempDirectory("masternote-teacher-receipt-order").toFile()
+        try {
+            val store = PageOperationLogStore(root)
+            val first = AppliedTeacherReviewReceipt(
+                bookId = BOOK_ID,
+                pageNumber = PAGE,
+                attemptNo = 1,
+                publicationId = "a".repeat(64),
+                resultLayerSha256 = "b".repeat(64),
+                markGroupsSha256 = "c".repeat(64),
+                appliedAtEpochMillis = 8_000L,
+                publishedAtEpochMillis = 7_000L,
+                remotePairId = "pair_student_one",
+                remoteWorkbookToken = "workbook_one",
+            )
+            store.recordAppliedTeacherReviewReceipt(first)
+            store.recordAppliedTeacherReviewReceipt(first.copy(
+                appliedAtEpochMillis = 9_000L,
+                publishedAtEpochMillis = 6_000L,
+            ))
+
+            assertEquals(
+                7_000L,
+                PageOperationLogStore(root).appliedTeacherReviewReceipts(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                    "workbook_one",
+                ).single().publishedAtEpochMillis,
+            )
+            store.recordAppliedTeacherReviewReceipt(first.copy(
+                publicationId = "d".repeat(64),
+                publishedAtEpochMillis = 10_000L,
+            ))
+            assertEquals(
+                10_000L,
+                store.appliedTeacherReviewReceipts(BOOK_ID, PAGE).single().publishedAtEpochMillis,
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun exactReceiptLookupAndPublicationOrderingArePairScopedAndDeterministic() {
+        val root = Files.createTempDirectory("masternote-teacher-receipt-disposition").toFile()
+        try {
+            val store = PageOperationLogStore(root)
+            val current = AppliedTeacherReviewReceipt(
+                bookId = BOOK_ID,
+                pageNumber = PAGE,
+                attemptNo = 3,
+                publicationId = "a".repeat(64),
+                resultLayerSha256 = "b".repeat(64),
+                markGroupsSha256 = "c".repeat(64),
+                appliedAtEpochMillis = 8_000L,
+                publishedAtEpochMillis = 7_000L,
+                remotePairId = "pair_student_one",
+                remoteWorkbookToken = "workbook_one",
+            )
+            store.recordAppliedTeacherReviewReceipt(current)
+
+            assertEquals(current, store.appliedTeacherReviewReceipt(
+                BOOK_ID, PAGE, 3, "pair_student_one",
+            ))
+            assertEquals(current, store.appliedTeacherReviewReceipt(
+                BOOK_ID, PAGE, 3, "pair_student_one", "workbook_one",
+            ))
+            assertEquals(null, store.appliedTeacherReviewReceipt(
+                BOOK_ID, PAGE, 3, "another_pair",
+            ))
+            assertEquals(null, store.appliedTeacherReviewReceipt(
+                BOOK_ID, PAGE, 3, "pair_student_one", "another_workbook",
+            ))
+            assertEquals(
+                TeacherReviewPublicationOrderDisposition.STALE,
+                teacherReviewPublicationOrderDisposition(current, "d".repeat(64), 0L),
+            )
+            assertEquals(
+                TeacherReviewPublicationOrderDisposition.STALE,
+                teacherReviewPublicationOrderDisposition(current, "d".repeat(64), 6_999L),
+            )
+            assertEquals(
+                TeacherReviewPublicationOrderDisposition.DUPLICATE_VERIFY,
+                teacherReviewPublicationOrderDisposition(current, current.publicationId, 7_000L),
+            )
+            assertEquals(
+                TeacherReviewPublicationOrderDisposition.CONFLICT,
+                teacherReviewPublicationOrderDisposition(current, "d".repeat(64), 7_000L),
+            )
+            assertEquals(
+                TeacherReviewPublicationOrderDisposition.APPLY,
+                teacherReviewPublicationOrderDisposition(current, "d".repeat(64), 7_001L),
+            )
+            assertEquals(
+                TeacherReviewPublicationOrderDisposition.APPLY,
+                teacherReviewPublicationOrderDisposition(
+                    current.copy(publishedAtEpochMillis = 0L),
+                    "d".repeat(64),
+                    0L,
+                ),
+            )
+            assertEquals(
+                TeacherReviewPublicationOrderDisposition.APPLY,
+                teacherReviewPublicationOrderDisposition(null, "d".repeat(64), 0L),
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun teacherReviewTargetLockIsProcessGlobalAcrossStoreInstances() {
+        val firstRoot = Files.createTempDirectory("masternote-teacher-lock-a").toFile()
+        val secondRoot = Files.createTempDirectory("masternote-teacher-lock-b").toFile()
+        val executor = Executors.newFixedThreadPool(2)
+        val releaseFirst = CountDownLatch(1)
+        try {
+            val firstStore = PageOperationLogStore(firstRoot)
+            val secondStore = PageOperationLogStore(secondRoot)
+            val firstEntered = CountDownLatch(1)
+            val secondEntered = CountDownLatch(1)
+            val first = executor.submit {
+                firstStore.withTeacherReviewTargetLock(BOOK_ID, PAGE, 4) {
+                    firstEntered.countDown()
+                    assertTrue(releaseFirst.await(5, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(firstEntered.await(5, TimeUnit.SECONDS))
+            val second = executor.submit {
+                secondStore.withTeacherReviewTargetLock(BOOK_ID, PAGE, 4) {
+                    secondEntered.countDown()
+                }
+            }
+
+            assertFalse(secondEntered.await(150, TimeUnit.MILLISECONDS))
+            releaseFirst.countDown()
+            first.get(5, TimeUnit.SECONDS)
+            second.get(5, TimeUnit.SECONDS)
+            assertEquals(0L, secondEntered.count)
+        } finally {
+            releaseFirst.countDown()
+            executor.shutdownNow()
+            firstRoot.deleteRecursively()
+            secondRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun appliedTeacherReceiptIsDurablePairScopedAndAdvertisedOnlyWhileActualStateMatches() {
+        val teacherRoot = Files.createTempDirectory("masternote-teacher-receipt-source").toFile()
+        val studentRoot = Files.createTempDirectory("masternote-teacher-receipt-target").toFile()
+        try {
+            val teacher = PageOperationLogStore(teacherRoot)
+            val groups = listOf(
+                MarkGroup(
+                    id = "grade_exact_attempt",
+                    bookId = BOOK_ID,
+                    pageNumber = PAGE,
+                    anchor = PagePoint(10f, 20f),
+                    marks = listOf(Mark(1, MarkColor.BLUE, 2_000L)),
+                    createdAtEpochMillis = 1_900L,
+                    syncRevision = 1L,
+                    lastModifiedByDeviceId = "teacher-device",
+                ),
+            )
+            val publication = teacher.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(BOOK_ID, PAGE, 1, 2_100L),
+                groups,
+            )
+            val artifact = requireNotNull(teacher.teacherReviewPublicationArtifact(
+                BOOK_ID,
+                PAGE,
+                1,
+                publication.publicationId,
+            ))
+            val student = PageOperationLogStore(studentRoot)
+            student.applyPublishedTeacherLayerCheckpoint(
+                localBookId = BOOK_ID,
+                pageNumber = PAGE,
+                attemptNo = 1,
+                checkpointBytes = artifact.copyCheckpointBytes(),
+                expectedResultLayerSha256 = publication.resultLayerSha256,
+            )
+            student.recordAppliedTeacherReviewReceipt(
+                AppliedTeacherReviewReceipt(
+                    bookId = BOOK_ID,
+                    pageNumber = PAGE,
+                    attemptNo = 1,
+                    publicationId = publication.publicationId,
+                    resultLayerSha256 = publication.resultLayerSha256,
+                    markGroupsSha256 = teacherReviewMarkGroupsSha256(groups),
+                    appliedAtEpochMillis = 2_200L,
+                    remotePairId = "pair_student_one",
+                    remoteWorkbookToken = "workbook_one",
+                ),
+            )
+            student.recordAppliedTeacherReviewReceipt(
+                AppliedTeacherReviewReceipt(
+                    bookId = BOOK_ID,
+                    pageNumber = PAGE,
+                    attemptNo = 2,
+                    publicationId = "a".repeat(64),
+                    resultLayerSha256 = "b".repeat(64),
+                    markGroupsSha256 = "c".repeat(64),
+                    appliedAtEpochMillis = 2_201L,
+                    remotePairId = "pair_student_one",
+                    // Legacy journals do not have workbook provenance and must remain readable,
+                    // but they are not eligible for an exact-workbook manifest claim.
+                    remoteWorkbookToken = null,
+                ),
+            )
+
+            val restarted = PageOperationLogStore(studentRoot)
+            assertEquals(
+                listOf(1, 2),
+                restarted.appliedTeacherReviewReceipts(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                ).map { it.attemptNo },
+            )
+            assertEquals(
+                listOf(1),
+                restarted.appliedTeacherReviewReceipts(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                    "workbook_one",
+                ).map { it.attemptNo },
+            )
+            assertEquals(
+                listOf(publication.publicationId),
+                restarted.verifiedAppliedTeacherReviewEvidence(
+                    BOOK_ID,
+                    PAGE,
+                    groups,
+                    "pair_student_one",
+                    "workbook_one",
+                ).map { it.publicationId },
+            )
+            assertTrue(restarted.verifiedAppliedTeacherReviewEvidence(
+                BOOK_ID,
+                PAGE,
+                groups,
+                "another_pair",
+                "workbook_one",
+            ).isEmpty())
+            assertTrue(restarted.verifiedAppliedTeacherReviewEvidence(
+                BOOK_ID,
+                PAGE,
+                groups,
+                "pair_student_one",
+                "another_workbook",
+            ).isEmpty())
+            assertTrue(restarted.verifiedAppliedTeacherReviewEvidence(
+                BOOK_ID,
+                PAGE,
+                emptyList(),
+                "pair_student_one",
+                "workbook_one",
+            ).isEmpty())
+        } finally {
+            teacherRoot.deleteRecursively()
+            studentRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun sharedGradeMetadataUsesLatestRetainedAuthorityAndDetectsStudentRollback() {
+        val teacherRoot = Files.createTempDirectory("masternote-teacher-metadata-source").toFile()
+        val studentRoot = Files.createTempDirectory("masternote-teacher-metadata-target").toFile()
+        try {
+            val teacher = PageOperationLogStore(teacherRoot)
+            val firstGroup = MarkGroup(
+                id = "shared-grade",
+                bookId = BOOK_ID,
+                pageNumber = PAGE,
+                anchor = PagePoint(10f, 20f),
+                marks = listOf(Mark(1, MarkColor.BLUE, 2_000L)),
+                createdAtEpochMillis = 1_900L,
+                syncRevision = 1L,
+                lastModifiedByDeviceId = "teacher-a",
+            )
+            val secondGroup = firstGroup.copy(
+                anchor = PagePoint(80f, 90f),
+                marks = listOf(Mark(2, MarkColor.RED, 3_000L)),
+                syncRevision = 2L,
+                lastModifiedByDeviceId = "teacher-b",
+            )
+            val first = teacher.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(
+                    BOOK_ID,
+                    PAGE,
+                    1,
+                    2_100L,
+                    remotePairId = "pair_student_one",
+                    remoteWorkbookToken = "workbook_one",
+                ),
+                listOf(firstGroup),
+            )
+            val second = teacher.recordTeacherReviewPublishIntent(
+                TeacherReviewPublishIntent(
+                    BOOK_ID,
+                    PAGE,
+                    2,
+                    3_100L,
+                    remotePairId = "pair_student_one",
+                    remoteWorkbookToken = "workbook_one",
+                ),
+                listOf(secondGroup),
+            )
+            listOf(first, second).forEach { publication ->
+                assertTrue(teacher.removeTeacherReviewPublishIntent(
+                    publication.bookId,
+                    publication.pageNumber,
+                    publication.attemptNo,
+                    publication.publicationId,
+                ))
+            }
+            val restartedTeacher = PageOperationLogStore(teacherRoot)
+            val authority = restartedTeacher.teacherReviewAuthorityEvidence(
+                BOOK_ID,
+                PAGE,
+                "pair_student_one",
+                "workbook_one",
+            )
+            assertEquals(listOf(1, 2), authority.map { it.attemptNo })
+            assertTrue(restartedTeacher.teacherReviewAuthorityEvidence(
+                BOOK_ID,
+                PAGE,
+                "pair_student_one",
+                "workbook_two",
+                setOf(1, 2),
+            ).isEmpty())
+
+            val student = PageOperationLogStore(studentRoot)
+            listOf(first to firstGroup, second to secondGroup).forEach { (publication, group) ->
+                val artifact = requireNotNull(restartedTeacher.teacherReviewPublicationArtifact(
+                    BOOK_ID,
+                    PAGE,
+                    publication.attemptNo,
+                    publication.publicationId,
+                ))
+                student.applyPublishedTeacherLayerCheckpoint(
+                    localBookId = BOOK_ID,
+                    pageNumber = PAGE,
+                    attemptNo = publication.attemptNo,
+                    checkpointBytes = artifact.copyCheckpointBytes(),
+                    expectedResultLayerSha256 = publication.resultLayerSha256,
+                )
+                student.recordAppliedTeacherReviewReceipt(
+                    AppliedTeacherReviewReceipt(
+                        bookId = BOOK_ID,
+                        pageNumber = PAGE,
+                        attemptNo = publication.attemptNo,
+                        publicationId = publication.publicationId,
+                        resultLayerSha256 = publication.resultLayerSha256,
+                        markGroupsSha256 = teacherReviewMarkGroupsSha256(listOf(group)),
+                        appliedAtEpochMillis = 4_000L + publication.attemptNo,
+                        remotePairId = "pair_student_one",
+                        remoteWorkbookToken = "workbook_one",
+                    ),
+                )
+            }
+            val currentStudentGroup = secondGroup.copy(
+                marks = firstGroup.marks + secondGroup.marks,
+            )
+            val installed = student.verifiedAppliedTeacherReviewEvidence(
+                BOOK_ID,
+                PAGE,
+                listOf(currentStudentGroup),
+                "pair_student_one",
+                "workbook_one",
+            )
+            assertEquals(authority, installed)
+            assertTrue(student.verifiedAppliedTeacherReviewEvidence(
+                BOOK_ID,
+                PAGE,
+                listOf(currentStudentGroup),
+                "pair_student_one",
+                "workbook_two",
+                setOf(1, 2),
+            ).isEmpty())
+            val secondAuthority = restartedTeacher.teacherReviewAuthorityEvidence(
+                BOOK_ID,
+                PAGE,
+                "pair_student_one",
+                "workbook_one",
+                setOf(2),
+            )
+            val secondInstalled = student.verifiedAppliedTeacherReviewEvidence(
+                BOOK_ID,
+                PAGE,
+                listOf(currentStudentGroup),
+                "pair_student_one",
+                "workbook_one",
+                setOf(2),
+            )
+            assertEquals(listOf(2), secondAuthority.map { it.attemptNo })
+            assertEquals(secondAuthority, secondInstalled)
+            assertThrows(IllegalArgumentException::class.java) {
+                restartedTeacher.teacherReviewAuthorityEvidence(
+                    BOOK_ID,
+                    PAGE,
+                    "pair_student_one",
+                    "workbook_one",
+                    emptySet(),
+                )
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                student.verifiedAppliedTeacherReviewEvidence(
+                    BOOK_ID,
+                    PAGE,
+                    listOf(currentStudentGroup),
+                    "pair_student_one",
+                    "workbook_one",
+                    emptySet(),
+                )
+            }
+
+            val anchorRollback = student.verifiedAppliedTeacherReviewEvidence(
+                BOOK_ID,
+                PAGE,
+                listOf(currentStudentGroup.copy(anchor = firstGroup.anchor)),
+                "pair_student_one",
+                "workbook_one",
+            )
+            val visibilityRollback = student.verifiedAppliedTeacherReviewEvidence(
+                BOOK_ID,
+                PAGE,
+                listOf(currentStudentGroup.copy(hiddenAtEpochMillis = 5_000L)),
+                "pair_student_one",
+                "workbook_one",
+            )
+            assertNotEquals(authority, anchorRollback)
+            assertNotEquals(authority, visibilityRollback)
+        } finally {
+            teacherRoot.deleteRecursively()
+            studentRoot.deleteRecursively()
+        }
+    }
+
     private fun stroke(deviceId: String) = StrokeAsset(
         pageNumber = PAGE,
         tool = StrokeTool.PEN,
@@ -1598,6 +2760,25 @@ class PageOperationLogStoreTest {
         attemptNo = 1,
         deviceId = deviceId,
     )
+
+    private fun teacherReviewRecoveryMarkGroup() = MarkGroup(
+        id = "grade-recovery",
+        bookId = BOOK_ID,
+        pageNumber = PAGE,
+        anchor = PagePoint(10f, 20f),
+        marks = listOf(Mark(1, MarkColor.BLUE, 900L)),
+        createdAtEpochMillis = 800L,
+        syncRevision = 1L,
+        lastModifiedByDeviceId = "teacher-device",
+    )
+
+    private fun deleteTeacherReviewStateJournal(root: java.io.File) {
+        listOf(
+            "teacher-review-state-v1.json",
+            "teacher-review-state-v1.json.bak",
+            "teacher-review-state-v1.json.tmp",
+        ).forEach { name -> root.resolve(name).delete() }
+    }
 
     private fun largePath(size: Int): List<PagePoint> = List(size) { index ->
         PagePoint((index % 512).toFloat(), (index / 512).toFloat())

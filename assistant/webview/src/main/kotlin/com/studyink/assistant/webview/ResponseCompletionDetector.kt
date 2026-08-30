@@ -31,3 +31,14 @@ internal object ResponseCompletionDetector {
 
     private const val MIN_RESPONSE_CHARS = 2
 }
+
+/** Never offers a pre-query answer as the partial result for the current page. */
+internal fun preferredPartialResponse(
+    newResponseObserved: Boolean,
+    extractedMarkdown: String?,
+    latestNewText: String,
+): String = if (newResponseObserved) {
+    extractedMarkdown.orEmpty().ifBlank { latestNewText }
+} else {
+    ""
+}

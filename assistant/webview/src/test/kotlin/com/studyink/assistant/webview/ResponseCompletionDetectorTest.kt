@@ -64,6 +64,16 @@ class ResponseCompletionDetectorTest {
         )
     }
 
+    @Test
+    fun partialResponseRequiresANewAnswerAndPrefersPortableMarkdown() {
+        assertEquals("", preferredPartialResponse(false, "old markdown", "old text"))
+        assertEquals(
+            "답은 ${'$'}\\frac{1}{2}${'$'}",
+            preferredPartialResponse(true, "답은 ${'$'}\\frac{1}{2}${'$'}", "답은 1/2"),
+        )
+        assertEquals("새 답변", preferredPartialResponse(true, "", "새 답변"))
+    }
+
     private fun snapshot(
         count: Int,
         text: String,

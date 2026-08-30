@@ -79,6 +79,7 @@ dependencies {
     implementation(project(":monitor:core"))
     implementation(project(":monitor:telegram"))
     implementation(project(":monitor:render"))
+    implementation(project(":memo:core"))
     implementation(project(":library:data"))
     implementation(project(":annotation:storage"))
     implementation(project(":sync:lan"))

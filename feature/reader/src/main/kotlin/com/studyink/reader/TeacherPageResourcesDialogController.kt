@@ -1,5 +1,6 @@
 package com.studyink.reader
 
+import android.app.AlertDialog
 import android.app.Dialog
 import android.content.Context
 import android.content.res.ColorStateList
@@ -26,6 +27,7 @@ import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import com.studyink.assistant.core.AssistantPageKey
 import com.studyink.assistant.core.AssistantPromptSlot
 import com.studyink.assistant.core.StudentExplanationTarget
@@ -71,6 +73,16 @@ data class TeacherExplanationSendDraft(
 class TeacherPageResourcesDialogController(
     private val context: Context,
     private val onPromptSelected: (TeacherPromptChoice) -> Unit,
+    private val onPromptUpdate: (
+        AssistantPromptSlot,
+        String,
+        (Result<AssistantPromptSlot>) -> Unit,
+    ) -> Unit,
+    private val onDeleteResource: (
+        AssistantPageKey,
+        String,
+        (Result<Boolean>) -> Unit,
+    ) -> Unit,
     private val onSend: (TeacherExplanationSendDraft, (Result<Unit>) -> Unit) -> Unit,
     private val onDismiss: () -> Unit = {},
 ) {
@@ -88,8 +100,12 @@ class TeacherPageResourcesDialogController(
             }
         }
         setOnDismissListener {
+            promptEditorDialog?.dismiss()
+            promptEditorDialog = null
             sendGeneration += 1L
             sendInProgress = false
+            deleteGeneration += 1L
+            deleteInProgress = false
             releaseFormattedAnswer()
             mode = Mode.COMPACT
             onDismiss()
@@ -102,9 +118,12 @@ class TeacherPageResourcesDialogController(
     private var selectedResourceId: String? = null
     private var selectedRevisionId: String? = null
     private var formattedAnswerView: FormattedAssistantAnswerView? = null
+    private var promptEditorDialog: AlertDialog? = null
     private var mode = Mode.COMPACT
     private var sendInProgress = false
     private var sendGeneration = 0L
+    private var deleteInProgress = false
+    private var deleteGeneration = 0L
 
     fun show(
         target: TeacherPageAssistantTarget,
@@ -145,6 +164,8 @@ class TeacherPageResourcesDialogController(
     }
 
     fun dismiss() {
+        promptEditorDialog?.dismiss()
+        promptEditorDialog = null
         dialog.dismiss()
     }
 
@@ -177,10 +198,9 @@ class TeacherPageResourcesDialogController(
             gravity = Gravity.CENTER_VERTICAL
         }
         row.addView(compactCell("×", "GPT 메뉴 닫기") { dialog.dismiss() }, fixedWidth(dp(44)))
-        row.addView(label(context, 11f, bold = true).apply {
-            text = "GPT"
-            gravity = Gravity.CENTER
-        }, fixedWidth(dp(38)))
+        val promptEditorCell = compactCell("질문수정", "GPT 질문 편집") {}
+        promptEditorCell.setOnClickListener { anchor -> showPromptEditMenu(anchor) }
+        row.addView(promptEditorCell, fixedWidth(dp(62)))
         promptSlots.forEach { prompt ->
             row.addView(
                 compactCell(
@@ -275,7 +295,7 @@ class TeacherPageResourcesDialogController(
                         append("${superscript(revision.promptSlotNumber)}${compactPromptLabel(revision.promptSlotNumber, revision.promptTitle)}")
                         append(" · 버전 ${revision.revisionNumber}")
                         val preview = assistantPreviewText(
-                            revision.answerText,
+                            visibleAssistantAnswer(revision),
                             RESOURCE_PREVIEW_CHARS,
                             revision.answerFormat,
                         )
@@ -315,7 +335,7 @@ class TeacherPageResourcesDialogController(
         )
         val rendered = FormattedAssistantAnswerView(context).also { view ->
             formattedAnswerView = view
-            view.render(revision.answerText, revision.answerFormat)
+            view.render(visibleAssistantAnswer(revision), revision.answerFormat)
         }
         root.addView(rendered, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         target?.studentTargetOrNull()?.let { studentTarget ->
@@ -377,7 +397,7 @@ class TeacherPageResourcesDialogController(
             setText(resource.title.take(MAX_TITLE_CHARS))
             setSelection(text.length)
         }
-        val excerpt = assistantStudentText(revision.answerText, revision.answerFormat)
+        val excerpt = assistantStudentText(visibleAssistantAnswer(revision), revision.answerFormat)
             .let { validUtf16Prefix(it, MAX_EDITABLE_EXCERPT_CHARS) }
         val excerptEditor = EditText(context).apply {
             hint = "학생에게 보낼 설명을 골라 다듬으세요"
@@ -491,12 +511,56 @@ class TeacherPageResourcesDialogController(
         leading = headerButton("‹", "답변 목록") { showLibrary() },
         title = "${target?.page?.pageNumber?.plus(1)}쪽 · $title",
         trailing = listOf(
+            headerButton("삭제", "이 GPT 자료 삭제") { confirmDeleteSelectedResource() } to dp(52),
             headerButton(versionAction.first, "답변 버전 선택") { view ->
                 versionAction.second(view)
             } to dp(58),
             headerButton("×", "닫기") { dialog.dismiss() } to dp(48),
         ),
     )
+
+    private fun confirmDeleteSelectedResource() {
+        if (deleteInProgress || sendInProgress) return
+        val currentTarget = target ?: return
+        val resource = selectedResource() ?: return
+        AlertDialog.Builder(context)
+            .setTitle("GPT 자료 삭제")
+            .setMessage(
+                "${currentTarget.page.pageNumber + 1}쪽의 ‘${resource.title}’ 자료만 삭제합니다. " +
+                    "필기와 학생에게 이미 보낸 설명은 유지됩니다.",
+            )
+            .setNegativeButton("취소", null)
+            .setPositiveButton("삭제") { _, _ ->
+                val generation = ++deleteGeneration
+                deleteInProgress = true
+                val finishDelete: (Result<Boolean>) -> Unit = { result ->
+                    dialog.window?.decorView?.post {
+                        val stillCurrent = deleteInProgress && generation == deleteGeneration &&
+                            target == currentTarget && selectedResourceId == resource.resourceId
+                        if (!stillCurrent) return@post
+                        deleteInProgress = false
+                        result.onSuccess { removed ->
+                            if (removed) {
+                                resources = resources.filterNot { it.resourceId == resource.resourceId }
+                                selectedResourceId = resources.firstOrNull()?.resourceId
+                                selectedRevisionId = resources.firstOrNull()?.currentRevisionId
+                                showLibrary()
+                                Toast.makeText(context, "이 GPT 자료만 삭제했습니다.", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(context, "이미 삭제된 자료입니다.", Toast.LENGTH_SHORT).show()
+                                showLibrary()
+                            }
+                        }.onFailure {
+                            Toast.makeText(context, "GPT 자료를 삭제하지 못했습니다.", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
+                runCatching {
+                    onDeleteResource(currentTarget.page, resource.resourceId, finishDelete)
+                }.onFailure { error -> finishDelete(Result.failure(error)) }
+            }
+            .show()
+    }
 
     private fun panelHeader(
         title: String,
@@ -743,6 +807,109 @@ class TeacherPageResourcesDialogController(
         onPromptSelected(TeacherPromptChoice(currentTarget, prompt))
     }
 
+    private fun showPromptEditMenu(anchor: View) {
+        val currentPrompts = promptSlots
+        PopupMenu(context, anchor).apply {
+            currentPrompts.forEach { prompt ->
+                menu.add(
+                    0,
+                    prompt.slotNumber,
+                    prompt.slotNumber,
+                    "${prompt.slotNumber}. ${prompt.title}",
+                )
+            }
+            setOnMenuItemClickListener { item ->
+                currentPrompts.firstOrNull { it.slotNumber == item.itemId }
+                    ?.let(::showPromptEditor)
+                true
+            }
+        }.show()
+    }
+
+    private fun showPromptEditor(prompt: AssistantPromptSlot) {
+        promptEditorDialog?.dismiss()
+        dialog.setCancelable(false)
+        dialog.setCanceledOnTouchOutside(false)
+        val bodyEditor = EditText(context).apply {
+            gravity = Gravity.TOP or Gravity.START
+            textSize = 15f
+            minLines = 7
+            maxLines = 14
+            filters = arrayOf(InputFilter.LengthFilter(MAX_PROMPT_BODY_CHARS))
+            inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            setText(prompt.body)
+            setSelection(text.length)
+        }
+        val editorDialog = AlertDialog.Builder(context)
+            .setTitle("${prompt.slotNumber}. ${prompt.title}")
+            .setMessage("이미지와 함께 보낼 질문입니다. 수정 내용은 다음 질문부터 적용됩니다.")
+            .setView(bodyEditor)
+            .setNegativeButton("취소", null)
+            .setPositiveButton("저장", null)
+            .create()
+        promptEditorDialog = editorDialog
+        editorDialog.setOnDismissListener {
+            if (promptEditorDialog === editorDialog) promptEditorDialog = null
+            if (dialog.isShowing && !sendInProgress) {
+                dialog.setCancelable(true)
+                dialog.setCanceledOnTouchOutside(true)
+            }
+        }
+        editorDialog.setOnShowListener {
+            val saveButton = editorDialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            saveButton.setOnClickListener {
+                val editedBody = bodyEditor.text?.toString()?.trim().orEmpty()
+                if (editedBody.isBlank()) {
+                    bodyEditor.error = "질문 내용을 입력하세요."
+                    return@setOnClickListener
+                }
+                if (editedBody == prompt.body) {
+                    editorDialog.dismiss()
+                    return@setOnClickListener
+                }
+                bodyEditor.isEnabled = false
+                saveButton.isEnabled = false
+                saveButton.text = "저장 중…"
+                editorDialog.setCancelable(false)
+                editorDialog.setCanceledOnTouchOutside(false)
+                val finishUpdate: (Result<AssistantPromptSlot>) -> Unit = { result ->
+                    bodyEditor.post {
+                        if (!editorDialog.isShowing) return@post
+                        result.onSuccess { updated ->
+                            if (updated.slotNumber != prompt.slotNumber) {
+                                bodyEditor.isEnabled = true
+                                saveButton.isEnabled = true
+                                saveButton.text = "저장"
+                                bodyEditor.error = "질문을 저장하지 못했습니다. 다시 시도해 주세요."
+                                return@onSuccess
+                            }
+                            promptSlots = canonicalPrompts(
+                                promptSlots.map { current ->
+                                    if (current.slotNumber == updated.slotNumber) updated else current
+                                },
+                            )
+                            editorDialog.dismiss()
+                            if (dialog.isShowing && mode == Mode.COMPACT) showCompact()
+                        }.onFailure {
+                            editorDialog.setCancelable(true)
+                            editorDialog.setCanceledOnTouchOutside(true)
+                            bodyEditor.isEnabled = true
+                            saveButton.isEnabled = true
+                            saveButton.text = "저장"
+                            bodyEditor.error = "질문을 저장하지 못했습니다. 다시 시도해 주세요."
+                        }
+                    }
+                }
+                runCatching { onPromptUpdate(prompt, editedBody, finishUpdate) }
+                    .onFailure { error -> finishUpdate(Result.failure(error)) }
+            }
+        }
+        editorDialog.show()
+    }
+
     private fun handleBack() {
         when (mode) {
             Mode.COMPACT -> dialog.dismiss()
@@ -834,6 +1001,7 @@ class TeacherPageResourcesDialogController(
         const val TABLET_PANEL_WIDTH_DP = 420
         const val TABLET_DETAIL_WIDTH_DP = 500
         const val PHONE_LIBRARY_MAX_HEIGHT_DP = 420
+        const val MAX_PROMPT_BODY_CHARS = 16_000
         const val MAX_TITLE_CHARS = 200
         const val MAX_EDITABLE_EXCERPT_CHARS = 16_000
         const val RESOURCE_PREVIEW_CHARS = 120
@@ -887,6 +1055,9 @@ internal fun assistantPreviewText(
 ): String = assistantStudentText(text, format).replace(Regex("\\s+"), " ").trim()
     .let { validUtf16Prefix(it, maxChars) }
 
+internal fun visibleAssistantAnswer(revision: TeacherGptResourceRevision): String =
+    AssistantAnswerBlocks.visibleSource(revision.answerText, revision.answerMask)
+
 /** Plain student cards intentionally stay protocol-compatible while teacher answers use rich view. */
 internal fun assistantStudentText(
     markdown: String,
@@ -916,7 +1087,7 @@ internal fun assistantStudentText(
         .replace("\\(", "").replace("\\)", "")
         .replace("$$", "").replace("$", "")
     repeat(3) {
-        value = value.replace(Regex("\\\\frac\\{([^{}]+)}\\{([^{}]+)}"), "($1)/($2)")
+        value = value.replace(Regex("\\\\frac\\{([^{}]+)\\}\\{([^{}]+)\\}"), "($1)/($2)")
     }
     val replacements = mapOf(
         "\\times" to "×",

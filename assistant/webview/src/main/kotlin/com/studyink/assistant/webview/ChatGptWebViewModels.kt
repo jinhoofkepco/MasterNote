@@ -23,6 +23,72 @@ enum class ChatGptTextFormat {
     MARKDOWN_TEX,
 }
 
+/** Preserves pasted/timeout TeX and obvious Markdown instead of flattening it as plain text. */
+fun inferChatGptTextFormat(text: String): ChatGptTextFormat {
+    val normalized = text.replace("\r\n", "\n").replace('\r', '\n')
+    val delimitedMath = hasDelimitedPair(normalized, "\\(", "\\)") ||
+        hasDelimitedPair(normalized, "\\[", "\\]") ||
+        hasUnescapedDollarMath(normalized)
+    val markdownBlock = normalized.lineSequence().any { line ->
+        val trimmed = line.trimStart()
+        line.matches(Regex("^\\s{0,3}#{1,6}\\s+.+$")) ||
+            line.matches(Regex("^\\s*[-+*]\\s+.+$")) ||
+            line.matches(Regex("^\\s*\\d+[.)]\\s+.+$")) ||
+            trimmed.startsWith("```") || trimmed.startsWith("~~~") ||
+            trimmed.startsWith("> ")
+    }
+    return if (delimitedMath || markdownBlock) {
+        ChatGptTextFormat.MARKDOWN_TEX
+    } else {
+        ChatGptTextFormat.PLAIN_TEXT
+    }
+}
+
+private fun hasDelimitedPair(text: String, open: String, close: String): Boolean {
+    var start = text.indexOf(open)
+    while (start >= 0) {
+        val end = text.indexOf(close, start + open.length)
+        if (end > start + open.length && text.substring(start + open.length, end).isNotBlank()) {
+            return true
+        }
+        start = text.indexOf(open, start + open.length)
+    }
+    return false
+}
+
+private fun hasUnescapedDollarMath(text: String): Boolean {
+    var cursor = 0
+    while (cursor < text.length) {
+        if (text[cursor] != '$' || text.isEscapedAt(cursor)) {
+            cursor += 1
+            continue
+        }
+        val delimiterLength = if (text.getOrNull(cursor + 1) == '$') 2 else 1
+        val delimiter = "$".repeat(delimiterLength)
+        var end = text.indexOf(delimiter, cursor + delimiterLength)
+        while (end >= 0 && text.isEscapedAt(end)) {
+            end = text.indexOf(delimiter, end + delimiterLength)
+        }
+        if (end > cursor + delimiterLength &&
+            text.substring(cursor + delimiterLength, end).isNotBlank()
+        ) {
+            return true
+        }
+        cursor += delimiterLength
+    }
+    return false
+}
+
+private fun String.isEscapedAt(index: Int): Boolean {
+    var slashes = 0
+    var cursor = index - 1
+    while (cursor >= 0 && this[cursor] == '\\') {
+        slashes += 1
+        cursor -= 1
+    }
+    return slashes % 2 == 1
+}
+
 enum class ChatGptCompletion {
     ACTIONS_READY,
     TEXT_STABLE,

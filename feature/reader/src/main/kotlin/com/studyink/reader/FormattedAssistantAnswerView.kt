@@ -64,6 +64,7 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
     private var destroyed = false
     @Volatile
     private var renderGeneration = 0L
+    private var expectedEditorGeneration: Long? = null
 
     init {
         clipToPadding = false
@@ -76,16 +77,73 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
         text: String,
         format: TeacherGptAnswerFormat = TeacherGptAnswerFormat.MARKDOWN_TEX,
     ) {
+        renderDocument(
+            fallback = FormattedAssistantAnswerDocument.fallbackText(text),
+            editor = false,
+            build = { FormattedAssistantAnswerDocument.build(text, format) },
+        )
+    }
+
+    /** Shows immutable rendered blocks with a drag-select checkbox rail. */
+    fun renderEditor(
+        text: String,
+        format: TeacherGptAnswerFormat = TeacherGptAnswerFormat.MARKDOWN_TEX,
+        hiddenBlockOrdinals: Set<Int> = emptySet(),
+    ) {
+        val visible = AssistantAnswerBlocks.visibleSource(text, hiddenBlockOrdinals)
+        renderDocument(
+            fallback = FormattedAssistantAnswerDocument.fallbackText(visible),
+            editor = true,
+            build = {
+                FormattedAssistantAnswerDocument.buildEditor(text, format, hiddenBlockOrdinals)
+            },
+        )
+    }
+
+    /** Returns checked block ordinals, or null while the current editor document is unavailable. */
+    fun selectedEditorBlockOrdinals(onResult: (Set<Int>?) -> Unit) {
         checkMainThread()
         check(!destroyed) { "FormattedAssistantAnswerView was already destroyed" }
-        fallbackAnswer = FormattedAssistantAnswerDocument.fallbackText(text)
+        val renderer = webView
+        val expectedGeneration = expectedEditorGeneration
+        if (renderer == null || renderer.visibility != View.VISIBLE || expectedGeneration == null) {
+            onResult(null)
+            return
+        }
+        renderer.evaluateJavascript(
+            "(function(){var e=window.MasterNoteAnswerEditor;" +
+                "return e&&e.generation()==='${expectedGeneration}'?e.selectedOrdinals():null;})()",
+        ) { encoded ->
+            if (
+                destroyed || renderer !== webView ||
+                renderGeneration != expectedGeneration ||
+                expectedEditorGeneration != expectedGeneration ||
+                encoded.isNullOrBlank() || encoded == "null"
+            ) {
+                onResult(null)
+                return@evaluateJavascript
+            }
+            val ordinals = Regex("\\d+").findAll(encoded.orEmpty())
+                .mapNotNull { it.value.toIntOrNull() }
+                .filter { it >= 0 }
+                .take(MAX_EDITOR_BLOCKS)
+                .toSet()
+            onResult(ordinals)
+        }
+    }
+
+    private fun renderDocument(fallback: String, editor: Boolean, build: () -> String) {
+        checkMainThread()
+        check(!destroyed) { "FormattedAssistantAnswerView was already destroyed" }
+        fallbackAnswer = fallback
         val generation = renderGeneration + 1L
         renderGeneration = generation
+        expectedEditorGeneration = generation.takeIf { editor }
         webView?.visibility = View.GONE
         fallbackText.text = "답변을 정리하는 중…"
         fallbackScroll.visibility = View.VISIBLE
         DOCUMENT_EXECUTOR.execute {
-            val document = runCatching { FormattedAssistantAnswerDocument.build(text, format) }
+            val document = runCatching(build)
             post {
                 if (destroyed || generation != renderGeneration) return@post
                 document.onSuccess { html ->
@@ -129,6 +187,7 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
         if (destroyed) return
         destroyed = true
         renderGeneration += 1L
+        expectedEditorGeneration = null
         currentDocument = null
         disposeWebView()
         fallbackAnswer = ""
@@ -351,7 +410,7 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
         companion object {
             private const val LOCAL_HOST = "appassets.androidplatform.net"
             private const val LOCAL_DIRECTORY = "gpt-answer"
-            private const val ASSET_VERSION = "katex-0.18.1-r1"
+            private const val ASSET_VERSION = FormattedAssistantAnswerDocument.ASSET_VERSION
             private const val DOCUMENT_PATH = FormattedAssistantAnswerDocument.LOCAL_DOCUMENT_PATH
             private const val DOCUMENT_GENERATION_QUERY = "generation"
             private val STATIC_ASSETS = setOf(
@@ -359,6 +418,7 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
                 "katex.min.js",
                 "reader.css",
                 "renderer.js",
+                "editor.js",
             )
             private val FONT_ASSET = Regex("fonts/KaTeX_[A-Za-z0-9_-]+\\.woff2")
         }
@@ -369,6 +429,7 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
         const val UTF_8 = "UTF-8"
         const val HTTP_OK = 200
         const val HTTP_FORBIDDEN = 403
+        const val MAX_EDITOR_BLOCKS = 4_096
         val DOCUMENT_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "MasterNote-GptAnswer").apply { isDaemon = true }
         }

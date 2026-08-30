@@ -5,7 +5,8 @@ import com.studyink.assistant.core.TeacherGptAnswerFormat
 /** Builds the self-contained answer body loaded by [FormattedAssistantAnswerView]. */
 internal object FormattedAssistantAnswerDocument {
     const val LOCAL_ORIGIN = "https://appassets.androidplatform.net"
-    const val LOCAL_BASE_URL = "$LOCAL_ORIGIN/gpt-answer/katex-0.18.1-r1/"
+    const val ASSET_VERSION = "katex-0.18.1-r2"
+    const val LOCAL_BASE_URL = "$LOCAL_ORIGIN/gpt-answer/$ASSET_VERSION/"
     const val LOCAL_DOCUMENT_PATH = "document.html"
     const val MAX_SOURCE_CHARS = 120_000
 
@@ -32,16 +33,69 @@ internal object FormattedAssistantAnswerDocument {
     ): String {
         val truncated = source.length > MAX_SOURCE_CHARS
         val normalized = normalizeForDisplay(validUtf16Prefix(source, MAX_SOURCE_CHARS))
-        val body = when (format) {
-            TeacherGptAnswerFormat.PLAIN_TEXT ->
-                "<div class=\"plain-answer\">${escapeHtml(normalized)}</div>"
-            TeacherGptAnswerFormat.MARKDOWN_TEX -> MarkdownBodyRenderer(normalized).render()
-        }
+        val body = renderBody(normalized, format)
         val truncationNote = if (truncated) {
             "<p class=\"answer-note\">답변이 너무 길어 앞부분만 표시했습니다.</p>"
         } else {
             ""
         }
+
+        return document(body = body + truncationNote, editor = false)
+    }
+
+    fun buildEditor(
+        source: String,
+        format: TeacherGptAnswerFormat = TeacherGptAnswerFormat.MARKDOWN_TEX,
+        hiddenBlockOrdinals: Set<Int> = emptySet(),
+    ): String {
+        val truncated = source.length > MAX_SOURCE_CHARS
+        val boundedSource = validUtf16Prefix(source, MAX_SOURCE_CHARS)
+        val blocks = AssistantAnswerBlocks.parse(boundedSource)
+            .filterNot { it.ordinal in hiddenBlockOrdinals }
+        val body = buildString {
+            var remainingMathExpressions = MAX_RENDERED_MATH_EXPRESSIONS
+            if (blocks.isEmpty()) {
+                append("<p class=\"answer-empty\">남은 답변이 없습니다. 되돌리거나 전체 복원을 눌러주세요.</p>")
+            } else {
+                blocks.forEach { block ->
+                    append("<section class=\"edit-block\" data-block-ordinal=\"")
+                        .append(block.ordinal)
+                        .append("\">")
+                    append("<button class=\"block-check\" type=\"button\" aria-pressed=\"false\" ")
+                        .append("aria-label=\"")
+                        .append(block.ordinal + 1)
+                        .append("번째 줄 선택\"><span aria-hidden=\"true\"></span></button>")
+                    append("<div class=\"block-content\">")
+                    val normalizedBlock = normalizeForDisplay(block.source)
+                    when (format) {
+                        TeacherGptAnswerFormat.PLAIN_TEXT ->
+                            append("<div class=\"plain-answer\">${escapeHtml(normalizedBlock)}</div>")
+                        TeacherGptAnswerFormat.MARKDOWN_TEX -> {
+                            val renderer = MarkdownBodyRenderer(normalizedBlock, remainingMathExpressions)
+                            append(renderer.render())
+                            remainingMathExpressions -= renderer.renderedMathExpressionCount
+                        }
+                    }
+                    append("</div></section>")
+                }
+            }
+            if (truncated) {
+                append("<p class=\"answer-note\">답변이 너무 길어 앞부분만 편집합니다.</p>")
+            }
+        }
+
+        return document(body = body, editor = true)
+    }
+
+    private fun renderBody(source: String, format: TeacherGptAnswerFormat): String = when (format) {
+        TeacherGptAnswerFormat.PLAIN_TEXT ->
+            "<div class=\"plain-answer\">${escapeHtml(source)}</div>"
+        TeacherGptAnswerFormat.MARKDOWN_TEX -> MarkdownBodyRenderer(source).render()
+    }
+
+    private fun document(body: String, editor: Boolean): String {
+        val editorScript = if (editor) "<script defer src=\"editor.js\"></script>" else ""
+        val answerClass = if (editor) "answer answer-editor" else "answer"
 
         return """
             <!doctype html>
@@ -55,10 +109,11 @@ internal object FormattedAssistantAnswerDocument {
               <link rel="stylesheet" href="reader.css">
               <script defer src="katex.min.js"></script>
               <script defer src="renderer.js"></script>
+              $editorScript
               <title>GPT 답변</title>
             </head>
             <body>
-              <main class="answer">$body$truncationNote</main>
+              <main class="$answerClass">$body</main>
             </body>
             </html>
         """.trimIndent()
@@ -74,40 +129,18 @@ internal object FormattedAssistantAnswerDocument {
     }
 
     internal fun normalizeForDisplay(source: String): String {
-        val validSource = validUtf16Prefix(source, source.length)
-        return buildString(validSource.length) {
-            validSource.replace("\r\n", "\n").replace('\r', '\n').forEach { character ->
-            when (character) {
-                '\u00a0' -> append(' ')
-                '\u2028', '\u2029' -> append('\n')
-                '\u00ad',
-                '\u200b',
-                '\u200c',
-                '\u200d',
-                '\u2060',
-                '\ufeff',
-                '\ufffd',
-                '\u202a',
-                '\u202b',
-                '\u202c',
-                '\u202d',
-                '\u202e',
-                '\u2066',
-                '\u2067',
-                '\u2068',
-                '\u2069',
-                -> Unit
-                '\n', '\t' -> append(character)
-                else -> if (character.code >= 0x20 && character.code != 0x7f) append(character)
-            }
-            }
-        }
+        return AssistantAnswerBlocks.normalizeForDisplay(source)
     }
 
-    private class MarkdownBodyRenderer(source: String) {
+    private class MarkdownBodyRenderer(
+        source: String,
+        private val mathExpressionLimit: Int = MAX_RENDERED_MATH_EXPRESSIONS,
+    ) {
         private val lines = source.split('\n')
         private var index = 0
         private var renderedMathExpressions = 0
+        val renderedMathExpressionCount: Int
+            get() = renderedMathExpressions
 
         fun render(): String {
             if (lines.all(String::isBlank)) return "<p class=\"answer-empty\">저장된 답변이 없습니다.</p>"
@@ -198,11 +231,11 @@ internal object FormattedAssistantAnswerDocument {
         }
 
         private fun renderTable(output: StringBuilder) {
-            val header = splitTableRow(lines[index])
+            val header = AssistantAnswerBlocks.splitTableRow(lines[index])
             index += 2
             val rows = mutableListOf<List<String>>()
-            while (index < lines.size && looksLikeTableRow(lines[index])) {
-                rows += splitTableRow(lines[index])
+            while (index < lines.size && AssistantAnswerBlocks.looksLikeTableRow(lines[index])) {
+                rows += AssistantAnswerBlocks.splitTableRow(lines[index])
                 index += 1
             }
             output.append("<div class=\"table-scroll\"><table><thead><tr>")
@@ -297,40 +330,7 @@ internal object FormattedAssistantAnswerDocument {
         }
 
         private fun isTableStart(at: Int): Boolean {
-            if (at + 1 >= lines.size || !looksLikeTableRow(lines[at])) return false
-            val divider = splitTableRow(lines[at + 1])
-            return divider.isNotEmpty() && divider.all { cell ->
-                cell.trim().matches(Regex(":?-{3,}:?"))
-            }
-        }
-
-        private fun looksLikeTableRow(line: String): Boolean = splitTableRow(line).size >= 2
-
-        private fun splitTableRow(line: String): List<String> {
-            val content = line.trim().removePrefix("|").removeSuffix("|")
-            if (!content.contains('|')) return emptyList()
-            val cells = mutableListOf<String>()
-            val cell = StringBuilder()
-            var escaped = false
-            content.forEach { character ->
-                when {
-                    escaped -> {
-                        cell.append(character)
-                        escaped = false
-                    }
-                    character == '\\' -> {
-                        cell.append(character)
-                        escaped = true
-                    }
-                    character == '|' -> {
-                        cells += cell.toString()
-                        cell.clear()
-                    }
-                    else -> cell.append(character)
-                }
-            }
-            cells += cell.toString()
-            return cells
+            return AssistantAnswerBlocks.isTableStart(lines, at)
         }
 
         private fun renderInline(text: String, depth: Int = 0): String {
@@ -348,6 +348,26 @@ internal object FormattedAssistantAnswerDocument {
                             } else {
                                 appendEscaped(text[cursor])
                                 cursor += 1
+                            }
+                        }
+                        text.startsWith("\$\$", cursor) -> {
+                            var end = findUnescaped(text, '$', cursor + 2)
+                            while (end >= 0 && text.getOrNull(end + 1) != '$') {
+                                end = findUnescaped(text, '$', end + 1)
+                            }
+                            val source = if (end > cursor + 2) {
+                                text.substring(cursor + 2, end).trim()
+                            } else {
+                                ""
+                            }
+                            if (source.isNotEmpty()) {
+                                // ChatGPT can place display math inside a list item. The DOM-to-
+                                // Markdown converter keeps it on that item, so render it inline.
+                                append(mathElement(source, display = false))
+                                cursor = end + 2
+                            } else {
+                                append("&#36;&#36;")
+                                cursor += 2
                             }
                         }
                         text[cursor] == '$' && text.getOrNull(cursor + 1) != '$' -> {
@@ -466,7 +486,7 @@ internal object FormattedAssistantAnswerDocument {
             val open = if (display) "\\[" else "\\("
             val close = if (display) "\\]" else "\\)"
             val wrapped = open + source + close
-            if (renderedMathExpressions >= MAX_RENDERED_MATH_EXPRESSIONS) return escapeHtml(wrapped)
+            if (renderedMathExpressions >= mathExpressionLimit) return escapeHtml(wrapped)
             renderedMathExpressions += 1
             return "<$tag class=\"$cssClass\">${escapeHtml(wrapped)}</$tag>"
         }

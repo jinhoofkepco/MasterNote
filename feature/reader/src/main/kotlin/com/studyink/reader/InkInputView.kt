@@ -11,16 +11,16 @@ import androidx.ink.brush.StockBrushes
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
-import com.studyink.document.pdf.PdfViewportAdapter
+import com.studyink.document.pdf.InkViewport
 
 enum class ReaderTool { PAN, PEN, HIGHLIGHTER, PARTIAL_ERASER, WHOLE_ERASER, GRADE }
 
 class InkInputView(context: Context) : View(context) {
-    lateinit var viewport: PdfViewportAdapter
+    lateinit var viewport: InkViewport
     lateinit var wetInkView: InProgressStrokesView
     var tool: ReaderTool = ReaderTool.PEN
-    var penColorArgb: Int = 0xFF17233C.toInt()
-    var penWidthDp: Float = 3.2f
+    var penColorArgb: Int = DEFAULT_PEN_COLOR_ARGB
+    var penWidthDp: Float = DEFAULT_PEN_WIDTH_DP
     var penOpacity: Float = 1f
     var onStroke: (StrokeAsset) -> Unit = {}
     var onStylusContact: () -> Unit = {}
@@ -82,7 +82,19 @@ class InkInputView(context: Context) : View(context) {
      */
     fun cancelActiveEraserGesture(): Boolean {
         if (currentPointer < 0 || !activeTool.isEraser()) return false
+        return cancelActiveGesture()
+    }
+
+    /** Cancels any in-flight pen, highlighter, or eraser gesture without emitting a mutation. */
+    fun cancelActiveGesture(): Boolean {
+        if (currentPointer < 0) return false
+        cancelGradeLongPress()
+        markHistoryGroupId?.let(onEndMarkHistoryDrag)
+        if (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) {
+            wetInkView.cancelUnfinishedStrokes()
+        }
         if (activeEraserGestureId != NO_ERASER_GESTURE) onEraserPreview(null)
+        onHoverPreview(null)
         reset()
         return true
     }

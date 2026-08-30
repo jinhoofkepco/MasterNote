@@ -114,6 +114,44 @@ class AnnotationDocumentTest {
         assertTrue(document.snapshot().activeStrokeIds.contains(added.addedAssets.single().id))
     }
 
+    @Test
+    fun checkpointRestorePreservesSnapshotClockAndUndoRedoHistory() {
+        val document = AnnotationDocument(AnnotationSnapshot.empty("book", 0))
+        val first = document.addStroke(stroke("student")).addedAssets.single()
+        val second = document.addStroke(stroke("student")).addedAssets.single()
+        document.undo("device")
+        val before = document.snapshot()
+        val beforeClock = document.operationClockHighWater
+        val checkpoint = document.checkpoint()
+
+        document.addStroke(stroke("student"))
+        assertFalse(document.canRedo)
+
+        val restored = document.restore(checkpoint)
+        assertEquals(before.bookId, restored.bookId)
+        assertEquals(before.pageNumber, restored.pageNumber)
+        assertEquals(before.revision, restored.revision)
+        assertEquals(before.assets, restored.assets)
+        assertEquals(before.activeStrokeIds, restored.activeStrokeIds)
+        assertEquals(before.appliedOperationIds, restored.appliedOperationIds)
+        assertEquals(beforeClock, document.operationClockHighWater)
+        assertTrue(document.canUndo)
+        assertTrue(document.canRedo)
+
+        val redone = requireNotNull(document.redo("device"))
+        assertTrue(redone.snapshot.activeStrokeIds.containsAll(listOf(first.id, second.id)))
+    }
+
+    @Test
+    fun checkpointCannotBeRestoredIntoAnotherDocument() {
+        val checkpoint = AnnotationDocument(AnnotationSnapshot.empty("book", 0)).checkpoint()
+        val other = AnnotationDocument(AnnotationSnapshot.empty("book", 0))
+
+        val failure = runCatching { other.restore(checkpoint) }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+    }
+
     private fun stroke(author: String) = StrokeAsset(
         pageNumber = 0,
         tool = StrokeTool.PEN,

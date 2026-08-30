@@ -2,11 +2,18 @@ package com.studyink.app
 
 import android.os.SystemClock
 import android.util.Log
+import com.studyink.annotation.storage.AppliedTeacherReviewReceipt
 import com.studyink.annotation.storage.PageOperationLogStore
+import com.studyink.annotation.storage.TeacherReviewPublicationArtifact
+import com.studyink.annotation.storage.TeacherReviewPublicationOrderDisposition
 import com.studyink.annotation.storage.TeacherReviewPublishIntent
+import com.studyink.annotation.storage.teacherReviewPublicationOrderDisposition
 import com.studyink.core.model.Attempt
 import com.studyink.core.model.MarkColor
 import com.studyink.core.model.MarkGroup
+import com.studyink.core.model.TeacherReviewStateEvidence
+import com.studyink.core.model.compareTeacherReviewMarkGroupMetadataGlobalOrder
+import com.studyink.core.model.teacherReviewMarkGroupsSha256
 import com.studyink.library.data.LibraryRepository
 import com.studyink.monitor.core.PageAnnotationCompression
 import com.studyink.monitor.core.PageAnnotationEnvelope
@@ -37,6 +44,7 @@ import com.studyink.monitor.core.StudentWorkHeartbeat
 import com.studyink.monitor.core.TeacherReviewPublished
 import com.studyink.monitor.core.TeacherReviewPublicationProvenance
 import com.studyink.monitor.core.pageAnnotationSha256Hex
+import com.studyink.monitor.core.teacherReviewStateSha256
 import com.studyink.monitor.telegram.RemoteReviewRole
 import com.studyink.monitor.telegram.TelegramEnqueueResult
 import com.studyink.sync.lan.LanTeacherReviewPublication
@@ -83,6 +91,12 @@ private data class StudentInventoryBook(
     val key: String get() = "$syncGeneration:$bookId"
 }
 
+private data class TeacherReviewTransactionResult(
+    val disposition: PageSyncAckDisposition,
+    val reasonCode: String? = null,
+    val appliedPayload: RemoteTeacherPageReviewPayload? = null,
+)
+
 /**
  * Serial, page-scoped slow-live synchronization. It intentionally allows only one student-page
  * request at a time; current/recent pages are automatic and every older page is explicit UI work.
@@ -96,6 +110,133 @@ internal class RemotePageSyncController(
     private val reserveTeacherReviewRevision: (pageToken: String, transferId: String) -> Long,
     private val outboundState: (payloadType: String, transferId: String) -> RemotePageSyncOutboundState,
     private val sendEnvelope: (RemoteReviewEnvelope) -> TelegramEnqueueResult,
+    /** Pair-scoped latest publications, including already ACKed authority rows. */
+    private val teacherReviewAuthorities: (
+        pairId: String,
+        workbookToken: String,
+        bookId: String,
+        pageNumber: Int,
+    ) -> List<TeacherReviewPublishIntent> = { pairId, workbookToken, bookId, pageNumber ->
+        annotationStore.teacherReviewAuthorityIntents(
+            bookId,
+            pageNumber,
+            pairId,
+            workbookToken,
+        )
+    },
+    /** Small durable evidence rows; normal manifest comparison must not read checkpoint artifacts. */
+    private val teacherReviewAuthorityState: (
+        pairId: String,
+        workbookToken: String,
+        bookId: String,
+        pageNumber: Int,
+        attemptNos: Set<Int>,
+    ) -> List<TeacherReviewStateEvidence> = { pairId, workbookToken, bookId, pageNumber, attemptNos ->
+        if (attemptNos.isEmpty()) emptyList() else annotationStore.teacherReviewAuthorityEvidence(
+            bookId,
+            pageNumber,
+            pairId,
+            workbookToken,
+            attemptNos,
+        )
+    },
+    private val requeueTeacherReviewAuthorities: (
+        pairId: String,
+        workbookToken: String,
+        bookId: String,
+        pageNumber: Int,
+        attemptNos: Set<Int>,
+    ) -> List<TeacherReviewPublishIntent> = { pairId, workbookToken, bookId, pageNumber, attemptNos ->
+        if (attemptNos.isEmpty()) emptyList() else annotationStore.requeueTeacherReviewAuthorities(
+            bookId,
+            pageNumber,
+            pairId,
+            attemptNos,
+            workbookToken,
+        )
+    },
+    /** Resolves both a live pending artifact and an ACKed authority artifact. */
+    private val teacherReviewArtifact: (
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        publicationId: String,
+    ) -> TeacherReviewPublicationArtifact? = { bookId, pageNumber, attemptNo, publicationId ->
+        annotationStore.teacherReviewPublicationArtifact(
+            bookId,
+            pageNumber,
+            attemptNo,
+            publicationId,
+        )
+    },
+    /** Durable student-side evidence, returned only while the installed ink and grades still match. */
+    private val appliedTeacherReviewState: (
+        pairId: String,
+        workbookToken: String,
+        pageToken: String,
+        bookId: String,
+        pageNumber: Int,
+        attemptNos: Set<Int>,
+        currentPageMarkGroups: Collection<MarkGroup>,
+    ) -> Collection<TeacherReviewStateEvidence> = {
+            pairId, workbookToken, _, bookId, pageNumber, attemptNos, currentPageMarkGroups ->
+        if (attemptNos.isEmpty()) {
+            emptyList()
+        } else {
+            annotationStore.verifiedAppliedTeacherReviewEvidence(
+                bookId = bookId,
+                pageNumber = pageNumber,
+                currentPageMarkGroups = currentPageMarkGroups,
+                remotePairId = pairId,
+                remoteWorkbookToken = workbookToken,
+                attemptNos = attemptNos,
+            )
+        }
+    },
+    /** Shared LAN/Telegram applied ledger hook; app-local sourceRevision cache remains separate. */
+    private val recordAppliedTeacherReviewPublication: (
+        pairId: String,
+        workbookToken: String,
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        publicationId: String,
+        payloadSha256: String,
+        resultLayerSha256: String,
+        markGroupsSha256: String,
+        publishedAtEpochMs: Long,
+        appliedAtEpochMs: Long,
+    ) -> Unit = { pairId, workbookToken, bookId, pageNumber, attemptNo, publicationId,
+            _, resultLayerSha256, markGroupsSha256, publishedAtEpochMs, appliedAtEpochMs ->
+        val current = annotationStore.appliedTeacherReviewReceipt(
+            bookId,
+            pageNumber,
+            attemptNo,
+            pairId,
+            workbookToken,
+        )
+        val appliedAt = current?.takeIf {
+            it.publicationId == publicationId && it.resultLayerSha256 == resultLayerSha256 &&
+                it.markGroupsSha256 == markGroupsSha256
+        }?.appliedAtEpochMillis ?: appliedAtEpochMs
+        val publishedAt = current?.takeIf {
+            it.publicationId == publicationId && it.publishedAtEpochMillis > 0L
+        }?.publishedAtEpochMillis ?: publishedAtEpochMs
+        annotationStore.recordAppliedTeacherReviewReceipt(
+            AppliedTeacherReviewReceipt(
+                bookId = bookId,
+                pageNumber = pageNumber,
+                attemptNo = attemptNo,
+                publicationId = publicationId,
+                resultLayerSha256 = resultLayerSha256,
+                markGroupsSha256 = markGroupsSha256,
+                appliedAtEpochMillis = appliedAt,
+                publishedAtEpochMillis = publishedAt,
+                remotePairId = pairId,
+                remoteWorkbookToken = workbookToken,
+            ),
+        )
+    },
     private val nowElapsedMs: () -> Long = SystemClock::elapsedRealtime,
     private val nowEpochMs: () -> Long = System::currentTimeMillis,
 ) {
@@ -142,6 +283,12 @@ internal class RemotePageSyncController(
     private val failedPageTokens = linkedSetOf<String>()
     private val failedTeacherReviewKeys = linkedSetOf<String>()
     private var nextTeacherReviewSendAtElapsedMs = 0L
+    /** Student advertises the manifest extension only after a new teacher proves it can decode it. */
+    private var studentTeacherReviewStateCapabilityGeneration = 0L
+    /** At most one durably accepted capability probe is sent for each observed student generation. */
+    private var teacherReviewStateProbeGeneration = 0L
+    /** Only an actually decoded digest manifest proves that this generation accepts extensions. */
+    private var teacherReviewStatePeerGeneration = 0L
     /** UI attachment must never wait behind a multi-megabyte page decode held by this controller. */
     @Volatile private var latestUiState = RemotePageSyncUiState()
 
@@ -176,6 +323,9 @@ internal class RemotePageSyncController(
         failedPageTokens.clear()
         failedTeacherReviewKeys.clear()
         nextTeacherReviewSendAtElapsedMs = 0L
+        studentTeacherReviewStateCapabilityGeneration = 0L
+        teacherReviewStateProbeGeneration = 0L
+        teacherReviewStatePeerGeneration = 0L
         if (next?.role == RemoteReviewRole.STUDENT && telegramActive) {
             // Transport callbacks may arrive before the peer session is bound on process start.
             // Reconstruct the bounded crash-gap audit here as well as on a live fallback edge.
@@ -545,6 +695,8 @@ internal class RemotePageSyncController(
             }
             pages.filter { it.localBookId != null }.forEach(::applyManifestAttempts)
             bindDeferredTeacherReviews(manifestReviewEvidence(envelope, store.teacherPages()))
+            sendTeacherReviewStateCapabilityProbe(envelope)
+            reconcileTeacherReviewState(envelope, store.teacherPages())
             failedPageTokens.retainAll(
                 store.teacherPages().mapTo(linkedSetOf(), TeacherPageSyncRecord::pageToken),
             )
@@ -566,9 +718,146 @@ internal class RemotePageSyncController(
             applyManifestAttempts(page)
         }
         bindDeferredTeacherReviews(manifestReviewEvidence(envelope, installedPages))
+        sendTeacherReviewStateCapabilityProbe(envelope)
+        reconcileTeacherReviewState(envelope, installedPages)
         publishTeacherCursor()
         tickTeacher(requireNotNull(session))
         notifyUiChanged()
+    }
+
+    /**
+     * Uses the already-compatible ACK envelope as a one-shot capability probe. Old students simply
+     * drop it because it matches no annotation response; new students answer by advertising the
+     * optional digest extension in their next fast manifest.
+     */
+    private fun sendTeacherReviewStateCapabilityProbe(envelope: PageSyncManifestEnvelope) {
+        if (envelope.entries.any { it.teacherReviewStateSha256 != null }) {
+            teacherReviewStateProbeGeneration = envelope.syncGeneration
+            teacherReviewStatePeerGeneration = envelope.syncGeneration
+            return
+        }
+        if (teacherReviewStateProbeGeneration == envelope.syncGeneration) return
+        val first = envelope.entries.firstOrNull() ?: return
+        val probe = pageSyncAck(
+            syncGeneration = envelope.syncGeneration,
+            sourceType = PageSyncAckSourceType.ANNOTATION,
+            sourceTransferId = envelope.transferId,
+            pageToken = first.pageToken,
+            pageNumber = first.pageNumber,
+            sourceRevision = first.revision,
+            disposition = PageSyncAckDisposition.DUPLICATE,
+            reasonCode = TEACHER_REVIEW_STATE_CAPABILITY_REASON,
+        )
+        if (runCatching { sendEnvelope(probe).isDurablyAccepted() }.getOrDefault(false)) {
+            teacherReviewStateProbeGeneration = envelope.syncGeneration
+        }
+    }
+
+    /**
+     * A transport ACK is only a hint. A newer student manifest is the application-level proof of
+     * the exact published ink and grades installed for each attempt. Unknown legacy state is left
+     * alone; a known mismatch reopens every authoritative attempt on that page so partial loss is
+     * repaired without guessing which member of the page digest differed.
+     */
+    private fun reconcileTeacherReviewState(
+        envelope: PageSyncManifestEnvelope,
+        installedPages: List<TeacherPageSyncRecord>,
+    ) {
+        val currentSession = session?.takeIf { it.role == RemoteReviewRole.TEACHER } ?: return
+        val entriesByToken = envelope.entries.associateBy(PageSyncManifestEntry::pageToken)
+        var reopened = false
+        installedPages.forEach { page ->
+            val localBookId = page.localBookId ?: return@forEach
+            val entry = entriesByToken[page.pageToken] ?: return@forEach
+            // Legacy manifests are intentionally a no-op and should not trigger any storage I/O.
+            val observedStateSha256 = entry.teacherReviewStateSha256 ?: return@forEach
+            val book = runCatching { library.book(localBookId) }.getOrNull() ?: return@forEach
+            if (book.contentSha256.lowercase() != page.contentSha256) return@forEach
+            val intents = teacherReviewAuthorities(
+                currentSession.pairId,
+                page.workbookToken,
+                localBookId,
+                page.pageNumber,
+            ).filter { intent ->
+                isTeacherReviewAuthorityForManifest(
+                    intent = intent,
+                    pairId = currentSession.pairId,
+                    workbookToken = page.workbookToken,
+                    bookId = localBookId,
+                    pageNumber = page.pageNumber,
+                    attemptNos = entry.attemptNos,
+                )
+            }
+            if (intents.isEmpty()) return@forEach
+            val distinctByAttempt = intents.groupBy(TeacherReviewPublishIntent::attemptNo)
+            if (distinctByAttempt.values.any { it.size != 1 }) return@forEach
+            val evidenceByAttempt = teacherReviewAuthorityState(
+                currentSession.pairId,
+                page.workbookToken,
+                localBookId,
+                page.pageNumber,
+                entry.attemptNos.toSet(),
+            ).groupBy(TeacherReviewStateEvidence::attemptNo)
+            if (evidenceByAttempt.values.any { it.size != 1 }) return@forEach
+            val expectedEvidence = intents.mapNotNull { intent ->
+                evidenceByAttempt[intent.attemptNo]?.singleOrNull()?.takeIf { evidence ->
+                    evidence.publicationId == intent.publicationId &&
+                        evidence.resultLayerSha256 == intent.resultLayerSha256
+                }
+            }
+            // An incomplete or inconsistent ledger must never clear a still-valid publication.
+            if (expectedEvidence.size != intents.size) return@forEach
+            val expectedStateSha256 = runCatching {
+                teacherReviewStateSha256(expectedEvidence)
+            }.getOrNull() ?: return@forEach
+            val records = intents.map { intent ->
+                PendingTeacherReviewRecord(
+                    intentId = intent.publicationId,
+                    bookId = localBookId,
+                    contentSha256 = page.contentSha256,
+                    workbookToken = page.workbookToken,
+                    pageNumber = page.pageNumber,
+                    attemptNo = intent.attemptNo,
+                    queuedAtEpochMs = intent.updatedAtEpochMillis,
+                )
+            }
+            when (teacherReviewManifestDisposition(observedStateSha256, expectedStateSha256)) {
+                TeacherReviewManifestDisposition.UNKNOWN -> Unit
+                TeacherReviewManifestDisposition.MATCH -> {
+                    records.forEach { record ->
+                        store.confirmTeacherReviewFromManifest(record, envelope.createdAtEpochMs)
+                        annotationStore.removeTeacherReviewPublishIntent(
+                            record.bookId,
+                            record.pageNumber,
+                            record.attemptNo,
+                            record.intentId,
+                        )
+                        failedTeacherReviewKeys -= record.key
+                    }
+                }
+                TeacherReviewManifestDisposition.MISMATCH -> {
+                    val requeuedIds = requeueTeacherReviewAuthorities(
+                        currentSession.pairId,
+                        page.workbookToken,
+                        localBookId,
+                        page.pageNumber,
+                        records.mapTo(linkedSetOf(), PendingTeacherReviewRecord::attemptNo),
+                    ).mapTo(hashSetOf(), TeacherReviewPublishIntent::publicationId)
+                    records.filter { it.intentId in requeuedIds }.forEach { record ->
+                        if (store.reopenTeacherReviewFromManifest(record)) {
+                            failedTeacherReviewKeys -= record.key
+                            reopened = true
+                        }
+                    }
+                }
+            }
+        }
+        if (reopened) {
+            nextTeacherReviewSendAtElapsedMs = minOf(
+                nextTeacherReviewSendAtElapsedMs,
+                nowElapsedMs(),
+            )
+        }
     }
 
     @Synchronized
@@ -738,6 +1027,19 @@ internal class RemotePageSyncController(
                 if (envelope.sourceType != PageSyncAckSourceType.ANNOTATION) {
                     return RemotePageSyncIncomingResult.DROP
                 }
+                if (envelope.reasonCode == TEACHER_REVIEW_STATE_CAPABILITY_REASON) {
+                    val generation = store.studentGeneration()
+                    val page = store.studentPage(envelope.pageToken)
+                        ?: return RemotePageSyncIncomingResult.DROP
+                    if (envelope.disposition != PageSyncAckDisposition.DUPLICATE ||
+                        envelope.syncGeneration != generation || page.syncGeneration != generation ||
+                        page.pageNumber + 1 != envelope.pageNumber ||
+                        envelope.sourceRevision > page.sourceRevision
+                    ) return RemotePageSyncIncomingResult.DROP
+                    studentTeacherReviewStateCapabilityGeneration = generation
+                    scheduleInteractiveManifest()
+                    return RemotePageSyncIncomingResult.ACKNOWLEDGE
+                }
                 val accepted = envelope.disposition != PageSyncAckDisposition.REJECTED
                 val resolved = store.resolveStudentAnnotationAck(
                     envelope.syncGeneration,
@@ -819,11 +1121,15 @@ internal class RemotePageSyncController(
                 },
         )
         rebound.forEach(::applyManifestAttempts)
-        bindDeferredTeacherReviewsAfterExplicitMapping(
+        val reviewBindingChanged = bindDeferredTeacherReviewsAfterExplicitMapping(
             page.workbookToken,
             candidate.localBookId,
             rebound,
         )
+        if (reviewBindingChanged) {
+            drainTeacherPublishIntents()
+            nextTeacherReviewSendAtElapsedMs = minOf(nextTeacherReviewSendAtElapsedMs, nowElapsedMs())
+        }
         failedPageTokens.removeAll(rebound.map(TeacherPageSyncRecord::pageToken).toSet())
         publishTeacherCursor()
         session?.let(::tickTeacher)
@@ -1041,6 +1347,16 @@ internal class RemotePageSyncController(
             )
         }
         val ordered = selectedTokens.mapNotNull(pagesByToken::get)
+        val advertisesTeacherReviewState =
+            studentTeacherReviewStateCapabilityGeneration == reservation.syncGeneration
+        // markGroupsForSync performs whole-book ordering. Read it once per selected book, then
+        // reuse page buckets across a 47-row inventory manifest instead of repeating that work.
+        val markGroupsByBookAndPage = if (advertisesTeacherReviewState) {
+            ordered.asSequence().map(StudentPageSyncRecord::bookId).distinct().associateWith { bookId ->
+                runCatching { library.markGroupsForSync(bookId).groupBy(MarkGroup::pageNumber) }
+                    .getOrNull()
+            }
+        } else emptyMap()
         val entries = ordered.map { page ->
             PageSyncManifestEntry(
                 pageToken = page.pageToken,
@@ -1053,6 +1369,22 @@ internal class RemotePageSyncController(
                 revision = page.sourceRevision,
                 lastChangedEpochMs = page.lastChangedAtEpochMs,
                 approxBytes = page.approximateBytes.coerceAtMost(RemoteReviewLimits.MAX_PAGE_SYNC_APPROX_BYTES),
+                teacherReviewStateSha256 = if (advertisesTeacherReviewState &&
+                    markGroupsByBookAndPage[page.bookId] != null
+                ) {
+                    teacherReviewStateDigestOrNull {
+                        appliedTeacherReviewState(
+                            requireNotNull(session).pairId,
+                            page.workbookToken,
+                            page.pageToken,
+                            page.bookId,
+                            page.pageNumber,
+                            page.attemptNos.toSet(),
+                            markGroupsByBookAndPage.getValue(page.bookId)
+                                .orEmpty()[page.pageNumber].orEmpty(),
+                        )
+                    }
+                } else null,
             )
         }
         val current = currentToken?.let { token -> ordered.firstOrNull { it.pageToken == token } }
@@ -1212,6 +1544,7 @@ internal class RemotePageSyncController(
                     }
                     if (pageAnnotationSha256Hex(rebuilt.copyDecodedPayloadBytes()) != pending.inFlightPayloadSha256 ||
                         rebuilt.resultLayerSha256 != pending.inFlightResultLayerSha256 ||
+                        (rebuilt.responseToTransferId != null) != pending.inFlightCarriesPublicationId ||
                         !runCatching { sendEnvelope(rebuilt).isDurablyAccepted() }.getOrDefault(false)
                     ) {
                         store.expirePendingTeacherReview(pending.key, nowEpochMs())
@@ -1237,11 +1570,13 @@ internal class RemotePageSyncController(
             "${pending.intentId}:${pending.retryCount}:${manifestPage.syncGeneration}:${manifestPage.pageToken}",
         )
         val revision = reserveTeacherReviewRevision(manifestPage.pageToken, transferId)
+        val carriesPublicationId = teacherReviewStatePeerGeneration == manifestPage.syncGeneration
         val envelope = buildTeacherReviewEnvelope(
             pending,
             manifestPage,
             transferId,
             revision,
+            carriesPublicationId,
         ) ?: run {
             failedTeacherReviewKeys += pending.key
             nextTeacherReviewSendAtElapsedMs = safeAdd(nowElapsedMs(), SEND_RETRY_MS)
@@ -1258,6 +1593,7 @@ internal class RemotePageSyncController(
             payloadSha,
             envelope.resultLayerSha256,
             nowEpochMs(),
+            carriesPublicationId,
         )
         if (runCatching { sendEnvelope(envelope).isDurablyAccepted() }.getOrDefault(false)) {
             nextTeacherReviewSendAtElapsedMs = safeAdd(nowElapsedMs(), TEACHER_REVIEW_INTERVAL_MS)
@@ -1272,6 +1608,7 @@ internal class RemotePageSyncController(
             page,
             requireNotNull(pending.inFlightTransferId),
             pending.inFlightSourceRevision,
+            pending.inFlightCarriesPublicationId,
         )
     }
 
@@ -1280,11 +1617,12 @@ internal class RemotePageSyncController(
         manifestPage: TeacherPageSyncRecord,
         transferId: String,
         sourceRevision: Long,
+        carriesPublicationId: Boolean,
     ): PageAnnotationEnvelope? = runCatching {
         val book = library.book(pending.bookId)
         require(book.contentSha256.lowercase() == pending.contentSha256)
         val artifact = requireNotNull(
-            annotationStore.teacherReviewPublicationArtifact(
+            teacherReviewArtifact(
                 book.id,
                 pending.pageNumber,
                 pending.attemptNo,
@@ -1299,10 +1637,17 @@ internal class RemotePageSyncController(
         )
         PageAnnotationEnvelope.fromDecodedPayload(
             transferId = transferId,
-            createdAtEpochMs = pending.queuedAtEpochMs,
+            // Cross-route ordering must use the immutable publication time, never a retry time.
+            createdAtEpochMs = artifact.intent.updatedAtEpochMillis,
             syncGeneration = manifestPage.syncGeneration,
             purpose = PageAnnotationPurpose.TEACHER_REVIEW,
-            responseToTransferId = null,
+            // Old students reject the extension. Freeze this decision with the in-flight transfer
+            // and expose the semantic publication id only after this generation advertised proof.
+            responseToTransferId = teacherReviewPublicationIdForPeer(
+                pending.intentId,
+                peerCapabilityGeneration = if (carriesPublicationId) manifestPage.syncGeneration else 0L,
+                pageGeneration = manifestPage.syncGeneration,
+            ),
             pageToken = manifestPage.pageToken,
             pageNumber = pending.pageNumber + 1,
             attemptNos = listOf(pending.attemptNo),
@@ -1446,87 +1791,232 @@ internal class RemotePageSyncController(
         if (attemptNo !in page.attemptNos) {
             return acknowledgeAnnotation(envelope, PageSyncAckDisposition.REJECTED, "ATTEMPT_UNKNOWN")
         }
-        val appliedReview = store.appliedTeacherReview(envelope.pageToken, attemptNo)
+        val pairId = session?.takeIf { it.role == RemoteReviewRole.STUDENT }?.pairId
+            ?: return RemotePageSyncIncomingResult.DROP
+        val transaction = runCatching {
+            annotationStore.withTeacherReviewTargetLock(page.bookId, page.pageNumber, attemptNo) {
+                applyTeacherReviewTransaction(page, attemptNo, pairId, envelope)
+            }
+        }.getOrElse { error ->
+            if (error is Error) throw error
+            null
+        } ?: return RemotePageSyncIncomingResult.RETAIN
+        transaction.appliedPayload?.let { payload ->
+            RemoteReviewFeedbackBus.publish(
+                RemoteTeacherFeedbackApplied(
+                    bookId = page.bookId,
+                    pageNumber = page.pageNumber,
+                    attemptNo = attemptNo,
+                    transferId = envelope.transferId,
+                    basedOnStudentRevision = page.sourceRevision,
+                ),
+            )
+            payload.markGroups.forEach { group ->
+                if (group.hiddenAtEpochMillis != null) return@forEach
+                val latest = group.marks.lastOrNull {
+                    it.attemptNo == attemptNo && it.hiddenAtEpochMillis == null
+                } ?: return@forEach
+                RemoteGradeAppliedBus.publish(
+                    RemoteGradeApplied(
+                        page.bookId,
+                        page.pageNumber,
+                        attemptNo,
+                        group.id,
+                        latest.color == MarkColor.BLUE,
+                    ),
+                )
+            }
+            // Do not wait for the next handwriting callback: advertise application-level proof on
+            // the fast manifest lane so a lost ACK cannot leave the publication pinned in flight.
+            scheduleInteractiveManifest()
+        }
+        return acknowledgeAnnotation(
+            envelope,
+            transaction.disposition,
+            transaction.reasonCode,
+        )
+    }
+
+    /** Must run under [PageOperationLogStore.withTeacherReviewTargetLock]. */
+    private fun applyTeacherReviewTransaction(
+        page: StudentPageSyncRecord,
+        attemptNo: Int,
+        pairId: String,
+        envelope: PageAnnotationEnvelope,
+    ): TeacherReviewTransactionResult? {
+        val sharedReceipt = annotationStore.appliedTeacherReviewReceipt(
+            page.bookId,
+            page.pageNumber,
+            attemptNo,
+            pairId,
+        )
+        val publicationId = envelope.responseToTransferId
+        val order = if (publicationId == null) {
+            if (sharedReceipt?.publishedAtEpochMillis?.let { it > 0L } == true) {
+                TeacherReviewPublicationOrderDisposition.STALE
+            } else {
+                TeacherReviewPublicationOrderDisposition.APPLY
+            }
+        } else {
+            teacherReviewPublicationOrderDisposition(
+                sharedReceipt,
+                publicationId,
+                envelope.createdAtEpochMs,
+            )
+        }
+        when (order) {
+            TeacherReviewPublicationOrderDisposition.STALE -> return TeacherReviewTransactionResult(
+                PageSyncAckDisposition.DUPLICATE,
+            )
+            TeacherReviewPublicationOrderDisposition.CONFLICT -> return TeacherReviewTransactionResult(
+                PageSyncAckDisposition.REJECTED,
+                "PUBLICATION_TIME_CONFLICT",
+            )
+            TeacherReviewPublicationOrderDisposition.DUPLICATE_VERIFY -> {
+                val installedMarkGroupsSha256 = installedTeacherReviewMarkGroupsSha256(
+                    page,
+                    attemptNo,
+                    envelope,
+                )
+                if (installedMarkGroupsSha256 != null) {
+                    if (!recordSharedTeacherReviewReceipt(
+                            page, attemptNo, envelope, installedMarkGroupsSha256,
+                        )
+                    ) return null
+                    return TeacherReviewTransactionResult(PageSyncAckDisposition.DUPLICATE)
+                }
+                // Known publication, rolled-back actual state: exact payload repair continues.
+            }
+            TeacherReviewPublicationOrderDisposition.APPLY -> Unit
+        }
+
+        // Only an identity-less legacy frame may use route-local revisions. A semantic
+        // publication ordered by the shared receipt is authoritative across LAN and Telegram.
+        val appliedReview = if (publicationId == null) {
+            store.appliedTeacherReview(envelope.pageToken, attemptNo)
+        } else null
         if (appliedReview != null && envelope.sourceRevision < appliedReview.sourceRevision) {
-            return acknowledgeAnnotation(envelope, PageSyncAckDisposition.DUPLICATE)
+            return TeacherReviewTransactionResult(PageSyncAckDisposition.DUPLICATE)
         }
         if (appliedReview != null && envelope.sourceRevision == appliedReview.sourceRevision) {
-            return if (
-                appliedReview.payloadSha256 == envelope.payloadSha256 &&
+            val exactPayload = appliedReview.payloadSha256 == envelope.payloadSha256 &&
                 appliedReview.resultLayerSha256 == envelope.resultLayerSha256
-            ) {
-                acknowledgeAnnotation(envelope, PageSyncAckDisposition.DUPLICATE)
-            } else {
-                acknowledgeAnnotation(
-                    envelope,
+            if (!exactPayload) {
+                return TeacherReviewTransactionResult(
                     PageSyncAckDisposition.REJECTED,
                     "REVISION_PAYLOAD_MISMATCH",
                 )
             }
-        }
-        val payload = runCatching {
-            val decoded = RemoteTeacherPageReviewCodec.decode(envelope.copyDecodedPayloadBytes())
-            require(decoded.pageNumber == envelope.pageNumber && decoded.attemptNo == attemptNo)
-            // An explicit teacher publication may target the student's current open attempt.
-            // Exact book/page/attempt provenance was already verified above; submission is not
-            // part of that identity and must not silently reject a live correction.
-            require(isKnownStudentAttemptForReview(
-                library.attempts(page.bookId, page.pageNumber),
+            val installedMarkGroupsSha256 = installedTeacherReviewMarkGroupsSha256(
+                page,
                 attemptNo,
-            ))
+                envelope,
+            )
+            if (installedMarkGroupsSha256 != null) {
+                return TeacherReviewTransactionResult(PageSyncAckDisposition.DUPLICATE)
+            }
+        }
+
+        val applied = runCatching {
+            val payload = RemoteTeacherPageReviewCodec.decode(envelope.copyDecodedPayloadBytes())
+            require(payload.pageNumber == envelope.pageNumber && payload.attemptNo == attemptNo)
+            require(
+                isKnownStudentAttemptForReview(
+                    library.attempts(page.bookId, page.pageNumber),
+                    attemptNo,
+                ),
+            )
             val layer = annotationStore.applyPublishedTeacherLayerCheckpoint(
                 localBookId = page.bookId,
                 pageNumber = page.pageNumber,
                 attemptNo = attemptNo,
-                checkpointBytes = decoded.copyPublishedTeacherCheckpoint(),
+                checkpointBytes = payload.copyPublishedTeacherCheckpoint(),
                 expectedResultLayerSha256 = envelope.resultLayerSha256,
             )
             require(layer.layerSha256 == envelope.resultLayerSha256)
-            library.upsertMarkGroupAttemptsFromSync(
+            library.replaceMarkGroupAttemptSnapshotFromSync(
                 bookId = page.bookId,
                 pageNumber = page.pageNumber,
                 attemptNo = attemptNo,
-                incoming = decoded.markGroups.map { remote ->
+                incoming = payload.markGroups.map { remote ->
                     remote.copy(bookId = page.bookId, pageNumber = page.pageNumber)
                 },
             )
+            val markGroupsSha256 = teacherReviewMarkGroupsSha256(payload.markGroups)
             store.recordTeacherReviewApplied(
                 envelope.pageToken,
                 attemptNo,
                 envelope.sourceRevision,
                 envelope.payloadSha256,
                 envelope.resultLayerSha256,
+                publicationId,
+                markGroupsSha256,
             )
-            decoded
-        }.getOrNull() ?: return acknowledgeAnnotation(
-            envelope,
+            payload to markGroupsSha256
+        }.getOrNull() ?: return TeacherReviewTransactionResult(
             PageSyncAckDisposition.REJECTED,
             "REVIEW_APPLY_FAILED",
         )
-        RemoteReviewFeedbackBus.publish(
-            RemoteTeacherFeedbackApplied(
-                bookId = page.bookId,
-                pageNumber = page.pageNumber,
-                attemptNo = attemptNo,
-                transferId = envelope.transferId,
-                basedOnStudentRevision = page.sourceRevision,
-            ),
+        if (!recordSharedTeacherReviewReceipt(
+                page,
+                attemptNo,
+                envelope,
+                applied.second,
+            )
+        ) return null
+        return TeacherReviewTransactionResult(
+            PageSyncAckDisposition.APPLIED,
+            appliedPayload = applied.first,
         )
-        payload.markGroups.forEach { group ->
-            if (group.hiddenAtEpochMillis != null) return@forEach
-            val latest = group.marks.lastOrNull { it.attemptNo == attemptNo && it.hiddenAtEpochMillis == null }
-                ?: return@forEach
-            RemoteGradeAppliedBus.publish(
-                RemoteGradeApplied(
-                    page.bookId,
-                    page.pageNumber,
-                    attemptNo,
-                    group.id,
-                    latest.color == MarkColor.BLUE,
-                ),
+    }
+
+    private fun installedTeacherReviewMarkGroupsSha256(
+        page: StudentPageSyncRecord,
+        attemptNo: Int,
+        envelope: PageAnnotationEnvelope,
+    ): String? {
+        val decoded = runCatching {
+            RemoteTeacherPageReviewCodec.decode(envelope.copyDecodedPayloadBytes())
+        }.getOrNull() ?: return null
+        if (decoded.pageNumber != envelope.pageNumber || decoded.attemptNo != attemptNo) return null
+        val installedLayer = runCatching {
+            annotationStore.publishedTeacherLayerSha256(page.bookId, page.pageNumber, attemptNo)
+        }.getOrNull() ?: return null
+        if (installedLayer != envelope.resultLayerSha256) return null
+        val payloadGrades = teacherReviewMarkGroupsSha256(decoded.markGroups)
+        val installedGroups = exactTeacherReviewMarkGroups(page.bookId, page.pageNumber, attemptNo)
+        val installedGrades = teacherReviewMarkGroupsSha256(installedGroups)
+        return payloadGrades.takeIf {
+            it == installedGrades && teacherReviewMetadataCoversIncoming(
+                current = installedGroups,
+                incoming = decoded.markGroups,
             )
         }
-        return acknowledgeAnnotation(envelope, PageSyncAckDisposition.APPLIED)
+    }
+
+    private fun recordSharedTeacherReviewReceipt(
+        page: StudentPageSyncRecord,
+        attemptNo: Int,
+        envelope: PageAnnotationEnvelope,
+        markGroupsSha256: String,
+    ): Boolean {
+        val publicationId = envelope.responseToTransferId ?: return true
+        val pairId = session?.takeIf { it.role == RemoteReviewRole.STUDENT }?.pairId ?: return false
+        return runCatching {
+            recordAppliedTeacherReviewPublication(
+                pairId,
+                page.workbookToken,
+                page.bookId,
+                page.pageNumber,
+                attemptNo,
+                publicationId,
+                envelope.payloadSha256,
+                envelope.resultLayerSha256,
+                markGroupsSha256,
+                envelope.createdAtEpochMs,
+                nowEpochMs(),
+            )
+        }.isSuccess
     }
 
     private fun receiveTeacherAck(envelope: PageSyncAckEnvelope): RemotePageSyncIncomingResult {
@@ -2422,7 +2912,7 @@ internal class RemotePageSyncController(
     private fun queueTeacherEvent(event: TeacherReviewPublished) {
         val book = runCatching { library.book(event.bookId) }.getOrNull() ?: return
         if (event.pageNumber !in 0 until book.pageCount || book.contentSha256.length != 64) return
-        val artifact = annotationStore.teacherReviewPublicationArtifact(
+        val artifact = teacherReviewArtifact(
             book.id,
             event.pageNumber,
             event.attemptNo,
@@ -2512,7 +3002,7 @@ internal class RemotePageSyncController(
                     annotationStore.recordTeacherReviewPublishIntent(intent, exactGroups)
                 }.getOrNull() ?: return@forEach
             } else intent
-            val artifact = annotationStore.teacherReviewPublicationArtifact(
+            val artifact = teacherReviewArtifact(
                 intent.bookId,
                 intent.pageNumber,
                 intent.attemptNo,
@@ -2563,9 +3053,29 @@ internal class RemotePageSyncController(
     }
 
     private fun bindDeferredTeacherReviews(evidence: List<TeacherReviewManifestEvidence>) {
+        val pairId = session?.pairId?.takeIf { it == store.currentPairId() } ?: return
         store.pendingTeacherReviews().forEach { pending ->
             val token = resolveDeferredReviewWorkbookToken(pending, evidence) ?: return@forEach
-            store.bindDeferredTeacherReviewWorkbook(pending.key, pending.intentId, token)
+            bindDeferredTeacherReviewAuthority(pending, pairId, token)
+        }
+        val visitedPublications = hashSetOf<String>()
+        evidence.forEach { row ->
+            val authorities = runCatching {
+                annotationStore.teacherReviewAuthorityIntents(
+                    row.localBookId,
+                    row.pageNumber,
+                    pairId,
+                )
+            }.getOrDefault(emptyList())
+            authorities.forEach authorityLoop@{ authority ->
+                if (!visitedPublications.add(authority.publicationId)) return@authorityLoop
+                val token = resolveDeferredAuthorityWorkbookToken(
+                    authority,
+                    pairId,
+                    evidence,
+                ) ?: return@authorityLoop
+                bindTeacherReviewAuthority(authority, pairId, token)
+            }
         }
     }
 
@@ -2609,7 +3119,9 @@ internal class RemotePageSyncController(
         workbookToken: String,
         localBookId: String,
         pages: List<TeacherPageSyncRecord>,
-    ) {
+    ): Boolean {
+        val pairId = session?.pairId?.takeIf { it == store.currentPairId() } ?: return false
+        var changed = false
         store.pendingTeacherReviews().forEach { pending ->
             if (!pending.deferredWorkbookBinding || pending.workbookToken != null ||
                 pending.inFlight || pending.bookId != localBookId
@@ -2619,9 +3131,118 @@ internal class RemotePageSyncController(
                     page.pageNumber == pending.pageNumber && pending.attemptNo in page.attemptNos
             }
             if (exact) {
-                store.bindDeferredTeacherReviewWorkbook(pending.key, pending.intentId, workbookToken)
+                changed = bindDeferredTeacherReviewAuthority(pending, pairId, workbookToken) || changed
             }
         }
+        val visitedPublications = hashSetOf<String>()
+        pages.asSequence()
+            .filter { page -> page.localBookId == localBookId && page.workbookToken == workbookToken }
+            .forEach { page ->
+                val authorities = runCatching {
+                    annotationStore.teacherReviewAuthorityIntents(
+                        localBookId,
+                        page.pageNumber,
+                        pairId,
+                    )
+                }.getOrDefault(emptyList())
+                authorities.forEach authorityLoop@{ authority ->
+                    if (!visitedPublications.add(authority.publicationId) ||
+                        !canBindDeferredAuthorityForExplicitMapping(
+                            authority,
+                            pairId,
+                            workbookToken,
+                            localBookId,
+                            pages,
+                        )
+                    ) return@authorityLoop
+                    val bound = bindTeacherReviewAuthority(authority, pairId, workbookToken)
+                        ?: return@authorityLoop
+                    val requeued = runCatching {
+                        annotationStore.requeueTeacherReviewAuthorities(
+                            bound.bookId,
+                            bound.pageNumber,
+                            pairId,
+                            setOf(bound.attemptNo),
+                            workbookToken,
+                        )
+                    }.getOrDefault(emptyList())
+                    if (requeued.none { it.publicationId == bound.publicationId }) {
+                        return@authorityLoop
+                    }
+                    val exactPage = pages.firstOrNull { candidate ->
+                        candidate.workbookToken == workbookToken &&
+                            candidate.localBookId == bound.bookId &&
+                            candidate.pageNumber == bound.pageNumber &&
+                            bound.attemptNo in candidate.attemptNos
+                    } ?: return@authorityLoop
+                    changed = store.reopenTeacherReviewFromManifest(
+                        PendingTeacherReviewRecord(
+                            intentId = bound.publicationId,
+                            bookId = bound.bookId,
+                            contentSha256 = exactPage.contentSha256,
+                            workbookToken = workbookToken,
+                            pageNumber = bound.pageNumber,
+                            attemptNo = bound.attemptNo,
+                            queuedAtEpochMs = bound.updatedAtEpochMillis,
+                        ),
+                    ) || changed
+                }
+            }
+        return changed
+    }
+
+    /** Durable authority ownership must commit before the app transport row becomes sendable. */
+    private fun bindDeferredTeacherReviewAuthority(
+        pending: PendingTeacherReviewRecord,
+        pairId: String,
+        workbookToken: String,
+    ): Boolean {
+        val bound = bindTeacherReviewAuthority(
+            pending.bookId,
+            pending.pageNumber,
+            pending.attemptNo,
+            pending.intentId,
+            pairId,
+            workbookToken,
+        ) ?: return false
+        return store.bindDeferredTeacherReviewWorkbook(
+            pending.key,
+            bound.publicationId,
+            workbookToken,
+        ) != null
+    }
+
+    private fun bindTeacherReviewAuthority(
+        authority: TeacherReviewPublishIntent,
+        pairId: String,
+        workbookToken: String,
+    ): TeacherReviewPublishIntent? = bindTeacherReviewAuthority(
+        authority.bookId,
+        authority.pageNumber,
+        authority.attemptNo,
+        authority.publicationId,
+        pairId,
+        workbookToken,
+    )
+
+    private fun bindTeacherReviewAuthority(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        publicationId: String,
+        pairId: String,
+        workbookToken: String,
+    ): TeacherReviewPublishIntent? = runCatching {
+        annotationStore.bindTeacherReviewAuthorityWorkbook(
+            bookId = bookId,
+            pageNumber = pageNumber,
+            attemptNo = attemptNo,
+            publicationId = publicationId,
+            remotePairId = pairId,
+            remoteWorkbookToken = workbookToken,
+        )
+    }.getOrNull()?.takeIf { intent ->
+        intent.remotePairId == pairId && intent.remoteWorkbookToken == workbookToken
     }
 
     private fun exactTeacherReviewMarkGroups(
@@ -2708,6 +3329,60 @@ internal class RemotePageSyncController(
         const val INVENTORY_PAGE_RETRY_MS = 60_000L
         const val PAGE_DELTA_HEADER_BYTES = 8
         const val PAGE_DELTA_OPERATION_FRAME_BYTES = 4
+        const val TEACHER_REVIEW_STATE_CAPABILITY_REASON = "CAP_TEACHER_REVIEW_STATE_V1"
+    }
+}
+
+internal enum class TeacherReviewManifestDisposition { UNKNOWN, MATCH, MISMATCH }
+
+/** A null digest is a legacy/capability-unknown frame and must never reopen or complete state. */
+internal fun teacherReviewManifestDisposition(
+    observedStateSha256: String?,
+    expectedStateSha256: String,
+): TeacherReviewManifestDisposition = when {
+    observedStateSha256 == null -> TeacherReviewManifestDisposition.UNKNOWN
+    observedStateSha256 == expectedStateSha256 -> TeacherReviewManifestDisposition.MATCH
+    else -> TeacherReviewManifestDisposition.MISMATCH
+}
+
+/** Optional reconciliation evidence must never block the ordinary page inventory manifest. */
+internal fun teacherReviewStateDigestOrNull(
+    evidence: () -> Collection<TeacherReviewStateEvidence>,
+): String? = runCatching { teacherReviewStateSha256(evidence()) }.getOrNull()
+
+/** Mixed-version fence: only a digest-capable generation receives the publication extension. */
+internal fun teacherReviewPublicationIdForPeer(
+    publicationId: String,
+    peerCapabilityGeneration: Long,
+    pageGeneration: Long,
+): String? = publicationId.takeIf {
+    publicationId.isNotBlank() && pageGeneration > 0L && peerCapabilityGeneration == pageGeneration
+}
+
+/** Exact pair/workbook/local-page/attempt authorization for one manifest reconciliation row. */
+internal fun isTeacherReviewAuthorityForManifest(
+    intent: TeacherReviewPublishIntent,
+    pairId: String,
+    workbookToken: String,
+    bookId: String,
+    pageNumber: Int,
+    attemptNos: Collection<Int>,
+): Boolean = intent.bookId == bookId && intent.pageNumber == pageNumber &&
+    intent.attemptNo in attemptNos && intent.publicationId.isNotEmpty() &&
+    intent.remotePairId == pairId &&
+    intent.remoteWorkbookToken == workbookToken
+
+/** A duplicate ACK is safe only when installed shared metadata is not older than the payload. */
+internal fun teacherReviewMetadataCoversIncoming(
+    current: Collection<MarkGroup>,
+    incoming: Collection<MarkGroup>,
+): Boolean {
+    val currentById = current.associateBy(MarkGroup::id)
+    if (currentById.size != current.size) return false
+    return incoming.all { candidate ->
+        currentById[candidate.id]?.let { installed ->
+            compareTeacherReviewMarkGroupMetadataGlobalOrder(installed, candidate) >= 0
+        } == true
     }
 }
 
@@ -3050,6 +3725,44 @@ internal fun resolveDeferredReviewWorkbookToken(
     val token = identityMatches.map(TeacherReviewManifestEvidence::workbookToken).distinct().singleOrNull()
     return token
 }
+
+/** Resolves a retained authority even when LAN already removed the app transport row. */
+internal fun resolveDeferredAuthorityWorkbookToken(
+    authority: TeacherReviewPublishIntent,
+    currentPairId: String?,
+    evidence: List<TeacherReviewManifestEvidence>,
+): String? {
+    if (currentPairId == null || authority.remotePairId != currentPairId ||
+        authority.remoteWorkbookToken != null
+    ) return null
+    val identityMatches = evidence.asSequence()
+        .filter { row ->
+            val newer = row.manifestGeneration > authority.remoteManifestGeneration ||
+                row.manifestGeneration == authority.remoteManifestGeneration &&
+                row.manifestSequence > authority.remoteManifestSequence
+            newer && row.localBookId == authority.bookId && row.pageNumber == authority.pageNumber &&
+                authority.attemptNo in row.attemptNos
+        }
+        .toList()
+    return identityMatches.map(TeacherReviewManifestEvidence::workbookToken)
+        .distinct()
+        .singleOrNull()
+}
+
+/** Explicit user mapping supplies identity without requiring a newer manifest high-water. */
+internal fun canBindDeferredAuthorityForExplicitMapping(
+    authority: TeacherReviewPublishIntent,
+    currentPairId: String?,
+    workbookToken: String,
+    localBookId: String,
+    pages: Collection<TeacherPageSyncRecord>,
+): Boolean = currentPairId != null && authority.remotePairId == currentPairId &&
+    (authority.remoteWorkbookToken == null || authority.remoteWorkbookToken == workbookToken) &&
+    authority.bookId == localBookId &&
+    pages.any { page ->
+        page.workbookToken == workbookToken && page.localBookId == localBookId &&
+            page.pageNumber == authority.pageNumber && authority.attemptNo in page.attemptNos
+    }
 
 /** Picks the newest review that has an exact remote page/attempt without letting poison entries block it. */
 internal fun selectTransmittableTeacherReview(

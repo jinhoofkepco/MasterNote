@@ -1,5 +1,7 @@
 package com.studyink.monitor.core
 
+import com.studyink.core.model.TeacherReviewStateEvidence
+import com.studyink.core.model.teacherReviewStateSha256 as canonicalTeacherReviewStateSha256
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -43,6 +45,12 @@ class PageSyncManifestEntry(
     val revision: Long,
     val lastChangedEpochMs: Long,
     val approxBytes: Long,
+    /**
+     * Digest of the exact teacher publications durably installed on this page, or null when this
+     * legacy/limited manifest does not advertise that state. The canonical input is provided by
+     * [teacherReviewStateSha256]. A non-null empty-state digest is distinct from unknown.
+     */
+    val teacherReviewStateSha256: String? = null,
 ) {
     val attemptNos: List<Int> = immutableListCopy(attemptNos)
     val submittedAttemptNos: List<Int> = immutableListCopy(submittedAttemptNos)
@@ -70,6 +78,9 @@ class PageSyncManifestEntry(
         }
         checkProtocol(approxBytes in 0L..RemoteReviewLimits.MAX_PAGE_SYNC_APPROX_BYTES, "entries.approxBytes") {
             "must be between 0 and ${RemoteReviewLimits.MAX_PAGE_SYNC_APPROX_BYTES}"
+        }
+        teacherReviewStateSha256?.let {
+            validateSha256Hex(it, "entries.teacherReviewStateSha256")
         }
     }
 }
@@ -108,7 +119,6 @@ class PageSyncManifestEnvelope(
             "must include every row in this window and not exceed " +
                 RemoteReviewLimits.MAX_PAGE_SYNC_INVENTORY_PAGES
         }
-
         val pageTokens = HashSet<String>(this.entries.size)
         val workbookPages = HashSet<Pair<String, Int>>(this.entries.size)
         this.entries.forEach { entry ->
@@ -145,6 +155,16 @@ class PageSyncManifestEnvelope(
         }
     }
 }
+
+/**
+ * Canonical page digest for installed teacher publications.
+ *
+ * This monitor-facing delegate shares the core-model canonical implementation with annotation
+ * storage and LAN sync. A non-null empty-state digest means "no review installed" while a null
+ * manifest field continues to mean "state not advertised".
+ */
+fun teacherReviewStateSha256(entries: Collection<TeacherReviewStateEvidence>): String =
+    canonicalTeacherReviewStateSha256(entries)
 
 /** A page request. A null [attemptNo] requests the complete page including every student attempt. */
 data class PageSyncRequestEnvelope(
@@ -196,6 +216,7 @@ class PageAnnotationEnvelope(
     override val createdAtEpochMs: Long,
     val syncGeneration: Long,
     val purpose: PageAnnotationPurpose,
+    /** Student-page request id, or the explicit publication id for a teacher review. */
     val responseToTransferId: String?,
     val pageToken: String,
     val pageNumber: Int,
@@ -250,8 +271,10 @@ class PageAnnotationEnvelope(
                 validateOpaqueToken(requireNotNull(responseToTransferId), "responseToTransferId")
             }
             PageAnnotationPurpose.TEACHER_REVIEW -> {
-                checkProtocol(responseToTransferId == null, "responseToTransferId") {
-                    "must be null for teacher review"
+                // Null remains decodable for already queued legacy frames. New writers attach the
+                // 64-hex explicit publication id so a student can advertise durable receipt state.
+                responseToTransferId?.let { publicationId ->
+                    validateSha256Hex(publicationId, "responseToTransferId")
                 }
                 checkProtocol(kind == PageAnnotationKind.CHECKPOINT, "kind") {
                     "must be CHECKPOINT for teacher review"

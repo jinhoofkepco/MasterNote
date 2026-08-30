@@ -1,13 +1,22 @@
 package com.studyink.app
 
+import com.studyink.annotation.storage.AppliedTeacherReviewReceipt
+import com.studyink.annotation.storage.TeacherReviewPublicationOrderDisposition
 import com.studyink.annotation.storage.TeacherReviewPublishIntent
+import com.studyink.annotation.storage.teacherReviewPublicationOrderDisposition
 import com.studyink.core.model.Attempt
+import com.studyink.core.model.Mark
+import com.studyink.core.model.MarkColor
+import com.studyink.core.model.MarkGroup
+import com.studyink.core.model.PagePoint
+import com.studyink.core.model.TeacherReviewStateEvidence
 import com.studyink.monitor.core.PageAnnotationKind
 import com.studyink.monitor.core.RemoteReviewEnvelopeType
 import com.studyink.monitor.core.RemoteReviewLimits
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -737,6 +746,165 @@ class RemotePageSyncPolicyTest {
         )
     }
 
+    @Test fun retainedAuthorityWithoutAppPendingBindsOnlyFromExactNewerManifestEvidence() {
+        val authority = teacherAuthority(
+            remoteManifestGeneration = 2L,
+            remoteManifestSequence = 4L,
+        )
+        val exact = reviewEvidence(
+            "workbook-book-a",
+            "book-a",
+            listOf(2),
+            generation = 2L,
+            sequence = 5L,
+        )
+
+        assertEquals(
+            exact.workbookToken,
+            resolveDeferredAuthorityWorkbookToken(authority, "pair-a", listOf(exact)),
+        )
+        assertNull(resolveDeferredAuthorityWorkbookToken(authority, "pair-b", listOf(exact)))
+        assertNull(resolveDeferredAuthorityWorkbookToken(
+            authority.copy(remoteWorkbookToken = "workbook-other"),
+            "pair-a",
+            listOf(exact),
+        ))
+        assertNull(resolveDeferredAuthorityWorkbookToken(
+            authority,
+            "pair-a",
+            listOf(exact.copy(manifestSequence = 4L)),
+        ))
+        assertNull(resolveDeferredAuthorityWorkbookToken(
+            authority,
+            "pair-a",
+            listOf(exact.copy(attemptNos = listOf(1))),
+        ))
+        assertNull(resolveDeferredAuthorityWorkbookToken(
+            authority,
+            "pair-a",
+            listOf(exact, exact.copy(workbookToken = "workbook-other")),
+        ))
+    }
+
+    @Test fun explicitMappingBindsOnlyExactPairPageAttemptAndNeverRebindsAnotherWorkbook() {
+        val authority = teacherAuthority()
+        val exactPage = teacherPage("page-exact", bookId = "book-a")
+
+        assertTrue(canBindDeferredAuthorityForExplicitMapping(
+            authority,
+            "pair-a",
+            exactPage.workbookToken,
+            "book-a",
+            listOf(exactPage),
+        ))
+        assertTrue(canBindDeferredAuthorityForExplicitMapping(
+            authority.copy(remoteWorkbookToken = exactPage.workbookToken),
+            "pair-a",
+            exactPage.workbookToken,
+            "book-a",
+            listOf(exactPage),
+        ))
+        assertFalse(canBindDeferredAuthorityForExplicitMapping(
+            authority.copy(remoteWorkbookToken = "workbook-other"),
+            "pair-a",
+            exactPage.workbookToken,
+            "book-a",
+            listOf(exactPage),
+        ))
+        assertFalse(canBindDeferredAuthorityForExplicitMapping(
+            authority,
+            "pair-b",
+            exactPage.workbookToken,
+            "book-a",
+            listOf(exactPage),
+        ))
+        assertFalse(canBindDeferredAuthorityForExplicitMapping(
+            authority,
+            "pair-a",
+            exactPage.workbookToken,
+            "book-a",
+            listOf(exactPage.copy(attemptNos = listOf(1))),
+        ))
+    }
+
+    @Test fun equalRevisionDuplicateRequiresInstalledMetadataAtLeastAsNewAsPayload() {
+        val incoming = MarkGroup(
+            id = "grade-a",
+            bookId = "remote-book",
+            pageNumber = 81,
+            anchor = PagePoint(20f, 30f),
+            marks = listOf(Mark(2, MarkColor.BLUE, 10L)),
+            createdAtEpochMillis = 1L,
+            hiddenAtEpochMillis = 20L,
+            syncRevision = 2L,
+            lastModifiedByDeviceId = "teacher",
+        )
+        val same = incoming.copy(bookId = "local-book")
+        val newer = same.copy(
+            anchor = PagePoint(40f, 50f),
+            hiddenAtEpochMillis = null,
+            syncRevision = 3L,
+            lastModifiedByDeviceId = "student",
+        )
+        val rolledBack = same.copy(
+            anchor = PagePoint(1f, 2f),
+            hiddenAtEpochMillis = null,
+            syncRevision = 1L,
+        )
+
+        assertTrue(teacherReviewMetadataCoversIncoming(listOf(same), listOf(incoming)))
+        assertTrue(teacherReviewMetadataCoversIncoming(listOf(newer), listOf(incoming)))
+        assertFalse(teacherReviewMetadataCoversIncoming(listOf(rolledBack), listOf(incoming)))
+        assertFalse(teacherReviewMetadataCoversIncoming(emptyList(), listOf(incoming)))
+    }
+
+    @Test fun sharedPublicationTimeOrdersLanAndTelegramWithoutTrustingRouteRevision() {
+        val receipt = AppliedTeacherReviewReceipt(
+            bookId = "book-a",
+            pageNumber = 81,
+            attemptNo = 2,
+            publicationId = SHA_A,
+            resultLayerSha256 = SHA_B,
+            markGroupsSha256 = SHA_C,
+            appliedAtEpochMillis = 20L,
+            publishedAtEpochMillis = 100L,
+            remotePairId = "pair-a",
+            remoteWorkbookToken = "old-workbook-token",
+        )
+        fun order(publicationId: String = SHA_B, publishedAt: Long = 99L) =
+            teacherReviewPublicationOrderDisposition(receipt, publicationId, publishedAt)
+
+        assertEquals(TeacherReviewPublicationOrderDisposition.STALE, order())
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.STALE,
+            order(publishedAt = 0L),
+        )
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.DUPLICATE_VERIFY,
+            order(publicationId = SHA_A, publishedAt = 100L),
+        )
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.CONFLICT,
+            order(publicationId = SHA_B, publishedAt = 100L),
+        )
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.APPLY,
+            order(publicationId = SHA_B, publishedAt = 101L),
+        )
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.APPLY,
+            teacherReviewPublicationOrderDisposition(
+                receipt.copy(publishedAtEpochMillis = 0L),
+                SHA_B,
+                1L,
+            ),
+        )
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.APPLY,
+            teacherReviewPublicationOrderDisposition(null, SHA_B, 0L),
+        )
+    }
+
     @Test fun failedReviewYieldsToAnotherSendableReview() {
         val first = pendingReview("book-a").copy(queuedAtEpochMs = 20L)
         val second = pendingReview("book-b").copy(queuedAtEpochMs = 10L)
@@ -761,6 +929,81 @@ class RemotePageSyncPolicyTest {
         assertEquals(120L, resolveStudentPageChangedAt(null, 0L, "state-a", 120L, 9_999L))
         assertEquals(120L, resolveStudentPageChangedAt("state-a", 120L, "state-a", 80L, 9_999L))
         assertEquals(9_999L, resolveStudentPageChangedAt("state-a", 120L, "state-b", 80L, 9_999L))
+    }
+
+    @Test fun teacherReviewPublicationIdentityWaitsForObservedPeerCapability() {
+        assertNull(teacherReviewPublicationIdForPeer(SHA_A, 0L, 7L))
+        assertNull(teacherReviewPublicationIdForPeer(SHA_A, 6L, 7L))
+        assertEquals(SHA_A, teacherReviewPublicationIdForPeer(SHA_A, 7L, 7L))
+    }
+
+    @Test fun teacherReviewManifestUnknownMatchesOrReopensWithoutGuessing() {
+        assertEquals(
+            TeacherReviewManifestDisposition.UNKNOWN,
+            teacherReviewManifestDisposition(null, SHA_A),
+        )
+        assertEquals(
+            TeacherReviewManifestDisposition.MATCH,
+            teacherReviewManifestDisposition(SHA_A, SHA_A),
+        )
+        assertEquals(
+            TeacherReviewManifestDisposition.MISMATCH,
+            teacherReviewManifestDisposition(SHA_B, SHA_A),
+        )
+    }
+
+    @Test fun optionalTeacherReviewDigestFailureDoesNotBlockManifest() {
+        val evidence = TeacherReviewStateEvidence(2, SHA_A, SHA_B, SHA_C)
+        assertEquals(
+            com.studyink.monitor.core.teacherReviewStateSha256(emptyList()),
+            teacherReviewStateDigestOrNull { emptyList() },
+        )
+        assertEquals(
+            com.studyink.monitor.core.teacherReviewStateSha256(listOf(evidence)),
+            teacherReviewStateDigestOrNull { listOf(evidence) },
+        )
+        assertNull(teacherReviewStateDigestOrNull { error("receipt storage unavailable") })
+    }
+
+    @Test fun teacherReviewAuthorityRequiresExactPairWorkbookPageAndAttempt() {
+        val intent = TeacherReviewPublishIntent(
+            bookId = "book-a",
+            pageNumber = 81,
+            attemptNo = 2,
+            updatedAtEpochMillis = 1L,
+            publicationId = SHA_A,
+            checkpointSha256 = SHA_B,
+            resultLayerSha256 = SHA_C,
+            checkpointSizeBytes = 1,
+            markGroupsSha256 = SHA_B,
+            markGroupsSizeBytes = 1,
+            remotePairId = "pair-a",
+            remoteWorkbookToken = "workbook-a",
+        )
+        fun eligible(
+            pairId: String = "pair-a",
+            workbookToken: String = "workbook-a",
+            bookId: String = "book-a",
+            pageNumber: Int = 81,
+            attempts: List<Int> = listOf(2),
+        ) = isTeacherReviewAuthorityForManifest(
+            intent, pairId, workbookToken, bookId, pageNumber, attempts,
+        )
+
+        assertTrue(eligible())
+        assertFalse(eligible(pairId = "pair-b"))
+        assertFalse(eligible(workbookToken = "workbook-b"))
+        assertFalse(eligible(bookId = "book-b"))
+        assertFalse(eligible(pageNumber = 82))
+        assertFalse(eligible(attempts = listOf(1, 3)))
+        assertFalse(isTeacherReviewAuthorityForManifest(
+            intent.copy(remoteWorkbookToken = null),
+            "pair-a",
+            "workbook-a",
+            "book-a",
+            81,
+            listOf(2),
+        ))
     }
 
     private fun pendingReview(bookId: String) = PendingTeacherReviewRecord(
@@ -818,6 +1061,25 @@ class RemotePageSyncPolicyTest {
         attemptNos = attempts,
         manifestGeneration = generation,
         manifestSequence = sequence,
+    )
+
+    private fun teacherAuthority(
+        remoteManifestGeneration: Long = 1L,
+        remoteManifestSequence: Long = 1L,
+    ) = TeacherReviewPublishIntent(
+        bookId = "book-a",
+        pageNumber = 81,
+        attemptNo = 2,
+        updatedAtEpochMillis = 1L,
+        publicationId = SHA_A,
+        checkpointSha256 = SHA_B,
+        resultLayerSha256 = SHA_C,
+        checkpointSizeBytes = 1,
+        markGroupsSha256 = SHA_B,
+        markGroupsSizeBytes = 1,
+        remotePairId = "pair-a",
+        remoteManifestGeneration = remoteManifestGeneration,
+        remoteManifestSequence = remoteManifestSequence,
     )
 
     private companion object {

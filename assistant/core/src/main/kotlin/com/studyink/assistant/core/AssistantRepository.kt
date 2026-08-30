@@ -43,12 +43,16 @@ class AssistantRepository(
         slotNumber: Int,
         title: String,
         body: String,
+        expectedRevision: Long? = null,
     ): AssistantPromptSlot = locked {
         requireSlotNumber(slotNumber)
         val cleanTitle = title.trim()
         val cleanBody = body.trim()
         val current = readPrompts()
         val prior = current[slotNumber - 1]
+        expectedRevision?.let { expected ->
+            check(prior.revision == expected) { "Assistant prompt changed while it was being edited" }
+        }
         if (prior.title == cleanTitle && prior.body == cleanBody) return@locked prior
         check(prior.revision < Long.MAX_VALUE) { "Prompt revision is exhausted" }
         val updated = prior.copy(
@@ -119,6 +123,7 @@ class AssistantRepository(
         promptTitleSnapshot: String? = null,
         promptBodySnapshot: String? = null,
         answerFormat: TeacherGptAnswerFormat = TeacherGptAnswerFormat.PLAIN_TEXT,
+        answerMask: TeacherGptAnswerMask? = null,
     ): TeacherGptResource = locked {
         requireSlotNumber(promptSlotNumber)
         require((promptTitleSnapshot == null) == (promptBodySnapshot == null)) {
@@ -158,6 +163,7 @@ class AssistantRepository(
             providerName = cleanProvider,
             createdAtEpochMillis = timestamp,
             answerFormat = answerFormat,
+            answerMask = AssistantValidation.answerMaskForWrite(cleanAnswer, answerMask),
         )
         val resource = TeacherGptResource(
             resourceId = resourceId,
@@ -183,6 +189,7 @@ class AssistantRepository(
         answerHtml: String? = null,
         providerName: String? = null,
         answerFormat: TeacherGptAnswerFormat = TeacherGptAnswerFormat.PLAIN_TEXT,
+        answerMask: TeacherGptAnswerMask? = null,
     ): TeacherGptResourceRevision = locked {
         requireSlotNumber(promptSlotNumber)
         AssistantValidation.id(resourceId, "resourceId")
@@ -198,6 +205,7 @@ class AssistantRepository(
         val usedIds = resources.flatMapTo(hashSetOf()) { resource ->
             listOf(resource.resourceId) + resource.revisions.map(TeacherGptResourceRevision::revisionId)
         }
+        val cleanAnswer = answerText.trim()
         val revision = TeacherGptResourceRevision(
             revisionId = freshId(usedIds),
             revisionNumber = prior.revisions.size + 1L,
@@ -205,11 +213,52 @@ class AssistantRepository(
             promptTitle = prompt.title,
             promptBody = prompt.body,
             selectionBounds = selectionBounds,
-            answerText = answerText.trim(),
+            answerText = cleanAnswer,
             answerHtml = answerHtml?.trim()?.takeIf(String::isNotEmpty),
             providerName = providerName?.trim()?.takeIf(String::isNotEmpty),
             createdAtEpochMillis = monotonicNow(prior.currentRevision.createdAtEpochMillis),
             answerFormat = answerFormat,
+            answerMask = AssistantValidation.answerMaskForWrite(cleanAnswer, answerMask),
+        )
+        val updated = prior.copy(
+            currentRevisionId = revision.revisionId,
+            revisions = prior.revisions + revision,
+        )
+        val next = resources.toMutableList().apply { this[index] = updated }.toList()
+        AssistantValidation.teacherPage(page, next, limits)
+        writeTeacherPage(page, next)
+        revision
+    }
+
+    /**
+     * Appends a metadata-only revision. Source text and every piece of request provenance are copied
+     * byte-for-byte from the current revision; only [answerMask] and revision identity/time change.
+     */
+    fun appendTeacherResourceAnswerMaskRevision(
+        page: AssistantPageKey,
+        resourceId: String,
+        answerMask: TeacherGptAnswerMask?,
+    ): TeacherGptResourceRevision = locked {
+        AssistantValidation.id(resourceId, "resourceId")
+        val resources = readTeacherPage(page)
+        val index = resources.indexOfFirst { it.resourceId == resourceId }
+        check(index >= 0) { "Unknown teacher GPT resource" }
+        val prior = resources[index]
+        val source = prior.currentRevision
+        val canonicalMask = AssistantValidation.answerMaskForWrite(source.answerText, answerMask)
+        if (source.answerMask == canonicalMask) return@locked source
+        require(prior.revisions.size < limits.maxRevisionsPerResource) {
+            "Too many revisions for one teacher GPT resource"
+        }
+        check(prior.revisions.size.toLong() < Long.MAX_VALUE)
+        val usedIds = resources.flatMapTo(hashSetOf()) { resource ->
+            listOf(resource.resourceId) + resource.revisions.map(TeacherGptResourceRevision::revisionId)
+        }
+        val revision = source.copy(
+            revisionId = freshId(usedIds),
+            revisionNumber = prior.revisions.size + 1L,
+            createdAtEpochMillis = monotonicNow(source.createdAtEpochMillis),
+            answerMask = canonicalMask,
         )
         val updated = prior.copy(
             currentRevisionId = revision.revisionId,
@@ -546,6 +595,7 @@ class AssistantRepository(
         } ?: return DefaultAssistantPrompts.slots
         return try {
             AssistantJsonCodec.decodePrompts(bytes, limits)
+                .map(DefaultAssistantPrompts::upgradeLegacySeed)
         } catch (error: Exception) {
             file.quarantineCorrupt()
             DefaultAssistantPrompts.slots

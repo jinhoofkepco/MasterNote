@@ -192,6 +192,7 @@ internal object AssistantJsonCodec {
         .put("providerName", value.providerName ?: JSONObject.NULL)
         .put("createdAtEpochMillis", value.createdAtEpochMillis)
         .put("answerFormat", value.answerFormat.name)
+        .also { json -> value.answerMask?.let { json.put("answerMask", answerMaskToJson(it)) } }
 
     private fun resourceFromJson(
         value: JSONObject,
@@ -212,20 +213,23 @@ internal object AssistantJsonCodec {
         )
     }
 
-    private fun revisionFromJson(value: JSONObject): TeacherGptResourceRevision =
-        TeacherGptResourceRevision(
+    private fun revisionFromJson(value: JSONObject): TeacherGptResourceRevision {
+        val answerText = value.getString("answerText")
+        return TeacherGptResourceRevision(
             revisionId = value.getString("revisionId"),
             revisionNumber = value.getLong("revisionNumber"),
             promptSlotNumber = value.getInt("promptSlotNumber"),
             promptTitle = value.getString("promptTitle"),
             promptBody = value.getString("promptBody"),
             selectionBounds = boundsFromJson(value.getJSONObject("selectionBounds")),
-            answerText = value.getString("answerText"),
+            answerText = answerText,
             answerHtml = value.nullableString("answerHtml"),
             providerName = value.nullableString("providerName"),
             createdAtEpochMillis = value.getLong("createdAtEpochMillis"),
             answerFormat = answerFormatFromJson(value),
+            answerMask = answerMaskFromJson(value, answerText),
         )
+    }
 
     /** Missing means a pre-format-field file; present values are strict to expose corruption. */
     private fun answerFormatFromJson(value: JSONObject): TeacherGptAnswerFormat {
@@ -234,6 +238,36 @@ internal object AssistantJsonCodec {
         val encoded = value.getString("answerFormat")
         return TeacherGptAnswerFormat.entries.firstOrNull { it.name == encoded }
             ?: throw IllegalArgumentException("Unknown teacher GPT answer format: $encoded")
+    }
+
+    private fun answerMaskToJson(value: TeacherGptAnswerMask): JSONObject = JSONObject()
+        .put("parserVersion", value.parserVersion)
+        .put("sourceSha256", value.sourceSha256)
+        .put(
+            "hiddenBlockOrdinals",
+            JSONArray().apply { value.hiddenBlockOrdinals.sorted().forEach(::put) },
+        )
+
+    /** Optional visibility metadata always fails open; malformed data cannot hide the answer. */
+    private fun answerMaskFromJson(
+        value: JSONObject,
+        answerText: String,
+    ): TeacherGptAnswerMask? {
+        if (!value.has("answerMask") || value.isNull("answerMask")) return null
+        return try {
+            val encoded = value.getJSONObject("answerMask")
+            val ordinals = encoded.getJSONArray("hiddenBlockOrdinals")
+            if (ordinals.length() > TeacherGptAnswerMask.MAX_HIDDEN_BLOCKS) return null
+            val mask = TeacherGptAnswerMask(
+                parserVersion = encoded.getInt("parserVersion"),
+                sourceSha256 = encoded.getString("sourceSha256"),
+                hiddenBlockOrdinals = (0 until ordinals.length())
+                    .mapTo(sortedSetOf()) { index -> ordinals.getInt(index) },
+            )
+            AssistantValidation.sanitizeAnswerMask(answerText, mask)
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun cardToJson(value: StudentExplanationCard): JSONObject = JSONObject()

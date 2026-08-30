@@ -145,7 +145,17 @@ enum class LanSessionPhase {
 internal const val LAN_AUTH_VERSION = 2
 /** V2 adds durable publication IDs, authority epochs, and exact digest ACKs. */
 internal const val LAN_CAPABILITY_GPT_EXPLANATION_V2 = "GPT_EXPLANATION_V2"
+/** Optional PAGE_STATE/PAGE_SYNCED evidence for repairing an ACKed teacher review. */
+internal const val LAN_CAPABILITY_TEACHER_REVIEW_STATE_V1 = "TEACHER_REVIEW_STATE_V1"
+/** Student-authored attempt memos, transferred as independently replayable full memo states. */
+internal const val LAN_CAPABILITY_STUDENT_MEMO_V1 = "STUDENT_MEMO_V1"
 private val LAN_SHA256_HEX = Regex("[0-9a-f]{64}")
+
+internal fun lanCapabilities(): List<String> = listOf(
+    LAN_CAPABILITY_GPT_EXPLANATION_V2,
+    LAN_CAPABILITY_TEACHER_REVIEW_STATE_V1,
+    LAN_CAPABILITY_STUDENT_MEMO_V1,
+)
 
 internal fun isValidLanSha256(value: String): Boolean = LAN_SHA256_HEX.matches(value)
 
@@ -179,7 +189,10 @@ internal fun lanHelloMessage(
     lanHelloPublicFields(deviceId, role, bookId, documentSha256, nonceHex).forEach { (key, value) ->
         put(key, value)
     }
-    put("capabilities", JSONArray().put(LAN_CAPABILITY_GPT_EXPLANATION_V2))
+    put(
+        "capabilities",
+        JSONArray().apply { lanCapabilities().forEach(::put) },
+    )
 }
 
 internal fun lanHelloPublicFields(

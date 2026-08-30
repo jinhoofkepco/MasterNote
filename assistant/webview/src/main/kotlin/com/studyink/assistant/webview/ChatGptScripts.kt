@@ -210,31 +210,56 @@ internal object ChatGptScripts {
 
           function studyInkMathSource(node) {
             if (!node) return "";
-            const annotation = node.matches &&
-                node.matches("annotation[encoding='application/x-tex'], annotation[encoding='application/x-latex']")
-              ? node
-              : node.querySelector(
-                  "annotation[encoding='application/x-tex'], annotation[encoding='application/x-latex']"
-                );
+            const annotations = [];
+            if (node.matches && node.matches("annotation")) annotations.push(node);
+            Array.from(node.querySelectorAll && node.querySelectorAll("annotation") || [])
+              .forEach(function(value) { annotations.push(value); });
+            const annotation = annotations.find(function(value) {
+              return /tex|latex/i.test(String(value.getAttribute("encoding") || ""));
+            }) || annotations.find(function(value) {
+              const candidate = stripStudyInkMathDelimiters(value.textContent);
+              return /\\[A-Za-z]+|[_^{}]/.test(candidate);
+            });
             if (annotation) {
               const annotated = stripStudyInkMathDelimiters(annotation.textContent);
               if (annotated) return annotated;
             }
             const sourceNode = (node.matches &&
-                node.matches("[data-tex],[data-latex],[data-math],[data-formula]"))
+                node.matches("[data-tex],[data-latex],[data-math],[data-formula],[data-expression]"))
               ? node
-              : node.querySelector("[data-tex],[data-latex],[data-math],[data-formula]");
+              : node.querySelector(
+                  "[data-tex],[data-latex],[data-math],[data-formula],[data-expression]"
+                );
             if (sourceNode) {
-              const names = ["data-tex", "data-latex", "data-math", "data-formula"];
+              const names = [
+                "data-tex", "data-latex", "data-math", "data-formula", "data-expression"
+              ];
               for (const name of names) {
                 const source = stripStudyInkMathDelimiters(sourceNode.getAttribute(name));
                 if (source) return source;
               }
             }
-            // MathML textContent/aria-label is not TeX (it may be spoken text or flattened
-            // glyphs). Without an explicit TeX annotation/data field, leave the node intact so
-            // the semantic/plain fallback remains readable instead of feeding bogus TeX to KaTeX.
+            const altNode = (node.matches && node.matches("[alttext]"))
+              ? node : node.querySelector("[alttext]");
+            if (altNode) {
+              const source = stripStudyInkMathDelimiters(altNode.getAttribute("alttext"));
+              if (source) return source;
+            }
+            const ariaSource = stripStudyInkMathDelimiters(
+              node.getAttribute && node.getAttribute("aria-label")
+            );
+            if (/\\[A-Za-z]+|[_^{}]/.test(ariaSource)) return ariaSource;
+            // A generic MathML aria-label may be spoken prose, so accept it as TeX only when it
+            // contains TeX structure. The caller preserves visible glyphs separately otherwise.
             return "";
+          }
+
+          function studyInkMathFallback(node) {
+            if (!node) return "";
+            const visual = node.querySelector && node.querySelector(".katex-html");
+            return cleanStudyInkCharacters(
+              visual && visual.textContent || node.textContent || ""
+            ).replace(/\s+/g, " ").trim();
           }
 
           function isStudyInkDisplayMath(node) {
@@ -257,8 +282,16 @@ internal object ChatGptScripts {
                 ancestor = ancestor.parentElement;
               }
               const tex = studyInkMathSource(node);
-              if (!tex) return;
               const display = isStudyInkDisplayMath(node);
+              if (!tex) {
+                const fallback = studyInkMathFallback(node);
+                if (!fallback) return;
+                const replacement = document.createElement(display ? "div" : "span");
+                replacement.setAttribute("data-studyink-math-fallback", "true");
+                replacement.textContent = fallback;
+                node.replaceWith(replacement);
+                return;
+              }
               const marker = display
                 ? "\n\n" + STUDYINK_DOLLAR + STUDYINK_DOLLAR + "\n" + tex +
                   "\n" + STUDYINK_DOLLAR + STUDYINK_DOLLAR + "\n\n"

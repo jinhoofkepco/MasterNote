@@ -16,7 +16,7 @@ import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
 import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.core.model.resultBundleGrid
-import com.studyink.document.pdf.PdfViewportAdapter
+import com.studyink.document.pdf.InkViewport
 import kotlin.math.hypot
 import kotlin.math.max
 
@@ -46,7 +46,7 @@ data class StylusHoverPreview(
 
 class DryInkView(context: Context) : View(context) {
     private val readerTokens = readerCanvasTokens()
-    var viewport: PdfViewportAdapter? = null
+    var viewport: InkViewport? = null
         set(value) { field = value; invalidate() }
     var snapshot: AnnotationSnapshot = AnnotationSnapshot.empty("unopened")
         set(value) {
@@ -150,7 +150,7 @@ class DryInkView(context: Context) : View(context) {
             .groupBy(StrokeAsset::pageNumber)
     }
 
-    private fun isOnScreen(adapter: PdfViewportAdapter, stroke: StrokeAsset, viewportBounds: RectF): Boolean {
+    private fun isOnScreen(adapter: InkViewport, stroke: StrokeAsset, viewportBounds: RectF): Boolean {
         val topLeft = adapter.canonicalToView(stroke.pageNumber, PagePoint(stroke.bounds.left, stroke.bounds.top))
             ?: return false
         val bottomRight = adapter.canonicalToView(stroke.pageNumber, PagePoint(stroke.bounds.right, stroke.bounds.bottom))
@@ -165,7 +165,7 @@ class DryInkView(context: Context) : View(context) {
         return RectF.intersects(bounds, viewportBounds)
     }
 
-    private fun drawStroke(canvas: Canvas, adapter: PdfViewportAdapter, stroke: StrokeAsset, preview: Boolean) {
+    private fun drawStroke(canvas: Canvas, adapter: InkViewport, stroke: StrokeAsset, preview: Boolean) {
         if (stroke.points.isEmpty()) return
         val published = !preview &&
             stroke.authorId == "teacher" &&
@@ -198,7 +198,7 @@ class DryInkView(context: Context) : View(context) {
         canvas.drawPath(path, paint)
     }
 
-    private fun drawEraserPath(canvas: Canvas, adapter: PdfViewportAdapter, preview: EraserPreview) {
+    private fun drawEraserPath(canvas: Canvas, adapter: InkViewport, preview: EraserPreview) {
         if (preview.path.isEmpty()) return
         paint.color = Color.rgb(39, 110, 255)
         paint.alpha = 95
@@ -212,7 +212,7 @@ class DryInkView(context: Context) : View(context) {
         else canvas.drawPath(path, paint)
     }
 
-    private fun drawMarks(canvas: Canvas, adapter: PdfViewportAdapter) {
+    private fun drawMarks(canvas: Canvas, adapter: InkViewport) {
         val groups = markGroups.asSequence()
             .filter { it.pageNumber == activePage && it.hiddenAtEpochMillis == null }
             .mapNotNull { group ->

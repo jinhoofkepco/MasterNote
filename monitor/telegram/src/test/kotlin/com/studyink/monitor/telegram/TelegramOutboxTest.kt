@@ -100,6 +100,86 @@ class TelegramOutboxTest {
         assertEquals(TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED, queue.enqueueLatestText(first))
     }
 
+    @Test fun latestPeerDocumentDurablyReplacesOnlyUnsentEntry() {
+        val journal = temporary.newFile("latest-peer-document.v1")
+        val queue = TelegramOutbox(journal)
+        val first = peerDocument("telegram-peer-document:pair:memo_first", "memo_first", "first.mne", 30L)
+        val latest = peerDocument("telegram-peer-document:pair:memo_latest", "memo_latest", "latest.mne", 40L)
+        queue.enqueue(first)
+
+        val outcome = queue.enqueueLatest(latest)
+
+        assertEquals(TelegramEnqueueResult.ENQUEUED, outcome.result)
+        assertEquals(listOf(first), outcome.supersededEntries)
+        assertEquals(listOf(latest.idempotencyKey), queue.pendingSnapshot().map { it.idempotencyKey })
+        assertEquals(
+            listOf(latest.idempotencyKey),
+            TelegramOutbox(journal).pendingSnapshot().map { it.idempotencyKey },
+        )
+        assertEquals(TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED, queue.enqueueLatest(first).result)
+    }
+
+    @Test fun latestPeerDocumentLeavesClaimedEntryImmutableAcrossReplay() {
+        val journal = temporary.newFile("latest-peer-in-flight.v1")
+        val queue = TelegramOutbox(journal)
+        val claimed = peerDocument("telegram-peer-document:pair:memo_claimed", "memo_claimed", "claimed.mne", 30L)
+        val latest = peerDocument("telegram-peer-document:pair:memo_after", "memo_after", "after.mne", 40L)
+        queue.enqueue(claimed)
+        assertEquals(claimed, queue.claimDue(30L))
+
+        val outcome = queue.enqueueLatest(latest)
+
+        assertTrue(outcome.supersededEntries.isEmpty())
+        assertEquals(
+            setOf(claimed.idempotencyKey, latest.idempotencyKey),
+            queue.pendingSnapshot().mapTo(linkedSetOf(), TelegramOutboxEntry::idempotencyKey),
+        )
+        assertEquals(
+            setOf(claimed.idempotencyKey, latest.idempotencyKey),
+            TelegramOutbox(journal).pendingSnapshot()
+                .mapTo(linkedSetOf(), TelegramOutboxEntry::idempotencyKey),
+        )
+    }
+
+    @Test fun latestPeerDocumentNeverSupersedesServerAcceptedAckRetention() {
+        val journal = temporary.newFile("latest-peer-accepted.v1")
+        val queue = TelegramOutbox(journal)
+        val accepted = peerDocument("telegram-peer-document:pair:memo_accepted", "memo_accepted", "accepted.mne", 30L)
+        val latest = peerDocument("telegram-peer-document:pair:memo_newer", "memo_newer", "newer.mne", 40L)
+        queue.enqueue(accepted)
+        queue.deferUntil(accepted.idempotencyKey, 86_400_030L, PEER_ACK_WAIT_REASON)
+
+        val outcome = queue.enqueueLatest(latest)
+
+        assertTrue(outcome.supersededEntries.isEmpty())
+        assertEquals(
+            setOf(accepted.idempotencyKey, latest.idempotencyKey),
+            TelegramOutbox(journal).pendingSnapshot()
+                .mapTo(linkedSetOf(), TelegramOutboxEntry::idempotencyKey),
+        )
+    }
+
+    @Test fun supersededCiphertextCleanupDeletesOnlyUnreferencedOwnedFiles() {
+        val owned = temporary.newFolder("owned-peer-outbox")
+        val obsoleteFile = owned.resolve("obsolete.mne").apply { writeBytes(byteArrayOf(1)) }
+        val protectedFile = owned.resolve("protected.mne").apply { writeBytes(byteArrayOf(2)) }
+        val outsideFile = temporary.newFile("outside.mne").apply { writeBytes(byteArrayOf(3)) }
+        val obsolete = peerDocument("telegram-peer-document:pair:memo_old", "memo_old", "ignored-a", 1L)
+            .copy(filePath = obsoleteFile.absolutePath)
+        val protected = peerDocument("telegram-peer-document:pair:memo_protected", "memo_protected", "ignored-b", 2L)
+            .copy(filePath = protectedFile.absolutePath)
+        val outside = peerDocument("telegram-peer-document:pair:memo_outside", "memo_outside", "ignored-c", 3L)
+            .copy(filePath = outsideFile.absolutePath)
+
+        assertEquals(
+            1,
+            deleteSupersededOwnedPeerPayloads(owned, listOf(obsolete, protected, outside), listOf(protected)),
+        )
+        assertFalse(obsoleteFile.exists())
+        assertTrue(protectedFile.exists())
+        assertTrue(outsideFile.exists())
+    }
+
     @Test fun cancellingCoalescedTextIsDurableAndPreventsInflightRetry() {
         val journal = temporary.newFile("cancel-latest.v1")
         val queue = TelegramOutbox(journal)
@@ -264,6 +344,29 @@ class TelegramOutboxTest {
         nextAttemptEpochMs = createdAt,
         createdAtEpochMs = createdAt,
         deleteAfterSend = false,
+        route = TelegramOutboxRoute.PEER,
+        destinationUsername = "teacher_bot",
+        peerTransferId = transferId,
+    )
+
+    private fun peerDocument(
+        key: String,
+        transferId: String,
+        name: String,
+        createdAt: Long,
+    ) = TelegramOutboxEntry(
+        idempotencyKey = key,
+        destinationChatId = 202L,
+        kind = TelegramOutboxKind.DOCUMENT,
+        filePath = temporary.newFile(name).absolutePath,
+        text = "MNPEER2 pair_123 $transferId STUDENT_MEMO",
+        mimeType = TelegramPeerProtocol.CIPHERTEXT_MIME,
+        displayName = name,
+        attempts = 0,
+        nextAttemptEpochMs = createdAt,
+        createdAtEpochMs = createdAt,
+        deleteAfterSend = true,
+        coalesceKey = "STUDENT_MEMO:page:4:memo",
         route = TelegramOutboxRoute.PEER,
         destinationUsername = "teacher_bot",
         peerTransferId = transferId,

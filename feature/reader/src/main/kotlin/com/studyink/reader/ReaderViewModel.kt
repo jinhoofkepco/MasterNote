@@ -21,6 +21,8 @@ import com.studyink.core.model.trimmedTo
 import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.library.data.LibraryRepository
 import com.studyink.library.data.TeacherGradeDraftCommitInput
+import com.studyink.memo.core.MemoTarget
+import com.studyink.memo.core.StudentMemoRepository
 import com.studyink.monitor.core.RemoteReviewFeedbackBus
 import com.studyink.monitor.core.RemoteTeacherFeedbackApplied
 import com.studyink.monitor.core.HybridLinkDecision
@@ -390,6 +392,7 @@ internal fun AnnotationSnapshot.studentAttemptNos(): Set<Int> = assets.values.as
 class ReaderViewModel(application: Application) : AndroidViewModel(application) {
     private val store = PageOperationLogStore.get(application)
     private val library = LibraryRepository.get(application)
+    private val memos = StudentMemoRepository.get(application)
     private val gradeDrafts = TeacherGradeDraftStore.get(application)
     private val remoteMonitorGateway = RemoteMonitorGateway.get(application)
     private val mutationMutex = Mutex()
@@ -425,6 +428,30 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         state.workflow,
         state.attemptNo,
     )
+
+    /** A memo is durable student work even before the first ordinary page stroke. */
+    private fun studentAttemptEvidence(
+        bookId: String,
+        pageNumber: Int,
+        snapshot: AnnotationSnapshot,
+        attempts: List<Attempt>,
+    ): Set<Int> {
+        val observed = snapshot.studentAttemptNos()
+        // There can be only one ordinary writable attempt. Probe its deterministic sidecar path
+        // instead of walking the entire memo inventory on every live-ink refresh.
+        val memoOnlyOpenAttempts = attempts.asSequence()
+            .filter { !it.locked && it.attemptNo !in observed }
+            .mapNotNull { attempt ->
+                runCatching {
+                    memos.snapshot(MemoTarget(bookId, pageNumber, attempt.attemptNo))
+                        .takeIf { it.revision > 0L }
+                        ?.target
+                        ?.attemptNo
+                }.getOrNull()
+            }
+            .toSet()
+        return observed + memoOnlyOpenAttempts
+    }
     private val _remoteFeedbackArrivals = MutableSharedFlow<RemoteTeacherFeedbackApplied>(
         extraBufferCapacity = 4,
     )
@@ -672,7 +699,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                         workflow = resolvedWorkflow,
                         selectedAttemptNo = selectedAttemptNo,
                         attempts = attempts,
-                        observedStudentAttemptNos = snapshot.studentAttemptNos(),
+                        observedStudentAttemptNos = studentAttemptEvidence(book.id, target, snapshot, attempts),
                         liveStudentAttemptNo = resolvedLiveAttemptNo,
                     )
                     _uiState.value = ReaderUiState(
@@ -818,7 +845,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                         latest.workflow == ReaderWorkflow.LIVE_MONITOR && !latest.attemptPinned
                     },
                     attempts = attempts,
-                    observedStudentAttemptNos = loaded.studentAttemptNos(),
+                    observedStudentAttemptNos = studentAttemptEvidence(bookId, pageNumber, loaded, attempts),
                     liveStudentAttemptNo = if (
                         latest.workflow == ReaderWorkflow.LIVE_MONITOR &&
                         latest.isFollowingStudent
@@ -1019,6 +1046,22 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             workflow = state.workflow,
             pinAttempt = true,
             followRemoteStudent = false,
+        )
+    }
+
+    /** Reveals a just-created memo's writable attempt without rebuilding the PDF or annotation page. */
+    fun showWritableAttemptForMemo(attemptNo: Int) {
+        val state = _uiState.value
+        if (state.role != ReaderRole.STUDENT || !state.documentReady || attemptNo <= 0) return
+        val attempts = library.attempts(state.bookId, state.pageNumber)
+        if (attempts.none { it.attemptNo == attemptNo && !it.locked }) return
+        _uiState.value = state.copy(
+            attemptNo = attemptNo,
+            capabilities = ReaderCapabilities.forSession(state.role, state.workflow, attemptNo),
+            currentAttemptWritable = true,
+            currentAttemptSubmitted = false,
+            pageAttemptNos = attempts.map(Attempt::attemptNo),
+            attemptPinned = false,
         )
     }
 

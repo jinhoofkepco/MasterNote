@@ -170,8 +170,8 @@ internal fun isToolExtensionGestureArmed(
     currentTool: ReaderTool?,
 ): Boolean = startedTool != null && startedTool == currentTool
 
-/** The ring is sized for the busiest page so it never resizes as the user pages through it. */
-private fun mainMenuItemCount(state: ReaderUiState) = if (state.capabilities.canGrade) 7 else 6
+/** Student memo creation replaces the teacher-only grade slot, so the main ring stays stable. */
+private fun mainMenuItemCount(state: ReaderUiState) = 7
 
 /**
  * Whether an S Pen side button is held down, read straight from the platform event.
@@ -199,6 +199,7 @@ fun StylusToolMenu(
     onSelectColor: (Int) -> Unit,
     onSelectWidth: (Float) -> Unit,
     onSelectOpacity: (Float) -> Unit,
+    onCreateMemo: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onInputRegionChanged: (StylusMenuInputRegion?) -> Unit,
@@ -397,6 +398,7 @@ fun StylusToolMenu(
                                 }
                             },
                             onOpenColors = { menuPage = RadialMenuPage.COLORS },
+                            onCreateMemo = onCreateMemo,
                             onSelectTool = onSelectTool,
                             onUndo = onUndo,
                             onRedo = onRedo,
@@ -436,6 +438,7 @@ private fun MainRadialMenu(
     selectedColorArgb: Int,
     onPenClick: () -> Unit,
     onOpenColors: () -> Unit,
+    onCreateMemo: () -> Unit,
     onSelectTool: (ReaderTool) -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
@@ -444,7 +447,8 @@ private fun MainRadialMenu(
 ) {
     val tokens = readerChromeTokens(state.role)
     val canGrade = state.capabilities.canGrade
-    val redoIndex = if (canGrade) 6 else 5
+    val paletteIndex = if (canGrade) 4 else 5
+    val redoIndex = 6
     RadialFan(
         itemCount = mainMenuItemCount(state),
         geometry = geometry,
@@ -494,7 +498,15 @@ private fun MainRadialMenu(
                 radialAngleDegrees = angleDegrees,
                 radialRadius = geometry.radius,
             )
-            index == 4 -> PaletteButton(
+            !canGrade && index == 4 -> RadialActionButton(
+                iconRes = R.drawable.ic_memo,
+                label = "메모 만들기",
+                enabled = state.documentReady && state.storageAvailable &&
+                    !state.submissionInProgress,
+                role = state.role,
+                onClick = onCreateMemo,
+            )
+            index == paletteIndex -> PaletteButton(
                 selectedColorArgb = selectedColorArgb,
                 role = state.role,
                 onClick = onOpenColors,
@@ -578,7 +590,7 @@ private fun PenRadialMenu(
     previewStatic: Boolean = false,
 ) {
     val tokens = readerChromeTokens(role)
-    val widths = listOf(6.4f, 4.8f, 3.2f, 2.4f, 1.6f)
+    val widths = PEN_WIDTH_CHOICES_DP
     val angles = penMenuAngleSpec()
     CurvedOpacitySlider(
         color = Color(selectedColorArgb),
@@ -1015,6 +1027,7 @@ private fun StylusMenuDevicePreview(
                         selectedColorArgb = tokens.paletteBlue.toArgb(),
                         onPenClick = {},
                         onOpenColors = {},
+                        onCreateMemo = {},
                         onSelectTool = {},
                         onUndo = {},
                         onRedo = {},
@@ -1035,7 +1048,7 @@ private fun StylusMenuDevicePreview(
                         role = state.role,
                         geometry = geometry,
                         selectedColorArgb = tokens.paletteBlue.toArgb(),
-                        selectedWidthDp = 3.2f,
+                        selectedWidthDp = DEFAULT_PEN_WIDTH_DP,
                         selectedOpacity = 0.72f,
                         onSelectWidth = {},
                         onSelectOpacity = {},

@@ -84,6 +84,17 @@ class FormattedAssistantAnswerDocumentTest {
     }
 
     @Test
+    fun build_rendersDisplayDelimiterCompactedInsideAListItem() {
+        val document = FormattedAssistantAnswerDocument.build(
+            "- 대입: ${'$'}${'$'} \\frac{1}{2} ${'$'}${'$'}",
+        )
+
+        assertTrue(document.contains("<li>대입: <span class=\"math-inline\">"))
+        assertTrue(document.contains("\\(\\frac{1}{2}\\)"))
+        assertFalse(document.contains("${'$'}${'$'} \\frac{1}{2} ${'$'}${'$'}"))
+    }
+
+    @Test
     fun build_removesExtractionArtifactsButKeepsLineBreaks() {
         val document = FormattedAssistantAnswerDocument.build("첫째\u200b\u200c\u200d\u2060\ufeff\r\n둘째\u202e\ufffd")
 
@@ -162,5 +173,29 @@ class FormattedAssistantAnswerDocumentTest {
         assertFalse(document.contains("<em>"))
         assertFalse(document.contains("math-inline"))
         assertFalse(document.contains("<blockquote>"))
+    }
+
+    @Test
+    fun editorWrapsOnlyVisibleWholeBlocksAndLoadsLocalEditorScript() {
+        val document = FormattedAssistantAnswerDocument.buildEditor(
+            "첫 설명\n\n수식은 \\(x^2\\) 입니다.\n\n마지막 설명",
+            hiddenBlockOrdinals = setOf(1),
+        )
+
+        assertTrue(document.contains("src=\"editor.js\""))
+        assertTrue(document.contains("data-block-ordinal=\"0\""))
+        assertFalse(document.contains("data-block-ordinal=\"1\""))
+        assertTrue(document.contains("data-block-ordinal=\"2\""))
+        assertFalse(document.contains("x^2"))
+        assertEquals(2, Regex("class=\"edit-block\"").findAll(document).count())
+    }
+
+    @Test
+    fun editorKeepsOneDocumentWideMathBudgetAcrossManyBlocks() {
+        val source = (1..400).joinToString("\n\n") { index -> "${'$'}x_$index${'$'}" }
+
+        val document = FormattedAssistantAnswerDocument.buildEditor(source)
+
+        assertEquals(256, Regex("class=\"math-inline\"").findAll(document).count())
     }
 }

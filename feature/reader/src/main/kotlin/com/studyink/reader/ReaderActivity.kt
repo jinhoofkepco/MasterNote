@@ -62,6 +62,11 @@ import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.document.pdf.PdfViewportAdapter
 import com.studyink.document.pdf.ReaderPdfFragment
 import com.studyink.library.data.LibraryRepository
+import com.studyink.memo.core.MemoAnchor
+import com.studyink.memo.core.MemoTarget
+import com.studyink.memo.core.StudentMemo
+import com.studyink.memo.core.StudentMemoChangeBus
+import com.studyink.memo.core.StudentMemoRepository
 import com.studyink.monitor.core.ParentMessage
 import com.studyink.monitor.core.RemotePeerChatDirection
 import com.studyink.monitor.core.RemotePeerChatState
@@ -97,6 +102,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private val viewModel: ReaderViewModel by viewModels()
     private val viewport = PdfViewportAdapter()
     private val assistantRepository by lazy { AssistantRepositoryProvider.get(this) }
+    private val memoRepository by lazy { StudentMemoRepository.get(this) }
     private lateinit var rootHost: FrameLayout
     private lateinit var pdfContainer: FragmentContainerView
     private lateinit var dryInkView: DryInkView
@@ -107,6 +113,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private lateinit var stylusMenuOverlay: StylusMenuOverlayView
     private lateinit var pageRegionSelectionView: PageRegionSelectionView
     private lateinit var studentExplanationOverlay: StudentExplanationOverlayView
+    private lateinit var memoOverlay: AttemptMemoOverlayView
     private lateinit var messageOverlayHost: LinearLayout
     private lateinit var parentMessageOverlay: ParentMessageOverlayView
     private lateinit var studentStatusOverlay: ParentMessageOverlayView
@@ -166,9 +173,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private var selectedTool by mutableStateOf(ReaderTool.PEN)
-    private var selectedPenColor by mutableStateOf(0xFF17233C.toInt())
-    private var selectedPenWidthDp by mutableStateOf(3.2f)
+    private var selectedPenColor by mutableStateOf(DEFAULT_PEN_COLOR_ARGB)
+    private var selectedPenWidthDp by mutableStateOf(DEFAULT_PEN_WIDTH_DP)
     private var selectedPenOpacity by mutableStateOf(1f)
+    private lateinit var penPreferences: ReaderPenPreferences
     private var latestState by mutableStateOf(ReaderUiState())
     private var initialPage = 0
     private var initialAttemptNo: Int? = null
@@ -198,6 +206,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var parentMessageSubscription: AutoCloseable? = null
     private var preferenceSubscription: AutoCloseable? = null
     private var peerChatSubscription: AutoCloseable? = null
+    private var memoChangeSubscription: AutoCloseable? = null
     private var peerChatPrimed = false
     private var lastPeerChatMessageId: String? = null
     private val peerChatOverlayDeliveryGate = PeerChatOverlayDeliveryGate()
@@ -217,6 +226,14 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var displayedExplanationTarget: StudentExplanationTarget? = null
     private var loadingExplanationTarget: StudentExplanationTarget? = null
     private var explanationLoadGeneration = 0L
+    private var displayedMemoTarget: MemoTarget? = null
+    private var loadingMemoTarget: MemoTarget? = null
+    private var displayedMemos: List<StudentMemo> = emptyList()
+    private var memoLoadGeneration = 0L
+    private var pendingOpenMemo: Pair<MemoTarget, String>? = null
+    private var memoEditorVisible by mutableStateOf(false)
+    private var memoCanUndo by mutableStateOf(false)
+    private var memoCanRedo by mutableStateOf(false)
     private var assistantCaptureInProgress = false
     private var answerCropPopup: AnswerCropPopupView? = null
     private var answerPopupTarget: Pair<String, Int>? = null
@@ -230,6 +247,11 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         super.onCreate(savedInstanceState)
         pruneStaleGptCaptures()
         bookId = intent.getStringExtra(EXTRA_BOOK_ID) ?: run { finish(); return }
+        penPreferences = ReaderPenPreferences(this)
+        penPreferences.load().let { settings ->
+            selectedPenColor = settings.colorArgb
+            selectedPenWidthDp = settings.widthDp
+        }
         initialPage = intent.getIntExtra(EXTRA_PAGE_NUMBER, 0)
         initialAttemptNo = if (intent.hasExtra(EXTRA_ATTEMPT_NUMBER)) {
             intent.getIntExtra(EXTRA_ATTEMPT_NUMBER, 1).takeIf { it >= TEACHER_PAGE_REVIEW_ATTEMPT_NO }
@@ -292,6 +314,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 studentExplanationOverlay.setContentBoundsInView(viewport.activePageBounds())
                 studentExplanationOverlay.notifyViewportChanged()
             }
+            if (::memoOverlay.isInitialized) memoOverlay.notifyPageViewportChanged()
             if (::pageRegionSelectionView.isInitialized &&
                 pageRegionSelectionView.visibility == View.VISIBLE
             ) {
@@ -379,6 +402,49 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
         studentExplanationOverlay = StudentExplanationOverlayView(this).also { overlay ->
             overlay.viewportAdapter = viewport
+            root.addView(overlay, FrameLayout.LayoutParams(MATCH, MATCH))
+        }
+
+        memoOverlay = AttemptMemoOverlayView(this).also { overlay ->
+            val memoStore = memoRepository
+            overlay.pageViewport = viewport
+            overlay.setTool(selectedTool)
+            overlay.setPenColor(selectedPenColor)
+            overlay.setPenWidth(selectedPenWidthDp)
+            overlay.setPenOpacity(selectedPenOpacity)
+            overlay.onReplaceStrokes = { target, memoId, revision, strokes ->
+                memoStore.replaceStrokes(target, memoId, revision, strokes)
+            }
+            overlay.onMoveMemo = { target, memoId, revision, anchor ->
+                memoStore.move(target, memoId, revision, anchor)
+            }
+            overlay.onDeleteMemo = { target, memoId, revision ->
+                memoStore.delete(target, memoId, revision)
+            }
+            overlay.onEditorVisibilityChanged = { visible ->
+                memoEditorVisible = visible
+                if (visible) {
+                    overlay.bringToFront()
+                    // Parent/teacher text remains readable above the memo sheet, while the sheet
+                    // still owns all otherwise-empty space and cannot be dismissed accidentally.
+                    if (::messageOverlayHost.isInitialized) messageOverlayHost.bringToFront()
+                    if (::stylusMenuOverlay.isInitialized) stylusMenuOverlay.bringToFront()
+                }
+                updateReaderInputEnabled()
+            }
+            overlay.onUndoStateChanged = { canUndo, canRedo ->
+                memoCanUndo = canUndo
+                memoCanRedo = canRedo
+            }
+            overlay.onStylusContact = {
+                if (stylusMenuExpanded) closeStylusMenu()
+            }
+            overlay.onWorkActivity = {
+                publishStudentHeartbeat(StudentWorkKind.PEN_CONTACT)
+            }
+            overlay.onPersistenceError = {
+                Toast.makeText(this, "메모를 저장하지 못했습니다.", Toast.LENGTH_SHORT).show()
+            }
             root.addView(overlay, FrameLayout.LayoutParams(MATCH, MATCH))
         }
 
@@ -504,6 +570,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                     }
                     updateReaderInputEnabled()
                     refreshStudentExplanationLayer()
+                    refreshAttemptMemos()
                     publishStudentPresence(state)
                     updateStudentVoiceEnabled()
                     ReaderDebugSessionStore.save(this@ReaderActivity, state)
@@ -594,7 +661,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private fun submitCurrentPage() {
         // A stroke is not durable until ACTION_UP. Refuse the submit tap while InkInputView still
         // owns a gesture so the final points can never fall on the far side of the attempt lock.
-        if (inputView.hasActiveGesture || latestState.submissionInProgress) return
+        if (inputView.hasActiveGesture || memoOverlay.hasActiveGesture || memoEditorVisible ||
+            latestState.submissionInProgress
+        ) return
         val submittedState = latestState
         viewModel.submit { nextPage ->
             publishStudentHeartbeat(StudentWorkKind.SUBMIT, submittedState)
@@ -678,21 +747,28 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private fun selectTool(tool: ReaderTool) {
         selectedTool = tool
         inputView.tool = tool
+        memoOverlay.setTool(tool)
         dryInkView.eraserPreview = null
     }
 
     private fun selectPenColor(colorArgb: Int) {
         selectedPenColor = colorArgb
+        penPreferences.saveColor(colorArgb)
         selectedTool = ReaderTool.PEN
         inputView.penColorArgb = colorArgb
         inputView.tool = ReaderTool.PEN
+        memoOverlay.setPenColor(colorArgb)
+        memoOverlay.setTool(ReaderTool.PEN)
     }
 
     private fun selectPenWidth(widthDp: Float) {
         selectedPenWidthDp = widthDp
+        penPreferences.saveWidth(widthDp)
         selectedTool = ReaderTool.PEN
         inputView.penWidthDp = widthDp
         inputView.tool = ReaderTool.PEN
+        memoOverlay.setPenWidth(widthDp)
+        memoOverlay.setTool(ReaderTool.PEN)
     }
 
     private fun selectPenOpacity(opacity: Float) {
@@ -700,6 +776,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         selectedTool = ReaderTool.PEN
         inputView.penOpacity = selectedPenOpacity
         inputView.tool = ReaderTool.PEN
+        memoOverlay.setPenOpacity(selectedPenOpacity)
+        memoOverlay.setTool(ReaderTool.PEN)
     }
 
     private fun updateReaderInputEnabled() {
@@ -712,7 +790,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             state.storageAvailable &&
             !state.submissionInProgress &&
             !selectingAssistantRegion &&
-            !assistantCaptureInProgress
+            !assistantCaptureInProgress &&
+            !memoEditorVisible
     }
 
     private fun currentStudentExplanationTarget(
@@ -765,6 +844,109 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         }
     }
 
+    private fun currentMemoTarget(state: ReaderUiState): MemoTarget? {
+        if (!state.documentReady || state.bookId.isBlank() ||
+            state.attemptNo <= TEACHER_PAGE_REVIEW_ATTEMPT_NO
+        ) return null
+        return runCatching { MemoTarget(state.bookId, state.pageNumber, state.attemptNo) }.getOrNull()
+    }
+
+    private fun refreshAttemptMemos(force: Boolean = false) {
+        if (!::memoOverlay.isInitialized) return
+        val target = currentMemoTarget(latestState)
+        if (target == null) {
+            memoLoadGeneration += 1L
+            displayedMemoTarget = null
+            loadingMemoTarget = null
+            displayedMemos = emptyList()
+            pendingOpenMemo = null
+            memoOverlay.clearMemos()
+            return
+        }
+        val writable = latestState.role == ReaderRole.STUDENT && latestState.currentAttemptWritable
+        if (!force && displayedMemoTarget == target) {
+            // The overlay owns edits that have just been durably committed. Rebinding the activity's
+            // older cache here can briefly roll that memo back before its change-bus reload arrives.
+            memoOverlay.updateStudentWritable(target, writable)
+            pendingOpenMemo?.takeIf { it.first == target }?.let { (_, memoId) ->
+                if (memoOverlay.openMemo(memoId)) pendingOpenMemo = null
+            }
+            return
+        }
+        if (!force && loadingMemoTarget == target) return
+        loadingMemoTarget = target
+        val generation = ++memoLoadGeneration
+        lifecycleScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) { memoRepository.activeMemos(target) }
+            }
+            if (generation != memoLoadGeneration || target != currentMemoTarget(latestState)) {
+                return@launch
+            }
+            loadingMemoTarget = null
+            result.onSuccess { memos ->
+                displayedMemoTarget = target
+                displayedMemos = memos
+                val canWrite = latestState.role == ReaderRole.STUDENT &&
+                    latestState.currentAttemptWritable
+                memoOverlay.showMemos(target, memos, canWrite)
+                pendingOpenMemo?.takeIf { it.first == target }?.let { (_, memoId) ->
+                    if (memoOverlay.openMemo(memoId)) pendingOpenMemo = null
+                }
+            }.onFailure { error ->
+                displayedMemoTarget = null
+                displayedMemos = emptyList()
+                memoOverlay.clearMemos()
+                Log.w(MEMO_LOG_TAG, "Unable to load attempt memos", error)
+            }
+        }
+    }
+
+    private fun createAttemptMemoAtStylus() {
+        val state = latestState
+        if (state.role != ReaderRole.STUDENT || !state.documentReady ||
+            !state.storageAvailable || state.submissionInProgress
+        ) return
+        val pageBounds = viewport.activePageBounds() ?: return
+        if (pageBounds.width() <= 0f || pageBounds.height() <= 0f) return
+        // PdfViewportAdapter and memoOverlay both use root-view coordinates. The radial menu has a
+        // status-bar top margin, so its local anchor must not be reused here or every memo is shifted.
+        val overlayOnScreen = IntArray(2).also(memoOverlay::getLocationOnScreen)
+        val source = lastStylusRawPosition
+            .takeIf { it.x.isFinite() && it.y.isFinite() }
+            ?.let { raw -> Offset(raw.x - overlayOnScreen[0], raw.y - overlayOnScreen[1]) }
+            ?: Offset(pageBounds.centerX(), pageBounds.centerY())
+        val anchor = MemoAnchor(
+            normalizedX = ((source.x - pageBounds.left) / pageBounds.width()).coerceIn(0f, 1f),
+            normalizedY = ((source.y - pageBounds.top) / pageBounds.height()).coerceIn(0f, 1f),
+        )
+        val sourceBookId = state.bookId
+        val sourcePage = state.pageNumber
+        closeStylusMenu()
+        lifecycleScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val attempt = LibraryRepository.get(this@ReaderActivity)
+                        .writableAttempt(sourceBookId, sourcePage, create = true)
+                        ?: error("Writable attempt is unavailable")
+                    val target = MemoTarget(sourceBookId, sourcePage, attempt.attemptNo)
+                    target to memoRepository.create(target, anchor)
+                }
+            }
+            if (latestState.bookId != sourceBookId || latestState.pageNumber != sourcePage ||
+                latestState.role != ReaderRole.STUDENT
+            ) return@launch
+            result.onSuccess { (target, memo) ->
+                viewModel.showWritableAttemptForMemo(target.attemptNo)
+                pendingOpenMemo = target to memo.id
+                refreshAttemptMemos(force = true)
+            }.onFailure { error ->
+                Log.w(MEMO_LOG_TAG, "Unable to create attempt memo", error)
+                Toast.makeText(this@ReaderActivity, "메모를 만들지 못했습니다.", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     private fun openTeacherGptResources(openLibrary: Boolean = false) {
         val state = latestState
         if (state.role == ReaderRole.STUDENT || !state.documentReady || state.bookId.isBlank()) {
@@ -805,6 +987,31 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 val controller = teacherResourcesDialog ?: TeacherPageResourcesDialogController(
                     context = this@ReaderActivity,
                     onPromptSelected =(::beginGptRegionSelection),
+                    onPromptUpdate = { prompt, body, completion ->
+                        lifecycleScope.launch {
+                            val result = runCatching {
+                                withContext(Dispatchers.IO) {
+                                    assistantRepository.updatePromptSlot(
+                                        slotNumber = prompt.slotNumber,
+                                        title = prompt.title,
+                                        body = body,
+                                        expectedRevision = prompt.revision,
+                                    )
+                                }
+                            }
+                            completion(result)
+                        }
+                    },
+                    onDeleteResource = { page, resourceId, completion ->
+                        lifecycleScope.launch {
+                            val result = runCatching {
+                                withContext(Dispatchers.IO) {
+                                    assistantRepository.removeTeacherResource(page, resourceId)
+                                }
+                            }
+                            completion(result)
+                        }
+                    },
                     onSend = { draft, completion ->
                         publishStudentExplanation(draft, completion)
                     },
@@ -1417,10 +1624,15 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             }
         }
         stylusMenuOverlay.setContent {
+            val menuState = if (memoEditorVisible) {
+                latestState.copy(canUndo = memoCanUndo, canRedo = memoCanRedo)
+            } else {
+                latestState
+            }
             StylusToolMenu(
                 expanded = stylusMenuExpanded,
                 anchorInHost = stylusMenuAnchorInHost,
-                state = latestState,
+                state = menuState,
                 selectedTool = selectedTool,
                 selectedColorArgb = selectedPenColor,
                 selectedWidthDp = selectedPenWidthDp,
@@ -1438,6 +1650,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 },
                 onSelectWidth =(::selectPenWidth),
                 onSelectOpacity =(::selectPenOpacity),
+                onCreateMemo =(::createAttemptMemoAtStylus),
                 onUndo =(::undoCurrentPage),
                 onRedo =(::redoCurrentPage),
                 onInputRegionChanged = { region ->
@@ -1465,6 +1678,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun undoCurrentPage() {
         val state = latestState
+        if (memoEditorVisible) {
+            if (memoOverlay.undo()) publishStudentHeartbeat(StudentWorkKind.UNDO, state)
+            return
+        }
         if (!state.canUndo) return
         viewModel.undo()
         publishStudentHeartbeat(StudentWorkKind.UNDO, state)
@@ -1472,6 +1689,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun redoCurrentPage() {
         val state = latestState
+        if (memoEditorVisible) {
+            if (memoOverlay.redo()) publishStudentHeartbeat(StudentWorkKind.REDO, state)
+            return
+        }
         if (!state.canRedo) return
         viewModel.redo()
         publishStudentHeartbeat(StudentWorkKind.REDO, state)
@@ -1812,6 +2033,15 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         readerStarted = true
         StudentExplanationLayerBus.addListener(studentExplanationListener)
         refreshStudentExplanationLayer(force = true)
+        memoChangeSubscription?.close()
+        memoChangeSubscription = StudentMemoChangeBus.addListener { change ->
+            runOnUiThread {
+                if (readerStarted && change.target == currentMemoTarget(latestState)) {
+                    refreshAttemptMemos(force = true)
+                }
+            }
+        }
+        refreshAttemptMemos(force = true)
         remoteMonitorPreferences = remoteMonitorGateway.preferences()
         parentMessageSubscription?.close()
         parentMessageSubscription = remoteMonitorGateway.subscribeParentMessages { message ->
@@ -1858,6 +2088,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         if (::parentMessageSpeaker.isInitialized) parentMessageSpeaker.stop()
         if (::stylusMenuOverlay.isInitialized) closeStylusMenu()
         if (::inputView.isInitialized) cancelActiveEraserInput()
+        if (::memoOverlay.isInitialized) memoOverlay.cancelActiveGesture()
         stylusButtonPressed = false
         lastStylusButtonPressEventTime = Long.MIN_VALUE
         super.onPause()
@@ -1866,6 +2097,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     override fun onStop() {
         readerStarted = false
         StudentExplanationLayerBus.removeListener(studentExplanationListener)
+        memoChangeSubscription?.close()
+        memoChangeSubscription = null
         publishInactiveStudentPresence()
         parentMessageSubscription?.close()
         parentMessageSubscription = null
@@ -1882,12 +2115,14 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     override fun onDestroy() {
         explanationLoadGeneration += 1L
+        memoLoadGeneration += 1L
         dismissAnswerCropPopup()
         teacherResourcesDialog?.dismiss()
         teacherResourcesDialog = null
         parentMessageSubscription?.close()
         preferenceSubscription?.close()
         peerChatSubscription?.close()
+        memoChangeSubscription?.close()
         if (::studentVoiceController.isInitialized) studentVoiceController.close()
         if (::parentMessageSpeaker.isInitialized) parentMessageSpeaker.close()
         super.onDestroy()
@@ -1900,6 +2135,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         if (!hasFocus && ::inputView.isInitialized) cancelActiveEraserInput()
+        if (!hasFocus && ::memoOverlay.isInitialized) memoOverlay.cancelActiveGesture()
         super.onWindowFocusChanged(hasFocus)
     }
 
@@ -1926,7 +2162,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             stylusButtonPressed = true
             when {
                 stylusMenuExpanded -> closeStylusMenu()
-                inputView.hasActiveGesture -> Unit
+                inputView.hasActiveGesture || memoOverlay.hasActiveGesture -> Unit
                 else -> showStylusMenu()
             }
             return true
@@ -1962,6 +2198,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         // the matching polar input region. Until that region arrives the overlay still returns
         // false, so the page underneath remains the owner of the S Pen stream.
         stylusMenuOverlay.visibility = View.VISIBLE
+        stylusMenuOverlay.bringToFront()
         val location = IntArray(2)
         stylusMenuOverlay.getLocationOnScreen(location)
         val raw = lastStylusRawPosition.takeIf { it.x.isFinite() && it.y.isFinite() }
@@ -1971,6 +2208,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             Offset(raw.x - location[0], raw.y - location[1])
         }
         dryInkView.hoverPreview = null
+        memoOverlay.cancelActiveGesture()
         stylusMenuExpanded = true
     }
 
@@ -2019,6 +2257,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 wetInkView,
                 inputView,
                 studentExplanationOverlay,
+                memoOverlay,
             ).forEach { view ->
                 view.updateFrameLayoutParams { bottomMargin = bars.bottom }
             }
@@ -2081,6 +2320,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         private const val PEN_INPUT_LOG_TAG = "MasterNotePenInput"
         private const val REMOTE_MONITOR_LOG_TAG = "MasterNoteRemoteMonitor"
         private const val GPT_ASSISTANT_LOG_TAG = "MasterNoteGptAssistant"
+        private const val MEMO_LOG_TAG = "MasterNoteMemo"
         private const val ANSWER_PDF_LOG_TAG = "MasterNoteAnswerPdf"
         private const val GPT_CAPTURE_CACHE_DIRECTORY = "gpt-assistant"
         private const val GPT_CAPTURE_MAX_EDGE_PX = 1_800

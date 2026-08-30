@@ -26,6 +26,19 @@ class AnnotationDocument(
      */
     operationClockHighWater: Long = 0L,
 ) {
+    /** Opaque in-memory editor state used to abandon a local mutation that failed to persist. */
+    class Checkpoint internal constructor(
+        internal val owner: Any,
+        internal val revision: Long,
+        internal val logicalClock: Long,
+        internal val assets: Map<StrokeId, StrokeAsset>,
+        internal val activeStrokeIds: Set<StrokeId>,
+        internal val appliedOperationIds: Set<OperationId>,
+        internal val undo: List<AssetOperation>,
+        internal val redo: List<AssetOperation>,
+    )
+
+    private val checkpointOwner = Any()
     private val bookId = initial.bookId
     private val pageNumber = initial.pageNumber
     private var revision = initial.revision
@@ -45,6 +58,38 @@ class AnnotationDocument(
     val canRedo: Boolean @Synchronized get() = redo.isNotEmpty()
 
     val operationClockHighWater: Long @Synchronized get() = logicalClock
+
+    /** Captures visible state and local history without serializing the document. */
+    @Synchronized
+    fun checkpoint(): Checkpoint = Checkpoint(
+        owner = checkpointOwner,
+        revision = revision,
+        logicalClock = logicalClock,
+        assets = assets.toMap(),
+        activeStrokeIds = active.toSet(),
+        appliedOperationIds = appliedOperationIds.toSet(),
+        undo = undo.toList(),
+        redo = redo.toList(),
+    )
+
+    /** Restores a checkpoint created by this document, including its undo/redo stacks. */
+    @Synchronized
+    fun restore(checkpoint: Checkpoint): AnnotationSnapshot {
+        require(checkpoint.owner === checkpointOwner) { "Checkpoint belongs to another document" }
+        revision = checkpoint.revision
+        logicalClock = checkpoint.logicalClock
+        assets.clear()
+        assets.putAll(checkpoint.assets)
+        active.clear()
+        active.addAll(checkpoint.activeStrokeIds)
+        appliedOperationIds.clear()
+        appliedOperationIds.addAll(checkpoint.appliedOperationIds)
+        undo.clear()
+        undo.addAll(checkpoint.undo)
+        redo.clear()
+        redo.addAll(checkpoint.redo)
+        return snapshot()
+    }
 
     @Synchronized
     fun snapshot(): AnnotationSnapshot = AnnotationSnapshot(

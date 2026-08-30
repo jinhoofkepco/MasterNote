@@ -27,6 +27,7 @@ dependencies {
     implementation(project(":sync:lan"))
     implementation(project(":monitor:core"))
     implementation(project(":monitor:telegram"))
+    implementation(project(":memo:core"))
 
     val composeBom = platform("androidx.compose:compose-bom:2026.06.00")
     implementation(composeBom)

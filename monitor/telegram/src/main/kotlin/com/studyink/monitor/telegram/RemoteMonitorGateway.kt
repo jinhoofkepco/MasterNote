@@ -388,6 +388,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         transferId: String,
         payloadType: String,
         plaintext: File,
+        coalesceKey: String? = null,
     ): TelegramEnqueueResult = synchronized(lifecycleLock) {
         val active = credentials.load() ?: return TelegramEnqueueResult.NOT_CONFIGURED
         val peer = active.peerBinding ?: return TelegramEnqueueResult.NOT_CONFIGURED
@@ -418,11 +419,18 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             route = TelegramOutboxRoute.PEER,
             destinationUsername = peer.username,
             peerTransferId = transferId,
+            coalesceKey = coalesceKey,
         )
-        val pendingPeerDocuments = outbox.pendingSnapshot().filter { pending ->
+        val pendingSnapshot = outbox.pendingSnapshot()
+        val immutableKeys = pendingSnapshot.filter(::isServerAcceptedPeerDocument)
+            .mapTo(linkedSetOf(), TelegramOutboxEntry::idempotencyKey)
+        val replaceable = coalesceKey?.let {
+            outbox.replaceableLatestEntries(it, immutableKeys)
+        }.orEmpty().mapTo(linkedSetOf(), TelegramOutboxEntry::idempotencyKey)
+        val pendingPeerDocuments = pendingSnapshot.filter { pending ->
             pending.route == TelegramOutboxRoute.PEER &&
                 pending.kind == TelegramOutboxKind.DOCUMENT &&
-                !isServerAcceptedPeerDocument(pending)
+                !isServerAcceptedPeerDocument(pending) && pending.idempotencyKey !in replaceable
         }
         val alreadyPending = pendingPeerDocuments.any { it.idempotencyKey == entry.idempotencyKey }
         val pendingBytes = pendingPeerDocuments.sumOf { pending ->
@@ -438,7 +446,19 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             staged.delete()
             return TelegramEnqueueResult.QUEUE_FULL
         }
-        val result = outbox.enqueue(entry)
+        val latest = if (coalesceKey == null) {
+            TelegramLatestEnqueueOutcome(outbox.enqueue(entry))
+        } else {
+            outbox.enqueueLatest(entry, immutableKeys)
+        }
+        val result = latest.result
+        if (result == TelegramEnqueueResult.ENQUEUED && latest.supersededEntries.isNotEmpty()) {
+            deleteSupersededOwnedPeerPayloads(
+                ownedPeerOutboxRoot = paths.peerOutboxDirectory,
+                superseded = latest.supersededEntries,
+                stillPending = outbox.pendingSnapshot(),
+            )
+        }
         if (result == TelegramEnqueueResult.ENQUEUED) uploader?.wake() else staged.delete()
         result
     }
@@ -1640,6 +1660,22 @@ private fun deleteOwnedPeerOutboxFile(rootDirectory: File, file: File?): Boolean
     val candidate = runCatching { file.canonicalFile }.getOrNull() ?: return false
     if (!candidate.toPath().startsWith(root.toPath())) return false
     return runCatching { candidate.delete() }.getOrDefault(false)
+}
+
+internal fun deleteSupersededOwnedPeerPayloads(
+    ownedPeerOutboxRoot: File,
+    superseded: List<TelegramOutboxEntry>,
+    stillPending: List<TelegramOutboxEntry>,
+): Int {
+    val protected = stillPending.mapNotNull(TelegramOutboxEntry::file)
+        .mapNotNull { runCatching { it.canonicalPath }.getOrNull() }
+        .toSet()
+    return superseded.count { entry ->
+        val candidate = entry.file
+        val path = candidate?.let { runCatching { it.canonicalPath }.getOrNull() }
+        entry.deleteAfterSend && path != null && path !in protected &&
+            deleteOwnedPeerOutboxFile(ownedPeerOutboxRoot, candidate)
+    }
 }
 
 private const val MAX_PEER_PAYLOAD_FILTER_TYPES = 32

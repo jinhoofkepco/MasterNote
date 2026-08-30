@@ -112,6 +112,102 @@ class RemotePageSyncStoreInventoryTest {
         }
 
     @Test
+    fun appliedTeacherPublicationIdentitySurvivesJournalRestart() =
+        withStoreFile { file ->
+            val publicationId = "c".repeat(64)
+            RemotePageSyncStore(file).apply {
+                bindPair(PAIR_ID)
+                beginStudentGeneration()
+                assertTrue(
+                    recordTeacherReviewApplied(
+                        pageToken = "page_token_receipt",
+                        attemptNo = 2,
+                        sourceRevision = 7L,
+                        payloadSha256 = "a".repeat(64),
+                        resultLayerSha256 = "b".repeat(64),
+                        publicationId = publicationId,
+                        markGroupsSha256 = "d".repeat(64),
+                    ),
+                )
+            }
+
+            RemotePageSyncStore(file).apply {
+                val evidence = appliedTeacherReviewState("page_token_receipt").single()
+                assertEquals(2, evidence.attemptNo)
+                assertEquals(publicationId, evidence.publicationId)
+                assertEquals("b".repeat(64), evidence.resultLayerSha256)
+                assertEquals("d".repeat(64), evidence.markGroupsSha256)
+            }
+        }
+
+    @Test
+    fun manifestMismatchCanReopenAnAcknowledgedExactPublication() =
+        withStoreFile { file ->
+            val pending = PendingTeacherReviewRecord(
+                intentId = "d".repeat(64),
+                bookId = "local_book",
+                contentSha256 = "e".repeat(64),
+                workbookToken = "workbook_token",
+                pageNumber = 4,
+                attemptNo = 3,
+                queuedAtEpochMs = 10L,
+            )
+            RemotePageSyncStore(file).apply {
+                bindPair(PAIR_ID)
+                queueTeacherReview(pending)
+                requireNotNull(
+                    reservePendingTeacherReview(
+                        key = pending.key,
+                        syncGeneration = 8L,
+                        pageToken = "page_token",
+                        transferId = "teacher_review_transfer",
+                        sourceRevision = 9L,
+                        payloadSha256 = "a".repeat(64),
+                        resultLayerSha256 = "b".repeat(64),
+                        sentAtEpochMs = 20L,
+                        carriesPublicationId = true,
+                    ),
+                )
+                assertTrue(pendingTeacherReviews().single().inFlightCarriesPublicationId)
+                assertFalse(reopenTeacherReviewFromManifest(pending.copy(queuedAtEpochMs = 25L)))
+                assertTrue(pendingTeacherReviews().single().inFlight)
+                assertEquals(0, pendingTeacherReviews().single().retryCount)
+                assertTrue(
+                    resolvePendingTeacherReview(
+                        syncGeneration = 8L,
+                        pageToken = "page_token",
+                        sourceTransferId = "teacher_review_transfer",
+                        sourceRevision = 9L,
+                        accepted = true,
+                        retryQueuedAtEpochMs = 30L,
+                    ),
+                )
+                assertTrue(isTeacherPublicationCompleted(
+                    pending.bookId,
+                    pending.pageNumber,
+                    pending.attemptNo,
+                    pending.intentId,
+                ))
+                assertTrue(reopenTeacherReviewFromManifest(pending.copy(queuedAtEpochMs = 40L)))
+                assertFalse(isTeacherPublicationCompleted(
+                    pending.bookId,
+                    pending.pageNumber,
+                    pending.attemptNo,
+                    pending.intentId,
+                ))
+                assertEquals(pending.intentId, pendingTeacherReviews().single().intentId)
+                assertTrue(confirmTeacherReviewFromManifest(pending, 50L))
+                assertTrue(pendingTeacherReviews().isEmpty())
+                assertTrue(isTeacherPublicationCompleted(
+                    pending.bookId,
+                    pending.pageNumber,
+                    pending.attemptNo,
+                    pending.intentId,
+                ))
+            }
+        }
+
+    @Test
     fun deletedWorkbookMappingStaysExplicitAcrossRestartUntilUserRebinds() =
         withStoreFile { file ->
             val token = "workbook_token_a"

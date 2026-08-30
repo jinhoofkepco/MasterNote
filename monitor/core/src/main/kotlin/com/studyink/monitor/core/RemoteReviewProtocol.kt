@@ -60,6 +60,9 @@ object RemoteReviewLimits {
     // never be safe. 4,096 keeps the manifest bounded while covering years of repeated work.
     const val MAX_PAGE_SYNC_ATTEMPTS_PER_PAGE: Int = 4_096
     const val MAX_PAGE_SYNC_APPROX_BYTES: Long = 64L * 1024L * 1024L
+
+    /** Keeps a full memo snapshot and its metadata inside one ordinary two MiB document. */
+    const val MAX_STUDENT_MEMO_BYTES: Int = OPERATIONAL_DOCUMENT_BYTES - (32 * 1024)
 }
 
 class RemoteReviewValidationException(
@@ -78,6 +81,7 @@ enum class RemoteReviewEnvelopeType {
     PAGE_ANNOTATION,
     PAGE_SYNC_ACK,
     GPT_EXPLANATION_LAYER,
+    STUDENT_MEMO,
 }
 
 sealed interface RemoteReviewEnvelope {

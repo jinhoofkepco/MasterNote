@@ -778,6 +778,40 @@ class LibraryRepository private constructor(private val context: Context) {
         )
     }
 
+    /**
+     * Installs the complete published grade snapshot for one student attempt.
+     *
+     * Unlike [upsertMarkGroupAttemptsFromSync], absence is meaningful here: an existing group that
+     * is not present in [incoming] loses only [attemptNo]'s marks. Marks for every other attempt are
+     * retained, and a group is removed only when no marks remain. This exact replacement lets a
+     * replay repair a restored or otherwise stale extra grade instead of retrying forever.
+     */
+    @Synchronized
+    fun replaceMarkGroupAttemptSnapshotFromSync(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        incoming: List<MarkGroup>,
+    ): Boolean {
+        val targetBook = book(bookId)
+        val result = replaceRemoteMarkGroupAttemptSnapshot(
+            markGroups = catalog.markGroups,
+            bookId = bookId,
+            pageNumber = pageNumber,
+            pageCount = targetBook.pageCount,
+            attempts = catalog.attempts,
+            attemptNo = attemptNo,
+            incoming = incoming,
+        )
+        val previousCatalog = catalog
+        return applyRemoteMarkGroupAttemptBatch(
+            result = result,
+            install = { markGroups -> catalog = previousCatalog.copy(markGroups = markGroups) },
+            rollback = { catalog = previousCatalog },
+            persist = ::persist,
+        )
+    }
+
     /** Idempotent peer upsert. Received attempts are not emitted back onto [LibraryAttemptBus]. */
     @Synchronized
     fun upsertAttemptFromSync(
@@ -1159,6 +1193,52 @@ internal fun mergeRemoteMarkGroupAttempts(
         )
     }
     return folded
+}
+
+/**
+ * Pure exact replacement for one published teacher-review attempt.
+ *
+ * Incoming groups are first validated and merged with the same metadata ordering as the ordinary
+ * delayed-review path. The final pass then removes [attemptNo] from target-page groups omitted by
+ * the publication while preserving all other attempts verbatim.
+ */
+internal fun replaceRemoteMarkGroupAttemptSnapshot(
+    markGroups: List<MarkGroup>,
+    bookId: String,
+    pageNumber: Int,
+    pageCount: Int,
+    attempts: List<Attempt>,
+    attemptNo: Int,
+    incoming: List<MarkGroup>,
+): MarkGroupUpsertResult {
+    val merged = mergeRemoteMarkGroupAttempts(
+        markGroups = markGroups,
+        bookId = bookId,
+        pageNumber = pageNumber,
+        pageCount = pageCount,
+        attempts = attempts,
+        attemptNo = attemptNo,
+        incoming = incoming,
+    )
+    val incomingIds = incoming.mapTo(HashSet(incoming.size), MarkGroup::id)
+    var removedSlice = false
+    val exact = buildList(merged.markGroups.size) {
+        merged.markGroups.forEach { group ->
+            if (group.bookId != bookId || group.pageNumber != pageNumber ||
+                group.id in incomingIds || group.marks.none { it.attemptNo == attemptNo }
+            ) {
+                add(group)
+                return@forEach
+            }
+            removedSlice = true
+            val retainedMarks = group.marks.filterNot { it.attemptNo == attemptNo }
+            if (retainedMarks.isNotEmpty()) add(group.copy(marks = retainedMarks))
+        }
+    }
+    return MarkGroupUpsertResult(
+        markGroups = exact,
+        changed = merged.changed || removedSlice,
+    )
 }
 
 /**

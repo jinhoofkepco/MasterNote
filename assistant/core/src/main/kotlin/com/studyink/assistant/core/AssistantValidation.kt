@@ -60,12 +60,33 @@ internal object AssistantValidation {
                     optionalText(it, "answer HTML", limits.maxAnswerHtmlUtf8Bytes)
                 }
                 revision.providerName?.let { optionalText(it, "provider name", MAX_PROVIDER_UTF8_BYTES) }
+                require(revision.answerMask == sanitizeAnswerMask(revision.answerText, revision.answerMask)) {
+                    "Teacher GPT answer mask is invalid"
+                }
                 require(revision.createdAtEpochMillis >= priorTimestamp) {
                     "Teacher GPT revision timestamp moved backwards"
                 }
                 priorTimestamp = revision.createdAtEpochMillis
             }
         }
+    }
+
+    /** Invalid optional metadata is discarded so it can never hide or invalidate the source answer. */
+    fun sanitizeAnswerMask(
+        answerText: String,
+        answerMask: TeacherGptAnswerMask?,
+    ): TeacherGptAnswerMask? = answerMask
+        ?.takeIf { it.isValidFor(answerText) }
+        ?.let { it.copy(hiddenBlockOrdinals = it.hiddenBlockOrdinals.toSortedSet()) }
+
+    /** Write callers must see a mismatch instead of silently saving an unexpectedly unmasked answer. */
+    fun answerMaskForWrite(
+        answerText: String,
+        answerMask: TeacherGptAnswerMask?,
+    ): TeacherGptAnswerMask? {
+        if (answerMask == null) return null
+        require(answerMask.isValidFor(answerText)) { "Teacher GPT answer mask does not match its source" }
+        return answerMask.copy(hiddenBlockOrdinals = answerMask.hiddenBlockOrdinals.toSortedSet())
     }
 
     fun studentLayer(layer: StudentExplanationLayer, limits: AssistantStorageLimits) {

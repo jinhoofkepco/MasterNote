@@ -1,6 +1,7 @@
 package com.studyink.app
 
 import android.util.AtomicFile
+import com.studyink.core.model.TeacherReviewStateEvidence
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -155,6 +156,8 @@ internal data class PendingTeacherReviewRecord(
     val inFlightSourceRevision: Long = 0L,
     val inFlightPayloadSha256: String? = null,
     val inFlightResultLayerSha256: String? = null,
+    /** Frozen wire capability: rebuilding this transfer must preserve legacy/new responseTo. */
+    val inFlightCarriesPublicationId: Boolean = false,
     val sentAtEpochMs: Long? = null,
     val transportAcknowledgedAtEpochMs: Long? = null,
 ) {
@@ -190,6 +193,10 @@ internal data class AppliedTeacherReviewRecord(
     val sourceRevision: Long,
     val payloadSha256: String?,
     val resultLayerSha256: String?,
+    /** Exact explicit teacher publication installed by the student; absent for older journals. */
+    val publicationId: String? = null,
+    /** Portable grade-state digest; absent for legacy receipts. */
+    val markGroupsSha256: String? = null,
 )
 
 internal enum class TeacherManifestInstallResult { APPLIED, DUPLICATE, STALE, REGRESSION }
@@ -1150,6 +1157,25 @@ internal class RemotePageSyncStore(
     @Synchronized fun appliedTeacherReviewRevision(pageToken: String, attemptNo: Int): Long =
         appliedTeacherReview(pageToken, attemptNo)?.sourceRevision ?: 0L
 
+    /** Legacy applied rows cannot prove which explicit publish press they installed, so omit them. */
+    @Synchronized
+    fun appliedTeacherReviewState(pageToken: String): List<TeacherReviewStateEvidence> {
+        val prefix = "$pageToken:"
+        return appliedTeacherReviews.asSequence().mapNotNull { (key, value) ->
+            if (!key.startsWith(prefix)) return@mapNotNull null
+            val attemptNo = key.removePrefix(prefix).toIntOrNull()?.takeIf { it > 0 }
+                ?: return@mapNotNull null
+            runCatching {
+                TeacherReviewStateEvidence(
+                    attemptNo = attemptNo,
+                    publicationId = value.publicationId ?: return@mapNotNull null,
+                    resultLayerSha256 = value.resultLayerSha256 ?: return@mapNotNull null,
+                    markGroupsSha256 = value.markGroupsSha256 ?: return@mapNotNull null,
+                )
+            }.getOrNull()
+        }.sortedBy(TeacherReviewStateEvidence::attemptNo).toList()
+    }
+
     @Synchronized
     fun recordTeacherReviewApplied(
         pageToken: String,
@@ -1157,6 +1183,8 @@ internal class RemotePageSyncStore(
         sourceRevision: Long,
         payloadSha256: String,
         resultLayerSha256: String,
+        publicationId: String? = null,
+        markGroupsSha256: String? = null,
     ): Boolean {
         val key = teacherReviewKey(pageToken, attemptNo)
         val current = appliedTeacherReviews[key]
@@ -1165,6 +1193,8 @@ internal class RemotePageSyncStore(
             sourceRevision,
             payloadSha256,
             resultLayerSha256,
+            publicationId,
+            markGroupsSha256,
         )
         persist()
         return true
@@ -1192,6 +1222,49 @@ internal class RemotePageSyncStore(
         }
         pendingTeacherReviews[value.key] = value
         persist()
+    }
+
+    /**
+     * Reopens an exact completed publication only after a newer student manifest proves that the
+     * corresponding page/attempt receipt is absent or different. This deliberately bypasses the
+     * ACK tombstone used by the ordinary durable-intent scan.
+     */
+    @Synchronized
+    fun reopenTeacherReviewFromManifest(value: PendingTeacherReviewRecord): Boolean {
+        val completionKey = teacherPublicationCompletionKey(value)
+        var changed = completedTeacherPublications.remove(completionKey) != null
+        val current = pendingTeacherReviews[value.key]
+        if (current?.intentId != value.intentId) {
+            pendingTeacherReviews[value.key] = value
+            changed = true
+        }
+        // A repeated mismatch is not new work. Preserve an existing retry timestamp, failure
+        // cooldown, and in-flight transfer instead of rebuilding a large artifact every 5 seconds.
+        if (changed) persist()
+        return changed
+    }
+
+    /** A manifest receipt is application-level proof and can settle an ACK lost in transit. */
+    @Synchronized
+    fun confirmTeacherReviewFromManifest(
+        value: PendingTeacherReviewRecord,
+        confirmedAtEpochMs: Long,
+    ): Boolean {
+        require(confirmedAtEpochMs >= 0L)
+        val completionKey = teacherPublicationCompletionKey(value)
+        var changed = false
+        if (completionKey !in completedTeacherPublications) {
+            completedTeacherPublications[completionKey] = confirmedAtEpochMs
+            trimCompletedTeacherPublications()
+            changed = true
+        }
+        val pending = pendingTeacherReviews[value.key]
+        if (pending?.intentId == value.intentId) {
+            pendingTeacherReviews.remove(value.key)
+            changed = true
+        }
+        if (changed) persist()
+        return changed
     }
 
     @Synchronized
@@ -1230,6 +1303,7 @@ internal class RemotePageSyncStore(
         payloadSha256: String,
         resultLayerSha256: String,
         sentAtEpochMs: Long,
+        carriesPublicationId: Boolean = false,
     ): PendingTeacherReviewRecord? {
         val current = pendingTeacherReviews[key] ?: return null
         if (current.inFlight) return current
@@ -1240,6 +1314,7 @@ internal class RemotePageSyncStore(
             inFlightSourceRevision = sourceRevision,
             inFlightPayloadSha256 = payloadSha256,
             inFlightResultLayerSha256 = resultLayerSha256,
+            inFlightCarriesPublicationId = carriesPublicationId,
             sentAtEpochMs = sentAtEpochMs,
             transportAcknowledgedAtEpochMs = null,
         ).also {
@@ -1387,6 +1462,7 @@ internal class RemotePageSyncStore(
         inFlightSourceRevision = 0L,
         inFlightPayloadSha256 = null,
         inFlightResultLayerSha256 = null,
+        inFlightCarriesPublicationId = false,
         sentAtEpochMs = null,
         transportAcknowledgedAtEpochMs = null,
     )
@@ -1571,6 +1647,8 @@ internal class RemotePageSyncStore(
                                 sourceRevision = raw.getLong("sourceRevision"),
                                 payloadSha256 = raw.optNullableString("payloadSha256"),
                                 resultLayerSha256 = raw.optNullableString("resultLayerSha256"),
+                                publicationId = raw.optNullableString("publicationId"),
+                                markGroupsSha256 = raw.optNullableString("markGroupsSha256"),
                             )
                         }.getOrNull()
                         else -> null
@@ -1671,7 +1749,9 @@ internal class RemotePageSyncStore(
                     put(key, JSONObject()
                         .put("sourceRevision", value.sourceRevision)
                         .put("payloadSha256", value.payloadSha256 ?: JSONObject.NULL)
-                        .put("resultLayerSha256", value.resultLayerSha256 ?: JSONObject.NULL))
+                        .put("resultLayerSha256", value.resultLayerSha256 ?: JSONObject.NULL)
+                        .put("publicationId", value.publicationId ?: JSONObject.NULL)
+                        .put("markGroupsSha256", value.markGroupsSha256 ?: JSONObject.NULL))
                 }
             })
             .put("pendingTeacherReviews", JSONArray().apply { pendingTeacherReviews.values.forEach { put(encode(it)) } })
@@ -1785,6 +1865,7 @@ internal class RemotePageSyncStore(
         .put("inFlightSourceRevision", v.inFlightSourceRevision)
         .put("inFlightPayloadSha256", v.inFlightPayloadSha256 ?: JSONObject.NULL)
         .put("inFlightResultLayerSha256", v.inFlightResultLayerSha256 ?: JSONObject.NULL)
+        .put("inFlightCarriesPublicationId", v.inFlightCarriesPublicationId)
         .put("sentAt", v.sentAtEpochMs ?: JSONObject.NULL)
         .put("transportAcknowledgedAt", v.transportAcknowledgedAtEpochMs ?: JSONObject.NULL)
 
@@ -1893,6 +1974,7 @@ internal class RemotePageSyncStore(
         inFlightPageToken = v.optNullableString("inFlightPageToken"), inFlightTransferId = v.optNullableString("inFlightTransferId"),
         inFlightSourceRevision = v.optLong("inFlightSourceRevision"), inFlightPayloadSha256 = v.optNullableString("inFlightPayloadSha256"),
         inFlightResultLayerSha256 = v.optNullableString("inFlightResultLayerSha256"), sentAtEpochMs = v.optNullableLong("sentAt"),
+        inFlightCarriesPublicationId = v.optBoolean("inFlightCarriesPublicationId"),
         transportAcknowledgedAtEpochMs = v.optNullableLong("transportAcknowledgedAt"),
     ) }.getOrNull()
 

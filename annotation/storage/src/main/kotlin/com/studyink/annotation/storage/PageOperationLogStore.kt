@@ -16,6 +16,13 @@ import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeId
 import com.studyink.core.model.StrokeTool
 import com.studyink.core.model.TeacherReviewPublicationLimits
+import com.studyink.core.model.TeacherReviewMarkGroupMetadata
+import com.studyink.core.model.TeacherReviewStateEvidence
+import com.studyink.core.model.normalizeTeacherReviewMarkGroupMetadata
+import com.studyink.core.model.normalizeTeacherReviewMarkGroupMetadataValues
+import com.studyink.core.model.teacherReviewGradeStateSha256
+import com.studyink.core.model.teacherReviewMarkGroupMetadataSha256
+import com.studyink.core.model.teacherReviewMarkGroupsSha256
 import com.google.gson.stream.JsonReader
 import com.google.gson.stream.JsonToken
 import com.google.gson.stream.JsonWriter
@@ -182,6 +189,137 @@ data class TeacherReviewPublishIntent(
     }
 }
 
+/**
+ * Durable proof of the latest explicit teacher publication installed for one exact attempt.
+ *
+ * [remotePairId] and [remoteWorkbookToken] keep Telegram inventory evidence scoped to the exact
+ * paired workbook. LAN may still compare the same receipt without filters because its authenticated
+ * socket already pins the peer device and workbook.
+ */
+data class AppliedTeacherReviewReceipt(
+    val bookId: String,
+    val pageNumber: Int,
+    val attemptNo: Int,
+    val publicationId: String,
+    val resultLayerSha256: String,
+    val markGroupsSha256: String,
+    val appliedAtEpochMillis: Long,
+    /** Teacher-side frozen publication order shared by LAN and Telegram; zero means legacy/unknown. */
+    val publishedAtEpochMillis: Long = 0L,
+    val remotePairId: String? = null,
+    val remoteWorkbookToken: String? = null,
+) {
+    init {
+        require(bookId.isNotBlank()) { "Applied teacher review book id cannot be blank" }
+        require(pageNumber >= 0) { "Applied teacher review page cannot be negative" }
+        require(attemptNo > 0) { "Applied teacher review attempt must be positive" }
+        require(publicationId.matches(Regex("[0-9a-f]{64}"))) {
+            "Applied teacher review publication id is invalid"
+        }
+        require(resultLayerSha256.matches(Regex("[0-9a-f]{64}"))) {
+            "Applied teacher review layer digest is invalid"
+        }
+        require(markGroupsSha256.matches(Regex("[0-9a-f]{64}"))) {
+            "Applied teacher review grade digest is invalid"
+        }
+        require(appliedAtEpochMillis >= 0L) { "Applied teacher review timestamp cannot be negative" }
+        require(publishedAtEpochMillis >= 0L) {
+            "Applied teacher review publication timestamp cannot be negative"
+        }
+        require(remotePairId == null || remotePairId.isNotBlank()) {
+            "Applied teacher review pair id cannot be blank"
+        }
+        require(remoteWorkbookToken == null || remoteWorkbookToken.isNotBlank()) {
+            "Applied teacher review workbook token cannot be blank"
+        }
+    }
+
+    fun evidence(pageMetadataSha256: String): TeacherReviewStateEvidence = TeacherReviewStateEvidence(
+        attemptNo = attemptNo,
+        publicationId = publicationId,
+        resultLayerSha256 = resultLayerSha256,
+        markGroupsSha256 = teacherReviewGradeStateSha256(
+            markGroupsSha256,
+            pageMetadataSha256,
+        ),
+    )
+}
+
+/**
+ * Produces a strict per-target publication order across every durable crash-boundary witness.
+ * The epoch value is an ordering token, not a claim that a rolled-back wall clock is current.
+ */
+internal fun nextTeacherReviewPublicationTimestamp(
+    requestedEpochMillis: Long,
+    authorityEpochMillis: Long?,
+    outboxEpochMillis: Long?,
+    preparationEpochMillis: Long?,
+): Long {
+    val witnesses = listOfNotNull(
+        authorityEpochMillis,
+        outboxEpochMillis,
+        preparationEpochMillis,
+    )
+    require(requestedEpochMillis >= 0L && witnesses.all { it >= 0L }) {
+        "Teacher review publication timestamp cannot be negative"
+    }
+    val previous = witnesses.maxOrNull() ?: return requestedEpochMillis
+    require(previous < Long.MAX_VALUE) { "Teacher review publication order is exhausted" }
+    return maxOf(requestedEpochMillis, previous + 1L)
+}
+
+enum class TeacherReviewPublicationOrderDisposition {
+    /** A strictly older or unknown-order frame behind a sequenced receipt. */
+    STALE,
+    /** The same sequenced publication; verify actual ink/grade metadata before acknowledging. */
+    DUPLICATE_VERIFY,
+    /** Two different publications claim the same sequence and neither may overwrite the other. */
+    CONFLICT,
+    /** No ordered receipt exists, or this publication is strictly newer. */
+    APPLY,
+}
+
+/** Shared LAN/Telegram ordering rule for one already pair-scoped exact target. */
+fun teacherReviewPublicationOrderDisposition(
+    current: AppliedTeacherReviewReceipt?,
+    incomingPublicationId: String,
+    incomingPublishedAtEpochMillis: Long,
+): TeacherReviewPublicationOrderDisposition {
+    require(incomingPublicationId.matches(Regex("[0-9a-f]{64}"))) {
+        "Incoming teacher review publication id is invalid"
+    }
+    require(incomingPublishedAtEpochMillis >= 0L) {
+        "Incoming teacher review publication timestamp cannot be negative"
+    }
+    if (current == null || current.publishedAtEpochMillis == 0L) {
+        return TeacherReviewPublicationOrderDisposition.APPLY
+    }
+    return when {
+        incomingPublishedAtEpochMillis == 0L ||
+            incomingPublishedAtEpochMillis < current.publishedAtEpochMillis ->
+            TeacherReviewPublicationOrderDisposition.STALE
+        incomingPublishedAtEpochMillis > current.publishedAtEpochMillis ->
+            TeacherReviewPublicationOrderDisposition.APPLY
+        incomingPublicationId == current.publicationId ->
+            TeacherReviewPublicationOrderDisposition.DUPLICATE_VERIFY
+        else -> TeacherReviewPublicationOrderDisposition.CONFLICT
+    }
+}
+
+/** Process-global stripes shared even by separately constructed store holders in one app process. */
+private object TeacherReviewTargetLocks {
+    private const val STRIPE_COUNT = 64
+    private val stripes = Array(STRIPE_COUNT) { Any() }
+
+    fun lock(bookId: String, pageNumber: Int, attemptNo: Int): Any {
+        var hash = bookId.hashCode()
+        hash = 31 * hash + pageNumber
+        hash = 31 * hash + attemptNo
+        hash = hash xor (hash ushr 16)
+        return stripes[hash and (STRIPE_COUNT - 1)]
+    }
+}
+
 class TeacherReviewPublicationArtifact internal constructor(
     val intent: TeacherReviewPublishIntent,
     checkpointBytes: ByteArray,
@@ -241,6 +379,7 @@ data class StoredAnnotationPage(
 class PageOperationLogStore(
     private val rootDirectory: File,
     checkpointInterval: Int = DEFAULT_CHECKPOINT_INTERVAL,
+    private val beforeTeacherReviewWorkbookOutboxPersist: (() -> Unit)? = null,
 ) {
     private val checkpointInterval = checkpointInterval.coerceAtLeast(1)
     /**
@@ -266,7 +405,31 @@ class PageOperationLogStore(
         0.75f,
         true,
     )
+    /**
+     * Exact structural cache for installed published-teacher layers. Page revisions are too broad:
+     * ordinary student writing changes them every few seconds. The canonical active teacher-id
+     * signature changes only when this attempt's published layer can change; immutable assets make
+     * an equal signature an exact witness rather than a TTL guess.
+     */
+    private val publishedTeacherLayerDigests =
+        LinkedHashMap<TeacherReviewIntentKey, PublishedTeacherLayerDigest>(
+            MAX_CACHED_PUBLISHED_TEACHER_LAYER_DIGESTS + 1,
+            0.75f,
+            true,
+        )
+    /** Mutation witness independent of the three-entry decoded page LRU. */
+    private val publishedTeacherLayerGenerations =
+        LinkedHashMap<TeacherReviewIntentKey, Long>(
+            MAX_CACHED_PUBLISHED_TEACHER_LAYER_DIGESTS + 1,
+            0.75f,
+            true,
+        )
+    private var publishedTeacherLayerDigestMaterializations = 0L
     private val teacherReviewPublishIntents = linkedMapOf<TeacherReviewIntentKey, TeacherReviewPublishIntent>()
+    /** Latest explicit publish per page/attempt, retained after its transport outbox is ACKed. */
+    private val teacherReviewAuthorities = linkedMapOf<TeacherReviewIntentKey, TeacherReviewAuthorityRecord>()
+    /** Latest successfully installed publication per page/attempt on the receiving device. */
+    private val appliedTeacherReviewReceipts = linkedMapOf<TeacherReviewIntentKey, AppliedTeacherReviewReceipt>()
     /**
      * Bridges the tiny in-process race where the coordinator promotes and LAN acknowledges an
      * intent before the Reader's original publish call returns. A restarted process cannot still
@@ -275,6 +438,7 @@ class PageOperationLogStore(
     private val recentlyPromotedTeacherReviewPublications =
         linkedMapOf<String, TeacherReviewPublishIntent>()
     private var teacherReviewPublishIntentsLoaded = false
+    private var teacherReviewStateLoaded = false
 
     constructor(context: Context, checkpointInterval: Int = DEFAULT_CHECKPOINT_INTERVAL) : this(
         File(context.filesDir, "masternote/annotation-pages"),
@@ -284,6 +448,7 @@ class PageOperationLogStore(
     init {
         check(rootDirectory.mkdirs() || rootDirectory.isDirectory) { "Cannot create annotation directory" }
         loadTeacherReviewPublishIntents()
+        loadTeacherReviewState()
     }
 
     /**
@@ -394,11 +559,21 @@ class PageOperationLogStore(
         }
         val merged = apply(current, record)
         index.add(record, line.toByteArray(Charsets.UTF_8), merged)
+        recordPublishedTeacherLayerMutation(
+            proposed.bookId,
+            proposed.pageNumber,
+            current,
+            record,
+        )
         MasterNoteDataCommitBus.recordDurableCommit()
         if (merged.revision % checkpointInterval == 0L) writeCheckpoint(merged)
         return merged
     }
 
+    /**
+     * Persists the current in-process snapshot; it is not a data-import/replacement API.
+     * Restore code must replace the stable root and call [resetCachedStateAfterRestore].
+     */
     @Synchronized
     fun writeCheckpoint(snapshot: AnnotationSnapshot) {
         val directory = pageDirectory(snapshot.bookId, snapshot.pageNumber)
@@ -726,7 +901,17 @@ class PageOperationLogStore(
     @Synchronized
     fun publishedTeacherLayerSha256(bookId: String, pageNumber: Int, attemptNo: Int): String {
         require(attemptNo > 0) { "Published teacher checkpoint attempt must be positive" }
-        return portablePublishedTeacherLayer(pageIndex(bookId, pageNumber).snapshot, attemptNo).sha256
+        val key = TeacherReviewIntentKey(bookId, pageNumber, attemptNo)
+        val generation = publishedTeacherLayerGenerations[key] ?: 0L
+        publishedTeacherLayerDigests[key]
+            ?.takeIf { it.mutationGeneration == generation }
+            ?.let { return it.sha256 }
+        return cachedPublishedTeacherLayerSha256(
+            bookId,
+            pageNumber,
+            attemptNo,
+            pageIndex(bookId, pageNumber).snapshot,
+        )
     }
 
     /** Captures one published teacher layer and its digest under the same store lock. */
@@ -785,14 +970,26 @@ class PageOperationLogStore(
         require(expectedResultLayerSha256 == null || incomingLayer.sha256 == expectedResultLayerSha256) {
             "Published teacher checkpoint result layer digest mismatch"
         }
-        val currentLayer = portablePublishedTeacherLayer(current, attemptNo)
+        val currentLayerSha256 = cachedPublishedTeacherLayerSha256(
+            localBookId,
+            pageNumber,
+            attemptNo,
+            current,
+        )
         decoded.assets.forEach { incoming ->
             val existing = current.assets[incoming.id]
             require(existing == null || existing == incoming) {
                 "Published teacher checkpoint asset collides with existing ink"
             }
         }
-        if (currentLayer.sha256 == incomingLayer.sha256) {
+        if (currentLayerSha256 == incomingLayer.sha256) {
+            cachePublishedTeacherLayerSha256(
+                localBookId,
+                pageNumber,
+                attemptNo,
+                current,
+                incomingLayer.sha256,
+            )
             return PublishedTeacherLayerCheckpointApplyResult(
                 checkpointId = decoded.checkpointId,
                 layerSha256 = incomingLayer.sha256,
@@ -809,7 +1006,7 @@ class PageOperationLogStore(
         val operationId = checkpointTransitionOperationId(
             prefix = PUBLISHED_TEACHER_CHECKPOINT_OPERATION_PREFIX,
             checkpointId = decoded.checkpointId,
-            currentLayerSha256 = currentLayer.sha256,
+            currentLayerSha256 = currentLayerSha256,
             currentRevision = current.revision,
         )
         val operation = AssetOperation(
@@ -827,7 +1024,12 @@ class PageOperationLogStore(
             addedAssets = decoded.assets,
         )
         val updated = appendSyntheticRecord(index, record)
-        check(portablePublishedTeacherLayer(updated, attemptNo).sha256 == incomingLayer.sha256) {
+        check(cachedPublishedTeacherLayerSha256(
+            localBookId,
+            pageNumber,
+            attemptNo,
+            updated,
+        ) == incomingLayer.sha256) {
             "Published teacher checkpoint replacement produced a different layer"
         }
         return PublishedTeacherLayerCheckpointApplyResult(
@@ -1120,6 +1322,7 @@ class PageOperationLogStore(
         }
         val updated = apply(current, localRecord)
         index.add(localRecord, localBytes, updated)
+        recordPublishedTeacherLayerMutation(bookId, pageNumber, current, localRecord)
         MasterNoteDataCommitBus.recordDurableCommit()
         if (updated.revision % checkpointInterval == 0L) writeCheckpoint(updated)
         return updated.revision
@@ -1158,17 +1361,34 @@ class PageOperationLogStore(
         publishedMarkGroups: List<MarkGroup>,
     ): TeacherReviewPublishIntent {
         ensureTeacherReviewPublishIntentsLoaded()
+        ensureTeacherReviewStateLoaded()
         validateTeacherReviewPublishIntent(intent)
         require(publishedSnapshot.bookId == intent.bookId &&
             publishedSnapshot.pageNumber == intent.pageNumber
         ) { "Teacher review preparation snapshot target mismatch" }
-        val frozen = freezeTeacherReviewPublication(intent, publishedSnapshot, publishedMarkGroups)
+        val key = TeacherReviewIntentKey(intent.bookId, intent.pageNumber, intent.attemptNo)
         val preparationFile = teacherReviewPublicationPreparationFile(
             intent.bookId,
             intent.pageNumber,
             intent.attemptNo,
         )
         val previous = readTeacherReviewPublicationPreparation(preparationFile)
+        // All three ledgers can briefly be the only surviving order witness at a crash boundary.
+        // Never reuse an order merely because the wall clock moved backwards or stayed in the
+        // same millisecond as the previous explicit press.
+        val orderedIntent = intent.copy(
+            updatedAtEpochMillis = nextTeacherReviewPublicationTimestamp(
+                requestedEpochMillis = intent.updatedAtEpochMillis,
+                authorityEpochMillis = teacherReviewAuthorities[key]?.intent?.updatedAtEpochMillis,
+                outboxEpochMillis = teacherReviewPublishIntents[key]?.updatedAtEpochMillis,
+                preparationEpochMillis = previous?.updatedAtEpochMillis,
+            ),
+        )
+        val frozen = freezeTeacherReviewPublication(
+            orderedIntent,
+            publishedSnapshot,
+            publishedMarkGroups,
+        )
         writeTeacherReviewPublicationArtifact(
             frozen.intent,
             frozen.checkpointBytes,
@@ -1233,6 +1453,7 @@ class PageOperationLogStore(
         val key = TeacherReviewIntentKey(bookId, pageNumber, attemptNo)
         val currentReady = teacherReviewPublishIntents[key]
         if (currentReady?.publicationId == publicationId) {
+            installTeacherReviewAuthority(currentReady)
             teacherReviewPublicationPreparationFile(bookId, pageNumber, attemptNo).delete()
             rememberRecentlyPromotedTeacherReview(currentReady)
             return currentReady
@@ -1270,6 +1491,7 @@ class PageOperationLogStore(
         persistTeacherReviewPublishIntents(next.values)
         teacherReviewPublishIntents.clear()
         teacherReviewPublishIntents.putAll(next)
+        installTeacherReviewAuthority(prepared)
         preparationFile.delete()
         rememberRecentlyPromotedTeacherReview(prepared)
         currentReady?.publicationId?.takeIf { it != publicationId }
@@ -1298,6 +1520,316 @@ class PageOperationLogStore(
         )
     }
 
+    /** Last explicit, immutable publication for each exact target, including ACKed publications. */
+    @Synchronized
+    fun teacherReviewAuthorityIntents(
+        bookId: String,
+        pageNumber: Int,
+        remotePairId: String? = null,
+        remoteWorkbookToken: String? = null,
+    ): List<TeacherReviewPublishIntent> {
+        ensureTeacherReviewStateLoaded()
+        return teacherReviewAuthorities.values.asSequence()
+            .map(TeacherReviewAuthorityRecord::intent)
+            .filter { intent ->
+                intent.bookId == bookId && intent.pageNumber == pageNumber &&
+                    (remotePairId == null || intent.remotePairId == remotePairId) &&
+                    (remoteWorkbookToken == null ||
+                        intent.remoteWorkbookToken == remoteWorkbookToken)
+            }
+            .sortedBy(TeacherReviewPublishIntent::attemptNo)
+            .toList()
+    }
+
+    /**
+     * Binds a pair-owned deferred publication to one exact Telegram workbook after manifest proof.
+     *
+     * Pairless legacy/LAN publications are deliberately ineligible. The authority journal commits
+     * first; if the following outbox write is interrupted, startup reconciles the same publication's
+     * non-null token back into both ledgers without ever promoting a pair id.
+     */
+    @Synchronized
+    fun bindTeacherReviewAuthorityWorkbook(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        publicationId: String,
+        remotePairId: String,
+        remoteWorkbookToken: String,
+    ): TeacherReviewPublishIntent? {
+        require(bookId.isNotBlank() && pageNumber >= 0 && attemptNo > 0)
+        require(publicationId.matches(STUDENT_CHECKPOINT_ID))
+        require(remotePairId.isNotBlank() && remoteWorkbookToken.isNotBlank())
+        ensureTeacherReviewPublishIntentsLoaded()
+        ensureTeacherReviewStateLoaded()
+        val key = TeacherReviewIntentKey(bookId, pageNumber, attemptNo)
+        val authority = teacherReviewAuthorities[key] ?: return null
+        val current = authority.intent
+        if (current.publicationId != publicationId || current.remotePairId != remotePairId ||
+            current.remoteWorkbookToken != null && current.remoteWorkbookToken != remoteWorkbookToken
+        ) return null
+        val pending = teacherReviewPublishIntents[key]
+        if (pending != null && (pending.publicationId != publicationId ||
+                pending.remotePairId != remotePairId ||
+                pending.remoteWorkbookToken != null && pending.remoteWorkbookToken != remoteWorkbookToken)
+        ) return null
+        val bound = current.copy(remoteWorkbookToken = remoteWorkbookToken)
+        if (bound != current) {
+            val nextAuthorities = LinkedHashMap(teacherReviewAuthorities).apply {
+                put(key, authority.copy(intent = bound))
+            }
+            persistTeacherReviewState(nextAuthorities.values, appliedTeacherReviewReceipts.values)
+            teacherReviewAuthorities.clear()
+            teacherReviewAuthorities.putAll(nextAuthorities)
+            MasterNoteDataCommitBus.recordDurableCommit()
+        }
+        if (pending != null && pending.publicationId == publicationId && pending != bound) {
+            val nextPending = LinkedHashMap(teacherReviewPublishIntents).apply { put(key, bound) }
+            beforeTeacherReviewWorkbookOutboxPersist?.invoke()
+            persistTeacherReviewPublishIntents(nextPending.values)
+            teacherReviewPublishIntents.clear()
+            teacherReviewPublishIntents.putAll(nextPending)
+            MasterNoteDataCommitBus.recordDurableCommit()
+        }
+        return bound
+    }
+
+    @Synchronized
+    fun teacherReviewAuthorityEvidence(
+        bookId: String,
+        pageNumber: Int,
+        remotePairId: String? = null,
+        remoteWorkbookToken: String? = null,
+        attemptNos: Collection<Int>? = null,
+    ): List<TeacherReviewStateEvidence> {
+        require(attemptNos == null || attemptNos.isNotEmpty()) {
+            "Teacher review authority attempt filter cannot be empty"
+        }
+        require(attemptNos == null || attemptNos.all { it > 0 }) {
+            "Teacher review authority attempts must be positive"
+        }
+        ensureTeacherReviewStateLoaded()
+        val authorities = teacherReviewAuthorities.values.asSequence()
+            .filter { authority ->
+                authority.intent.bookId == bookId && authority.intent.pageNumber == pageNumber &&
+                    (remotePairId == null || authority.intent.remotePairId == remotePairId) &&
+                    (remoteWorkbookToken == null ||
+                        authority.intent.remoteWorkbookToken == remoteWorkbookToken) &&
+                    (attemptNos == null || authority.intent.attemptNo in attemptNos)
+            }
+            .sortedBy { it.intent.attemptNo }
+            .toList()
+        if (authorities.isEmpty() || authorities.any { it.markGroupMetadata == null }) {
+            return emptyList()
+        }
+        val metadataSha256 = teacherReviewMarkGroupMetadataSha256(
+            normalizeTeacherReviewMarkGroupMetadataValues(
+                authorities.flatMap { requireNotNull(it.markGroupMetadata) },
+            ),
+        )
+        return authorities.map { it.evidence(metadataSha256) }
+    }
+
+    /**
+     * Reopens retained immutable authorities in the ordinary outbox. Current unpublished ink is
+     * never read here, so reconnect recovery cannot leak a teacher draft. The result is the exact
+     * recoverable authority set, including rows already present in the outbox: the caller needs it
+     * to repair an application tombstone after a crash between its commit and outbox deletion.
+     */
+    @Synchronized
+    fun requeueTeacherReviewAuthorities(
+        bookId: String,
+        pageNumber: Int,
+        remotePairId: String? = null,
+        attemptNos: Collection<Int>? = null,
+        remoteWorkbookToken: String? = null,
+    ): List<TeacherReviewPublishIntent> {
+        require(attemptNos == null || attemptNos.isNotEmpty()) {
+            "Teacher review authority attempt filter cannot be empty"
+        }
+        require(attemptNos == null || attemptNos.all { it > 0 }) {
+            "Teacher review authority attempts must be positive"
+        }
+        ensureTeacherReviewPublishIntentsLoaded()
+        ensureTeacherReviewStateLoaded()
+        val authorities = teacherReviewAuthorities.values.asSequence()
+            .filter { authority ->
+                authority.intent.bookId == bookId && authority.intent.pageNumber == pageNumber &&
+                    (remotePairId == null || authority.intent.remotePairId == remotePairId) &&
+                    (remoteWorkbookToken == null ||
+                        authority.intent.remoteWorkbookToken == remoteWorkbookToken) &&
+                    (attemptNos == null || authority.intent.attemptNo in attemptNos)
+            }
+            .sortedBy { it.intent.attemptNo }
+            .filter { readTeacherReviewPublicationArtifact(it.intent) != null }
+            .toList()
+        if (authorities.isEmpty()) return emptyList()
+        val next = LinkedHashMap(teacherReviewPublishIntents)
+        val requeued = buildList {
+            authorities.forEach { authority ->
+                val intent = authority.intent
+                val key = TeacherReviewIntentKey(intent.bookId, intent.pageNumber, intent.attemptNo)
+                val current = next[key]
+                if (current != null && current.publicationId != intent.publicationId) return@forEach
+                next[key] = intent
+                add(intent)
+            }
+        }
+        require(next.size <= MAX_TEACHER_REVIEW_PUBLISH_INTENTS) {
+            "Teacher review publish intent journal is full"
+        }
+        if (next != teacherReviewPublishIntents) {
+            persistTeacherReviewPublishIntents(next.values)
+            teacherReviewPublishIntents.clear()
+            teacherReviewPublishIntents.putAll(next)
+            MasterNoteDataCommitBus.recordDurableCommit()
+        }
+        return requeued
+    }
+
+    /** Portable digest of an exact-attempt grade snapshot, independent of local book identity. */
+    fun teacherReviewMarkGroupsStateSha256(groups: Collection<MarkGroup>): String =
+        teacherReviewMarkGroupsSha256(groups)
+
+    @Synchronized
+    fun recordAppliedTeacherReviewReceipt(receipt: AppliedTeacherReviewReceipt) {
+        ensureTeacherReviewStateLoaded()
+        validateAppliedTeacherReviewReceipt(receipt)
+        val key = TeacherReviewIntentKey(receipt.bookId, receipt.pageNumber, receipt.attemptNo)
+        val current = appliedTeacherReviewReceipts[key]
+        // A retry of the same immutable publication may arrive through another transport. Keep
+        // the first known teacher-side order instead of replacing it with a transport timestamp.
+        val durableReceipt = if (current?.publicationId == receipt.publicationId &&
+            current.publishedAtEpochMillis > 0L
+        ) {
+            receipt.copy(publishedAtEpochMillis = current.publishedAtEpochMillis)
+        } else receipt
+        if (current?.publicationId == durableReceipt.publicationId &&
+            current.resultLayerSha256 == durableReceipt.resultLayerSha256 &&
+            current.markGroupsSha256 == durableReceipt.markGroupsSha256 &&
+            current.remotePairId == durableReceipt.remotePairId &&
+            current.remoteWorkbookToken == durableReceipt.remoteWorkbookToken &&
+            current.publishedAtEpochMillis == durableReceipt.publishedAtEpochMillis
+        ) return
+        val next = LinkedHashMap(appliedTeacherReviewReceipts).apply { put(key, durableReceipt) }
+        require(next.size <= MAX_TEACHER_REVIEW_STATE_RECORDS) {
+            "Applied teacher review receipt journal is full"
+        }
+        persistTeacherReviewState(teacherReviewAuthorities.values, next.values)
+        appliedTeacherReviewReceipts.clear()
+        appliedTeacherReviewReceipts.putAll(next)
+        MasterNoteDataCommitBus.recordDurableCommit()
+    }
+
+    @Synchronized
+    fun appliedTeacherReviewReceipts(
+        bookId: String,
+        pageNumber: Int,
+        remotePairId: String? = null,
+        remoteWorkbookToken: String? = null,
+    ): List<AppliedTeacherReviewReceipt> {
+        ensureTeacherReviewStateLoaded()
+        return appliedTeacherReviewReceipts.values.asSequence()
+            .filter { receipt ->
+                receipt.bookId == bookId && receipt.pageNumber == pageNumber &&
+                    (remotePairId == null || receipt.remotePairId == remotePairId) &&
+                    (remoteWorkbookToken == null ||
+                        receipt.remoteWorkbookToken == remoteWorkbookToken)
+            }
+            .sortedBy(AppliedTeacherReviewReceipt::attemptNo)
+            .toList()
+    }
+
+    /** O(1) lookup for the one current exact-target receipt, scoped to a non-null peer pair. */
+    @Synchronized
+    fun appliedTeacherReviewReceipt(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        remotePairId: String,
+        /** Null deliberately ignores workbook provenance for a LAN-to-Telegram handoff fence. */
+        remoteWorkbookToken: String? = null,
+    ): AppliedTeacherReviewReceipt? {
+        require(bookId.isNotBlank() && pageNumber >= 0 && attemptNo > 0)
+        require(remotePairId.isNotBlank())
+        require(remoteWorkbookToken == null || remoteWorkbookToken.isNotBlank())
+        ensureTeacherReviewStateLoaded()
+        return appliedTeacherReviewReceipts[
+            TeacherReviewIntentKey(bookId, pageNumber, attemptNo)
+        ]?.takeIf { receipt ->
+            receipt.remotePairId == remotePairId &&
+                (remoteWorkbookToken == null || receipt.remoteWorkbookToken == remoteWorkbookToken)
+        }
+    }
+
+    /**
+     * Serializes the full layer + grade + receipt transaction for one exact target across every
+     * PageOperationLogStore holder in this process. Callers must keep the whole apply transaction
+     * inside [block], not just the receipt write.
+     */
+    fun <T> withTeacherReviewTargetLock(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        block: () -> T,
+    ): T {
+        require(bookId.isNotBlank() && pageNumber >= 0 && attemptNo > 0)
+        return synchronized(TeacherReviewTargetLocks.lock(bookId, pageNumber, attemptNo)) {
+            block()
+        }
+    }
+
+    /**
+     * Returns only receipts whose actual installed ink and grade snapshot still match. A receipt
+     * whose data was restored away is omitted, intentionally producing a manifest mismatch.
+     */
+    @Synchronized
+    fun verifiedAppliedTeacherReviewEvidence(
+        bookId: String,
+        pageNumber: Int,
+        currentPageMarkGroups: Collection<MarkGroup>,
+        remotePairId: String? = null,
+        remoteWorkbookToken: String? = null,
+        attemptNos: Collection<Int>? = null,
+    ): List<TeacherReviewStateEvidence> {
+        require(attemptNos == null || attemptNos.isNotEmpty()) {
+            "Applied teacher review attempt filter cannot be empty"
+        }
+        require(attemptNos == null || attemptNos.all { it > 0 }) {
+            "Applied teacher review attempts must be positive"
+        }
+        ensureTeacherReviewStateLoaded()
+        val receipts = appliedTeacherReviewReceipts(
+            bookId,
+            pageNumber,
+            remotePairId,
+            remoteWorkbookToken,
+        ).filter { receipt -> attemptNos == null || receipt.attemptNo in attemptNos }
+        if (receipts.isEmpty()) return emptyList()
+        val receiptAttempts = receipts.mapTo(hashSetOf(), AppliedTeacherReviewReceipt::attemptNo)
+        val scopedGroups = currentPageMarkGroups.filter { group ->
+            group.bookId == bookId && group.pageNumber == pageNumber &&
+                group.marks.any { it.attemptNo in receiptAttempts }
+        }
+        val metadataSha256 = teacherReviewMarkGroupMetadataSha256(
+            normalizeTeacherReviewMarkGroupMetadata(scopedGroups),
+        )
+        return receipts.mapNotNull { receipt ->
+            val exactGroups = scopedGroups.mapNotNull { group ->
+                if (group.bookId != bookId || group.pageNumber != pageNumber) return@mapNotNull null
+                val exactMarks = group.marks.filter { it.attemptNo == receipt.attemptNo }
+                exactMarks.takeIf(List<*>::isNotEmpty)?.let { group.copy(marks = exactMarks) }
+            }
+            val layerMatches = publishedTeacherLayerSha256(
+                bookId,
+                pageNumber,
+                receipt.attemptNo,
+            ) == receipt.resultLayerSha256
+            val gradesMatch = teacherReviewMarkGroupsSha256(exactGroups) == receipt.markGroupsSha256
+            receipt.evidence(metadataSha256).takeIf { layerMatches && gradesMatch }
+        }
+    }
+
     /** Returns the immutable bytes captured by the publish button, never the current live layer. */
     @Synchronized
     fun teacherReviewPublicationArtifact(
@@ -1307,8 +1839,11 @@ class PageOperationLogStore(
         publicationId: String? = null,
     ): TeacherReviewPublicationArtifact? {
         ensureTeacherReviewPublishIntentsLoaded()
+        ensureTeacherReviewStateLoaded()
         val key = TeacherReviewIntentKey(bookId, pageNumber, attemptNo)
-        var intent = teacherReviewPublishIntents[key] ?: return null
+        var intent = teacherReviewPublishIntents[key]
+            ?: teacherReviewAuthorities[key]?.intent
+            ?: return null
         if (publicationId != null && intent.publicationId != publicationId) return null
         return readTeacherReviewPublicationArtifact(intent)
     }
@@ -1464,6 +1999,129 @@ class PageOperationLogStore(
         )
     }
 
+    private fun cachedPublishedTeacherLayerSha256(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        snapshot: AnnotationSnapshot,
+    ): String {
+        val key = TeacherReviewIntentKey(bookId, pageNumber, attemptNo)
+        val generation = publishedTeacherLayerGenerations[key] ?: 0L
+        publishedTeacherLayerDigests[key]
+            ?.takeIf { it.mutationGeneration == generation }
+            ?.let { return it.sha256 }
+        val signature = publishedTeacherActiveIdSignature(snapshot, attemptNo)
+        val digest = portablePublishedTeacherLayer(snapshot, attemptNo).sha256
+        publishedTeacherLayerDigestMaterializations++
+        putPublishedTeacherLayerDigest(
+            key,
+            PublishedTeacherLayerDigest(generation, signature, digest),
+        )
+        return digest
+    }
+
+    private fun cachePublishedTeacherLayerSha256(
+        bookId: String,
+        pageNumber: Int,
+        attemptNo: Int,
+        snapshot: AnnotationSnapshot,
+        digestSha256: String,
+    ) {
+        require(digestSha256.matches(STUDENT_CHECKPOINT_ID))
+        val key = TeacherReviewIntentKey(bookId, pageNumber, attemptNo)
+        putPublishedTeacherLayerDigest(
+            key,
+            PublishedTeacherLayerDigest(
+                publishedTeacherLayerGenerations[key] ?: 0L,
+                publishedTeacherActiveIdSignature(snapshot, attemptNo),
+                digestSha256,
+            ),
+        )
+    }
+
+    private fun putPublishedTeacherLayerDigest(
+        key: TeacherReviewIntentKey,
+        value: PublishedTeacherLayerDigest,
+    ) {
+        publishedTeacherLayerGenerations[key] = value.mutationGeneration
+        publishedTeacherLayerDigests[key] = value
+        while (publishedTeacherLayerDigests.size > MAX_CACHED_PUBLISHED_TEACHER_LAYER_DIGESTS) {
+            val eldestKey = publishedTeacherLayerDigests.entries.iterator().next().key
+            publishedTeacherLayerDigests.remove(eldestKey)
+            publishedTeacherLayerGenerations.remove(eldestKey)
+        }
+        trimPublishedTeacherLayerGenerations()
+    }
+
+    private fun recordPublishedTeacherLayerMutation(
+        bookId: String,
+        pageNumber: Int,
+        before: AnnotationSnapshot,
+        record: StoredOperationRecord,
+    ) {
+        val addedById = record.addedAssets.associateBy(StrokeAsset::id)
+        val touchedIds = buildSet {
+            addAll(record.operation.removedStrokeIds)
+            addAll(record.operation.addedStrokeIds)
+            addAll(addedById.keys)
+        }
+        val attempts = buildSet {
+            touchedIds.forEach { id ->
+                listOfNotNull(before.assets[id], addedById[id]).forEach { asset ->
+                    // Published layers include inactive parent assets. A draft can therefore be a
+                    // canonical ancestor of an active published replacement even though the draft
+                    // itself has no publishedAt value; every touched teacher asset must invalidate.
+                    if (asset.authorId == TEACHER_AUTHOR_ID && asset.attemptNo > 0) {
+                        add(asset.attemptNo)
+                    }
+                }
+            }
+        }
+        attempts.forEach { attemptNo ->
+            val key = TeacherReviewIntentKey(bookId, pageNumber, attemptNo)
+            val current = publishedTeacherLayerGenerations[key] ?: 0L
+            publishedTeacherLayerGenerations[key] =
+                if (current == Long.MAX_VALUE) 0L else current + 1L
+            // Removing the entry makes a wrapped generation unable to match a very old cache row.
+            publishedTeacherLayerDigests.remove(key)
+        }
+        trimPublishedTeacherLayerGenerations()
+    }
+
+    private fun trimPublishedTeacherLayerGenerations() {
+        while (publishedTeacherLayerGenerations.size >
+            MAX_CACHED_PUBLISHED_TEACHER_LAYER_DIGESTS
+        ) {
+            val eldestKey = publishedTeacherLayerGenerations.entries.iterator().next().key
+            publishedTeacherLayerGenerations.remove(eldestKey)
+            publishedTeacherLayerDigests.remove(eldestKey)
+        }
+    }
+
+    private fun publishedTeacherActiveIdSignature(
+        snapshot: AnnotationSnapshot,
+        attemptNo: Int,
+    ): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val ids = snapshot.activeStrokeIds.asSequence()
+            .filter { id -> snapshot.assets[id]?.let { asset ->
+                asset.authorId == TEACHER_AUTHOR_ID && asset.attemptNo == attemptNo &&
+                    asset.publishedAtEpochMillis != null
+            } == true }
+            .map(StrokeId::value)
+            .sorted()
+            .toList()
+        digest.update(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(ids.size).array())
+        ids.forEach { id ->
+            val bytes = id.toByteArray(StandardCharsets.UTF_8)
+            digest.update(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(bytes.size).array())
+            digest.update(bytes)
+        }
+        return digest.digest().joinToString("") { byte ->
+            (byte.toInt() and 0xff).toString(16).padStart(2, '0')
+        }
+    }
+
     private fun portablePublishedTeacherLayer(
         pageNumber: Int,
         attemptNo: Int,
@@ -1501,6 +2159,7 @@ class PageOperationLogStore(
         }
         val updated = apply(current, record)
         index.add(record, encoded, updated)
+        recordPublishedTeacherLayerMutation(record.bookId, record.pageNumber, current, record)
         MasterNoteDataCommitBus.recordDurableCommit()
         if (updated.revision % checkpointInterval == 0L) writeCheckpoint(updated)
         return updated
@@ -1591,6 +2250,322 @@ class PageOperationLogStore(
 
     private fun ensureTeacherReviewPublishIntentsLoaded() {
         if (!teacherReviewPublishIntentsLoaded) loadTeacherReviewPublishIntents()
+    }
+
+    private fun loadTeacherReviewState() {
+        // A legacy complete outbox is the migration source when this newer journal is absent or
+        // corrupt. Load it first: the outbox loader is deliberately independent of state loading,
+        // so this cannot recurse and each recovery path still runs at most once per store holder.
+        ensureTeacherReviewPublishIntentsLoaded()
+        teacherReviewStateLoaded = true
+        recoverTeacherReviewStateJournal()
+        val file = File(rootDirectory, TEACHER_REVIEW_STATE_FILE)
+        var migratedAuthorityMetadata = false
+        if (file.isFile) {
+            runCatching {
+                require(file.length() in 1..MAX_TEACHER_REVIEW_STATE_JOURNAL_BYTES) {
+                    "Teacher review state journal has an invalid size"
+                }
+                val root = JSONObject(decodeUtf8Strict(file.readBytes()))
+                require(root.getInt("version") in 1..TEACHER_REVIEW_STATE_VERSION) {
+                    "Unsupported teacher review state journal"
+                }
+                val authorityValues = root.getJSONArray("authorities")
+                val receiptValues = root.getJSONArray("receipts")
+                require(authorityValues.length() <= MAX_TEACHER_REVIEW_STATE_RECORDS &&
+                    receiptValues.length() <= MAX_TEACHER_REVIEW_STATE_RECORDS
+                ) { "Teacher review state journal is too large" }
+                val authorities = linkedMapOf<TeacherReviewIntentKey, TeacherReviewAuthorityRecord>()
+                for (index in 0 until authorityValues.length()) {
+                    val value = authorityValues.getJSONObject(index)
+                    val intent = decodeTeacherReviewPublishIntent(value.getJSONObject("intent"))
+                    require(intent.publicationId.isNotEmpty() && intent.markGroupsSha256.isNotEmpty()) {
+                        "Teacher review authority is incomplete"
+                    }
+                    val storedMetadata = value.optJSONArray("markGroupMetadata")?.let(
+                        ::decodeTeacherReviewMarkGroupMetadata,
+                    )
+                    val metadata = storedMetadata ?: readTeacherReviewPublicationArtifact(intent)
+                        ?.let { artifact ->
+                            migratedAuthorityMetadata = true
+                            normalizeTeacherReviewMarkGroupMetadata(artifact.markGroups)
+                        }
+                    val record = TeacherReviewAuthorityRecord(
+                        intent = intent,
+                        markGroupsStateSha256 = value.getString("markGroupsStateSha256"),
+                        markGroupMetadata = metadata,
+                    )
+                    val key = TeacherReviewIntentKey(intent.bookId, intent.pageNumber, intent.attemptNo)
+                    require(authorities.put(key, record) == null) {
+                        "Teacher review state contains duplicate authorities"
+                    }
+                }
+                val receipts = linkedMapOf<TeacherReviewIntentKey, AppliedTeacherReviewReceipt>()
+                for (index in 0 until receiptValues.length()) {
+                    val value = receiptValues.getJSONObject(index)
+                    val receipt = AppliedTeacherReviewReceipt(
+                        bookId = value.getString("bookId"),
+                        pageNumber = value.getInt("pageNumber"),
+                        attemptNo = value.getInt("attemptNo"),
+                        publicationId = value.getString("publicationId"),
+                        resultLayerSha256 = value.getString("resultLayerSha256"),
+                        markGroupsSha256 = value.getString("markGroupsSha256"),
+                        appliedAtEpochMillis = value.getLong("appliedAt"),
+                        publishedAtEpochMillis = value.optLong("publishedAt"),
+                        remotePairId = value.optionalString("remotePairId"),
+                        remoteWorkbookToken = value.optionalString("remoteWorkbookToken"),
+                    ).also(::validateAppliedTeacherReviewReceipt)
+                    val key = TeacherReviewIntentKey(receipt.bookId, receipt.pageNumber, receipt.attemptNo)
+                    require(receipts.put(key, receipt) == null) {
+                        "Teacher review state contains duplicate receipts"
+                    }
+                }
+                authorities to receipts
+            }.onSuccess { (authorities, receipts) ->
+                teacherReviewAuthorities.clear()
+                teacherReviewAuthorities.putAll(authorities)
+                appliedTeacherReviewReceipts.clear()
+                appliedTeacherReviewReceipts.putAll(receipts)
+            }.onFailure {
+                teacherReviewAuthorities.clear()
+                appliedTeacherReviewReceipts.clear()
+                quarantineTeacherReviewStateJournal(file)
+            }
+        }
+
+        // The outbox commit precedes an initial authority commit. Workbook binding deliberately
+        // commits in the opposite order. Reconcile both directions for the same publication so
+        // either crash window converges without ever inferring or upgrading a null pair id.
+        var repaired = migratedAuthorityMetadata
+        var repairedOutbox = false
+        teacherReviewPublishIntents.values.toList().forEach { intent ->
+            if (intent.publicationId.isEmpty() || intent.markGroupsSha256.isEmpty()) return@forEach
+            val key = TeacherReviewIntentKey(intent.bookId, intent.pageNumber, intent.attemptNo)
+            val current = teacherReviewAuthorities[key]
+            if (current?.intent?.publicationId == intent.publicationId) {
+                val merged = mergeSameTeacherReviewPublicationOwnership(current.intent, intent)
+                    ?: return@forEach
+                if (current.intent != merged) {
+                    teacherReviewAuthorities[key] = current.copy(intent = merged)
+                    repaired = true
+                }
+                if (intent != merged) {
+                    teacherReviewPublishIntents[key] = merged
+                    repairedOutbox = true
+                }
+                return@forEach
+            }
+            val artifact = readTeacherReviewPublicationArtifact(intent) ?: return@forEach
+            teacherReviewAuthorities[key] = TeacherReviewAuthorityRecord(
+                intent,
+                teacherReviewMarkGroupsSha256(artifact.markGroups),
+                normalizeTeacherReviewMarkGroupMetadata(artifact.markGroups),
+            )
+            repaired = true
+        }
+        if (repaired || !file.exists() &&
+            (teacherReviewAuthorities.isNotEmpty() || appliedTeacherReviewReceipts.isNotEmpty())
+        ) {
+            persistTeacherReviewState(
+                teacherReviewAuthorities.values,
+                appliedTeacherReviewReceipts.values,
+            )
+        }
+        if (repairedOutbox) persistTeacherReviewPublishIntents(teacherReviewPublishIntents.values)
+    }
+
+    private fun mergeSameTeacherReviewPublicationOwnership(
+        authority: TeacherReviewPublishIntent,
+        outbox: TeacherReviewPublishIntent,
+    ): TeacherReviewPublishIntent? {
+        if (authority.publicationId != outbox.publicationId ||
+            authority.copy(remoteWorkbookToken = null) != outbox.copy(remoteWorkbookToken = null)
+        ) return null
+        val token = when {
+            authority.remoteWorkbookToken == outbox.remoteWorkbookToken -> authority.remoteWorkbookToken
+            authority.remoteWorkbookToken == null -> outbox.remoteWorkbookToken
+            outbox.remoteWorkbookToken == null -> authority.remoteWorkbookToken
+            else -> return null
+        }
+        // Both intents have the same pair by the equality check above. Never add a token to a
+        // pairless publication, even if a future malformed journal somehow bypasses construction.
+        if (token != null && authority.remotePairId == null) return null
+        return authority.copy(remoteWorkbookToken = token)
+    }
+
+    private fun ensureTeacherReviewStateLoaded() {
+        if (!teacherReviewStateLoaded) loadTeacherReviewState()
+    }
+
+    private fun installTeacherReviewAuthority(intent: TeacherReviewPublishIntent) {
+        ensureTeacherReviewStateLoaded()
+        val artifact = requireNotNull(readTeacherReviewPublicationArtifact(intent)) {
+            "Teacher review authority artifact is unavailable"
+        }
+        val record = TeacherReviewAuthorityRecord(
+            intent = intent,
+            markGroupsStateSha256 = teacherReviewMarkGroupsSha256(artifact.markGroups),
+            markGroupMetadata = normalizeTeacherReviewMarkGroupMetadata(artifact.markGroups),
+        )
+        val key = TeacherReviewIntentKey(intent.bookId, intent.pageNumber, intent.attemptNo)
+        val current = teacherReviewAuthorities[key]
+        if (current == record) return
+        val next = LinkedHashMap(teacherReviewAuthorities).apply { put(key, record) }
+        require(next.size <= MAX_TEACHER_REVIEW_STATE_RECORDS) {
+            "Teacher review authority journal is full"
+        }
+        persistTeacherReviewState(next.values, appliedTeacherReviewReceipts.values)
+        teacherReviewAuthorities.clear()
+        teacherReviewAuthorities.putAll(next)
+        MasterNoteDataCommitBus.recordDurableCommit()
+        current?.intent?.publicationId?.takeIf { it != intent.publicationId }
+            ?.let(::deleteUnreferencedTeacherReviewArtifact)
+    }
+
+    private fun persistTeacherReviewState(
+        authorities: Collection<TeacherReviewAuthorityRecord>,
+        receipts: Collection<AppliedTeacherReviewReceipt>,
+    ) {
+        require(authorities.size <= MAX_TEACHER_REVIEW_STATE_RECORDS &&
+            receipts.size <= MAX_TEACHER_REVIEW_STATE_RECORDS
+        )
+        val root = JSONObject()
+            .put("version", TEACHER_REVIEW_STATE_VERSION)
+            .put("authorities", JSONArray().apply {
+                authorities.sortedWith(
+                    compareBy<TeacherReviewAuthorityRecord> { it.intent.bookId }
+                        .thenBy { it.intent.pageNumber }
+                        .thenBy { it.intent.attemptNo },
+                ).forEach { authority ->
+                    val value = JSONObject()
+                        .put("intent", encodeTeacherReviewPublishIntent(authority.intent))
+                        .put("markGroupsStateSha256", authority.markGroupsStateSha256)
+                    authority.markGroupMetadata?.let { metadata ->
+                        value.put("markGroupMetadata", encodeTeacherReviewMarkGroupMetadata(metadata))
+                    }
+                    put(value)
+                }
+            })
+            .put("receipts", JSONArray().apply {
+                receipts.sortedWith(
+                    compareBy<AppliedTeacherReviewReceipt>(AppliedTeacherReviewReceipt::bookId)
+                        .thenBy(AppliedTeacherReviewReceipt::pageNumber)
+                        .thenBy(AppliedTeacherReviewReceipt::attemptNo),
+                ).forEach { receipt ->
+                    validateAppliedTeacherReviewReceipt(receipt)
+                    put(JSONObject()
+                        .put("bookId", receipt.bookId)
+                        .put("pageNumber", receipt.pageNumber)
+                        .put("attemptNo", receipt.attemptNo)
+                        .put("publicationId", receipt.publicationId)
+                        .put("resultLayerSha256", receipt.resultLayerSha256)
+                        .put("markGroupsSha256", receipt.markGroupsSha256)
+                        .put("appliedAt", receipt.appliedAtEpochMillis)
+                        .put("publishedAt", receipt.publishedAtEpochMillis)
+                        .put("remotePairId", receipt.remotePairId ?: JSONObject.NULL)
+                        .put("remoteWorkbookToken", receipt.remoteWorkbookToken ?: JSONObject.NULL))
+                }
+            })
+        val encoded = root.toString().toByteArray(StandardCharsets.UTF_8)
+        require(encoded.size <= MAX_TEACHER_REVIEW_STATE_JOURNAL_BYTES) {
+            "Teacher review state journal exceeds its byte limit"
+        }
+        atomicWriteTeacherReviewStateJournal(encoded)
+    }
+
+    private fun encodeTeacherReviewMarkGroupMetadata(
+        metadata: Collection<TeacherReviewMarkGroupMetadata>,
+    ): JSONArray = JSONArray().apply {
+        metadata.sortedBy(TeacherReviewMarkGroupMetadata::groupId).forEach { value ->
+            put(JSONObject()
+                .put("groupId", value.groupId)
+                .put("anchorXBits", value.anchor.x.toRawBits())
+                .put("anchorYBits", value.anchor.y.toRawBits())
+                .put("anchorPressureBits", value.anchor.pressure.toRawBits())
+                .put("createdAt", value.createdAtEpochMillis)
+                .put("hiddenAt", value.hiddenAtEpochMillis ?: JSONObject.NULL)
+                .put("syncRevision", value.syncRevision)
+                .put("lastModifiedByDeviceId", value.lastModifiedByDeviceId))
+        }
+    }
+
+    private fun decodeTeacherReviewMarkGroupMetadata(
+        values: JSONArray,
+    ): List<TeacherReviewMarkGroupMetadata> {
+        require(values.length() <= MAX_TEACHER_REVIEW_MARK_GROUPS) {
+            "Teacher review authority has too much grade metadata"
+        }
+        val decoded = buildList(values.length()) {
+            for (index in 0 until values.length()) {
+                val value = values.getJSONObject(index)
+                add(TeacherReviewMarkGroupMetadata(
+                    groupId = value.getString("groupId"),
+                    anchor = PagePoint(
+                        Float.fromBits(value.getInt("anchorXBits")),
+                        Float.fromBits(value.getInt("anchorYBits")),
+                        Float.fromBits(value.getInt("anchorPressureBits")),
+                    ),
+                    createdAtEpochMillis = value.getLong("createdAt"),
+                    hiddenAtEpochMillis = if (value.isNull("hiddenAt")) null else value.getLong("hiddenAt"),
+                    syncRevision = value.getLong("syncRevision"),
+                    lastModifiedByDeviceId = value.getString("lastModifiedByDeviceId"),
+                ))
+            }
+        }
+        val normalized = normalizeTeacherReviewMarkGroupMetadataValues(decoded)
+        require(normalized == decoded.sortedBy(TeacherReviewMarkGroupMetadata::groupId)) {
+            "Teacher review authority grade metadata is not normalized"
+        }
+        return normalized
+    }
+
+    private fun validateAppliedTeacherReviewReceipt(receipt: AppliedTeacherReviewReceipt) {
+        require(receipt.bookId.length <= MAX_CHECKPOINT_IDENTIFIER_CHARS) {
+            "Applied teacher review book id is too long"
+        }
+        require((receipt.remotePairId?.length ?: 0) <= MAX_CHECKPOINT_IDENTIFIER_CHARS) {
+            "Applied teacher review pair id is too long"
+        }
+        require((receipt.remoteWorkbookToken?.length ?: 0) <= MAX_CHECKPOINT_IDENTIFIER_CHARS) {
+            "Applied teacher review workbook token is too long"
+        }
+    }
+
+    private fun decodeTeacherReviewPublishIntent(value: JSONObject): TeacherReviewPublishIntent =
+        TeacherReviewPublishIntent(
+            bookId = value.getString("bookId"),
+            pageNumber = value.getInt("pageNumber"),
+            attemptNo = value.getInt("attemptNo"),
+            updatedAtEpochMillis = value.getLong("updatedAt"),
+            publicationId = value.optString("publicationId"),
+            checkpointSha256 = value.optString("checkpointSha256"),
+            resultLayerSha256 = value.optString("resultLayerSha256"),
+            checkpointSizeBytes = value.optInt("checkpointSizeBytes"),
+            markGroupsSha256 = value.optString("markGroupsSha256"),
+            markGroupsSizeBytes = value.optInt("markGroupsSizeBytes"),
+            remotePairId = value.optionalString("remotePairId"),
+            remoteWorkbookToken = value.optionalString("remoteWorkbookToken"),
+            remoteManifestGeneration = value.optLong("remoteManifestGeneration"),
+            remoteManifestSequence = value.optLong("remoteManifestSequence"),
+        ).also(::validateTeacherReviewPublishIntent)
+
+    private fun encodeTeacherReviewPublishIntent(intent: TeacherReviewPublishIntent): JSONObject {
+        validateTeacherReviewPublishIntent(intent)
+        return JSONObject()
+            .put("bookId", intent.bookId)
+            .put("pageNumber", intent.pageNumber)
+            .put("attemptNo", intent.attemptNo)
+            .put("updatedAt", intent.updatedAtEpochMillis)
+            .put("publicationId", intent.publicationId)
+            .put("checkpointSha256", intent.checkpointSha256)
+            .put("resultLayerSha256", intent.resultLayerSha256)
+            .put("checkpointSizeBytes", intent.checkpointSizeBytes)
+            .put("markGroupsSha256", intent.markGroupsSha256)
+            .put("markGroupsSizeBytes", intent.markGroupsSizeBytes)
+            .put("remotePairId", intent.remotePairId ?: JSONObject.NULL)
+            .put("remoteWorkbookToken", intent.remoteWorkbookToken ?: JSONObject.NULL)
+            .put("remoteManifestGeneration", intent.remoteManifestGeneration)
+            .put("remoteManifestSequence", intent.remoteManifestSequence)
     }
 
     private fun persistTeacherReviewPublishIntents(values: Collection<TeacherReviewPublishIntent>) {
@@ -1741,7 +2716,12 @@ class PageOperationLogStore(
     }
 
     private fun deleteUnreferencedTeacherReviewArtifact(publicationId: String) {
+        // A restore invalidates both caches. ACK cleanup may reach this method through an older
+        // store holder before any authority query has reloaded the restored state journal.
+        ensureTeacherReviewPublishIntentsLoaded()
+        ensureTeacherReviewStateLoaded()
         if (teacherReviewPublishIntents.values.any { it.publicationId == publicationId }) return
+        if (teacherReviewAuthorities.values.any { it.intent.publicationId == publicationId }) return
         if (teacherReviewPreparationReferences(publicationId)) return
         teacherReviewPublicationArtifactFile(publicationId).delete()
         teacherReviewPublicationMarkGroupsFile(publicationId).delete()
@@ -2014,6 +2994,53 @@ class PageOperationLogStore(
         file.renameTo(quarantined)
     }
 
+    private fun recoverTeacherReviewStateJournal() {
+        val target = File(rootDirectory, TEACHER_REVIEW_STATE_FILE)
+        val backup = File(rootDirectory, "$TEACHER_REVIEW_STATE_FILE.bak")
+        val temporary = File(rootDirectory, "$TEACHER_REVIEW_STATE_FILE.tmp")
+        if (!target.exists() && backup.isFile) backup.renameTo(target)
+        if (target.isFile && backup.exists()) backup.delete()
+        if (temporary.exists()) temporary.delete()
+    }
+
+    private fun atomicWriteTeacherReviewStateJournal(bytes: ByteArray) {
+        val target = File(rootDirectory, TEACHER_REVIEW_STATE_FILE)
+        val backup = File(rootDirectory, "$TEACHER_REVIEW_STATE_FILE.bak")
+        val temporary = File(rootDirectory, "$TEACHER_REVIEW_STATE_FILE.tmp")
+        FileOutputStream(temporary, false).use { output ->
+            output.write(bytes)
+            output.flush()
+            output.fd.sync()
+        }
+        if (backup.exists() && !backup.delete()) {
+            temporary.delete()
+            throw IOException("Cannot clear teacher review state backup")
+        }
+        if (target.exists() && !target.renameTo(backup)) {
+            temporary.delete()
+            throw IOException("Cannot stage teacher review state journal")
+        }
+        try {
+            if (!temporary.renameTo(target)) throw IOException("Cannot commit teacher review state journal")
+            if (backup.exists()) backup.delete()
+        } catch (error: Throwable) {
+            if (!target.exists() && backup.exists()) backup.renameTo(target)
+            temporary.delete()
+            throw error
+        }
+    }
+
+    private fun quarantineTeacherReviewStateJournal(file: File) {
+        if (!file.exists()) return
+        var suffix = System.currentTimeMillis()
+        var quarantined = File(file.parentFile, "${file.name}.corrupt-$suffix")
+        while (quarantined.exists()) {
+            suffix++
+            quarantined = File(file.parentFile, "${file.name}.corrupt-$suffix")
+        }
+        file.renameTo(quarantined)
+    }
+
     @Synchronized
     private fun pageIndex(bookId: String, pageNumber: Int): PageIndex {
         val key = PageKey(bookId, pageNumber)
@@ -2036,6 +3063,17 @@ class PageOperationLogStore(
 
     @Synchronized
     internal fun cachedStudentLayerDigestCount(): Int = studentLayerDigests.size
+
+    @Synchronized
+    internal fun cachedPublishedTeacherLayerDigestCount(): Int = publishedTeacherLayerDigests.size
+
+    @Synchronized
+    internal fun cachedPublishedTeacherLayerGenerationCount(): Int =
+        publishedTeacherLayerGenerations.size
+
+    @Synchronized
+    internal fun publishedTeacherLayerDigestMaterializationCount(): Long =
+        publishedTeacherLayerDigestMaterializations
 
     @Synchronized
     internal fun isPageIndexCached(bookId: String, pageNumber: Int): Boolean =
@@ -2498,6 +3536,11 @@ class PageOperationLogStore(
             val directory = File(rootDirectory, "${key.bookId.safeFileName()}/pages/${key.pageNumber}")
             file.absolutePath.startsWith(directory.absolutePath)
         }
+        // A quarantined log changes the durable state outside the ordinary mutation paths. Clear
+        // every structural witness so no prior digest can describe data that was just isolated.
+        studentLayerDigests.clear()
+        publishedTeacherLayerDigests.clear()
+        publishedTeacherLayerGenerations.clear()
         val quarantined = File(file.parentFile, "${file.name}.corrupt-${System.currentTimeMillis()}")
         if (!file.renameTo(quarantined)) {
             throw CorruptAnnotationDataException("손상된 필기 데이터를 격리하지 못했습니다.", file, error)
@@ -2555,6 +3598,12 @@ class PageOperationLogStore(
 
     private data class StudentLayerDigest(val revision: Long, val sha256: String)
 
+    private data class PublishedTeacherLayerDigest(
+        val mutationGeneration: Long,
+        val activeIdSignatureSha256: String,
+        val sha256: String,
+    )
+
     private data class StudentCheckpointCapture(
         val snapshot: AnnotationSnapshot,
         val originDeviceHighWater: Long,
@@ -2565,6 +3614,30 @@ class PageOperationLogStore(
         val pageNumber: Int,
         val attemptNo: Int,
     )
+
+    private data class TeacherReviewAuthorityRecord(
+        val intent: TeacherReviewPublishIntent,
+        /** Exact-attempt mark-history digest; page-global metadata is combined when evidence is read. */
+        val markGroupsStateSha256: String,
+        /** Captured once from the immutable artifact; null only when an old row cannot be migrated. */
+        val markGroupMetadata: List<TeacherReviewMarkGroupMetadata>?,
+    ) {
+        init {
+            require(markGroupsStateSha256.matches(Regex("[0-9a-f]{64}"))) {
+                "Teacher review authority grade state digest is invalid"
+            }
+        }
+
+        fun evidence(pageMetadataSha256: String): TeacherReviewStateEvidence = TeacherReviewStateEvidence(
+            attemptNo = intent.attemptNo,
+            publicationId = intent.publicationId,
+            resultLayerSha256 = intent.resultLayerSha256,
+            markGroupsSha256 = teacherReviewGradeStateSha256(
+                markGroupsStateSha256,
+                pageMetadataSha256,
+            ),
+        )
+    }
 
     private data class IndexedOperation(
         val record: StoredOperationRecord,
@@ -3052,6 +4125,20 @@ class PageOperationLogStore(
         return replace(Regex("[^a-zA-Z0-9._-]"), "_")
     }
 
+    /** Invalidates every cache backed by files that a validated restore replaces atomically. */
+    @Synchronized
+    internal fun resetCachedStateAfterRestore() {
+        pageIndexes.clear()
+        studentLayerDigests.clear()
+        publishedTeacherLayerDigests.clear()
+        publishedTeacherLayerGenerations.clear()
+        teacherReviewPublishIntents.clear()
+        teacherReviewPublishIntentsLoaded = false
+        teacherReviewAuthorities.clear()
+        appliedTeacherReviewReceipts.clear()
+        teacherReviewStateLoaded = false
+    }
+
     companion object {
         /** Complete checkpoints are fragmented into ordinary <=2 MiB transport documents. */
         const val MAX_STUDENT_LAYER_CHECKPOINT_BYTES = 8 * (2 * 1024 * 1024 - 32 * 1024)
@@ -3082,19 +4169,15 @@ class PageOperationLogStore(
         @Synchronized
         fun resetForRestore() {
             applicationInstance?.let { current ->
-                synchronized(current) {
-                    current.pageIndexes.clear()
-                    current.studentLayerDigests.clear()
-                    current.teacherReviewPublishIntents.clear()
-                    current.teacherReviewPublishIntentsLoaded = false
-                    applicationInstance = null
-                }
+                current.resetCachedStateAfterRestore()
+                applicationInstance = null
             }
         }
 
         private const val DEFAULT_CHECKPOINT_INTERVAL = 64
         internal const val MAX_CACHED_PAGE_INDEXES = 3
         internal const val MAX_CACHED_STUDENT_LAYER_DIGESTS = 32
+        internal const val MAX_CACHED_PUBLISHED_TEACHER_LAYER_DIGESTS = 64
         private const val CHECKPOINT_FILE = "checkpoint.json"
         private const val LOG_FILE = "operations.log"
         private const val MAX_ENCODED_OPERATION_BYTES = 512 * 1024
@@ -3134,6 +4217,11 @@ class PageOperationLogStore(
         private const val MAX_TEACHER_REVIEW_PREPARATION_BYTES = 16 * 1024
         private const val MAX_TEACHER_REVIEW_PUBLISH_INTENTS = 512
         private const val MAX_TEACHER_REVIEW_PUBLISH_INTENT_JOURNAL_BYTES = 512 * 1024
+        private const val TEACHER_REVIEW_STATE_FILE = "teacher-review-state-v1.json"
+        // Workbook provenance is an optional JSON field, so v1 readers safely ignore it.
+        private const val TEACHER_REVIEW_STATE_VERSION = 1
+        private const val MAX_TEACHER_REVIEW_STATE_RECORDS = 4_096
+        private const val MAX_TEACHER_REVIEW_STATE_JOURNAL_BYTES = 8 * 1024 * 1024
         private const val MAX_TEACHER_REVIEW_MARK_GROUPS = 512
         private const val MAX_TEACHER_REVIEW_MARKS_PER_GROUP = 4_096
         private val STUDENT_CHECKPOINT_ID = Regex("[0-9a-f]{64}")

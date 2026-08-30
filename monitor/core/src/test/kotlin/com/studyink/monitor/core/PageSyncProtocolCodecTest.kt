@@ -1,5 +1,6 @@
 package com.studyink.monitor.core
 
+import com.studyink.core.model.TeacherReviewStateEvidence
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -111,11 +112,63 @@ class PageSyncProtocolCodecTest {
         assertTrue(decodedManifest.entries.isEmpty())
         assertNull(decodedLegacy.inventoryPageCount)
         assertEquals(PAGE_TOKEN, decodedLegacy.entries.single().pageToken)
+        assertNull(decodedLegacy.entries.single().teacherReviewStateSha256)
         assertEquals(7, RemoteReviewDocumentCodec.encode(fullPageRequest).wireTypeCode())
         assertNull(decodedFull.attemptNo)
         assertEquals(3, decodedAttempt.attemptNo)
         assertEquals(8L, decodedAttempt.syncGeneration)
         assertEquals(fullPageRequest, decodedFull)
+    }
+
+    @Test fun manifestTeacherReviewStateRoundTripsWithoutRequiringACompleteInventory() {
+        val firstPublication = "11".repeat(32)
+        val secondPublication = "22".repeat(32)
+        val state = teacherReviewStateSha256(
+            listOf(
+                teacherReviewStateEntry(2, secondPublication, "33", "44"),
+                teacherReviewStateEntry(1, firstPublication, "55", "66"),
+            ),
+        )
+        val original = manifest(
+            currentCursor = null,
+            entries = listOf(
+                entry(teacherReviewStateSha256 = state),
+                entry(
+                    pageToken = "page_token_00000038",
+                    pageNumber = 38,
+                    contentSha256 = "dc".repeat(32),
+                ),
+            ),
+            inventoryPageCount = null,
+        )
+
+        val decoded = roundTrip(original) as PageSyncManifestEnvelope
+
+        assertNull(decoded.inventoryPageCount)
+        assertEquals(state, decoded.entries[0].teacherReviewStateSha256)
+        assertNull(decoded.entries[1].teacherReviewStateSha256)
+    }
+
+    @Test fun teacherReviewStateDigestIsCanonicalAndDistinguishesKnownEmptyFromUnknown() {
+        val firstPublication = "11".repeat(32)
+        val secondPublication = "22".repeat(32)
+        val first = teacherReviewStateEntry(1, firstPublication, "33", "44")
+        val second = teacherReviewStateEntry(2, secondPublication, "55", "66")
+
+        assertEquals(
+            teacherReviewStateSha256(listOf(first, second)),
+            teacherReviewStateSha256(listOf(second, first)),
+        )
+        assertEquals(64, teacherReviewStateSha256(emptyList()).length)
+        assertThrows(IllegalArgumentException::class.java) {
+            teacherReviewStateEntry(0, firstPublication, "33", "44")
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            teacherReviewStateEntry(1, "AB".repeat(32), "33", "44")
+        }
+        assertValidationField("entries.teacherReviewStateSha256") {
+            entry(teacherReviewStateSha256 = "AB".repeat(32))
+        }
     }
 
     @Test fun studentDeltaRoundTripsRequestAndOriginIdentityAndOwnsMutableInputs() {
@@ -193,6 +246,32 @@ class PageSyncProtocolCodecTest {
         assertTrue(decoded.payloadSizeBytes < canonical.size)
         assertArrayEquals(canonical, decoded.copyDecodedPayloadBytes())
         assertEquals(pageAnnotationSha256Hex(canonical), decoded.payloadSha256)
+    }
+
+    @Test fun teacherCheckpointCarriesExactPublicationIdWhileLegacyNullStillDecodes() {
+        val publicationId = "33".repeat(32)
+        val current = annotation(
+            transferId = "checkpoint_transfer_publication",
+            purpose = PageAnnotationPurpose.TEACHER_REVIEW,
+            responseToTransferId = publicationId,
+            attemptNos = listOf(5),
+            kind = PageAnnotationKind.CHECKPOINT,
+            payload = "teacher-review".toByteArray(),
+        )
+        val legacy = annotation(
+            transferId = "checkpoint_transfer_legacy",
+            purpose = PageAnnotationPurpose.TEACHER_REVIEW,
+            responseToTransferId = null,
+            attemptNos = listOf(5),
+            kind = PageAnnotationKind.CHECKPOINT,
+            payload = "legacy-teacher-review".toByteArray(),
+        )
+
+        assertEquals(
+            publicationId,
+            (roundTrip(current) as PageAnnotationEnvelope).responseToTransferId,
+        )
+        assertNull((roundTrip(legacy) as PageAnnotationEnvelope).responseToTransferId)
     }
 
     @Test fun studentCheckpointFragmentRoundTripsGroupOrderAndBothDigests() {
@@ -694,6 +773,7 @@ class PageSyncProtocolCodecTest {
         attemptNos: List<Int> = listOf(1, 2),
         submittedAttemptNos: List<Int> = emptyList(),
         approxBytes: Long = 100L,
+        teacherReviewStateSha256: String? = null,
     ) = PageSyncManifestEntry(
         pageToken = pageToken,
         workbookToken = workbookToken,
@@ -705,6 +785,19 @@ class PageSyncProtocolCodecTest {
         revision = 91L,
         lastChangedEpochMs = 12_000L,
         approxBytes = approxBytes,
+        teacherReviewStateSha256 = teacherReviewStateSha256,
+    )
+
+    private fun teacherReviewStateEntry(
+        attemptNo: Int,
+        publicationId: String,
+        layerByte: String,
+        gradeByte: String,
+    ) = TeacherReviewStateEvidence(
+        attemptNo = attemptNo,
+        publicationId = publicationId,
+        resultLayerSha256 = layerByte.repeat(32),
+        markGroupsSha256 = gradeByte.repeat(32),
     )
 
     private fun roundTrip(envelope: RemoteReviewEnvelope): RemoteReviewEnvelope =

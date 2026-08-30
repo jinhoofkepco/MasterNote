@@ -47,6 +47,8 @@ data class TeacherGptResourceRevision(
     val createdAtEpochMillis: Long,
     /** Defaults to the legacy behavior so existing Kotlin construction remains source-compatible. */
     val answerFormat: TeacherGptAnswerFormat = TeacherGptAnswerFormat.PLAIN_TEXT,
+    /** Optional block visibility only; [answerText] always remains the immutable original. */
+    val answerMask: TeacherGptAnswerMask? = null,
 )
 
 data class TeacherGptResource(

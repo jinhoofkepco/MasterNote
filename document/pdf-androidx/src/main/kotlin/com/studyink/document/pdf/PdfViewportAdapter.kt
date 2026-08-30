@@ -14,7 +14,7 @@ import kotlin.math.roundToInt
 
 data class CanonicalPdfPoint(val pageNumber: Int, val point: PagePoint)
 
-class PdfViewportAdapter {
+class PdfViewportAdapter : InkViewport {
     private var pdfView: PdfView? = null
     private var pageWidths: Map<Int, Float> = emptyMap()
     private var pageLocations = SparseArray<RectF>()
@@ -68,7 +68,7 @@ class PdfViewportAdapter {
         pageWidths = widths
     }
 
-    fun viewToCanonical(x: Float, y: Float): CanonicalPdfPoint? {
+    override fun viewToCanonical(x: Float, y: Float): CanonicalPdfPoint? {
         val pdfPoint = pdfView?.viewToPdfPoint(x, y) ?: return null
         val width = pageWidths[pdfPoint.pageNum] ?: return null
         return CanonicalPdfPoint(
@@ -77,26 +77,26 @@ class PdfViewportAdapter {
         )
     }
 
-    fun canonicalToView(pageNumber: Int, point: PagePoint): PointF? {
+    override fun canonicalToView(pageNumber: Int, point: PagePoint): PointF? {
         val width = pageWidths[pageNumber] ?: return null
         return pdfView?.pdfToViewPoint(
             PdfPoint(pageNumber, point.x / CANONICAL_PAGE_WIDTH * width, point.y / CANONICAL_PAGE_WIDTH * width)
         )
     }
 
-    fun canonicalWidthToView(pageNumber: Int, width: Float): Float {
+    override fun canonicalWidthToView(pageNumber: Int, width: Float): Float {
         val pageWidth = pageWidths[pageNumber] ?: return width
         return width / CANONICAL_PAGE_WIDTH * pageWidth * (pdfView?.zoom ?: 1f)
     }
 
-    fun viewWidthToCanonical(pageNumber: Int, widthPixels: Float): Float {
+    override fun viewWidthToCanonical(pageNumber: Int, widthPixels: Float): Float {
         val pageWidth = pageWidths[pageNumber] ?: return widthPixels
         return widthPixels / (pdfView?.zoom ?: 1f) / pageWidth * CANONICAL_PAGE_WIDTH
     }
 
-    fun activePage(): Int = activePageNumber
+    override fun activePage(): Int = activePageNumber
 
-    fun activePageBounds(): RectF? = pageLocations[activePageNumber]?.let(::RectF)
+    override fun activePageBounds(): RectF? = pageLocations[activePageNumber]?.let(::RectF)
 
     fun showPage(pageNumber: Int) {
         activePageNumber = pageNumber

@@ -5,6 +5,11 @@ import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.Base64
 
+internal data class TelegramLatestEnqueueOutcome(
+    val result: TelegramEnqueueResult,
+    val supersededEntries: List<TelegramOutboxEntry> = emptyList(),
+)
+
 /**
  * Durable append journal adapted from FocusMonitor2 DiskUploadQueue at commit e5809ebc.
  * Stable caller keys survive process death; DONE and DEAD records prevent accidental resends.
@@ -84,17 +89,32 @@ class TelegramOutbox(
      */
     @Synchronized
     fun enqueueLatestText(entry: TelegramOutboxEntry): TelegramEnqueueResult {
-        validate(entry)
         require(entry.kind == TelegramOutboxKind.TEXT)
+        return enqueueLatest(entry).result
+    }
+
+    /**
+     * Atomically installs the latest unsent text/document for one semantic stream. Exact replaced
+     * keys are journalled so a restart cannot accidentally remove an in-flight/server-accepted
+     * predecessor which the caller protected.
+     */
+    @Synchronized
+    internal fun enqueueLatest(
+        entry: TelegramOutboxEntry,
+        immutableKeys: Set<String> = emptySet(),
+    ): TelegramLatestEnqueueOutcome {
+        validate(entry)
+        require(entry.kind == TelegramOutboxKind.TEXT || entry.kind == TelegramOutboxKind.DOCUMENT)
         require(!entry.coalesceKey.isNullOrBlank())
-        priorResult(entry.idempotencyKey)?.let { return it }
+        priorResult(entry.idempotencyKey)?.let { return TelegramLatestEnqueueOutcome(it) }
         val replaceable = pending.values.filter {
-            it.coalesceKey == entry.coalesceKey && it.idempotencyKey !in inFlight
+            it.coalesceKey == entry.coalesceKey && !isImmutableLatestEntry(it) &&
+                it.idempotencyKey !in immutableKeys
         }
         if (regularPendingCount() - replaceable.size >= maxPendingEntries) {
-            return TelegramEnqueueResult.QUEUE_FULL
+            return TelegramLatestEnqueueOutcome(TelegramEnqueueResult.QUEUE_FULL)
         }
-        append(encodeLatest(entry))
+        append(encodeLatest(entry, replaceable.map(TelegramOutboxEntry::idempotencyKey)))
         replaceable.forEach {
             pending.remove(it.idempotencyKey)
             rememberBounded(
@@ -106,7 +126,16 @@ class TelegramOutbox(
         }
         pending[entry.idempotencyKey] = entry
         compactIfNeeded()
-        return TelegramEnqueueResult.ENQUEUED
+        return TelegramLatestEnqueueOutcome(TelegramEnqueueResult.ENQUEUED, replaceable)
+    }
+
+    @Synchronized
+    internal fun replaceableLatestEntries(
+        coalesceKey: String,
+        immutableKeys: Set<String> = emptySet(),
+    ): List<TelegramOutboxEntry> = pending.values.filter {
+        it.coalesceKey == coalesceKey && !isImmutableLatestEntry(it) &&
+            it.idempotencyKey !in immutableKeys
     }
 
     /**
@@ -352,7 +381,10 @@ class TelegramOutbox(
                     }
                 }
                 is JournalRecord.Latest -> {
-                    pending.values.filter { it.coalesceKey == record.entry.coalesceKey }
+                    val replaceable = record.supersededKeys?.let { exact ->
+                        pending.values.filter { it.idempotencyKey in exact }
+                    } ?: pending.values.filter { it.coalesceKey == record.entry.coalesceKey }
+                    replaceable
                         .forEach {
                             pending.remove(it.idempotencyKey)
                             rememberBounded(
@@ -423,7 +455,7 @@ class TelegramOutbox(
                 require(entry.destinationUsername == normalizeTelegramUsername(requireNotNull(entry.destinationUsername)))
                 require(PEER_IDENTIFIER.matches(requireNotNull(entry.peerTransferId)))
                 require(entry.kind != TelegramOutboxKind.VOICE)
-                require(entry.coalesceKey == null)
+                require(entry.coalesceKey == null || entry.kind == TelegramOutboxKind.DOCUMENT)
             }
         }
         when (entry.kind) {
@@ -475,6 +507,12 @@ class TelegramOutbox(
         entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_PREFIX) &&
             (":ping:" in entry.idempotencyKey || ":connect:" in entry.idempotencyKey)
 
+    private fun isImmutableLatestEntry(entry: TelegramOutboxEntry): Boolean =
+        entry.idempotencyKey in inFlight ||
+            entry.route == TelegramOutboxRoute.PEER &&
+            entry.kind == TelegramOutboxKind.DOCUMENT &&
+            entry.lastError == PEER_ACK_WAIT_REASON
+
     private fun append(line: String) {
         FileOutputStream(journal, true).use { output ->
             output.writer(StandardCharsets.UTF_8).use { writer ->
@@ -525,8 +563,9 @@ class TelegramOutbox(
         encode(entry.peerTransferId.orEmpty()),
     ).joinToString("\t")
 
-    private fun encodeLatest(entry: TelegramOutboxEntry): String =
-        encodePut(entry).replaceFirst("$VERSION\tPUT\t", "$VERSION\tLATEST\t")
+    private fun encodeLatest(entry: TelegramOutboxEntry, supersededKeys: List<String>): String =
+        encodePut(entry).replaceFirst("$VERSION\tPUT\t", "$VERSION\tLATEST\t") +
+            "\t${encode(supersededKeys.joinToString("\n"))}"
 
     private fun encodeDone(key: String, atEpochMs: Long): String =
         listOf(VERSION, "DONE", encode(key), atEpochMs.toString()).joinToString("\t")
@@ -546,7 +585,11 @@ class TelegramOutbox(
         if (fields.size < 2 || fields[0] != VERSION) return null
         when (fields[1]) {
             "PUT" -> JournalRecord.Put(decodeEntry(fields))
-            "LATEST" -> JournalRecord.Latest(decodeEntry(fields))
+            "LATEST" -> JournalRecord.Latest(
+                entry = decodeEntry(fields),
+                supersededKeys = fields.getOrNull(PUT_FIELD_COUNT)?.let(::decodeString)
+                    ?.split('\n')?.filter(String::isNotBlank)?.toSet(),
+            )
             "DONE" -> {
                 if (fields.size != 4) return null
                 JournalRecord.Done(decodeString(fields[2]), fields[3].toLong())
@@ -635,7 +678,11 @@ class TelegramOutbox(
 
     private sealed interface JournalRecord {
         data class Put(val entry: TelegramOutboxEntry) : JournalRecord
-        data class Latest(val entry: TelegramOutboxEntry) : JournalRecord
+        data class Latest(
+            val entry: TelegramOutboxEntry,
+            /** Null denotes the legacy replace-everything record. */
+            val supersededKeys: Set<String>?,
+        ) : JournalRecord
         data class Done(val key: String, val atEpochMs: Long) : JournalRecord
         data class Dead(val letter: TelegramDeadLetter) : JournalRecord
         data class Superseded(val key: String, val atEpochMs: Long) : JournalRecord

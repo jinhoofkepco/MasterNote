@@ -13,14 +13,10 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.InsetDrawable
 import android.graphics.drawable.StateListDrawable
 import android.os.Bundle
-import android.text.Editable
 import android.text.InputFilter
-import android.text.TextWatcher
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
-import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -36,6 +32,7 @@ import androidx.lifecycle.lifecycleScope
 import com.studyink.assistant.core.AssistantPageKey
 import com.studyink.assistant.core.AssistantRepositoryProvider
 import com.studyink.assistant.core.TeacherGptAnswerFormat
+import com.studyink.assistant.core.TeacherGptAnswerMask
 import com.studyink.assistant.webview.ChatGptCompletion
 import com.studyink.assistant.webview.ChatGptManualFallback
 import com.studyink.assistant.webview.ChatGptQuery
@@ -45,6 +42,7 @@ import com.studyink.assistant.webview.ChatGptTextFormat
 import com.studyink.assistant.webview.ChatGptWebViewController
 import com.studyink.assistant.webview.ChatGptWebViewListener
 import com.studyink.assistant.webview.ChatGptWebViewState
+import com.studyink.assistant.webview.inferChatGptTextFormat
 import com.studyink.core.model.PageBounds
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -57,7 +55,6 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
     private lateinit var request: GptAssistantRequest
     private lateinit var controller: ChatGptWebViewController
     private lateinit var contentHost: FrameLayout
-    private lateinit var answerEditor: EditText
     private lateinit var statusBanner: TextView
     private lateinit var titleView: TextView
     private lateinit var modeButton: TextView
@@ -68,7 +65,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
     private lateinit var sendButton: Button
     private lateinit var saveReadButton: Button
     private lateinit var saveEditButton: Button
-    private lateinit var penDeleteButton: TextView
+    private lateinit var deleteSelectedButton: TextView
     private lateinit var undoDeleteButton: TextView
 
     private var formattedAnswerView: FormattedAssistantAnswerView? = null
@@ -79,11 +76,10 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
     private var responseAvailable = false
     private var hasUnsavedAnswer = false
     private var answerFormat = TeacherGptAnswerFormat.PLAIN_TEXT
-    private var penDeleteMode = false
-    private var penDeleteAnchor = -1
-    private var penDeleteCurrent = -1
-    private var lastPenDeletion: PenDeletion? = null
-    private val clearUndoRunnable = Runnable { clearPenDeleteUndo() }
+    private var originalAnswerText = ""
+    private val hiddenBlockOrdinals = linkedSetOf<Int>()
+    private var lastHiddenBlockBatch: Set<Int>? = null
+    private var editorSelectionReadInProgress = false
     private val hideStatusRunnable = Runnable { statusBanner.visibility = View.GONE }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -114,33 +110,6 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         }
         contentHost.addView(
             controller.view,
-            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
-        )
-        answerEditor = EditText(this).apply {
-            hint = "받은 답변을 다듬으세요"
-            gravity = Gravity.TOP or Gravity.START
-            textSize = 17f
-            setTextColor(Color.rgb(34, 35, 32))
-            setHintTextColor(Color.rgb(132, 130, 122))
-            setLineSpacing(dp(5).toFloat(), 1.12f)
-            setPadding(dp(18), dp(15), dp(18), dp(54))
-            maxLines = Int.MAX_VALUE
-            isVerticalScrollBarEnabled = true
-            setBackgroundColor(Color.rgb(255, 253, 248))
-            filters = arrayOf(InputFilter.LengthFilter(MAX_ANSWER_CHARS))
-            visibility = View.GONE
-            setOnTouchListener { _, event -> handlePenDeleteTouch(event) }
-            addTextChangedListener(object : TextWatcher {
-                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
-                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                    if (responseAvailable) hasUnsavedAnswer = true
-                    updateSaveButtons()
-                }
-                override fun afterTextChanged(s: Editable?) = Unit
-            })
-        }
-        contentHost.addView(
-            answerEditor,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
         )
         statusBanner = TextView(this).apply {
@@ -190,15 +159,21 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
             setPadding(dp(8), 0, dp(8), 0)
             background = thinBarBackground(Color.rgb(247, 246, 240))
         }.also { footer ->
-            penDeleteButton = footerAction("펜 삭제") { setPenDeleteMode(!penDeleteMode) }
-            undoDeleteButton = footerAction("되돌리기") { undoLastPenDeletion() }.apply {
+            deleteSelectedButton = footerAction("선택 삭제") { deleteSelectedBlocks() }
+            undoDeleteButton = footerAction("되돌리기") {
+                withNoStagedEditorSelection(::undoLastBlockDeletion)
+            }.apply {
                 visibility = View.GONE
             }
+            val restoreAllButton = footerAction("전체 복원") {
+                withNoStagedEditorSelection(::restoreAllBlocks)
+            }
             saveEditButton = primaryButton("페이지에 저장") { saveAnswer() }
-            footer.addView(penDeleteButton, LinearLayout.LayoutParams(dp(78), dp(48)))
+            footer.addView(deleteSelectedButton, LinearLayout.LayoutParams(dp(82), dp(48)))
             footer.addView(undoDeleteButton, LinearLayout.LayoutParams(dp(76), dp(48)))
+            footer.addView(restoreAllButton, LinearLayout.LayoutParams(dp(76), dp(48)))
             footer.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-            footer.addView(saveEditButton, LinearLayout.LayoutParams(dp(128), dp(48)))
+            footer.addView(saveEditButton, LinearLayout.LayoutParams(dp(116), dp(48)))
         }
         listOf(queryFooter, readFooter, editFooter).forEach { footer ->
             root.addView(footer, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)))
@@ -356,45 +331,49 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         )
         showStatus(
             if (truncated) "답변이 너무 길어 안전한 지점까지만 가져왔습니다."
-            else "답변을 받았습니다. 읽어본 뒤 편집하거나 저장하세요.",
+            else "답변을 받았습니다. 줄 앞 칸을 누르거나 펜으로 훑어 삭제할 부분을 고르세요.",
             persistent = truncated,
         )
     }
 
     private fun showPartialAnswer(text: String) {
-        applyAnswer(text, TeacherGptAnswerFormat.PLAIN_TEXT)
+        applyAnswer(
+            text,
+            when (inferChatGptTextFormat(text)) {
+                ChatGptTextFormat.PLAIN_TEXT -> TeacherGptAnswerFormat.PLAIN_TEXT
+                ChatGptTextFormat.MARKDOWN_TEX -> TeacherGptAnswerFormat.MARKDOWN_TEX
+            },
+        )
         showStatus("완료 신호는 못 받았습니다. 보이는 답변을 검토한 뒤 저장할 수 있어요.", persistent = true)
     }
 
     private fun applyAnswer(text: String, format: TeacherGptAnswerFormat): Boolean {
-        setPenDeleteMode(false)
-        clearPenDeleteUndo()
         val bounded = boundedAssistantAnswer(text, MAX_ANSWER_CHARS)
         answerFormat = format
-        answerEditor.setText(bounded.text)
-        answerEditor.setSelection(answerEditor.text.length)
-        responseAvailable = answerEditor.text.isNotBlank()
+        originalAnswerText = bounded.text.trim()
+        hiddenBlockOrdinals.clear()
+        lastHiddenBlockBatch = null
+        undoDeleteButton.visibility = View.GONE
+        responseAvailable = originalAnswerText.isNotBlank()
         hasUnsavedAnswer = responseAvailable
         updateSaveButtons()
-        showMode(WorkspaceMode.READ)
+        showMode(WorkspaceMode.EDIT)
         return bounded.truncated
     }
 
     private fun togglePrimaryMode() {
         when (mode) {
-            WorkspaceMode.GPT -> if (responseAvailable) showMode(WorkspaceMode.READ)
+            WorkspaceMode.GPT -> if (responseAvailable) showMode(WorkspaceMode.EDIT)
             WorkspaceMode.READ -> showMode(WorkspaceMode.EDIT)
-            WorkspaceMode.EDIT -> showMode(WorkspaceMode.READ)
+            WorkspaceMode.EDIT -> withNoStagedEditorSelection { showMode(WorkspaceMode.READ) }
         }
     }
 
     private fun showMode(next: WorkspaceMode, renderAnswer: Boolean = true) {
         mode = next
-        setPenDeleteMode(false)
         controller.view.visibility = View.GONE
         formattedAnswerView?.onHostPause()
         formattedAnswerView?.visibility = View.GONE
-        answerEditor.visibility = View.GONE
         queryFooter.visibility = View.GONE
         readFooter.visibility = View.GONE
         editFooter.visibility = View.GONE
@@ -409,7 +388,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
                 controller.hide()
                 val renderer = ensureFormattedAnswerView()
                 if (renderAnswer) {
-                    renderer.render(answerEditor.text?.toString().orEmpty(), answerFormat)
+                    renderer.render(visibleAnswerText(), answerFormat)
                 }
                 renderer.visibility = View.VISIBLE
                 if (hostResumed) renderer.onHostResume() else renderer.onHostPause()
@@ -419,7 +398,12 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
             }
             WorkspaceMode.EDIT -> {
                 controller.hide()
-                answerEditor.visibility = View.VISIBLE
+                val renderer = ensureFormattedAnswerView()
+                if (renderAnswer) {
+                    renderer.renderEditor(originalAnswerText, answerFormat, hiddenBlockOrdinals)
+                }
+                renderer.visibility = View.VISIBLE
+                if (hostResumed) renderer.onHostResume() else renderer.onHostPause()
                 editFooter.visibility = View.VISIBLE
                 modeButton.text = "보기"
                 modeButton.visibility = View.VISIBLE
@@ -455,7 +439,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
             menu.add(0, MENU_PASTE, itemId, "답변 붙여넣기")
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
-                    MENU_GPT -> showMode(WorkspaceMode.GPT)
+                    MENU_GPT -> withNoStagedEditorSelection { showMode(WorkspaceMode.GPT) }
                     MENU_COPY -> copyPrompt()
                     MENU_PASTE -> showManualAnswerDialog()
                 }
@@ -464,102 +448,89 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         }.show()
     }
 
-    private fun setPenDeleteMode(enabled: Boolean) {
-        if (penDeleteMode == enabled) return
-        val wasEnabled = penDeleteMode
-        penDeleteMode = enabled
-        if (::penDeleteButton.isInitialized) {
-            penDeleteButton.text = if (enabled) "펜 삭제 켬" else "펜 삭제"
-            penDeleteButton.isSelected = enabled
-        }
-        if (!::answerEditor.isInitialized) return
-        answerEditor.showSoftInputOnFocus = !enabled
-        resetPenDeleteGesture()
-        if (enabled) {
-            answerEditor.clearFocus()
-            getSystemService(InputMethodManager::class.java)?.hideSoftInputFromWindow(answerEditor.windowToken, 0)
-            showStatus("S Pen으로 지울 부분을 긁고 떼세요. 손가락은 스크롤합니다.", persistent = true)
-        } else if (wasEnabled) {
-            hideStatus()
+    private fun deleteSelectedBlocks() {
+        if (mode != WorkspaceMode.EDIT || saveInProgress || editorSelectionReadInProgress) return
+        val renderer = formattedAnswerView ?: return
+        editorSelectionReadInProgress = true
+        renderer.selectedEditorBlockOrdinals { selected ->
+            editorSelectionReadInProgress = false
+            if (mode != WorkspaceMode.EDIT || saveInProgress) return@selectedEditorBlockOrdinals
+            if (selected == null) {
+                showStatus("편집 화면을 준비하는 중입니다. 잠시 후 다시 눌러주세요.")
+                return@selectedEditorBlockOrdinals
+            }
+            val existing = AssistantAnswerBlocks.parse(originalAnswerText).mapTo(mutableSetOf()) { it.ordinal }
+            val newlyHidden = selected.filterTo(linkedSetOf()) {
+                it in existing && it !in hiddenBlockOrdinals
+            }
+            if (newlyHidden.isEmpty()) {
+                showStatus("줄 앞 체크칸에서 삭제할 부분을 먼저 골라주세요.")
+                return@selectedEditorBlockOrdinals
+            }
+            if (hiddenBlockOrdinals.size + newlyHidden.size > TeacherGptAnswerMask.MAX_HIDDEN_BLOCKS) {
+                showStatus("한 답변에서 숨길 수 있는 줄 수를 넘었습니다.", persistent = true)
+                return@selectedEditorBlockOrdinals
+            }
+            if (existing.size - hiddenBlockOrdinals.size - newlyHidden.size <= 0) {
+                showStatus("답변은 한 줄 이상 남겨야 저장할 수 있습니다.", persistent = true)
+                return@selectedEditorBlockOrdinals
+            }
+            hiddenBlockOrdinals += newlyHidden
+            lastHiddenBlockBatch = newlyHidden
+            undoDeleteButton.visibility = View.VISIBLE
+            hasUnsavedAnswer = true
+            showMode(WorkspaceMode.EDIT)
+            showStatus("선택한 ${newlyHidden.size}개 줄을 숨겼습니다.")
         }
     }
 
-    private fun handlePenDeleteTouch(event: MotionEvent): Boolean {
-        if (!penDeleteMode || !event.isPenEvent()) return false
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                answerEditor.parent?.requestDisallowInterceptTouchEvent(true)
-                val offset = answerEditor.getOffsetForPosition(event.x, event.y)
-                penDeleteAnchor = offset
-                penDeleteCurrent = offset
-                answerEditor.setSelection(offset)
-            }
-            MotionEvent.ACTION_MOVE -> updatePenDeleteSelection(event)
-            MotionEvent.ACTION_UP -> {
-                updatePenDeleteSelection(event)
-                deleteCurrentPenSelection()
-                answerEditor.parent?.requestDisallowInterceptTouchEvent(false)
-                resetPenDeleteGesture()
-            }
-            MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
-                answerEditor.parent?.requestDisallowInterceptTouchEvent(false)
-                resetPenDeleteGesture()
-            }
-        }
-        return true
-    }
-
-    private fun updatePenDeleteSelection(event: MotionEvent) {
-        if (penDeleteAnchor < 0) return
-        penDeleteCurrent = answerEditor.getOffsetForPosition(event.x, event.y)
-        answerEditor.setSelection(minOf(penDeleteAnchor, penDeleteCurrent), maxOf(penDeleteAnchor, penDeleteCurrent))
-    }
-
-    private fun deleteCurrentPenSelection() {
-        val start = minOf(penDeleteAnchor, penDeleteCurrent)
-        val end = maxOf(penDeleteAnchor, penDeleteCurrent)
-        if (start < 0 || end <= start) return
-        val editable = answerEditor.text
-        val deleted = editable.subSequence(start, end).toString()
-        editable.delete(start, end)
-        answerEditor.setSelection(start.coerceAtMost(editable.length))
-        lastPenDeletion = PenDeletion(start, deleted)
-        undoDeleteButton.visibility = View.VISIBLE
-        answerEditor.removeCallbacks(clearUndoRunnable)
-        answerEditor.postDelayed(clearUndoRunnable, PEN_DELETE_UNDO_MS)
+    private fun undoLastBlockDeletion() {
+        val restored = lastHiddenBlockBatch ?: return
+        hiddenBlockOrdinals.removeAll(restored)
+        lastHiddenBlockBatch = null
+        undoDeleteButton.visibility = View.GONE
         hasUnsavedAnswer = true
-        updateSaveButtons()
-        showStatus("선택한 글을 삭제했습니다. 5초 안에 되돌릴 수 있어요.")
-    }
-
-    private fun undoLastPenDeletion() {
-        val deletion = lastPenDeletion ?: return
-        val editable = answerEditor.text
-        val offset = deletion.offset.coerceIn(0, editable.length)
-        editable.insert(offset, deletion.text)
-        answerEditor.setSelection((offset + deletion.text.length).coerceAtMost(editable.length))
-        clearPenDeleteUndo()
-        hasUnsavedAnswer = true
-        updateSaveButtons()
+        showMode(WorkspaceMode.EDIT)
         showStatus("마지막 삭제를 되돌렸습니다.")
     }
 
-    private fun clearPenDeleteUndo() {
-        if (::answerEditor.isInitialized) answerEditor.removeCallbacks(clearUndoRunnable)
-        lastPenDeletion = null
-        if (::undoDeleteButton.isInitialized) undoDeleteButton.visibility = View.GONE
+    private fun restoreAllBlocks() {
+        if (hiddenBlockOrdinals.isEmpty()) {
+            showStatus("숨긴 줄이 없습니다.")
+            return
+        }
+        hiddenBlockOrdinals.clear()
+        lastHiddenBlockBatch = null
+        undoDeleteButton.visibility = View.GONE
+        hasUnsavedAnswer = true
+        showMode(WorkspaceMode.EDIT)
+        showStatus("원문 전체를 복원했습니다.")
     }
 
-    private fun resetPenDeleteGesture() {
-        penDeleteAnchor = -1
-        penDeleteCurrent = -1
-    }
+    private fun visibleAnswerText(): String =
+        AssistantAnswerBlocks.visibleSource(originalAnswerText, hiddenBlockOrdinals)
 
-    private fun MotionEvent.isPenEvent(): Boolean {
-        if (pointerCount <= 0) return false
-        val pointerIndex = actionIndex.coerceIn(0, pointerCount - 1)
-        return getToolType(pointerIndex) == MotionEvent.TOOL_TYPE_STYLUS ||
-            getToolType(pointerIndex) == MotionEvent.TOOL_TYPE_ERASER
+    private fun withNoStagedEditorSelection(action: () -> Unit) {
+        if (mode != WorkspaceMode.EDIT) {
+            action()
+            return
+        }
+        if (editorSelectionReadInProgress) return
+        val renderer = formattedAnswerView ?: return action()
+        editorSelectionReadInProgress = true
+        renderer.selectedEditorBlockOrdinals { selected ->
+            editorSelectionReadInProgress = false
+            if (mode != WorkspaceMode.EDIT) return@selectedEditorBlockOrdinals
+            if (selected == null) {
+                showStatus("편집 화면을 준비하는 중입니다. 잠시 후 다시 눌러주세요.")
+                return@selectedEditorBlockOrdinals
+            }
+            if (selected.isNotEmpty()) {
+                showStatus("체크한 줄은 ‘선택 삭제’를 먼저 눌러 확정해 주세요.", persistent = true)
+            } else {
+                action()
+            }
+        }
     }
 
     private fun copyPrompt() {
@@ -584,18 +555,34 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
                 val text = editor.text?.toString()?.trim().orEmpty()
                 if (text.isEmpty()) return@setPositiveButton
                 if (!controller.provideManualResponse(text)) {
-                    showAnswer(ChatGptResult(text, null, 0, ChatGptCompletion.MANUAL))
+                    showAnswer(
+                        ChatGptResult(
+                            text = text,
+                            html = null,
+                            assistantMessageCount = 0,
+                            completion = ChatGptCompletion.MANUAL,
+                            textFormat = inferChatGptTextFormat(text),
+                        )
+                    )
                 }
             }
             .show()
     }
 
     private fun saveAnswer() {
+        if (saveInProgress || editorSelectionReadInProgress) return
+        if (mode == WorkspaceMode.EDIT) {
+            withNoStagedEditorSelection(::saveCommittedAnswer)
+        } else {
+            saveCommittedAnswer()
+        }
+    }
+
+    private fun saveCommittedAnswer() {
         if (saveInProgress) return
-        val text = answerEditor.text?.toString()?.trim().orEmpty()
-        if (text.isEmpty()) return
+        val original = originalAnswerText.trim()
+        if (original.isEmpty() || visibleAnswerText().isBlank()) return
         saveInProgress = true
-        answerEditor.isEnabled = false
         setSaveEnabled(false)
         showStatus("페이지에 저장 중…", persistent = true)
         lifecycleScope.launch {
@@ -606,12 +593,15 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
                         title = request.promptTitle,
                         selectionBounds = request.selectionBounds,
                         promptSlotNumber = request.promptSlotNumber,
-                        answerText = text,
+                        answerText = original,
                         answerHtml = null,
                         providerName = "ChatGPT WebView",
                         promptTitleSnapshot = request.promptTitle,
                         promptBodySnapshot = request.promptBody,
                         answerFormat = answerFormat,
+                        answerMask = hiddenBlockOrdinals.takeIf { it.isNotEmpty() }?.let { hidden ->
+                            TeacherGptAnswerMask.forAnswer(original, hidden)
+                        },
                     )
                 }
             }
@@ -628,7 +618,6 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
                 finish()
             }.onFailure { error ->
                 saveInProgress = false
-                answerEditor.isEnabled = true
                 updateSaveButtons()
                 showStatus(error.message ?: "답변을 저장하지 못했습니다.", persistent = true)
             }
@@ -636,8 +625,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
     }
 
     private fun updateSaveButtons() {
-        if (!::answerEditor.isInitialized) return
-        val enabled = !saveInProgress && answerEditor.text?.isNotBlank() == true
+        val enabled = !saveInProgress && visibleAnswerText().isNotBlank()
         if (::saveReadButton.isInitialized) saveReadButton.isEnabled = enabled
         if (::saveEditButton.isInitialized) saveEditButton.isEnabled = enabled
     }
@@ -705,7 +693,12 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putString(STATE_ANSWER_TEXT, answerEditor.text?.toString().orEmpty())
+        outState.putString(STATE_ANSWER_TEXT, originalAnswerText)
+        outState.putIntArray(STATE_HIDDEN_BLOCKS, hiddenBlockOrdinals.sorted().toIntArray())
+        outState.putIntArray(
+            STATE_LAST_HIDDEN_BATCH,
+            lastHiddenBlockBatch.orEmpty().sorted().toIntArray(),
+        )
         outState.putString(STATE_MODE, mode.name)
         outState.putBoolean(STATE_RESPONSE_AVAILABLE, responseAvailable)
         outState.putBoolean(STATE_UNSAVED_ANSWER, hasUnsavedAnswer)
@@ -725,8 +718,18 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         responseAvailable = state.getBoolean(STATE_RESPONSE_AVAILABLE, restoredAnswer.isNotBlank())
         val restoredUnsavedAnswer = state.getBoolean(STATE_UNSAVED_ANSWER, responseAvailable)
         if (responseAvailable) {
-            answerEditor.setText(restoredAnswer)
-            answerEditor.setSelection(answerEditor.text.length)
+            originalAnswerText = restoredAnswer.trim()
+            val knownOrdinals = AssistantAnswerBlocks.parse(originalAnswerText)
+                .mapTo(mutableSetOf()) { it.ordinal }
+            hiddenBlockOrdinals.clear()
+            (state.getIntArray(STATE_HIDDEN_BLOCKS) ?: IntArray(0)).forEach { ordinal ->
+                if (ordinal in knownOrdinals) hiddenBlockOrdinals += ordinal
+            }
+            lastHiddenBlockBatch = (state.getIntArray(STATE_LAST_HIDDEN_BATCH) ?: IntArray(0))
+                .filter { it in hiddenBlockOrdinals }
+                .toSet()
+                .takeIf { it.isNotEmpty() }
+            undoDeleteButton.visibility = if (lastHiddenBlockBatch == null) View.GONE else View.VISIBLE
             hasUnsavedAnswer = restoredUnsavedAnswer
             val restoredMode = runCatching {
                 WorkspaceMode.valueOf(state.getString(STATE_MODE).orEmpty())
@@ -745,8 +748,7 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         hostResumed = true
         when (mode) {
             WorkspaceMode.GPT -> controller.open()
-            WorkspaceMode.READ -> formattedAnswerView?.onHostResume()
-            WorkspaceMode.EDIT -> Unit
+            WorkspaceMode.READ, WorkspaceMode.EDIT -> formattedAnswerView?.onHostResume()
         }
     }
 
@@ -758,7 +760,6 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
     }
 
     override fun onDestroy() {
-        clearPenDeleteUndo()
         if (::statusBanner.isInitialized) statusBanner.removeCallbacks(hideStatusRunnable)
         formattedAnswerView?.destroyRenderer()
         formattedAnswerView = null
@@ -816,9 +817,10 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
         const val EXTRA_SAVED_PAGE_NUMBER = "gptSavedPageNumber"
         private const val MAX_ANSWER_CHARS = 120_000
         private const val MAX_MANUAL_INPUT_CHARS = 240_000
-        private const val PEN_DELETE_UNDO_MS = 5_000L
         private const val STATUS_DURATION_MS = 3_500L
         private const val STATE_ANSWER_TEXT = "gptAnswerText"
+        private const val STATE_HIDDEN_BLOCKS = "gptHiddenAnswerBlocks"
+        private const val STATE_LAST_HIDDEN_BATCH = "gptLastHiddenAnswerBlockBatch"
         private const val STATE_MODE = "gptMode"
         private const val STATE_RESPONSE_AVAILABLE = "gptResponseAvailable"
         private const val STATE_UNSAVED_ANSWER = "gptUnsavedAnswer"
@@ -832,7 +834,6 @@ class GptAssistantActivity : FragmentActivity(), ChatGptWebViewListener {
             Intent(context, GptAssistantActivity::class.java).apply { request.putInto(this) }
     }
 
-    private data class PenDeletion(val offset: Int, val text: String)
 }
 
 internal data class BoundedAssistantAnswer(

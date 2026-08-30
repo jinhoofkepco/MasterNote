@@ -21,5 +21,6 @@ dependencies {
     implementation(project(":assistant:core"))
     implementation(project(":annotation:storage"))
     implementation(project(":library:data"))
+    implementation(project(":memo:core"))
     testImplementation("junit:junit:4.13.2")
 }

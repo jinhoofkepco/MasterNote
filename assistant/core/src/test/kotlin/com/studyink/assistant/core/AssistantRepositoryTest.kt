@@ -30,10 +30,7 @@ class AssistantRepositoryTest {
         val seeds = repository.promptSlots()
         assertEquals(4, seeds.size)
         assertEquals(listOf(1, 2, 3, 4), seeds.map(AssistantPromptSlot::slotNumber))
-        assertEquals(
-            "이 부분을 보고 학생에게 설명하기 위해 수학적 깨달음을 얻을 수 있는 포인트를 짚어줘. 그리고 그 포인트를 단계적으로 설명할 수 있게 하기 위해서 세 단계로 구분해서 설명을 만들어 줘.",
-            seeds.first().body,
-        )
+        assertTrue(seeds.first().body.endsWith("HTML 태그는 작성하지 마."))
 
         val beforeCommit = MasterNoteDataCommitBus.currentGeneration()
         val edited = repository.updatePromptSlot(2, "나의 질문", "학생의 풀이를 분석해줘.")
@@ -49,6 +46,28 @@ class AssistantRepositoryTest {
         assertThrows(IllegalArgumentException::class.java) {
             repository.updatePromptSlot(5, "없음", "없음")
         }
+    }
+
+    @Test
+    fun stalePromptEditorCannotOverwriteANewerSavedRevision() {
+        val repository = repository(temporaryFolder.newFolder("prompt-cas"))
+        val opened = repository.promptSlot(1)
+        val newer = repository.updatePromptSlot(
+            slotNumber = 1,
+            title = opened.title,
+            body = "먼저 저장된 새 질문",
+            expectedRevision = opened.revision,
+        )
+
+        assertThrows(IllegalStateException::class.java) {
+            repository.updatePromptSlot(
+                slotNumber = 1,
+                title = opened.title,
+                body = "뒤늦게 도착한 오래된 질문",
+                expectedRevision = opened.revision,
+            )
+        }
+        assertEquals(newer, repository.promptSlot(1))
     }
 
     @Test
@@ -503,6 +522,33 @@ class AssistantRepositoryTest {
         }
         assertEquals(before, MasterNoteDataCommitBus.currentGeneration())
         assertFalse(File(root, "gpt-assistant-v1/teacher-pages").exists())
+    }
+
+    @Test
+    fun removingOneTeacherResourceKeepsOtherResourcesAndPublishedStudentCards() {
+        val root = temporaryFolder.newFolder("remove-one-teacher-resource")
+        val repository = repository(root)
+        val page = AssistantPageKey("book", 13)
+        val removed = repository.createTeacherResource(page, "삭제할 자료", bounds(), 1, "원문")
+        val kept = repository.createTeacherResource(page, "남길 자료", bounds(), 2, "다른 원문")
+        val target = StudentExplanationTarget(page, 1)
+        val card = repository.newStudentExplanationCard(
+            page,
+            removed.resourceId,
+            removed.currentRevisionId,
+            "이미 보낸 설명",
+            "학생에게 보낸 내용",
+            bounds(),
+        )
+        repository.replaceStudentExplanationCards(target, listOf(card))
+
+        assertTrue(repository.removeTeacherResource(page, removed.resourceId))
+
+        val reloaded = repository(root)
+        assertNull(reloaded.teacherResource(page, removed.resourceId))
+        assertEquals(listOf(kept.resourceId), reloaded.listTeacherResources(page).map { it.resourceId })
+        assertEquals("학생에게 보낸 내용", reloaded.studentExplanationLayer(target).cards.single().text)
+        assertTrue(reloaded.pendingStudentExplanationPublications().isNotEmpty())
     }
 
     private fun repository(

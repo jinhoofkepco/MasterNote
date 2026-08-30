@@ -1,10 +1,14 @@
 package com.studyink.sync.lan
 
+import com.studyink.annotation.storage.AppliedTeacherReviewReceipt
+import com.studyink.annotation.storage.TeacherReviewPublicationOrderDisposition
+import com.studyink.annotation.storage.teacherReviewPublicationOrderDisposition
 import com.studyink.core.model.Attempt
 import com.studyink.core.model.Mark
 import com.studyink.core.model.MarkColor
 import com.studyink.core.model.MarkGroup
 import com.studyink.core.model.PagePoint
+import com.studyink.memo.core.MemoTarget
 import java.io.BufferedReader
 import java.io.StringReader
 import java.util.UUID
@@ -20,6 +24,189 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LanSyncBusTest {
+
+    @Test
+    fun teacherReviewPublicationOrderFencesCrossTransportRollback() {
+        val older = "a".repeat(64)
+        val newer = "b".repeat(64)
+        fun receipt(publicationId: String, publishedAt: Long) = AppliedTeacherReviewReceipt(
+            bookId = "book",
+            pageNumber = 93,
+            attemptNo = 2,
+            publicationId = publicationId,
+            resultLayerSha256 = "c".repeat(64),
+            markGroupsSha256 = "d".repeat(64),
+            appliedAtEpochMillis = 1L,
+            publishedAtEpochMillis = publishedAt,
+            remotePairId = "pair",
+        )
+
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.APPLY,
+            teacherReviewPublicationOrderDisposition(null, older, 10L),
+        )
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.STALE,
+            teacherReviewPublicationOrderDisposition(receipt(newer, 20L), older, 10L),
+        )
+        assertEquals(
+            "an unsequenced delayed frame cannot overwrite ordered state",
+            TeacherReviewPublicationOrderDisposition.STALE,
+            teacherReviewPublicationOrderDisposition(receipt(newer, 20L), older, 0L),
+        )
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.DUPLICATE_VERIFY,
+            teacherReviewPublicationOrderDisposition(receipt(newer, 20L), newer, 20L),
+        )
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.CONFLICT,
+            teacherReviewPublicationOrderDisposition(receipt(newer, 20L), older, 20L),
+        )
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.APPLY,
+            teacherReviewPublicationOrderDisposition(receipt(older, 10L), newer, 20L),
+        )
+    }
+
+    @Test
+    fun legacyReceiptCanUpgradeButSameLegacyPublicationIsVerified() {
+        val legacy = "c".repeat(64)
+        val ordered = "d".repeat(64)
+        val receipt = AppliedTeacherReviewReceipt(
+            bookId = "book",
+            pageNumber = 93,
+            attemptNo = 2,
+            publicationId = legacy,
+            resultLayerSha256 = "e".repeat(64),
+            markGroupsSha256 = "f".repeat(64),
+            appliedAtEpochMillis = 1L,
+            publishedAtEpochMillis = 0L,
+            remotePairId = "pair",
+        )
+
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.APPLY,
+            teacherReviewPublicationOrderDisposition(receipt, legacy, 0L),
+        )
+        assertEquals(
+            TeacherReviewPublicationOrderDisposition.APPLY,
+            teacherReviewPublicationOrderDisposition(receipt, ordered, 30L),
+        )
+        assertEquals(
+            "legacy receipts have no cross-transport order, so another legacy frame remains compatible",
+            TeacherReviewPublicationOrderDisposition.APPLY,
+            teacherReviewPublicationOrderDisposition(receipt, ordered, 0L),
+        )
+    }
+
+    @Test
+    fun exactTeacherReviewGradeSliceDoesNotMixPagesBooksOrAttempts() {
+        val target = MarkGroup(
+            id = "group",
+            bookId = "book-a",
+            pageNumber = 93,
+            anchor = PagePoint(1f, 2f),
+            marks = listOf(
+                Mark(attemptNo = 1, color = MarkColor.RED, gradedAtEpochMillis = 10L),
+                Mark(attemptNo = 2, color = MarkColor.BLUE, gradedAtEpochMillis = 20L),
+            ),
+            createdAtEpochMillis = 1L,
+        )
+        val otherPage = target.copy(id = "other-page", pageNumber = 94)
+        val otherBook = target.copy(id = "other-book", bookId = "book-b")
+
+        val exact = exactLanTeacherReviewMarkGroups(
+            listOf(target, otherPage, otherBook),
+            "book-a",
+            93,
+            2,
+        )
+
+        assertEquals(listOf("group"), exact.map(MarkGroup::id))
+        assertEquals(listOf(2), exact.single().marks.map(Mark::attemptNo))
+    }
+
+    @Test
+    fun duplicateTeacherReviewRequiresIncomingMetadataOrNewer() {
+        val incoming = MarkGroup(
+            id = "group",
+            bookId = "book",
+            pageNumber = 93,
+            anchor = PagePoint(20f, 30f),
+            marks = listOf(Mark(attemptNo = 2, color = MarkColor.RED)),
+            createdAtEpochMillis = 1L,
+            syncRevision = 2L,
+            lastModifiedByDeviceId = "teacher",
+        )
+
+        assertTrue(lanTeacherReviewMetadataCoversIncoming(listOf(incoming), listOf(incoming)))
+        assertTrue(
+            "later-attempt metadata must not be rolled back by an older duplicate",
+            lanTeacherReviewMetadataCoversIncoming(
+                listOf(incoming.copy(syncRevision = 3L, lastModifiedByDeviceId = "student")),
+                listOf(incoming),
+            ),
+        )
+        assertFalse(
+            "restored older metadata must enter the exact replacement repair path",
+            lanTeacherReviewMetadataCoversIncoming(
+                listOf(incoming.copy(syncRevision = 1L)),
+                listOf(incoming),
+            ),
+        )
+        assertFalse(lanTeacherReviewMetadataCoversIncoming(emptyList(), listOf(incoming)))
+    }
+
+    @Test
+    fun helloAdvertisesTeacherReviewStateWithoutReplacingExistingCapabilities() {
+        assertTrue(LAN_CAPABILITY_GPT_EXPLANATION_V2 in lanCapabilities())
+        assertTrue(LAN_CAPABILITY_TEACHER_REVIEW_STATE_V1 in lanCapabilities())
+        assertTrue(LAN_CAPABILITY_STUDENT_MEMO_V1 in lanCapabilities())
+        assertEquals(lanCapabilities().size, lanCapabilities().distinct().size)
+    }
+
+    @Test
+    fun teacherReviewMismatchLatchIsPageAndConnectionScoped() {
+        val latch = LanTeacherReviewMismatchLatch()
+        val expected = "a".repeat(64)
+        val observed = "b".repeat(64)
+
+        assertTrue(latch.shouldRepair(1L, 93, expected, observed))
+        assertFalse(latch.shouldRepair(1L, 93, expected, observed))
+        assertTrue("another page must reconcile independently", latch.shouldRepair(1L, 94, expected, observed))
+        assertTrue("a reconnect must retry unresolved evidence", latch.shouldRepair(2L, 93, expected, observed))
+    }
+
+    @Test
+    fun matchingTeacherReviewStateClearsOnlyItsPageLatch() {
+        val latch = LanTeacherReviewMismatchLatch()
+        val expected = "c".repeat(64)
+        val observed = "d".repeat(64)
+        assertTrue(latch.shouldRepair(1L, 93, expected, observed))
+        assertTrue(latch.shouldRepair(1L, 94, expected, observed))
+
+        assertFalse(latch.shouldRepair(1L, 93, expected, expected))
+        assertTrue("a later rollback must be repairable", latch.shouldRepair(1L, 93, expected, observed))
+        assertFalse("matching page 93 must not reset page 94", latch.shouldRepair(1L, 94, expected, observed))
+
+        latch.clearPage(94)
+        assertTrue(latch.shouldRepair(1L, 94, expected, observed))
+    }
+
+    @Test
+    fun staleRepairFailureCannotClearNewerTeacherReviewMismatch() {
+        val latch = LanTeacherReviewMismatchLatch()
+        val oldExpected = "e".repeat(64)
+        val newExpected = "f".repeat(64)
+        val observed = "0".repeat(64)
+        assertTrue(latch.shouldRepair(1L, 93, oldExpected, observed))
+        assertTrue(latch.shouldRepair(1L, 93, newExpected, observed))
+
+        latch.clearIfMatches(1L, 93, oldExpected, observed)
+        assertFalse(latch.shouldRepair(1L, 93, newExpected, observed))
+        latch.clearIfMatches(1L, 93, newExpected, observed)
+        assertTrue(latch.shouldRepair(1L, 93, newExpected, observed))
+    }
 
     @Test
     fun gptAckMustMatchEveryDurablePublicationIdentityField() {
@@ -56,6 +243,143 @@ class LanSyncBusTest {
         assertFalse(isExactLanTeacherReviewAttempt(listOf(open), "book-a", 93, 3))
         assertFalse(isExactLanTeacherReviewAttempt(listOf(open), "book-a", 92, 4))
         assertFalse(isExactLanTeacherReviewAttempt(listOf(open), "book-b", 93, 4))
+    }
+
+    @Test
+    fun teacherReviewStateAdvertisesOnlyExactStudentPageAttempts() {
+        val attempts = listOf(
+            Attempt("book-a", pageNumber = 93, attemptNo = 4, locked = false),
+            Attempt("book-a", pageNumber = 93, attemptNo = 2, locked = true),
+            Attempt("book-a", pageNumber = 94, attemptNo = 9, locked = false),
+            Attempt("book-b", pageNumber = 93, attemptNo = 8, locked = false),
+        )
+
+        assertEquals(listOf(2, 4), exactLanStudentAttemptNos(attempts, "book-a", 93))
+    }
+
+    @Test
+    fun memoCatchUpTargetsOnlyCurrentCatalogAttemptsOnTheSubscribedPage() {
+        val attempts = listOf(
+            Attempt("book-a", pageNumber = 93, attemptNo = 4, locked = false),
+            Attempt("book-a", pageNumber = 93, attemptNo = 2, locked = true),
+            Attempt("book-a", pageNumber = 93, attemptNo = 4, locked = true),
+            Attempt("book-a", pageNumber = 94, attemptNo = 9, locked = false),
+            Attempt("book-b", pageNumber = 93, attemptNo = 8, locked = false),
+        )
+
+        assertEquals(
+            listOf(
+                MemoTarget("book-a", pageNumber = 93, attemptNo = 2),
+                MemoTarget("book-a", pageNumber = 93, attemptNo = 4),
+            ),
+            exactLanStudentMemoTargets(attempts, "book-a", 93),
+        )
+    }
+
+    @Test
+    fun memoSendQueueCoalescesOneIdentityAndYieldsFairlyToOtherMemos() {
+        val queue = LatestLanStudentMemoSendQueue()
+        val target = MemoTarget("book-a", pageNumber = 93, attemptNo = 4)
+        val first = LanStudentMemoSendKey(target, "memo-a")
+        val second = LanStudentMemoSendKey(target, "memo-b")
+
+        assertTrue(queue.offer(first))
+        assertFalse(queue.offer(first))
+        assertFalse(queue.offer(second))
+        assertEquals(listOf(first), queue.takeBatch(1))
+
+        // A new stroke for the in-flight memo is retained, but moves behind the waiting memo.
+        assertFalse(queue.offer(first))
+        assertTrue(queue.completeBatch())
+        assertEquals(listOf(second, first), queue.takeBatch(2))
+        assertFalse(queue.completeBatch())
+
+        // Completing the prior drain arms exactly one new worker for the next burst.
+        assertTrue(queue.offer(first))
+        queue.clear()
+        assertTrue(queue.offer(second))
+    }
+
+    @Test
+    fun memoTransferGateKeepsWholeChunkStreamsContiguous() {
+        val gate = LanStudentMemoTransferGate()
+        val firstEntered = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val secondAttempting = CountDownLatch(1)
+        val secondEntered = CountDownLatch(1)
+        val order = mutableListOf<String>()
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val first = executor.submit<Boolean> {
+                gate.serialize {
+                    order += "first-0"
+                    firstEntered.countDown()
+                    check(releaseFirst.await(2, TimeUnit.SECONDS))
+                    order += "first-1"
+                    true
+                }
+            }
+            assertTrue(firstEntered.await(2, TimeUnit.SECONDS))
+            val second = executor.submit<Boolean> {
+                secondAttempting.countDown()
+                gate.serialize {
+                    secondEntered.countDown()
+                    order += "second-0"
+                    order += "second-1"
+                    true
+                }
+            }
+            assertTrue(secondAttempting.await(2, TimeUnit.SECONDS))
+            assertFalse("a second transfer entered before the first completed", secondEntered.await(100, TimeUnit.MILLISECONDS))
+            releaseFirst.countDown()
+
+            assertTrue(first.get(2, TimeUnit.SECONDS))
+            assertTrue(second.get(2, TimeUnit.SECONDS))
+            assertEquals(listOf("first-0", "first-1", "second-0", "second-1"), order)
+        } finally {
+            releaseFirst.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun teacherReviewStateCacheKeepsRepeatedStrokeReportsOnTheCheapPath() {
+        val cache = LanTeacherReviewStateDigestCache()
+        val digest = "1".repeat(64)
+        val missing = cache.lookup(93, listOf(1, 2), 100L, 30_000L)
+        assertNull(missing.digestSha256)
+        assertTrue(missing.shouldRefresh)
+
+        val refresh = requireNotNull(cache.beginRefresh(93, listOf(2, 1), 1L))
+        assertTrue(cache.complete(refresh, digest, 100L))
+        repeat(100) { stroke ->
+            val cached = cache.lookup(93, listOf(1, 2), 101L + stroke, 30_000L)
+            assertEquals(digest, cached.digestSha256)
+            assertFalse("ordinary strokes must not request a full rehash", cached.shouldRefresh)
+        }
+
+        val stale = cache.lookup(93, listOf(1, 2), 30_100L, 30_000L)
+        assertEquals("stale evidence remains available while refreshing", digest, stale.digestSha256)
+        assertTrue(stale.shouldRefresh)
+        val changedAttempts = cache.lookup(93, listOf(1, 2, 3), 200L, 30_000L)
+        assertNull(changedAttempts.digestSha256)
+        assertTrue(changedAttempts.shouldRefresh)
+    }
+
+    @Test
+    fun teacherReviewStateCacheRejectsRefreshThatRacedAnApplyOrReconnect() {
+        val cache = LanTeacherReviewStateDigestCache()
+        val digest = "2".repeat(64)
+        val beforeApply = requireNotNull(cache.beginRefresh(93, listOf(1), 1L))
+        cache.invalidate(93)
+        assertFalse(cache.complete(beforeApply, digest, 10L))
+        assertNull(cache.lookup(93, listOf(1), 11L, 30_000L).digestSha256)
+
+        val beforeReconnect = requireNotNull(cache.beginRefresh(93, listOf(1), 1L))
+        cache.clear()
+        assertFalse(cache.complete(beforeReconnect, digest, 12L))
+        val afterReconnect = requireNotNull(cache.beginRefresh(93, listOf(1), 2L))
+        assertTrue(cache.complete(afterReconnect, digest, 13L))
     }
 
     @Test
@@ -180,11 +504,24 @@ class LanSyncBusTest {
     }
 
     @Test
+    fun heartbeatSilenceDoesNotCloseAProgressingBoundedCatchUp() {
+        assertFalse(isLanHeartbeatSilenceExpired(100L, 109L, 120L, 8L))
+        assertTrue(isLanHeartbeatSilenceExpired(100L, 109L, 0L, 8L))
+        assertFalse(isLanHeartbeatSilenceExpired(100L, 107L, 0L, 8L))
+    }
+
+    @Test
     fun invalidOperationClosesBeforeAFollowingPageSyncedCanClaimReady() {
         assertTrue(mustCloseLanConnectionAfterFailure("OPERATION", authenticated = true))
         assertTrue(mustCloseLanConnectionAfterFailure("PAGE_SYNCED", authenticated = true))
+        assertTrue(mustCloseLanConnectionAfterFailure("STUDENT_MEMO_CHUNK", authenticated = true))
         assertTrue(mustCloseLanConnectionAfterFailure("PING", authenticated = false))
         assertFalse(mustCloseLanConnectionAfterFailure("PING", authenticated = true))
+        assertFalse(
+            "a stale review attempt must be dropped without a reconnect loop",
+            mustCloseLanConnectionAfterFailure("TEACHER_REVIEW_CHUNK", authenticated = true),
+        )
+        assertFalse(mustCloseLanConnectionAfterFailure("TEACHER_REVIEW_REJECT", authenticated = true))
     }
 
     @Test

@@ -30,12 +30,23 @@ import com.studyink.assistant.core.StudentExplanationLayerBus
 import com.studyink.assistant.core.StudentExplanationTarget
 import com.studyink.assistant.core.StudentLayerApplyStatus
 import com.studyink.assistant.core.remapTo
+import com.studyink.annotation.storage.AppliedTeacherReviewReceipt
 import com.studyink.annotation.storage.PageOperationLogStore
+import com.studyink.annotation.storage.TeacherReviewPublicationOrderDisposition
+import com.studyink.annotation.storage.teacherReviewPublicationOrderDisposition
 import com.studyink.core.model.Attempt
 import com.studyink.core.model.MarkGroup
+import com.studyink.core.model.compareTeacherReviewMarkGroupMetadataGlobalOrder
+import com.studyink.core.model.teacherReviewStateSha256
 import com.studyink.library.data.LibraryAttemptBus
 import com.studyink.library.data.LibraryMarkGroupBus
 import com.studyink.library.data.LibraryRepository
+import com.studyink.memo.core.MemoTarget
+import com.studyink.memo.core.MemoTransportLimits
+import com.studyink.memo.core.StudentMemo
+import com.studyink.memo.core.StudentMemoChangeBus
+import com.studyink.memo.core.StudentMemoRepository
+import com.studyink.memo.core.remapTo
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -69,6 +80,7 @@ class LanSyncService : Service(),
     private val store by lazy { PageOperationLogStore.get(this) }
     private val library by lazy { LibraryRepository.get(this) }
     private val assistantRepository by lazy { AssistantRepositoryProvider.get(this) }
+    private val memoRepository by lazy { StudentMemoRepository.get(this) }
     private val pairingPreferences by lazy { getSharedPreferences("masternote-lan-pairs", MODE_PRIVATE) }
     private val nsd by lazy { getSystemService(NsdManager::class.java) }
     private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
@@ -104,6 +116,8 @@ class LanSyncService : Service(),
     @Volatile private var pendingPeerDeviceId: String = ""
     @Volatile private var pendingPeerRole: LanPeerRole? = null
     @Volatile private var peerSupportsGptExplanation = false
+    @Volatile private var peerSupportsTeacherReviewState = false
+    @Volatile private var peerSupportsStudentMemo = false
     /** True only for a session that is visibly offering/consuming a QR pairing payload. */
     @Volatile private var explicitPairingWindow = false
     @Volatile private var subscribedPage = -1
@@ -130,7 +144,15 @@ class LanSyncService : Service(),
     @Volatile private var lastSubscriptionPage = -1
     @Volatile private var lastTeacherRepairGeneration = -1L
     @Volatile private var lastTeacherPublicationRepairGeneration = -1L
+    /** The current student socket may publish memos only after receiving SUBSCRIBE on that socket. */
+    @Volatile private var studentMemoSubscriptionGeneration = -1L
+    private val teacherReviewMismatchLatch = LanTeacherReviewMismatchLatch()
+    private val teacherReviewStateCache = LanTeacherReviewStateDigestCache()
     private val incomingTeacherReviewChunks = linkedMapOf<String, IncomingTeacherReviewChunks>()
+    private val incomingStudentMemoChunks = linkedMapOf<String, IncomingStudentMemoChunks>()
+    private val pendingStudentMemoSends = LatestLanStudentMemoSendQueue()
+    private val studentMemoTransferGate = LanStudentMemoTransferGate()
+    private var memoChangeSubscription: AutoCloseable? = null
     private val stopping = AtomicBoolean(false)
 
     // The debounce timer lives on the main looper, but the flush it triggers writes to a socket.
@@ -138,6 +160,18 @@ class LanSyncService : Service(),
     // swallowed as a generic write failure - so live ink was never transmitted while the paths that
     // already ran off the main thread (peer SUBSCRIBE, page presence) worked and masked it.
     private val flushRunnable = Runnable { io.execute { flushPendingAtStrokeBoundary() } }
+    /** One shared timer, rather than one executor task for every completed memo stroke. */
+    private val studentMemoSendRunnable = Runnable {
+        if (stopping.get()) {
+            pendingStudentMemoSends.clear()
+            return@Runnable
+        }
+        runCatching { metadataIo.execute(::drainOnePendingStudentMemo) }
+            .onFailure { error ->
+                pendingStudentMemoSends.clear()
+                Log.w(TAG, "Student memo sender is unavailable", error)
+            }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -146,6 +180,18 @@ class LanSyncService : Service(),
         LanSyncBus.addListener(this)
         LibraryAttemptBus.addListener(this)
         LibraryMarkGroupBus.addListener(this)
+        memoChangeSubscription = StudentMemoChangeBus.addListener { change ->
+            if (role != LanPeerRole.STUDENT_SERVER || change.target.bookId != bookId ||
+                change.target.pageNumber != subscribedPage || !peerSupportsStudentMemo ||
+                studentMemoSubscriptionGeneration != connectionGeneration
+            ) return@addListener
+            val shouldSchedule = pendingStudentMemoSends.offer(
+                LanStudentMemoSendKey(change.target, change.memo.id),
+            )
+            if (shouldSchedule) {
+                handler.postDelayed(studentMemoSendRunnable, STUDENT_MEMO_SEND_DEBOUNCE_MS)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -362,6 +408,7 @@ class LanSyncService : Service(),
         lastSubscriptionPage = -1
         lastTeacherRepairGeneration = -1L
         lastTeacherPublicationRepairGeneration = -1L
+        studentMemoSubscriptionGeneration = -1L
         LanSyncBus.connectionStateChanged(bookId, LanConnectionState.CONNECTING)
         LanSyncBus.sessionPhaseChanged(bookId, LanSessionPhase.CONNECTING)
         val helloSent = send(
@@ -437,6 +484,7 @@ class LanSyncService : Service(),
                 lastTeacherRepairGeneration = -1L
                 lastTeacherPublicationRepairGeneration = -1L
                 synchronized(incomingTeacherReviewChunks) { incomingTeacherReviewChunks.clear() }
+                synchronized(incomingStudentMemoChunks) { incomingStudentMemoChunks.clear() }
                 updateNotification("연결 끊김")
                 Log.i(TAG, "LAN detached role=$role book=$bookId generation=$connectionGeneration")
                 LanSyncBus.connectionStateChanged(bookId, LanConnectionState.DISCONNECTED)
@@ -473,8 +521,12 @@ class LanSyncService : Service(),
             runCatching { connected.close() }
             return
         }
-        if (lastReceived > 0L && now >= lastReceived &&
-            now - lastReceived >= LAN_HEARTBEAT_TIMEOUT_MS
+        if (isLanHeartbeatSilenceExpired(
+                lastReceivedAtElapsedMs = lastReceived,
+                nowElapsedMs = now,
+                catchUpDeadlineAtElapsedMs = readyDeadline,
+                timeoutMs = LAN_HEARTBEAT_TIMEOUT_MS,
+            )
         ) {
             Log.w(TAG, "LAN heartbeat timed out book=$bookId generation=$generation")
             runCatching { connected.close() }
@@ -534,6 +586,15 @@ class LanSyncService : Service(),
                 peerSupportsGptExplanation = announcedCapabilities != null &&
                     (0 until announcedCapabilities.length()).any { index ->
                         announcedCapabilities.optString(index) == LAN_CAPABILITY_GPT_EXPLANATION_V2
+                    }
+                peerSupportsTeacherReviewState = announcedCapabilities != null &&
+                    (0 until announcedCapabilities.length()).any { index ->
+                        announcedCapabilities.optString(index) ==
+                            LAN_CAPABILITY_TEACHER_REVIEW_STATE_V1
+                    }
+                peerSupportsStudentMemo = announcedCapabilities != null &&
+                    (0 until announcedCapabilities.length()).any { index ->
+                        announcedCapabilities.optString(index) == LAN_CAPABILITY_STUDENT_MEMO_V1
                     }
                 require(
                     role == LanPeerRole.STUDENT_SERVER && announcedRole == LanPeerRole.TEACHER_CLIENT ||
@@ -637,6 +698,7 @@ class LanSyncService : Service(),
                 val requestedPage = message.getInt("page")
                 require(isPageInBook(requestedPage)) { "Subscription page is outside the book" }
                 updateDesiredSubscription(requestedPage, "peer-request")
+                studentMemoSubscriptionGeneration = attachedGeneration
                 peerReceivedClocks.replace(
                     pageNumber = requestedPage,
                     deviceId = library.deviceId,
@@ -647,7 +709,7 @@ class LanSyncService : Service(),
                 // A teacher may enter Live Monitor after the original page event. Repeating the
                 // state is safe because the teacher's subscription sender is connection-idempotent.
                 sendStudentPageState("subscription")
-                if (flushPage(subscribedPage)) {
+                if (flushPage(subscribedPage, includeStudentMemoCatchUp = true)) {
                     if (pendingPage == subscribedPage) pendingPage = -1
                     sendPageSyncedAndPublishReady(subscribedPage, attachedGeneration)
                 }
@@ -671,6 +733,7 @@ class LanSyncService : Service(),
                 })
             }
             "TEACHER_REVIEW_CHUNK" -> receiveTeacherReviewChunk(message)
+            "STUDENT_MEMO_CHUNK" -> receiveStudentMemoChunk(message)
             "GPT_EXPLANATION_LAYER" -> receiveGptExplanationLayer(message)
             "GPT_EXPLANATION_ACK" -> receiveGptExplanationAck(message)
             "TEACHER_REVIEW_ACK" -> {
@@ -689,7 +752,39 @@ class LanSyncService : Service(),
                         ?.takeIf { it.publication == publication }
                         ?.let { pendingTeacherReviewAcks.remove(publication.publicationId) }
                 }
+                // A transport ACK does not prove that the installed ink and grades still match.
+                // Keep the repair latch until a later PAGE_STATE/PAGE_SYNCED carries matching
+                // application-level evidence; this also prevents a stale state frame that raced
+                // the ACK from reopening the same publication immediately.
                 LanSyncBus.teacherReviewAcknowledged(publication)
+            }
+            "TEACHER_REVIEW_REJECT" -> {
+                require(
+                    role == LanPeerRole.TEACHER_CLIENT && peerRole == LanPeerRole.STUDENT_SERVER
+                ) { "Only a student peer may reject a teacher review" }
+                val publication = LanTeacherReviewPublication(
+                    bookId = bookId,
+                    pageNumber = message.getInt("page"),
+                    attemptNo = message.getInt("attemptNo"),
+                    publicationId = message.getString("publicationId"),
+                )
+                require(isPageInBook(publication.pageNumber)) {
+                    "Teacher review rejection page is outside the book"
+                }
+                val reason = message.getString("reason")
+                require(reason == "ATTEMPT_UNKNOWN" || reason == "PUBLICATION_ORDER_CONFLICT") {
+                    "Teacher review rejection reason is invalid"
+                }
+                synchronized(pendingTeacherReviewAcks) {
+                    pendingTeacherReviewAcks[publication.publicationId]
+                        ?.takeIf { it.publication == publication }
+                        ?.let { pendingTeacherReviewAcks.remove(publication.publicationId) }
+                }
+                Log.w(
+                    TAG,
+                    "Teacher review rejected book=$bookId page=${publication.pageNumber} " +
+                        "attempt=${publication.attemptNo} reason=$reason",
+                )
             }
             "ACK" -> {
                 require(
@@ -717,6 +812,15 @@ class LanSyncService : Service(),
                     require(it >= 0L) { "Student page revision cannot be negative" }
                 }
                 val location = StudentLocation(bookId, page, attemptNo, revision)
+                reconcileTeacherReviewState(
+                    pageNumber = page,
+                    observedStateSha256 = if (peerSupportsTeacherReviewState) {
+                        message.optionalSha256("teacherReviewStateSha256")
+                    } else null,
+                    observedAttemptNos = if (peerSupportsTeacherReviewState) {
+                        message.optionalPositiveIntSet("attemptNos")
+                    } else null,
+                )
                 Log.i(
                     TAG,
                     "PAGE_STATE receive book=$bookId page=$page attempt=${attemptNo ?: "-"} revision=$revision follow=$followRemoteStudent",
@@ -736,6 +840,15 @@ class LanSyncService : Service(),
                 ) { "Only a student peer may complete page catch-up" }
                 val page = message.getInt("page")
                 require(isPageInBook(page)) { "Synchronized page is outside the book" }
+                reconcileTeacherReviewState(
+                    pageNumber = page,
+                    observedStateSha256 = if (peerSupportsTeacherReviewState) {
+                        message.optionalSha256("teacherReviewStateSha256")
+                    } else null,
+                    observedAttemptNos = if (peerSupportsTeacherReviewState) {
+                        message.optionalPositiveIntSet("attemptNos")
+                    } else null,
+                )
                 if (page == subscribedPage) {
                     publishReadyIfCurrent(attachedGeneration)
                 }
@@ -769,10 +882,14 @@ class LanSyncService : Service(),
 
     override fun onLocalAttemptChanged(attempt: Attempt) {
         if (role != LanPeerRole.STUDENT_SERVER || attempt.bookId != bookId) return
+        teacherReviewStateCache.invalidate(attempt.pageNumber)
         enqueueAttempt(attempt)
     }
 
     override fun onLocalMarkGroupChanged(group: MarkGroup) {
+        if (role == LanPeerRole.STUDENT_SERVER && group.bookId == bookId) {
+            teacherReviewStateCache.invalidate(group.pageNumber)
+        }
         if (role == null || group.bookId != bookId || !isLegacyLanMarkGroup(group)) return
         enqueueMarkGroup(group)
     }
@@ -931,6 +1048,82 @@ class LanSyncService : Service(),
         if (flushPage(subscribedPage) && pendingPage == subscribedPage) pendingPage = -1
     }
 
+    /**
+     * Repairs only explicitly published immutable reviews. The live teacher layer is deliberately
+     * excluded, so a digest disagreement can never publish an unfinished correction or score.
+     */
+    private fun reconcileTeacherReviewState(
+        pageNumber: Int,
+        observedStateSha256: String?,
+        observedAttemptNos: Set<Int>?,
+    ) {
+        if (observedStateSha256 == null || observedAttemptNos == null ||
+            !peerSupportsTeacherReviewState ||
+            role != LanPeerRole.TEACHER_CLIENT || !isPageInBook(pageNumber)
+        ) return
+        val authorityEvidence = runCatching {
+            if (observedAttemptNos.isEmpty()) emptyList() else {
+                store.teacherReviewAuthorityEvidence(
+                    bookId = bookId,
+                    pageNumber = pageNumber,
+                    attemptNos = observedAttemptNos,
+                )
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "Teacher review authority evidence unavailable book=$bookId page=$pageNumber", error)
+        }.getOrNull() ?: return
+        val eligibleAttemptNos = authorityEvidence.mapTo(sortedSetOf()) { it.attemptNo }
+        val expectedStateSha256 = runCatching {
+            teacherReviewStateSha256(authorityEvidence)
+        }.onFailure { error ->
+            Log.w(TAG, "Teacher review authority evidence unavailable book=$bookId page=$pageNumber", error)
+        }.getOrNull() ?: return
+        val generation = connectionGeneration
+        if (!teacherReviewMismatchLatch.shouldRepair(
+                connectionGeneration = generation,
+                pageNumber = pageNumber,
+                expectedStateSha256 = expectedStateSha256,
+                observedStateSha256 = observedStateSha256,
+            )
+        ) return
+        Log.w(
+            TAG,
+            "Teacher review state mismatch book=$bookId page=$pageNumber generation=$generation",
+        )
+        teacherReviewIo.execute {
+            if (role != LanPeerRole.TEACHER_CLIENT || writer == null ||
+                connectionGeneration != generation
+            ) return@execute
+            runCatching {
+                // Send retained immutable authorities directly through the LAN retry queue. Do not
+                // reopen attempts absent from the student's own advertised inventory: that would
+                // make an old review retry forever and can never apply on this peer.
+                store.teacherReviewAuthorityIntents(bookId, pageNumber)
+                    .filter { it.attemptNo in eligibleAttemptNos }
+                    .forEach { intent ->
+                        queueTeacherReviewPublication(
+                            LanTeacherReviewPublication(
+                                bookId = intent.bookId,
+                                pageNumber = intent.pageNumber,
+                                attemptNo = intent.attemptNo,
+                                publicationId = intent.publicationId,
+                            ),
+                        )
+                    }
+            }.onFailure { error ->
+                // A transient journal failure should be retried by the next peer state frame, but
+                // never clear a newer mismatch that arrived while this task was queued.
+                teacherReviewMismatchLatch.clearIfMatches(
+                    connectionGeneration = generation,
+                    pageNumber = pageNumber,
+                    expectedStateSha256 = expectedStateSha256,
+                    observedStateSha256 = observedStateSha256,
+                )
+                Log.w(TAG, "Teacher review reconciliation failed book=$bookId page=$pageNumber", error)
+            }
+        }
+    }
+
     private fun updateDesiredSubscription(pageNumber: Int, reason: String) {
         if (!isPageInBook(pageNumber)) return
         if (subscribedPage == pageNumber) return
@@ -947,10 +1140,22 @@ class LanSyncService : Service(),
         val page = currentStudentPage
         val attemptNo = currentStudentAttemptNo
         val revision = currentStudentRevision
+        val attemptNos = localStudentAttemptNos(page)
+        // PAGE_STATE also follows every ordinary stroke. Cache misses refresh on metadataIo so the
+        // handwriting path never materializes and hashes every historical teacher layer here.
+        val teacherReviewStateSha256 = localAppliedTeacherReviewStateSha256(
+            pageNumber = page,
+            attemptNos = attemptNos,
+            allowSynchronousRefresh = false,
+        )
         val sent = send(LanWire.message("PAGE_STATE") {
             put("page", page)
             put("revision", revision)
             attemptNo?.let { put("attemptNo", it) }
+            if (peerSupportsTeacherReviewState) {
+                put("attemptNos", JSONArray(attemptNos))
+                teacherReviewStateSha256?.let { put("teacherReviewStateSha256", it) }
+            }
         })
         if (sent) {
             Log.i(
@@ -964,13 +1169,126 @@ class LanSyncService : Service(),
     /** Ordered after every operation emitted by [flushPage] on the same synchronized writer. */
     private fun sendPageSynced(page: Int): Boolean {
         if (role != LanPeerRole.STUDENT_SERVER || page != subscribedPage || writer == null) return false
+        val attemptNos = localStudentAttemptNos(page)
+        // A subscription is infrequent and may target a page other than the student's current
+        // page. Refreshing here ensures that page still advertises evidence without abusing
+        // PAGE_STATE (which must continue to mean the student's actual location).
+        val teacherReviewStateSha256 = localAppliedTeacherReviewStateSha256(
+            pageNumber = page,
+            attemptNos = attemptNos,
+            allowSynchronousRefresh = true,
+        )
         return send(LanWire.message("PAGE_SYNCED") {
             put("page", page)
             put("revision", currentStudentRevision.coerceAtLeast(0L))
+            if (peerSupportsTeacherReviewState) {
+                put("attemptNos", JSONArray(attemptNos))
+                teacherReviewStateSha256?.let { put("teacherReviewStateSha256", it) }
+            }
         }).also { sent ->
             if (sent) Log.i(TAG, "PAGE_SYNCED send book=$bookId page=$page generation=$connectionGeneration")
         }
     }
+
+    /**
+     * Builds evidence from the durable receipt only after checking the layer and grade state that
+     * are actually installed. An old peer never pays this disk/hash cost and receives no new field.
+     */
+    private fun localAppliedTeacherReviewStateSha256(
+        pageNumber: Int,
+        attemptNos: List<Int>,
+        allowSynchronousRefresh: Boolean,
+    ): String? {
+        if (!peerSupportsTeacherReviewState || role != LanPeerRole.STUDENT_SERVER ||
+            !isPageInBook(pageNumber)
+        ) return null
+        val now = SystemClock.elapsedRealtime()
+        val lookup = teacherReviewStateCache.lookup(
+            pageNumber,
+            attemptNos,
+            now,
+            TEACHER_REVIEW_STATE_REFRESH_MS,
+        )
+        if (!lookup.shouldRefresh) return lookup.digestSha256
+        if (allowSynchronousRefresh) {
+            return refreshLocalTeacherReviewStateNow(pageNumber, attemptNos) ?: lookup.digestSha256
+        }
+        scheduleLocalTeacherReviewStateRefresh(pageNumber, attemptNos)
+        return lookup.digestSha256
+    }
+
+    private fun refreshLocalTeacherReviewStateNow(
+        pageNumber: Int,
+        attemptNos: List<Int>,
+    ): String? {
+        val request = teacherReviewStateCache.beginRefresh(
+            pageNumber = pageNumber,
+            attemptNos = attemptNos,
+            connectionGeneration = connectionGeneration,
+            replaceExisting = true,
+        ) ?: return null
+        val digest = computeLocalTeacherReviewStateSha256(pageNumber, attemptNos)
+        if (digest == null) {
+            teacherReviewStateCache.fail(request)
+            return null
+        }
+        return digest.takeIf {
+            teacherReviewStateCache.complete(request, digest, SystemClock.elapsedRealtime())
+        }
+    }
+
+    private fun scheduleLocalTeacherReviewStateRefresh(
+        pageNumber: Int,
+        attemptNos: List<Int>,
+    ) {
+        val expectedBookId = bookId
+        val generation = connectionGeneration
+        val request = teacherReviewStateCache.beginRefresh(
+            pageNumber = pageNumber,
+            attemptNos = attemptNos,
+            connectionGeneration = generation,
+        ) ?: return
+        metadataIo.execute {
+            val digest = computeLocalTeacherReviewStateSha256(pageNumber, attemptNos)
+            val stillCurrent = role == LanPeerRole.STUDENT_SERVER && bookId == expectedBookId &&
+                peerSupportsTeacherReviewState && connectionGeneration == generation && writer != null
+            if (digest == null || !stillCurrent ||
+                !teacherReviewStateCache.complete(request, digest, SystemClock.elapsedRealtime())
+            ) {
+                teacherReviewStateCache.fail(request)
+                return@execute
+            }
+            if (currentStudentPage == pageNumber) {
+                sendStudentPageState("teacher-review-state-refreshed")
+            }
+        }
+    }
+
+    private fun computeLocalTeacherReviewStateSha256(
+        pageNumber: Int,
+        attemptNos: List<Int>,
+    ): String? {
+        val allowedAttempts = attemptNos.toHashSet()
+        if (allowedAttempts.isEmpty()) return teacherReviewStateSha256(emptyList())
+        return runCatching {
+            teacherReviewStateSha256(
+                store.verifiedAppliedTeacherReviewEvidence(
+                    bookId = bookId,
+                    pageNumber = pageNumber,
+                    currentPageMarkGroups = library.markGroupsForSync(bookId)
+                        .filter { it.pageNumber == pageNumber },
+                    attemptNos = allowedAttempts,
+                ),
+            )
+        }.onFailure { error ->
+            // Page presence and live-ink catch-up remain usable even if optional repair evidence is
+            // temporarily unreadable. The next state frame retries the verification.
+            Log.w(TAG, "Teacher review state evidence unavailable book=$bookId page=$pageNumber", error)
+        }.getOrNull()
+    }
+
+    private fun localStudentAttemptNos(pageNumber: Int): List<Int> =
+        exactLanStudentAttemptNos(library.attempts(bookId, pageNumber), bookId, pageNumber)
 
     /** Atomically chooses READY over a concurrent catch-up yield, including the peer notification. */
     @Synchronized
@@ -1332,11 +1650,21 @@ class LanSyncService : Service(),
         val chunks = splitLanTeacherReviewPayload(payload, TEACHER_REVIEW_CHUNK_BYTES)
         if (chunks.isEmpty() || chunks.size > MAX_TEACHER_REVIEW_CHUNKS) return false
         return chunks.indices.all { index ->
-            if (connectionGeneration != expectedGeneration || writer == null) return@all false
+            val stillAwaiting = synchronized(pendingTeacherReviewAcks) {
+                pendingTeacherReviewAcks[publication.publicationId]?.takeIf {
+                    it.connectionGeneration == expectedGeneration && it.publication == publication
+                } != null
+            }
+            if (connectionGeneration != expectedGeneration || writer == null || !stillAwaiting) {
+                return@all false
+            }
             send(LanWire.message("TEACHER_REVIEW_CHUNK") {
                 put("publicationId", publication.publicationId)
                 put("page", publication.pageNumber)
                 put("attemptNo", publication.attemptNo)
+                put("publishedAt", artifact.intent.updatedAtEpochMillis)
+                artifact.intent.remotePairId?.let { put("remotePairId", it) }
+                artifact.intent.remoteWorkbookToken?.let { put("remoteWorkbookToken", it) }
                 put("resultLayerSha256", artifact.intent.resultLayerSha256)
                 put("payloadSha256", payloadSha)
                 put("payloadSize", payload.size)
@@ -1350,7 +1678,7 @@ class LanSyncService : Service(),
     private fun queueTeacherReviewPublication(publication: LanTeacherReviewPublication) {
         val generation = connectionGeneration
         if (role != LanPeerRole.TEACHER_CLIENT || writer == null || publication.bookId != bookId) return
-        val alreadyQueued = synchronized(pendingTeacherReviewAcks) {
+        val queued = synchronized(pendingTeacherReviewAcks) {
             // TCP preserves send order and this executor is serial. Once a newer explicit publish
             // for the same exact target is queued, an older ACK-loss retry must never run after it
             // and roll the student's layer/grade back.
@@ -1360,18 +1688,34 @@ class LanSyncService : Service(),
                     pending.publication.pageNumber == publication.pageNumber &&
                     pending.publication.attemptNo == publication.attemptNo
             }
-            pendingTeacherReviewAcks[publication.publicationId]
-                ?.takeIf { it.connectionGeneration == generation && it.publication == publication } != null
+            if (pendingTeacherReviewAcks[publication.publicationId]
+                    ?.takeIf { it.connectionGeneration == generation && it.publication == publication } != null
+            ) {
+                false
+            } else {
+                // Install before the first chunk. A fast ACK or ATTEMPT_UNKNOWN rejection can then
+                // resolve this entry even while the remaining chunks are still being written.
+                pendingTeacherReviewAcks[publication.publicationId] = PendingLanTeacherReviewAck(
+                    publication,
+                    generation,
+                )
+                true
+            }
         }
-        if (alreadyQueued) return
-        if (!sendTeacherReviewPublication(publication)) return
-        synchronized(pendingTeacherReviewAcks) {
-            pendingTeacherReviewAcks[publication.publicationId] = PendingLanTeacherReviewAck(
-                publication,
-                generation,
-            )
+        if (!queued) return
+        if (!sendTeacherReviewPublication(publication)) {
+            synchronized(pendingTeacherReviewAcks) {
+                pendingTeacherReviewAcks[publication.publicationId]
+                    ?.takeIf { it.connectionGeneration == generation && it.publication == publication }
+                    ?.let { pendingTeacherReviewAcks.remove(publication.publicationId) }
+            }
+            return
         }
-        scheduleTeacherReviewRetry(publication.publicationId, generation)
+        if (synchronized(pendingTeacherReviewAcks) {
+                pendingTeacherReviewAcks[publication.publicationId]
+                    ?.takeIf { it.connectionGeneration == generation && it.publication == publication } != null
+            }
+        ) scheduleTeacherReviewRetry(publication.publicationId, generation)
     }
 
     private fun scheduleTeacherReviewRetry(publicationId: String, generation: Long) {
@@ -1409,15 +1753,71 @@ class LanSyncService : Service(),
         val publicationId = message.getString("publicationId")
         val page = message.getInt("page")
         val attemptNo = message.getInt("attemptNo")
+        val publishedAtEpochMillis = message.optLong("publishedAt", 0L)
         val resultLayerSha256 = message.getString("resultLayerSha256")
+        val remotePairId = message.optionalNonBlankString("remotePairId")
+        val remoteWorkbookToken = message.optionalNonBlankString("remoteWorkbookToken")
         val payloadSha256 = message.getString("payloadSha256")
         val payloadSize = message.getInt("payloadSize")
         val chunkIndex = message.getInt("chunkIndex")
         val chunkCount = message.getInt("chunkCount")
         require(publicationId.matches(SHA256_HEX) && resultLayerSha256.matches(SHA256_HEX))
+        require(publishedAtEpochMillis >= 0L) { "Teacher review publication order is invalid" }
         require(payloadSha256.matches(SHA256_HEX) && isPageInBook(page) && attemptNo > 0)
         require(payloadSize in 1..MAX_TEACHER_REVIEW_PAYLOAD_BYTES)
         require(chunkCount in 1..MAX_TEACHER_REVIEW_CHUNKS && chunkIndex in 0 until chunkCount)
+        if (!isExactLanTeacherReviewAttempt(
+                attempts = library.attempts(bookId, page),
+                bookId = bookId,
+                pageNumber = page,
+                attemptNo = attemptNo,
+            )
+        ) {
+            synchronized(incomingTeacherReviewChunks) {
+                incomingTeacherReviewChunks.remove(publicationId)
+            }
+            if (chunkIndex == 0) {
+                send(LanWire.message("TEACHER_REVIEW_REJECT") {
+                    put("publicationId", publicationId)
+                    put("page", page)
+                    put("attemptNo", attemptNo)
+                    put("reason", "ATTEMPT_UNKNOWN")
+                })
+            }
+            Log.w(TAG, "Teacher review dropped for unknown attempt book=$bookId page=$page attempt=$attemptNo")
+            return
+        }
+        val initialReceipt = appliedTeacherReviewReceipt(page, attemptNo, remotePairId)
+        when (teacherReviewPublicationOrderDisposition(
+            current = initialReceipt,
+            incomingPublicationId = publicationId,
+            incomingPublishedAtEpochMillis = publishedAtEpochMillis,
+        )) {
+            TeacherReviewPublicationOrderDisposition.STALE -> {
+                synchronized(incomingTeacherReviewChunks) {
+                    incomingTeacherReviewChunks.remove(publicationId)
+                }
+                if (chunkIndex == 0) sendTeacherReviewAck(publicationId, page, attemptNo)
+                return
+            }
+            TeacherReviewPublicationOrderDisposition.CONFLICT -> {
+                synchronized(incomingTeacherReviewChunks) {
+                    incomingTeacherReviewChunks.remove(publicationId)
+                }
+                if (chunkIndex == 0) {
+                    sendTeacherReviewReject(
+                        publicationId,
+                        page,
+                        attemptNo,
+                        "PUBLICATION_ORDER_CONFLICT",
+                    )
+                }
+                return
+            }
+            TeacherReviewPublicationOrderDisposition.APPLY,
+            TeacherReviewPublicationOrderDisposition.DUPLICATE_VERIFY,
+            -> Unit
+        }
         val chunk = Base64.decode(message.getString("payload"), Base64.NO_WRAP)
         require(chunk.isNotEmpty() && chunk.size <= TEACHER_REVIEW_CHUNK_BYTES)
         val completed = synchronized(incomingTeacherReviewChunks) {
@@ -1428,6 +1828,8 @@ class LanSyncService : Service(),
             require(current != null || chunkIndex == 0) { "Teacher review chunks must start at zero" }
             val compatible = current?.takeIf {
                 it.pageNumber == page && it.attemptNo == attemptNo &&
+                    it.publishedAtEpochMillis == publishedAtEpochMillis &&
+                    it.remotePairId == remotePairId && it.remoteWorkbookToken == remoteWorkbookToken &&
                     it.resultLayerSha256 == resultLayerSha256 &&
                     it.payloadSha256 == payloadSha256 && it.payloadSize == payloadSize &&
                     it.chunks.size == chunkCount
@@ -1435,6 +1837,9 @@ class LanSyncService : Service(),
             val assembly = compatible ?: IncomingTeacherReviewChunks(
                 page,
                 attemptNo,
+                publishedAtEpochMillis,
+                remotePairId,
+                remoteWorkbookToken,
                 resultLayerSha256,
                 payloadSha256,
                 payloadSize,
@@ -1451,35 +1856,160 @@ class LanSyncService : Service(),
         }
         require(payload.size == completed.payloadSize && sha256Hex(payload) == completed.payloadSha256)
         val decoded = decodeLanTeacherReviewPayload(payload, bookId, page)
-        require(
-            isExactLanTeacherReviewAttempt(
-                attempts = library.attempts(bookId, page),
+        val payloadMarkGroupsSha256 = store.teacherReviewMarkGroupsStateSha256(decoded.markGroups)
+        val applicationResult = store.withTeacherReviewTargetLock(bookId, page, attemptNo) {
+            // Attempt metadata and the shared high-water can both change while chunks assemble.
+            if (!isExactLanTeacherReviewAttempt(
+                    library.attempts(bookId, page), bookId, page, attemptNo,
+                )
+            ) return@withTeacherReviewTargetLock LanTeacherReviewApplicationResult.ATTEMPT_UNKNOWN
+            val currentReceipt = appliedTeacherReviewReceipt(
+                page,
+                attemptNo,
+                completed.remotePairId,
+            )
+            when (teacherReviewPublicationOrderDisposition(
+                current = currentReceipt,
+                incomingPublicationId = publicationId,
+                incomingPublishedAtEpochMillis = completed.publishedAtEpochMillis,
+            )) {
+                TeacherReviewPublicationOrderDisposition.STALE ->
+                    return@withTeacherReviewTargetLock LanTeacherReviewApplicationResult.STALE
+                TeacherReviewPublicationOrderDisposition.CONFLICT ->
+                    return@withTeacherReviewTargetLock LanTeacherReviewApplicationResult.CONFLICT
+                TeacherReviewPublicationOrderDisposition.DUPLICATE_VERIFY -> {
+                    if (currentReceipt?.resultLayerSha256 != completed.resultLayerSha256 ||
+                        currentReceipt.markGroupsSha256 != payloadMarkGroupsSha256
+                    ) {
+                        return@withTeacherReviewTargetLock LanTeacherReviewApplicationResult.CONFLICT
+                    }
+                    val installedLayerSha256 = runCatching {
+                        store.publishedTeacherLayerSha256(bookId, page, attemptNo)
+                    }.getOrNull()
+                    val installedMarkGroups = runCatching {
+                        exactLanTeacherReviewMarkGroups(
+                            library.markGroupsForSync(bookId),
+                            bookId,
+                            page,
+                            attemptNo,
+                        )
+                    }.getOrNull()
+                    val installedMarkGroupsSha256 = installedMarkGroups?.let(
+                        store::teacherReviewMarkGroupsStateSha256,
+                    )
+                    if (installedLayerSha256 == completed.resultLayerSha256 &&
+                        installedMarkGroupsSha256 == payloadMarkGroupsSha256 &&
+                        lanTeacherReviewMetadataCoversIncoming(installedMarkGroups, decoded.markGroups)
+                    ) {
+                        return@withTeacherReviewTargetLock LanTeacherReviewApplicationResult.DUPLICATE
+                    }
+                    // The receipt survived but its actual ink or grades were restored away.
+                }
+                TeacherReviewPublicationOrderDisposition.APPLY -> Unit
+            }
+            val applied = store.applyPublishedTeacherLayerCheckpoint(
+                localBookId = bookId,
+                pageNumber = page,
+                attemptNo = attemptNo,
+                checkpointBytes = decoded.checkpointBytes,
+                expectedResultLayerSha256 = completed.resultLayerSha256,
+            )
+            require(applied.layerSha256 == completed.resultLayerSha256)
+            library.replaceMarkGroupAttemptSnapshotFromSync(
                 bookId = bookId,
                 pageNumber = page,
                 attemptNo = attemptNo,
-            ),
-        ) { "Teacher review attempt does not exist" }
-        val applied = store.applyPublishedTeacherLayerCheckpoint(
-            localBookId = bookId,
-            pageNumber = page,
-            attemptNo = attemptNo,
-            checkpointBytes = decoded.checkpointBytes,
-            expectedResultLayerSha256 = completed.resultLayerSha256,
-        )
-        require(applied.layerSha256 == completed.resultLayerSha256)
-        library.upsertMarkGroupAttemptsFromSync(
+                incoming = decoded.markGroups,
+            )
+            store.recordAppliedTeacherReviewReceipt(
+                AppliedTeacherReviewReceipt(
+                    bookId = bookId,
+                    pageNumber = page,
+                    attemptNo = attemptNo,
+                    publicationId = publicationId,
+                    resultLayerSha256 = completed.resultLayerSha256,
+                    markGroupsSha256 = payloadMarkGroupsSha256,
+                    appliedAtEpochMillis = System.currentTimeMillis(),
+                    publishedAtEpochMillis = completed.publishedAtEpochMillis,
+                    remotePairId = completed.remotePairId,
+                    remoteWorkbookToken = completed.remoteWorkbookToken,
+                ),
+            )
+            LanTeacherReviewApplicationResult.APPLIED
+        }
+        when (applicationResult) {
+            LanTeacherReviewApplicationResult.APPLIED,
+            LanTeacherReviewApplicationResult.DUPLICATE,
+            -> {
+                teacherReviewStateCache.invalidate(page)
+                if (applicationResult == LanTeacherReviewApplicationResult.APPLIED) {
+                    LanSyncBus.remoteOperation(bookId, page)
+                }
+                sendTeacherReviewAck(publicationId, page, attemptNo)
+                if (page == currentStudentPage) {
+                    sendStudentPageState(
+                        if (applicationResult == LanTeacherReviewApplicationResult.APPLIED) {
+                            "teacher-review-applied"
+                        } else {
+                            "teacher-review-duplicate"
+                        },
+                    )
+                }
+            }
+            LanTeacherReviewApplicationResult.STALE ->
+                sendTeacherReviewAck(publicationId, page, attemptNo)
+            LanTeacherReviewApplicationResult.CONFLICT -> sendTeacherReviewReject(
+                publicationId,
+                page,
+                attemptNo,
+                "PUBLICATION_ORDER_CONFLICT",
+            )
+            LanTeacherReviewApplicationResult.ATTEMPT_UNKNOWN -> sendTeacherReviewReject(
+                publicationId,
+                page,
+                attemptNo,
+                "ATTEMPT_UNKNOWN",
+            )
+        }
+    }
+
+    private fun appliedTeacherReviewReceipt(
+        page: Int,
+        attemptNo: Int,
+        remotePairId: String?,
+    ): AppliedTeacherReviewReceipt? = if (remotePairId != null) {
+        store.appliedTeacherReviewReceipt(
             bookId = bookId,
             pageNumber = page,
             attemptNo = attemptNo,
-            incoming = decoded.markGroups,
+            remotePairId = remotePairId,
         )
-        LanSyncBus.remoteOperation(bookId, page)
+    } else {
+        store.appliedTeacherReviewReceipts(bookId, page).firstOrNull { receipt ->
+            // A legacy chunk has no ownership field. Conservatively compare it with the one
+            // actual installed exact-target high-water so it cannot roll back an ordered receipt.
+            receipt.attemptNo == attemptNo
+        }
+    }
+
+    private fun sendTeacherReviewAck(publicationId: String, page: Int, attemptNo: Int): Boolean =
         send(LanWire.message("TEACHER_REVIEW_ACK") {
             put("publicationId", publicationId)
             put("page", page)
             put("attemptNo", attemptNo)
         })
-    }
+
+    private fun sendTeacherReviewReject(
+        publicationId: String,
+        page: Int,
+        attemptNo: Int,
+        reason: String,
+    ): Boolean = send(LanWire.message("TEACHER_REVIEW_REJECT") {
+        put("publicationId", publicationId)
+        put("page", page)
+        put("attemptNo", attemptNo)
+        put("reason", reason)
+    })
 
     private fun encodeLanTeacherReviewPayload(
         checkpointBytes: ByteArray,
@@ -1528,7 +2058,230 @@ class LanSyncService : Service(),
         .digest(bytes)
         .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
 
-    private fun flushPage(page: Int): Boolean {
+    /**
+     * Sends at most one latest memo state per executor turn. A busy pen therefore coalesces by memo
+     * identity and yields the metadata executor between large full-state documents.
+     */
+    private fun drainOnePendingStudentMemo() {
+        val key = pendingStudentMemoSends.takeBatch(1).singleOrNull()
+        if (key != null && role == LanPeerRole.STUDENT_SERVER && peerSupportsStudentMemo &&
+            key.target.bookId == bookId && key.target.pageNumber == subscribedPage &&
+            studentMemoSubscriptionGeneration == connectionGeneration
+        ) {
+            runCatching {
+                memoRepository.memo(key.target, key.memoId, includeDeleted = true)
+                    ?.let(::sendStudentMemo)
+            }.onFailure { error ->
+                // The page operation stream remains authoritative and usable. Reconnect catch-up
+                // will retry healthy memo data; one corrupt optional sidecar must not stop it.
+                Log.w(
+                    TAG,
+                    "student memo send skipped book=${key.target.bookId} " +
+                        "page=${key.target.pageNumber} attempt=${key.target.attemptNo} memo=${key.memoId}",
+                    error,
+                )
+            }
+        }
+        if (pendingStudentMemoSends.completeBatch() && !stopping.get()) {
+            handler.postDelayed(studentMemoSendRunnable, STUDENT_MEMO_SEND_DEBOUNCE_MS)
+        }
+    }
+
+    /**
+     * A memo is a small student-owned sidecar, so reconnect repair sends each memo independently.
+     * One corrupt or oversized memo can then never prevent another memo from being retried.
+     */
+    private fun sendStudentMemosForPage(page: Int): Boolean {
+        if (!peerSupportsStudentMemo) return true
+        if (role != LanPeerRole.STUDENT_SERVER || page != subscribedPage || writer == null) return false
+        val attempts = runCatching { library.attempts(bookId, page) }
+            .onFailure { error ->
+                Log.w(TAG, "student memo attempts unavailable book=$bookId page=$page", error)
+            }
+            .getOrNull() ?: return true
+        val attemptsByNo = attempts.asSequence()
+            .filter { it.bookId == bookId && it.pageNumber == page && it.attemptNo > 0 }
+            .associateBy(Attempt::attemptNo)
+
+        // Memo files whose attempts no longer exist are deliberately not scanned. They are
+        // optional orphan data and must never prevent the ordinary page stream from reaching READY.
+        for (target in exactLanStudentMemoTargets(attempts, bookId, page)) {
+            val attempt = attemptsByNo[target.attemptNo] ?: continue
+            val memos = runCatching { memoRepository.snapshot(target).memos }
+                .onFailure { error ->
+                    Log.w(
+                        TAG,
+                        "student memo target skipped book=$bookId page=$page attempt=${target.attemptNo}",
+                        error,
+                    )
+                }
+                .getOrNull() ?: continue
+            if (memos.isEmpty()) continue
+
+            // Metadata snapshotting runs on another serial worker. Repeat this tiny upsert on the
+            // socket immediately before the memo so a fast SUBSCRIBE can never make the teacher
+            // reject a valid memo merely because attempt metadata was still queued.
+            if (!send(LanWire.message("ATTEMPT_UPSERT") {
+                    put("bookId", attempt.bookId)
+                    put("page", attempt.pageNumber)
+                    put("payload", AttemptWireCodec.encode(attempt))
+                })
+            ) return false
+            for (memo in memos) {
+                val sent = runCatching { sendStudentMemo(memo) }
+                    .onFailure { error ->
+                        Log.w(
+                            TAG,
+                            "student memo skipped book=$bookId page=$page " +
+                                "attempt=${target.attemptNo} memo=${memo.id}",
+                            error,
+                        )
+                    }
+                    .getOrNull()
+                // A local decode/export failure skips only that optional memo. A clean false means
+                // the socket/generation changed, so PAGE_SYNCED must not be published.
+                if (sent == false) return false
+            }
+        }
+        return true
+    }
+
+    private fun sendStudentMemo(requested: StudentMemo): Boolean = studentMemoTransferGate.serialize {
+        if (!peerSupportsStudentMemo || role != LanPeerRole.STUDENT_SERVER || writer == null ||
+            requested.target.bookId != bookId || !isPageInBook(requested.target.pageNumber) ||
+            requested.target.pageNumber != subscribedPage ||
+            studentMemoSubscriptionGeneration != connectionGeneration
+        ) return@serialize false
+        val expectedGeneration = connectionGeneration
+        val payload = memoRepository.exportMemo(requested.target, requested.id)
+        // The memo may have advanced between the change callback and this serialized send. Derive
+        // every header from the exact immutable bytes on the wire, never from the stale callback.
+        val memo = memoRepository.decodeMemo(payload)
+        val payloadSha256 = sha256Hex(payload)
+        val chunks = splitLanTeacherReviewPayload(payload, STUDENT_MEMO_CHUNK_BYTES)
+        if (chunks.isEmpty() || chunks.size > MAX_STUDENT_MEMO_CHUNKS) return@serialize false
+        val transferId = sha256Hex(
+            listOf(
+                memo.target.bookId,
+                memo.target.pageNumber.toString(),
+                memo.target.attemptNo.toString(),
+                memo.id,
+                memo.revision.toString(),
+                memo.digestSha256,
+                payloadSha256,
+            ).joinToString("\u0000").toByteArray(Charsets.UTF_8),
+        )
+        chunks.indices.all { index ->
+            if (connectionGeneration != expectedGeneration || writer == null ||
+                role != LanPeerRole.STUDENT_SERVER || !peerSupportsStudentMemo
+            ) return@all false
+            send(LanWire.message("STUDENT_MEMO_CHUNK") {
+                put("transferId", transferId)
+                put("sourceBookId", memo.target.bookId)
+                put("page", memo.target.pageNumber)
+                put("attemptNo", memo.target.attemptNo)
+                put("memoId", memo.id)
+                put("memoRevision", memo.revision)
+                put("memoDigestSha256", memo.digestSha256)
+                put("payloadSha256", payloadSha256)
+                put("payloadSize", payload.size)
+                put("chunkIndex", index)
+                put("chunkCount", chunks.size)
+                put("payload", Base64.encodeToString(chunks[index], Base64.NO_WRAP))
+            }).also { sent ->
+                if (sent && readyDeadlineAtElapsedMs > 0L) markPageCatchUpProgress()
+            }
+        }
+    }
+
+    private fun receiveStudentMemoChunk(message: JSONObject) {
+        require(peerSupportsStudentMemo) { "Student memo capability was not negotiated" }
+        require(
+            role == LanPeerRole.TEACHER_CLIENT && peerRole == LanPeerRole.STUDENT_SERVER
+        ) { "Only a student peer may publish student memos" }
+        val transferId = message.getString("transferId")
+        val sourceBookId = message.getString("sourceBookId")
+        val page = message.getInt("page")
+        val attemptNo = message.getInt("attemptNo")
+        val memoId = message.getString("memoId")
+        val memoRevision = message.getLong("memoRevision")
+        val memoDigestSha256 = message.getString("memoDigestSha256")
+        val payloadSha256 = message.getString("payloadSha256")
+        val payloadSize = message.getInt("payloadSize")
+        val chunkIndex = message.getInt("chunkIndex")
+        val chunkCount = message.getInt("chunkCount")
+        require(transferId.matches(SHA256_HEX) && sourceBookId == peerBookId)
+        require(isPageInBook(page) && attemptNo > 0 && memoRevision > 0L)
+        require(memoDigestSha256.matches(SHA256_HEX) && payloadSha256.matches(SHA256_HEX))
+        require(payloadSize in 1..MemoTransportLimits.MAX_ENCODED_MEMO_BYTES)
+        require(chunkCount in 1..MAX_STUDENT_MEMO_CHUNKS && chunkIndex in 0 until chunkCount)
+        require(isExactLanTeacherReviewAttempt(library.attempts(bookId, page), bookId, page, attemptNo)) {
+            "Student memo belongs to an unknown attempt"
+        }
+        val chunk = Base64.decode(message.getString("payload"), Base64.NO_WRAP)
+        require(chunk.isNotEmpty() && chunk.size <= STUDENT_MEMO_CHUNK_BYTES)
+        val completed = synchronized(incomingStudentMemoChunks) {
+            if (chunkIndex == 0 && transferId !in incomingStudentMemoChunks &&
+                incomingStudentMemoChunks.size >= MAX_INCOMING_STUDENT_MEMOS
+            ) {
+                incomingStudentMemoChunks.remove(incomingStudentMemoChunks.keys.first())
+            }
+            val existing = incomingStudentMemoChunks[transferId]
+            require(existing != null || chunkIndex == 0) { "Student memo chunks must start at zero" }
+            val compatible = existing?.takeIf {
+                it.sourceBookId == sourceBookId && it.pageNumber == page && it.attemptNo == attemptNo &&
+                    it.memoId == memoId && it.memoRevision == memoRevision &&
+                    it.memoDigestSha256 == memoDigestSha256 && it.payloadSha256 == payloadSha256 &&
+                    it.payloadSize == payloadSize && it.chunks.size == chunkCount
+            }
+            require(existing == null || compatible != null) { "Student memo chunk headers changed" }
+            val assembly = compatible ?: IncomingStudentMemoChunks(
+                sourceBookId,
+                page,
+                attemptNo,
+                memoId,
+                memoRevision,
+                memoDigestSha256,
+                payloadSha256,
+                payloadSize,
+                arrayOfNulls(chunkCount),
+            ).also { incomingStudentMemoChunks[transferId] = it }
+            val prior = assembly.chunks[chunkIndex]
+            require(prior == null || prior.contentEquals(chunk)) { "Student memo chunk changed during retry" }
+            assembly.chunks[chunkIndex] = chunk.copyOf()
+            val receivedBytes = assembly.chunks.filterNotNull().sumOf(ByteArray::size)
+            require(receivedBytes <= assembly.payloadSize) { "Student memo payload exceeded its header" }
+            if (assembly.chunks.any { it == null }) null else {
+                incomingStudentMemoChunks.remove(transferId)
+                assembly
+            }
+        } ?: return
+        val payload = ByteArray(completed.payloadSize)
+        var offset = 0
+        completed.chunks.filterNotNull().forEach { part ->
+            require(offset + part.size <= payload.size)
+            part.copyInto(payload, offset)
+            offset += part.size
+        }
+        require(offset == payload.size && sha256Hex(payload) == completed.payloadSha256)
+        val sourceMemo = memoRepository.decodeMemo(payload)
+        require(
+            sourceMemo.target == MemoTarget(sourceBookId, page, attemptNo) &&
+                sourceMemo.id == completed.memoId && sourceMemo.revision == completed.memoRevision &&
+                sourceMemo.digestSha256 == completed.memoDigestSha256
+        ) { "Student memo identity does not match its envelope" }
+        val result = memoRepository.applyAuthenticatedStudentMemo(
+            sourceMemo.remapTo(MemoTarget(bookId, page, attemptNo)),
+        )
+        markPageCatchUpProgress()
+        Log.i(
+            TAG,
+            "student memo receive book=$bookId page=$page attempt=$attemptNo " +
+                "memo=$memoId revision=$memoRevision status=${result.status}",
+        )
+    }
+
+    private fun flushPage(page: Int, includeStudentMemoCatchUp: Boolean = false): Boolean {
         if (page != subscribedPage || writer == null || !isPageInBook(page)) return false
         if (role == LanPeerRole.TEACHER_CLIENT) return true
         return runCatching {
@@ -1546,6 +2299,7 @@ class LanSyncService : Service(),
                 })
             }
             if (!allSent) return@runCatching false
+            if (includeStudentMemoCatchUp && !sendStudentMemosForPage(page)) return@runCatching false
             lastFlushAt = System.currentTimeMillis()
             Log.i(TAG, "operation flush role=$role book=$bookId page=$page count=${records.size}")
             true
@@ -1684,6 +2438,8 @@ class LanSyncService : Service(),
         reconnectPeerBookId = ""
         peerRole = null
         peerSupportsGptExplanation = false
+        peerSupportsTeacherReviewState = false
+        peerSupportsStudentMemo = false
         authenticatedConnectionGeneration = 0L
         peerDeviceId = ""
         peerHost = ""
@@ -1704,9 +2460,14 @@ class LanSyncService : Service(),
         lastSubscriptionPage = -1
         lastTeacherRepairGeneration = -1L
         lastTeacherPublicationRepairGeneration = -1L
+        studentMemoSubscriptionGeneration = -1L
+        pendingStudentMemoSends.clear()
         synchronized(incomingTeacherReviewChunks) { incomingTeacherReviewChunks.clear() }
+        synchronized(incomingStudentMemoChunks) { incomingStudentMemoChunks.clear() }
         synchronized(pendingTeacherReviewAcks) { pendingTeacherReviewAcks.clear() }
         synchronized(pendingGptExplanationAcks) { pendingGptExplanationAcks.clear() }
+        teacherReviewMismatchLatch.clear()
+        teacherReviewStateCache.clear()
         peerReceivedClocks.clear()
     }
 
@@ -1715,6 +2476,8 @@ class LanSyncService : Service(),
         peerBookId = ""
         peerRole = null
         peerSupportsGptExplanation = false
+        peerSupportsTeacherReviewState = false
+        peerSupportsStudentMemo = false
         peerDeviceId = ""
         localAuthNonce = ""
         pendingPeerHelloGeneration = 0L
@@ -1722,6 +2485,9 @@ class LanSyncService : Service(),
         pendingPeerBookId = ""
         pendingPeerDeviceId = ""
         pendingPeerRole = null
+        studentMemoSubscriptionGeneration = -1L
+        teacherReviewMismatchLatch.clear()
+        teacherReviewStateCache.clear()
     }
 
     /** PING/PONG deliberately do not call this; only actual page catch-up work extends the lease. */
@@ -1736,6 +2502,8 @@ class LanSyncService : Service(),
         LanSyncBus.removeListener(this)
         LibraryAttemptBus.removeListener(this)
         LibraryMarkGroupBus.removeListener(this)
+        memoChangeSubscription?.close()
+        memoChangeSubscription = null
         closeSession()
         io.shutdownNow()
         metadataIo.shutdownNow()
@@ -1864,6 +2632,7 @@ class LanSyncService : Service(),
         private const val LAN_HANDSHAKE_TIMEOUT_MS = 5_000L
         private const val LAN_READY_TIMEOUT_MS = 30_000L
         private const val LAN_TEACHER_REVIEW_RETRY_MS = 30_000L
+        private const val TEACHER_REVIEW_STATE_REFRESH_MS = 30_000L
         private const val LAN_GPT_EXPLANATION_RETRY_MS = 30_000L
         private const val MAX_GPT_EXPLANATION_PAYLOAD_BYTES = AssistantPublicationLimits.MAX_CHECKPOINT_BYTES
         private const val TEACHER_REVIEW_CHUNK_BYTES = 384 * 1024
@@ -1872,6 +2641,10 @@ class LanSyncService : Service(),
         private const val MAX_TEACHER_REVIEW_PAYLOAD_BYTES =
             PageOperationLogStore.MAX_PUBLISHED_TEACHER_LAYER_CHECKPOINT_BYTES +
                 PageOperationLogStore.MAX_TEACHER_REVIEW_MARK_GROUP_BYTES + Int.SIZE_BYTES * 2
+        private const val STUDENT_MEMO_SEND_DEBOUNCE_MS = 500L
+        private const val STUDENT_MEMO_CHUNK_BYTES = 256 * 1024
+        private const val MAX_STUDENT_MEMO_CHUNKS = 8
+        private const val MAX_INCOMING_STUDENT_MEMOS = 4
         private const val TAG = "MasterNoteLan"
 
         fun startStudent(context: Context, bookId: String) = context.startForegroundService(
@@ -1926,6 +2699,81 @@ internal fun isExactLanTeacherReviewAttempt(
     attempt.bookId == bookId && attempt.pageNumber == pageNumber && attempt.attemptNo == attemptNo
 }
 
+/** Stable positive attempt inventory advertised with teacher-review page evidence. */
+internal fun exactLanStudentAttemptNos(
+    attempts: List<Attempt>,
+    bookId: String,
+    pageNumber: Int,
+): List<Int> = attempts.asSequence()
+    .filter { it.bookId == bookId && it.pageNumber == pageNumber && it.attemptNo > 0 }
+    .map(Attempt::attemptNo)
+    .distinct()
+    .sorted()
+    .take(MAX_LAN_TEACHER_REVIEW_ATTEMPTS)
+    .toList()
+
+/** Current catalog attempts are the only memo targets eligible for reconnect catch-up. */
+internal fun exactLanStudentMemoTargets(
+    attempts: List<Attempt>,
+    bookId: String,
+    pageNumber: Int,
+): List<MemoTarget> = exactLanStudentAttemptNos(attempts, bookId, pageNumber).map { attemptNo ->
+    MemoTarget(bookId, pageNumber, attemptNo)
+}
+
+internal data class LanStudentMemoSendKey(
+    val target: MemoTarget,
+    val memoId: String,
+)
+
+/** Serializes whole memo transfers so two senders can never interleave duplicate chunk streams. */
+internal class LanStudentMemoTransferGate {
+    private val lock = Any()
+
+    fun <T> serialize(block: () -> T): T = synchronized(lock, block)
+}
+
+/**
+ * One scheduled worker owns this queue. Re-offering a pending key moves it behind other memos, so
+ * a continuously edited memo cannot starve a second memo and its eventual send always re-exports
+ * the latest durable revision.
+ */
+internal class LatestLanStudentMemoSendQueue {
+    private val pending = linkedMapOf<LanStudentMemoSendKey, Unit>()
+    private var workerScheduled = false
+
+    @Synchronized
+    fun offer(key: LanStudentMemoSendKey): Boolean {
+        pending.remove(key)
+        pending[key] = Unit
+        if (workerScheduled) return false
+        workerScheduled = true
+        return true
+    }
+
+    @Synchronized
+    fun takeBatch(maxItems: Int): List<LanStudentMemoSendKey> {
+        require(maxItems > 0)
+        val batch = pending.keys.take(maxItems)
+        batch.forEach(pending::remove)
+        return batch
+    }
+
+    /** Returns true when the existing worker must schedule one more bounded turn. */
+    @Synchronized
+    fun completeBatch(): Boolean {
+        if (pending.isNotEmpty()) return true
+        workerScheduled = false
+        return false
+    }
+
+    @Synchronized
+    fun clear() {
+        pending.clear()
+        workerScheduled = false
+    }
+}
+
 /** Attempt grades are released only by the atomic TEACHER_REVIEW_CHUNK protocol. */
 internal fun isLegacyLanMarkGroup(group: MarkGroup): Boolean =
     group.marks.none { it.attemptNo > 0 }
@@ -1946,6 +2794,183 @@ internal class MonotonicLanConnectionEpoch {
         generation += 1L
         return generation
     }
+}
+
+internal data class LanTeacherReviewStateCacheLookup(
+    val digestSha256: String?,
+    val shouldRefresh: Boolean,
+)
+
+internal data class LanTeacherReviewStateRefresh(
+    val cacheEpoch: Long,
+    val pageVersion: Long,
+    val pageNumber: Int,
+    val attemptNos: List<Int>,
+    val connectionGeneration: Long,
+)
+
+/**
+ * Small stale-while-revalidate cache that keeps teacher-layer materialization off the stroke path.
+ * A page mutation increments its version, so a refresh that raced that mutation cannot install an
+ * old digest. Connection clears similarly invalidate every in-flight task through [cacheEpoch].
+ */
+internal class LanTeacherReviewStateDigestCache {
+    private data class Entry(
+        val pageVersion: Long,
+        val attemptNos: List<Int>,
+        val digestSha256: String,
+        val computedAtElapsedMs: Long,
+    )
+
+    private val entries = mutableMapOf<Int, Entry>()
+    private val pageVersions = mutableMapOf<Int, Long>()
+    private val refreshes = mutableMapOf<Int, LanTeacherReviewStateRefresh>()
+    private var cacheEpoch = 0L
+
+    @Synchronized
+    fun lookup(
+        pageNumber: Int,
+        attemptNos: List<Int>,
+        nowElapsedMs: Long,
+        refreshAfterMs: Long,
+    ): LanTeacherReviewStateCacheLookup {
+        require(pageNumber >= 0 && nowElapsedMs >= 0L && refreshAfterMs > 0L)
+        val normalized = normalizeLanAttemptNos(attemptNos)
+        val version = pageVersions[pageNumber] ?: 0L
+        val entry = entries[pageNumber]?.takeIf {
+            it.pageVersion == version && it.attemptNos == normalized
+        } ?: return LanTeacherReviewStateCacheLookup(null, true)
+        val age = if (nowElapsedMs >= entry.computedAtElapsedMs) {
+            nowElapsedMs - entry.computedAtElapsedMs
+        } else Long.MAX_VALUE
+        return LanTeacherReviewStateCacheLookup(
+            digestSha256 = entry.digestSha256,
+            shouldRefresh = age >= refreshAfterMs,
+        )
+    }
+
+    @Synchronized
+    fun beginRefresh(
+        pageNumber: Int,
+        attemptNos: List<Int>,
+        connectionGeneration: Long,
+        replaceExisting: Boolean = false,
+    ): LanTeacherReviewStateRefresh? {
+        require(pageNumber >= 0 && connectionGeneration > 0L)
+        val normalized = normalizeLanAttemptNos(attemptNos)
+        val version = pageVersions[pageNumber] ?: 0L
+        val request = LanTeacherReviewStateRefresh(
+            cacheEpoch,
+            version,
+            pageNumber,
+            normalized,
+            connectionGeneration,
+        )
+        if (!replaceExisting && refreshes[pageNumber] == request) return null
+        refreshes[pageNumber] = request
+        return request
+    }
+
+    @Synchronized
+    fun complete(
+        request: LanTeacherReviewStateRefresh,
+        digestSha256: String,
+        computedAtElapsedMs: Long,
+    ): Boolean {
+        require(digestSha256.matches(SHA256_HEX) && computedAtElapsedMs >= 0L)
+        if (refreshes[request.pageNumber] != request) return false
+        refreshes.remove(request.pageNumber)
+        if (request.cacheEpoch != cacheEpoch ||
+            (pageVersions[request.pageNumber] ?: 0L) != request.pageVersion
+        ) return false
+        entries[request.pageNumber] = Entry(
+            request.pageVersion,
+            request.attemptNos,
+            digestSha256,
+            computedAtElapsedMs,
+        )
+        return true
+    }
+
+    @Synchronized
+    fun fail(request: LanTeacherReviewStateRefresh) {
+        if (refreshes[request.pageNumber] == request) refreshes.remove(request.pageNumber)
+    }
+
+    @Synchronized
+    fun invalidate(pageNumber: Int) {
+        if (pageNumber < 0) return
+        val current = pageVersions[pageNumber] ?: 0L
+        pageVersions[pageNumber] = if (current == Long.MAX_VALUE) 0L else current + 1L
+        entries.remove(pageNumber)
+        refreshes.remove(pageNumber)
+    }
+
+    @Synchronized
+    fun clear() {
+        cacheEpoch = if (cacheEpoch == Long.MAX_VALUE) 0L else cacheEpoch + 1L
+        entries.clear()
+        pageVersions.clear()
+        refreshes.clear()
+    }
+}
+
+private fun normalizeLanAttemptNos(attemptNos: List<Int>): List<Int> {
+    require(attemptNos.size <= MAX_LAN_TEACHER_REVIEW_ATTEMPTS)
+    require(attemptNos.all { it > 0 })
+    return attemptNos.distinct().sorted()
+}
+
+/**
+ * Suppresses identical repair work while still allowing independent pages and a new socket epoch.
+ * Matching evidence clears only that page, so a later rollback with the same digest is repairable.
+ */
+internal class LanTeacherReviewMismatchLatch {
+    private data class Mismatch(
+        val connectionGeneration: Long,
+        val expectedStateSha256: String,
+        val observedStateSha256: String,
+    )
+
+    private val mismatchesByPage = mutableMapOf<Int, Mismatch>()
+
+    @Synchronized
+    fun shouldRepair(
+        connectionGeneration: Long,
+        pageNumber: Int,
+        expectedStateSha256: String,
+        observedStateSha256: String,
+    ): Boolean {
+        require(connectionGeneration > 0L && pageNumber >= 0)
+        require(expectedStateSha256.matches(SHA256_HEX) && observedStateSha256.matches(SHA256_HEX))
+        if (expectedStateSha256 == observedStateSha256) {
+            mismatchesByPage.remove(pageNumber)
+            return false
+        }
+        val mismatch = Mismatch(connectionGeneration, expectedStateSha256, observedStateSha256)
+        if (mismatchesByPage[pageNumber] == mismatch) return false
+        mismatchesByPage[pageNumber] = mismatch
+        return true
+    }
+
+    @Synchronized
+    fun clearPage(pageNumber: Int) {
+        mismatchesByPage.remove(pageNumber)
+    }
+
+    @Synchronized
+    fun clearIfMatches(
+        connectionGeneration: Long,
+        pageNumber: Int,
+        expectedStateSha256: String,
+        observedStateSha256: String,
+    ) {
+        val expected = Mismatch(connectionGeneration, expectedStateSha256, observedStateSha256)
+        if (mismatchesByPage[pageNumber] == expected) mismatchesByPage.remove(pageNumber)
+    }
+
+    @Synchronized
+    fun clear() = mismatchesByPage.clear()
 }
 
 internal fun canPublishLanReady(
@@ -1970,7 +2995,22 @@ private data class PendingLanGptExplanationAck(
 private data class IncomingTeacherReviewChunks(
     val pageNumber: Int,
     val attemptNo: Int,
+    val publishedAtEpochMillis: Long,
+    val remotePairId: String?,
+    val remoteWorkbookToken: String?,
     val resultLayerSha256: String,
+    val payloadSha256: String,
+    val payloadSize: Int,
+    val chunks: Array<ByteArray?>,
+)
+
+private data class IncomingStudentMemoChunks(
+    val sourceBookId: String,
+    val pageNumber: Int,
+    val attemptNo: Int,
+    val memoId: String,
+    val memoRevision: Long,
+    val memoDigestSha256: String,
     val payloadSha256: String,
     val payloadSize: Int,
     val chunks: Array<ByteArray?>,
@@ -1981,7 +3021,29 @@ private data class DecodedLanTeacherReviewPayload(
     val markGroups: List<MarkGroup>,
 )
 
+private enum class LanTeacherReviewApplicationResult {
+    APPLIED,
+    DUPLICATE,
+    STALE,
+    CONFLICT,
+    ATTEMPT_UNKNOWN,
+}
+
+internal fun exactLanTeacherReviewMarkGroups(
+    groups: List<MarkGroup>,
+    bookId: String,
+    pageNumber: Int,
+    attemptNo: Int,
+): List<MarkGroup> = groups.asSequence()
+    .filter { it.bookId == bookId && it.pageNumber == pageNumber }
+    .mapNotNull { group ->
+        val marks = group.marks.filter { it.attemptNo == attemptNo }
+        marks.takeIf(List<*>::isNotEmpty)?.let { group.copy(marks = marks) }
+    }
+    .toList()
+
 private val SHA256_HEX = Regex("[0-9a-f]{64}")
+private const val MAX_LAN_TEACHER_REVIEW_ATTEMPTS = 4_096
 
 /**
  * Equivalent to [BufferedReader.readLine] for the protocol's LF/CRLF frames, except it refuses an
@@ -2011,14 +3073,44 @@ internal fun readBoundedLanLine(reader: BufferedReader, maxChars: Int): String? 
     }
 }
 
+/**
+ * A later attempt may legitimately have advanced shared group metadata after this publication.
+ * Accept that newer state, but force duplicate repair when any incoming group's metadata was
+ * restored away or is older on the receiver.
+ */
+internal fun lanTeacherReviewMetadataCoversIncoming(
+    current: Collection<MarkGroup>,
+    incoming: Collection<MarkGroup>,
+): Boolean {
+    val currentById = current.associateBy(MarkGroup::id)
+    return incoming.all { candidate ->
+        currentById[candidate.id]?.let { installed ->
+            compareTeacherReviewMarkGroupMetadataGlobalOrder(installed, candidate) >= 0
+        } == true
+    }
+}
+
 internal fun isLanPageCatchUpExpired(deadlineAtElapsedMs: Long, nowElapsedMs: Long): Boolean =
     deadlineAtElapsedMs > 0L && nowElapsedMs >= deadlineAtElapsedMs
+
+/** Outbound catch-up can temporarily occupy the socket reader; real progress uses its own lease. */
+internal fun isLanHeartbeatSilenceExpired(
+    lastReceivedAtElapsedMs: Long,
+    nowElapsedMs: Long,
+    catchUpDeadlineAtElapsedMs: Long,
+    timeoutMs: Long,
+): Boolean {
+    require(timeoutMs > 0L)
+    if (catchUpDeadlineAtElapsedMs > nowElapsedMs) return false
+    return lastReceivedAtElapsedMs > 0L && nowElapsedMs >= lastReceivedAtElapsedMs &&
+        nowElapsedMs - lastReceivedAtElapsedMs >= timeoutMs
+}
 
 /** A failed catch-up frame can never be followed by PAGE_SYNCED on the same socket. */
 internal fun mustCloseLanConnectionAfterFailure(type: String, authenticated: Boolean): Boolean =
     !authenticated || when (type) {
         "HELLO", "AUTH_PROOF", "HELLO_OK", "SUBSCRIBE", "OPERATION", "ACK", "PAGE_STATE",
-        "PAGE_SYNCED", "ATTEMPT_UPSERT",
+        "PAGE_SYNCED", "ATTEMPT_UPSERT", "STUDENT_MEMO_CHUNK",
         -> true
         else -> false
     }
@@ -2029,4 +3121,28 @@ private object UriCompat { fun parse(value: String) = android.net.Uri.parse(valu
 private fun JSONObject.optionalNonNegativeInt(name: String): Int? {
     if (!has(name) || isNull(name)) return null
     return getInt(name).also { require(it >= 0) { "$name cannot be negative" } }
+}
+
+private fun JSONObject.optionalSha256(name: String): String? {
+    if (!has(name) || isNull(name)) return null
+    return getString(name).also { require(it.matches(SHA256_HEX)) { "$name is invalid" } }
+}
+
+private fun JSONObject.optionalNonBlankString(name: String): String? {
+    if (!has(name) || isNull(name)) return null
+    return getString(name).also {
+        require(it.isNotBlank() && it.length <= 512) { "$name is invalid" }
+    }
+}
+
+private fun JSONObject.optionalPositiveIntSet(name: String): Set<Int>? {
+    if (!has(name) || isNull(name)) return null
+    val values = getJSONArray(name)
+    require(values.length() <= MAX_LAN_TEACHER_REVIEW_ATTEMPTS) { "$name is too large" }
+    return buildSet(values.length()) {
+        for (index in 0 until values.length()) {
+            val value = values.getInt(index)
+            require(value > 0 && add(value)) { "$name is invalid" }
+        }
+    }
 }

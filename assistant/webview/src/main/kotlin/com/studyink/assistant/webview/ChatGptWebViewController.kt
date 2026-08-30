@@ -119,7 +119,9 @@ class ChatGptWebViewController(
         val manual = CompletableDeferred<ChatGptResult>()
         manualResponse = manual
         var latestText = ""
+        var latestNewText = ""
         var latestHash = ""
+        var newResponseObserved = false
         var extractionFailures = 0
         var responseFallbackSent = false
         val deadline = elapsedRealtime() + timeoutMs
@@ -177,10 +179,19 @@ class ChatGptWebViewController(
                     if (extractionFailures >= EXTRACTION_FAILURES_BEFORE_FALLBACK &&
                         !responseFallbackSent
                     ) {
+                        val partial = preferredPartialResponse(
+                            newResponseObserved = newResponseObserved,
+                            extractedMarkdown = if (newResponseObserved) {
+                                readLatestResponseMarkdown()
+                            } else {
+                                null
+                            },
+                            latestNewText = latestNewText,
+                        )
                         notifyManualFallback(
                             ChatGptManualFallback.Response(
                                 reason = "ChatGPT 답변을 자동으로 읽지 못했습니다. 답변을 복사해 직접 붙여넣어 주세요.",
-                                partialText = latestText,
+                                partialText = partial,
                             )
                         )
                         responseFallbackSent = true
@@ -197,6 +208,10 @@ class ChatGptWebViewController(
                     val hasNewResponse = before?.let {
                         ResponseCompletionDetector.isNew(it, snapshot)
                     } ?: false
+                    if (hasNewResponse) {
+                        newResponseObserved = true
+                        latestNewText = snapshot.text
+                    }
                     val completion = ResponseCompletionDetector.completion(
                         snapshot = snapshot,
                         hasNewResponse = hasNewResponse,
@@ -225,15 +240,20 @@ class ChatGptWebViewController(
             }
 
             if (manual.isCompleted) return@withContext manual.await()
+            val partial = preferredPartialResponse(
+                newResponseObserved = newResponseObserved,
+                extractedMarkdown = if (newResponseObserved) readLatestResponseMarkdown() else null,
+                latestNewText = latestNewText,
+            )
             if (!responseFallbackSent) {
                 notifyManualFallback(
                     ChatGptManualFallback.Response(
                         reason = "응답 완료를 확인하지 못했습니다. 완성된 답변을 복사해 직접 붙여넣어 주세요.",
-                        partialText = latestText,
+                        partialText = partial,
                     )
                 )
             }
-            throw ChatGptResponseTimeoutException(latestText)
+            throw ChatGptResponseTimeoutException(partial)
         } finally {
             if (manualResponse === manual) manualResponse = null
             queryInProgress = false
@@ -258,6 +278,7 @@ class ChatGptWebViewController(
                 html = html?.trim()?.ifBlank { null },
                 assistantMessageCount = 0,
                 completion = ChatGptCompletion.MANUAL,
+                textFormat = inferChatGptTextFormat(text),
             )
         )
     }

@@ -1,6 +1,9 @@
 package com.studyink.reader
 
 import com.studyink.assistant.core.TeacherGptAnswerFormat
+import com.studyink.assistant.core.TeacherGptAnswerMask
+import com.studyink.assistant.core.TeacherGptResourceRevision
+import com.studyink.core.model.PageBounds
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -66,5 +69,30 @@ class AssistantResourceUiTextTest {
         assertTrue(bounded.text.contains("이후 내용은 생략했습니다"))
         assertTrue(bounded.text.length <= 96)
         assertFalse(bounded.text.any { Character.isSurrogate(it) })
+    }
+
+    @Test
+    fun savedResourceMaskHidesOnlySelectedBlocksFromPreviewAndStudentSeed() {
+        val source = "보낼 첫 줄\n\n숨길 수식 \\(x^2\\)\n\n보낼 마지막 줄"
+        val revision = TeacherGptResourceRevision(
+            revisionId = "revision-1",
+            revisionNumber = 1,
+            promptSlotNumber = 1,
+            promptTitle = "깨달음",
+            promptBody = "질문",
+            selectionBounds = PageBounds(0f, 0f, 1f, 1f),
+            answerText = source,
+            answerHtml = null,
+            providerName = "test",
+            createdAtEpochMillis = 1,
+            answerFormat = TeacherGptAnswerFormat.MARKDOWN_TEX,
+            answerMask = TeacherGptAnswerMask.forAnswer(source, setOf(1)),
+        )
+
+        val visible = visibleAssistantAnswer(revision)
+
+        assertEquals("보낼 첫 줄\n\n보낼 마지막 줄", visible)
+        assertFalse(assistantPreviewText(visible, 200).contains("x^2"))
+        assertFalse(assistantStudentText(visible).contains("x^2"))
     }
 }

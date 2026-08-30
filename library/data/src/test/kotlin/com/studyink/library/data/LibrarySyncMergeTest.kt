@@ -446,6 +446,109 @@ class LibrarySyncMergeTest {
         assertEquals(original, installed)
     }
 
+    @Test
+    fun publishedAttemptSnapshotRemovesGroupsOmittedByTeacher() {
+        val staleOnly = studentGroup(
+            marks = listOf(Mark(1, MarkColor.RED, gradedAtEpochMillis = 10L)),
+            revision = 1L,
+        ).copy(id = "stale-only")
+
+        val replaced = replaceRemoteMarkGroupAttemptSnapshot(
+            markGroups = listOf(staleOnly),
+            bookId = BOOK,
+            pageNumber = 2,
+            pageCount = PAGE_COUNT,
+            attempts = studentAttempts(1),
+            attemptNo = 1,
+            incoming = emptyList(),
+        )
+
+        assertTrue(replaced.changed)
+        assertTrue(replaced.markGroups.isEmpty())
+    }
+
+    @Test
+    fun publishedAttemptSnapshotRemovesOnlyOmittedAttemptSlice() {
+        val shared = studentGroup(
+            marks = listOf(
+                Mark(1, MarkColor.RED, gradedAtEpochMillis = 10L),
+                Mark(2, MarkColor.BLUE, gradedAtEpochMillis = 20L),
+            ),
+            revision = 4L,
+        ).copy(id = "shared")
+        val pageLevel = pageLevelGroup().copy(id = "page-level")
+
+        val replaced = replaceRemoteMarkGroupAttemptSnapshot(
+            markGroups = listOf(shared, pageLevel),
+            bookId = BOOK,
+            pageNumber = 2,
+            pageCount = PAGE_COUNT,
+            attempts = studentAttempts(1, 2),
+            attemptNo = 1,
+            incoming = emptyList(),
+        )
+
+        assertTrue(replaced.changed)
+        assertEquals(listOf(Mark(2, MarkColor.BLUE, gradedAtEpochMillis = 20L)), replaced.markGroups[0].marks)
+        assertEquals(shared.copy(marks = listOf(shared.marks[1])), replaced.markGroups[0])
+        assertEquals(pageLevel, replaced.markGroups[1])
+    }
+
+    @Test
+    fun publishedAttemptSnapshotReplacesIncomingAndPreservesOtherAttempts() {
+        val existing = studentGroup(
+            anchor = PagePoint(100f, 200f),
+            marks = listOf(
+                Mark(1, MarkColor.RED, gradedAtEpochMillis = 10L),
+                Mark(2, MarkColor.GRAY, gradedAtEpochMillis = 20L),
+            ),
+            revision = 2L,
+        ).copy(id = "shared")
+        val incoming = existing.copy(
+            anchor = PagePoint(300f, 400f),
+            marks = listOf(Mark(1, MarkColor.BLUE, gradedAtEpochMillis = 30L)),
+            syncRevision = 3L,
+        )
+
+        val replaced = replaceRemoteMarkGroupAttemptSnapshot(
+            markGroups = listOf(existing),
+            bookId = BOOK,
+            pageNumber = 2,
+            pageCount = PAGE_COUNT,
+            attempts = studentAttempts(1, 2),
+            attemptNo = 1,
+            incoming = listOf(incoming),
+        )
+
+        assertTrue(replaced.changed)
+        assertEquals(incoming.anchor, replaced.markGroups.single().anchor)
+        assertEquals(
+            listOf(incoming.marks.single(), existing.marks[1]),
+            replaced.markGroups.single().marks,
+        )
+    }
+
+    @Test
+    fun publishedAttemptSnapshotReplayIsNoOp() {
+        val published = studentGroup(
+            marks = listOf(Mark(1, MarkColor.BLUE, gradedAtEpochMillis = 30L)),
+            revision = 3L,
+        )
+
+        val replay = replaceRemoteMarkGroupAttemptSnapshot(
+            markGroups = listOf(published),
+            bookId = BOOK,
+            pageNumber = 2,
+            pageCount = PAGE_COUNT,
+            attempts = studentAttempts(1),
+            attemptNo = 1,
+            incoming = listOf(published),
+        )
+
+        assertFalse(replay.changed)
+        assertEquals(listOf(published), replay.markGroups)
+    }
+
     private fun pageLevelGroup(anchor: PagePoint = PagePoint(100f, 200f)) = MarkGroup(
         id = "mark-1",
         bookId = BOOK,

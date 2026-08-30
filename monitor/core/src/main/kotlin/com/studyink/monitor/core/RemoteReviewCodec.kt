@@ -258,8 +258,24 @@ object RemoteReviewDocumentCodec {
                         output.writeLong(entry.approxBytes)
                     }
                     // Optional trailing field keeps new readers compatible with already queued
-                    // manifest frames that predate bounded inventory pagination.
-                    envelope.inventoryPageCount?.let(output::writeInt)
+                    // manifest frames that predate bounded inventory pagination. A negative marker
+                    // represents a still-unknown inventory only when the extension follows it.
+                    val teacherReviewStates = envelope.entries.mapIndexedNotNull { index, entry ->
+                        entry.teacherReviewStateSha256?.let { index to it }
+                    }
+                    if (teacherReviewStates.isNotEmpty()) {
+                        output.writeInt(
+                            envelope.inventoryPageCount ?: PAGE_SYNC_UNKNOWN_INVENTORY_MARKER,
+                        )
+                        output.writeByte(PAGE_SYNC_TEACHER_REVIEW_STATE_EXTENSION_VERSION)
+                        output.writeInt(teacherReviewStates.size)
+                        teacherReviewStates.forEach { (entryIndex, digest) ->
+                            output.writeInt(entryIndex)
+                            output.writeBoundedString(digest)
+                        }
+                    } else {
+                        envelope.inventoryPageCount?.let(output::writeInt)
+                    }
                 }
 
                 is PageSyncRequestEnvelope -> {
@@ -336,6 +352,22 @@ object RemoteReviewDocumentCodec {
                         output.writeByte(GPT_AUTHORITY_EPOCH_EXTENSION_VERSION)
                         output.writeBoundedString(envelope.authorityEpoch)
                     }
+                }
+
+                is StudentMemoEnvelope -> {
+                    output.writeLong(envelope.syncGeneration)
+                    output.writeBoundedString(envelope.pageToken)
+                    output.writeBoundedString(envelope.workbookToken)
+                    output.writeBoundedString(envelope.contentSha256)
+                    output.writeInt(envelope.pageNumber)
+                    output.writeInt(envelope.attemptNo)
+                    output.writeBoundedString(envelope.memoId)
+                    output.writeLong(envelope.memoRevision)
+                    output.writeBoundedString(envelope.memoDigestSha256)
+                    output.writeBoundedString(envelope.payloadSha256)
+                    val memoPayload = envelope.payloadBytesForCodec()
+                    output.writeInt(memoPayload.size)
+                    output.write(memoPayload)
                 }
             }
         }
@@ -501,7 +533,7 @@ object RemoteReviewDocumentCodec {
                     RemoteReviewLimits.MAX_PAGE_SYNC_MANIFEST_ENTRIES,
                     "page sync manifest entry",
                 )
-                val entries = ArrayList<PageSyncManifestEntry>(entryCount)
+                var entries = ArrayList<PageSyncManifestEntry>(entryCount)
                 repeat(entryCount) {
                     entries += PageSyncManifestEntry(
                         pageToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
@@ -516,7 +548,56 @@ object RemoteReviewDocumentCodec {
                         approxBytes = input.readLong(),
                     )
                 }
-                val inventoryPageCount = if (input.available() == 0) null else input.readInt()
+                val encodedInventoryPageCount = if (input.available() == 0) null else input.readInt()
+                val inventoryPageCount = encodedInventoryPageCount?.takeUnless {
+                    it == PAGE_SYNC_UNKNOWN_INVENTORY_MARKER
+                }
+                if (encodedInventoryPageCount != null &&
+                    encodedInventoryPageCount < 0 &&
+                    encodedInventoryPageCount != PAGE_SYNC_UNKNOWN_INVENTORY_MARKER
+                ) {
+                    fail(RemoteReviewCodecError.MALFORMED_PAYLOAD) {
+                        "Page sync inventory marker is invalid."
+                    }
+                }
+                if (input.available() > 0) {
+                    val extensionVersion = input.readUnsignedByte()
+                    if (extensionVersion != PAGE_SYNC_TEACHER_REVIEW_STATE_EXTENSION_VERSION) {
+                        fail(RemoteReviewCodecError.UNSUPPORTED_VERSION) {
+                            "Unsupported page sync manifest extension $extensionVersion."
+                        }
+                    }
+                    val stateCount = input.readBoundedCount(entryCount, "teacher review state")
+                    var previousEntryIndex = -1
+                    repeat(stateCount) {
+                        val entryIndex = input.readInt()
+                        if (entryIndex <= previousEntryIndex || entryIndex !in entries.indices) {
+                            fail(RemoteReviewCodecError.MALFORMED_PAYLOAD) {
+                                "Teacher review state entry indexes must be unique and ascending."
+                            }
+                        }
+                        val digest = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES)
+                        val entry = entries[entryIndex]
+                        entries[entryIndex] = PageSyncManifestEntry(
+                            pageToken = entry.pageToken,
+                            workbookToken = entry.workbookToken,
+                            contentSha256 = entry.contentSha256,
+                            studentLayerSha256 = entry.studentLayerSha256,
+                            pageNumber = entry.pageNumber,
+                            attemptNos = entry.attemptNos,
+                            submittedAttemptNos = entry.submittedAttemptNos,
+                            revision = entry.revision,
+                            lastChangedEpochMs = entry.lastChangedEpochMs,
+                            approxBytes = entry.approxBytes,
+                            teacherReviewStateSha256 = digest,
+                        )
+                        previousEntryIndex = entryIndex
+                    }
+                } else if (encodedInventoryPageCount == PAGE_SYNC_UNKNOWN_INVENTORY_MARKER) {
+                    fail(RemoteReviewCodecError.INVALID_LENGTH) {
+                        "Unknown page inventory marker requires a manifest extension."
+                    }
+                }
                 PageSyncManifestEnvelope(
                     transferId = transferId,
                     createdAtEpochMs = createdAtEpochMs,
@@ -676,6 +757,22 @@ object RemoteReviewDocumentCodec {
                     authorityEpoch = authorityEpoch,
                 )
             }
+
+            RemoteReviewEnvelopeType.STUDENT_MEMO -> StudentMemoEnvelope(
+                transferId = transferId,
+                createdAtEpochMs = createdAtEpochMs,
+                syncGeneration = input.readLong(),
+                pageToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                workbookToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                contentSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES),
+                pageNumber = input.readInt(),
+                attemptNo = input.readInt(),
+                memoId = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
+                memoRevision = input.readLong(),
+                memoDigestSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES),
+                payloadSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES),
+                payloadBytes = input.readBoundedBytes(RemoteReviewLimits.MAX_STUDENT_MEMO_BYTES),
+            )
         }
         if (input.available() != 0) {
             fail(RemoteReviewCodecError.INVALID_LENGTH) {
@@ -801,6 +898,7 @@ object RemoteReviewDocumentCodec {
         RemoteReviewEnvelopeType.PAGE_ANNOTATION -> 8
         RemoteReviewEnvelopeType.PAGE_SYNC_ACK -> 9
         RemoteReviewEnvelopeType.GPT_EXPLANATION_LAYER -> 10
+        RemoteReviewEnvelopeType.STUDENT_MEMO -> 11
     }
 
     private fun envelopeTypeFromWire(code: Int): RemoteReviewEnvelopeType = when (code) {
@@ -814,6 +912,7 @@ object RemoteReviewDocumentCodec {
         8 -> RemoteReviewEnvelopeType.PAGE_ANNOTATION
         9 -> RemoteReviewEnvelopeType.PAGE_SYNC_ACK
         10 -> RemoteReviewEnvelopeType.GPT_EXPLANATION_LAYER
+        11 -> RemoteReviewEnvelopeType.STUDENT_MEMO
         else -> fail(RemoteReviewCodecError.UNKNOWN_TYPE) { "Unknown envelope type $code." }
     }
 
@@ -1112,6 +1211,8 @@ object RemoteReviewDocumentCodec {
     private const val SHA256_BYTES: Int = 32
     private const val FRAME_BYTES: Int = 4 + 1 + 1 + 4 + SHA256_BYTES
     private const val MAX_DETAIL_CODE_BYTES: Int = 64
+    private const val PAGE_SYNC_UNKNOWN_INVENTORY_MARKER: Int = -1
+    private const val PAGE_SYNC_TEACHER_REVIEW_STATE_EXTENSION_VERSION: Int = 1
     private const val PAGE_ANNOTATION_CHUNK_EXTENSION_VERSION: Int = 1
     private const val GPT_AUTHORITY_EPOCH_EXTENSION_VERSION: Int = 1
     private const val PNG_CHUNK_OVERHEAD_BYTES: Int = 12
