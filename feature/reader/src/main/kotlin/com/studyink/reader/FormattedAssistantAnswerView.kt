@@ -59,6 +59,8 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
     private var fallbackAnswer = ""
     private var hostPaused = false
     @Volatile
+    private var currentDocument: RenderedDocument? = null
+    @Volatile
     private var destroyed = false
     @Volatile
     private var renderGeneration = 0L
@@ -91,16 +93,14 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
                         showFallback()
                         return@onSuccess
                     }
+                    currentDocument = RenderedDocument(
+                        generation = generation,
+                        bytes = html.toByteArray(Charsets.UTF_8),
+                    )
                     fallbackScroll.visibility = View.GONE
                     renderer.visibility = View.VISIBLE
                     runCatching {
-                        renderer.loadDataWithBaseURL(
-                            FormattedAssistantAnswerDocument.LOCAL_BASE_URL,
-                            html,
-                            HTML_MIME_TYPE,
-                            UTF_8,
-                            null,
-                        )
+                        renderer.loadUrl(FormattedAssistantAnswerDocument.localDocumentUrl(generation))
                         if (hostPaused) renderer.onPause()
                     }.onFailure { showFallback() }
                 }.onFailure { showFallback() }
@@ -129,6 +129,7 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
         if (destroyed) return
         destroyed = true
         renderGeneration += 1L
+        currentDocument = null
         disposeWebView()
         fallbackAnswer = ""
         fallbackText.text = ""
@@ -163,8 +164,13 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
             overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
             webViewClient = LocalAssetClient(
                 assets = context.applicationContext.assets,
+                documentProvider = { requestedGeneration ->
+                    currentDocument
+                        ?.takeIf { it.generation == requestedGeneration }
+                        ?.bytes
+                },
                 onRendererGone = { failedView -> handleRendererGone(failedView) },
-                onMainFrameFailure = { showFallback() },
+                onMainFrameFailure = { post { showFallback() } },
             )
             settings.apply {
                 javaScriptEnabled = true
@@ -174,6 +180,8 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
                 allowContentAccess = false
                 allowFileAccessFromFileURLs = false
                 allowUniversalAccessFromFileURLs = false
+                // The exact local document and every static dependency are supplied by
+                // LocalAssetClient before WebView would reach the network.
                 blockNetworkLoads = true
                 mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                 safeBrowsingEnabled = true
@@ -239,16 +247,32 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
 
     private class LocalAssetClient(
         private val assets: AssetManager,
+        private val documentProvider: (Long) -> ByteArray?,
         private val onRendererGone: (WebView) -> Unit,
         private val onMainFrameFailure: () -> Unit,
     ) : WebViewClient() {
-        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = true
+        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean =
+            request?.url?.let(::documentGeneration) == null
 
         override fun shouldInterceptRequest(
             view: WebView?,
             request: WebResourceRequest?,
         ): WebResourceResponse {
             val uri = request?.url ?: return blockedResponse()
+            documentGeneration(uri)?.let { generation ->
+                val bytes = documentProvider(generation) ?: return blockedResponse()
+                return WebResourceResponse(
+                    HTML_MIME_TYPE,
+                    UTF_8,
+                    HTTP_OK,
+                    "OK",
+                    mapOf(
+                        "Cache-Control" to "no-store",
+                        "X-Content-Type-Options" to "nosniff",
+                    ),
+                    ByteArrayInputStream(bytes),
+                )
+            }
             val relativePath = allowedAssetPath(uri) ?: return blockedResponse()
             return runCatching {
                 val mimeType = when {
@@ -279,6 +303,14 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
             if (request?.isForMainFrame == true) onMainFrameFailure()
         }
 
+        override fun onReceivedHttpError(
+            view: WebView?,
+            request: WebResourceRequest?,
+            errorResponse: WebResourceResponse?,
+        ) {
+            if (request?.isForMainFrame == true) onMainFrameFailure()
+        }
+
         override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
             view?.let(onRendererGone)
             return true
@@ -300,6 +332,13 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
             }
         }
 
+        private fun documentGeneration(uri: Uri): Long? {
+            if (uri.scheme != "https" || uri.host != LOCAL_HOST || uri.port != -1) return null
+            if (uri.pathSegments != listOf(LOCAL_DIRECTORY, ASSET_VERSION, DOCUMENT_PATH)) return null
+            if (uri.queryParameterNames != setOf(DOCUMENT_GENERATION_QUERY)) return null
+            return uri.getQueryParameter(DOCUMENT_GENERATION_QUERY)?.toLongOrNull()
+        }
+
         private fun blockedResponse(): WebResourceResponse = WebResourceResponse(
             "text/plain",
             UTF_8,
@@ -313,6 +352,8 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
             private const val LOCAL_HOST = "appassets.androidplatform.net"
             private const val LOCAL_DIRECTORY = "gpt-answer"
             private const val ASSET_VERSION = "katex-0.18.1-r1"
+            private const val DOCUMENT_PATH = FormattedAssistantAnswerDocument.LOCAL_DOCUMENT_PATH
+            private const val DOCUMENT_GENERATION_QUERY = "generation"
             private val STATIC_ASSETS = setOf(
                 "katex.min.css",
                 "katex.min.js",
@@ -332,4 +373,9 @@ class FormattedAssistantAnswerView @JvmOverloads constructor(
             Thread(runnable, "MasterNote-GptAnswer").apply { isDaemon = true }
         }
     }
+
+    private data class RenderedDocument(
+        val generation: Long,
+        val bytes: ByteArray,
+    )
 }

@@ -6,7 +6,11 @@ import com.studyink.assistant.core.TeacherGptAnswerFormat
 internal object FormattedAssistantAnswerDocument {
     const val LOCAL_ORIGIN = "https://appassets.androidplatform.net"
     const val LOCAL_BASE_URL = "$LOCAL_ORIGIN/gpt-answer/katex-0.18.1-r1/"
+    const val LOCAL_DOCUMENT_PATH = "document.html"
     const val MAX_SOURCE_CHARS = 120_000
+
+    fun localDocumentUrl(generation: Long): String =
+        "$LOCAL_BASE_URL$LOCAL_DOCUMENT_PATH?generation=$generation"
 
     private const val CONTENT_SECURITY_POLICY =
         "default-src 'none'; " +
