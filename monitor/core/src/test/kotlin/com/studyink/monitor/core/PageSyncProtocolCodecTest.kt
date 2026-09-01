@@ -113,11 +113,53 @@ class PageSyncProtocolCodecTest {
         assertNull(decodedLegacy.inventoryPageCount)
         assertEquals(PAGE_TOKEN, decodedLegacy.entries.single().pageToken)
         assertNull(decodedLegacy.entries.single().teacherReviewStateSha256)
+        assertFalse(decodedLegacy.compactPagePayloadSupported)
         assertEquals(7, RemoteReviewDocumentCodec.encode(fullPageRequest).wireTypeCode())
         assertNull(decodedFull.attemptNo)
+        assertFalse(decodedFull.acceptsCompactPagePayload)
         assertEquals(3, decodedAttempt.attemptNo)
         assertEquals(8L, decodedAttempt.syncGeneration)
         assertEquals(fullPageRequest, decodedFull)
+    }
+
+    @Test fun compactPageCapabilityRoundTripsWithoutChangingLegacyDefaults() {
+        val capableManifest = manifest(
+            compactPagePayloadSupported = true,
+            inventoryPageCount = null,
+        )
+        val capableRequest = request(acceptsCompactPagePayload = true)
+
+        val decodedManifest = roundTrip(capableManifest) as PageSyncManifestEnvelope
+        val decodedRequest = roundTrip(capableRequest) as PageSyncRequestEnvelope
+
+        assertTrue(decodedManifest.compactPagePayloadSupported)
+        assertNull(decodedManifest.inventoryPageCount)
+        assertTrue(decodedRequest.acceptsCompactPagePayload)
+        assertFalse((roundTrip(manifest()) as PageSyncManifestEnvelope).compactPagePayloadSupported)
+        assertFalse((roundTrip(request()) as PageSyncRequestEnvelope).acceptsCompactPagePayload)
+    }
+
+    @Test fun compactPayloadRemainsOpaqueAndRoundTripsThroughOuterGzip() {
+        val compact = buildString {
+            append("{\"pointsQ16\":[")
+            repeat(8_000) { index ->
+                if (index > 0) append(',')
+                append(if (index % 4 == 0) 32 else 1)
+            }
+            append("],\"pointCount\":4000}")
+        }.encodeToByteArray()
+        val original = annotation(
+            compression = PageAnnotationCompression.GZIP,
+            payload = compact,
+        )
+
+        val encoded = RemoteReviewDocumentCodec.encode(original)
+        val decoded = RemoteReviewDocumentCodec.decode(encoded.copyBytes()).envelope as PageAnnotationEnvelope
+
+        assertEquals(PageAnnotationCompression.GZIP, decoded.compression)
+        assertTrue(decoded.payloadSizeBytes < compact.size)
+        assertArrayEquals(compact, decoded.copyDecodedPayloadBytes())
+        assertEquals(pageAnnotationSha256Hex(compact), decoded.payloadSha256)
     }
 
     @Test fun manifestTeacherReviewStateRoundTripsWithoutRequiringACompleteInventory() {
@@ -655,6 +697,7 @@ class PageSyncProtocolCodecTest {
         currentCursor: PageSyncCursor? = PageSyncCursor(sequence, PAGE_TOKEN, 37, 2, 91L),
         entries: List<PageSyncManifestEntry> = listOf(entry()),
         inventoryPageCount: Int? = entries.size,
+        compactPagePayloadSupported: Boolean = false,
     ) = PageSyncManifestEnvelope(
         transferId = transferId,
         createdAtEpochMs = 12_500L,
@@ -663,6 +706,7 @@ class PageSyncProtocolCodecTest {
         currentCursor = currentCursor,
         entries = entries,
         inventoryPageCount = inventoryPageCount,
+        compactPagePayloadSupported = compactPagePayloadSupported,
     )
 
     private fun request(
@@ -670,6 +714,7 @@ class PageSyncProtocolCodecTest {
         attemptNo: Int? = null,
         requesterRevision: Long = 91L,
         syncGeneration: Long = 7L,
+        acceptsCompactPagePayload: Boolean = false,
     ) = PageSyncRequestEnvelope(
         transferId = transferId,
         createdAtEpochMs = 13_000L,
@@ -678,6 +723,7 @@ class PageSyncProtocolCodecTest {
         pageNumber = 37,
         attemptNo = attemptNo,
         requesterRevision = requesterRevision,
+        acceptsCompactPagePayload = acceptsCompactPagePayload,
     )
 
     private fun annotation(

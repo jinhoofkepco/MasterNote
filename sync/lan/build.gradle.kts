@@ -23,4 +23,5 @@ dependencies {
     implementation(project(":library:data"))
     implementation(project(":memo:core"))
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20260814")
 }

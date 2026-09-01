@@ -98,6 +98,12 @@ class PageSyncManifestEnvelope(
     entries: List<PageSyncManifestEntry>,
     /** Total durable page rows in this inventory. Null is accepted only for older queued frames. */
     val inventoryPageCount: Int? = null,
+    /**
+     * True only after the student received a generation-scoped probe from a teacher that can
+     * decode this extension. It witnesses both compact page encoding support and safe request
+     * extension decoding; legacy manifests decode as false.
+     */
+    val compactPagePayloadSupported: Boolean = false,
 ) : RemoteReviewEnvelope {
     override val type: RemoteReviewEnvelopeType = RemoteReviewEnvelopeType.PAGE_SYNC_MANIFEST
 
@@ -176,6 +182,11 @@ data class PageSyncRequestEnvelope(
     val attemptNo: Int? = null,
     /** Latest source revision already applied by the requester; zero requests an initial state. */
     val requesterRevision: Long,
+    /**
+     * Requests compact point encoding for this exact response. Legacy queued requests decode as
+     * false, so their byte representation and response format remain unchanged.
+     */
+    val acceptsCompactPagePayload: Boolean = false,
 ) : RemoteReviewEnvelope {
     override val type: RemoteReviewEnvelopeType = RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST
 

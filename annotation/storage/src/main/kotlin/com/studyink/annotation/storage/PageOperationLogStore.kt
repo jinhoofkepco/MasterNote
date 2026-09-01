@@ -5,6 +5,8 @@ import com.studyink.annotation.engine.AnnotationChange
 import com.studyink.core.model.ANNOTATION_FORMAT_VERSION
 import com.studyink.core.model.AnnotationSnapshot
 import com.studyink.core.model.AssetOperation
+import com.studyink.core.model.CompactPagePointCodec
+import com.studyink.core.model.LosslessF32PagePointCodec
 import com.studyink.core.model.MasterNoteDataCommitBus
 import com.studyink.core.model.Mark
 import com.studyink.core.model.MarkColor
@@ -42,6 +44,7 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
+import java.util.Base64
 import java.util.UUID
 
 class CorruptAnnotationDataException(
@@ -61,6 +64,15 @@ internal inline fun <T> readAnnotationDataOrHandleCorruption(
 }
 
 data class OperationCursor(val deviceId: String, val logicalClock: Long)
+
+/** Point representation requested at a storage/transport boundary; runtime ink stays absolute. */
+enum class AnnotationPointEncoding {
+    /** Compatible with every format-v2 installation. */
+    LEGACY_FLOAT_ARRAYS,
+
+    /** Q16 deltas when exact, otherwise bit-exact F32 triples in bounded GZIP. */
+    COMPACT_Q16_DELTA,
+}
 
 data class PageOperationSyncStats(
     val logByteCount: Long,
@@ -548,8 +560,8 @@ class PageOperationLogStore(
             change.operation,
             change.addedAssets,
             System.currentTimeMillis(),
-        )
-        val line = encodeRecord(record).toString()
+        ).immutableCopy()
+        val line = encodeRecord(record, LOCAL_POINT_ENCODING).toString()
         val logFile = File(directory, LOG_FILE)
         FileOutputStream(logFile, true).use { output ->
             output.write(line.toByteArray(Charsets.UTF_8))
@@ -611,29 +623,39 @@ class PageOperationLogStore(
     fun operationLogFile(bookId: String, pageNumber: Int): File =
         File(pageDirectory(bookId, pageNumber), LOG_FILE)
 
-    @Synchronized
-    fun encodedOperationsAfter(bookId: String, pageNumber: Int, revision: Long): List<ByteArray> {
-        val records = pageIndex(bookId, pageNumber).records
-        val start = records.firstIndexAfterRevision(revision)
-        return records.subList(start, records.size).map { it.encoded.copyOf() }
+    fun encodedOperationsAfter(
+        bookId: String,
+        pageNumber: Int,
+        revision: Long,
+        pointEncoding: AnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
+    ): List<ByteArray> {
+        val captured = synchronized(this) {
+            val records = pageIndex(bookId, pageNumber).records
+            val start = records.firstIndexAfterRevision(revision)
+            records.subList(start, records.size).map(IndexedOperation::record)
+        }
+        return captured.map { it.encodeBytes(pointEncoding) }
     }
 
-    @Synchronized
     fun encodedOperationsAfter(
         bookId: String,
         pageNumber: Int,
         originDeviceId: String,
         logicalClock: Long,
         includeTeacherDrafts: Boolean = true,
+        pointEncoding: AnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
     ): List<ByteArray> {
-        val index = pageIndex(bookId, pageNumber)
-        val records = index.byDevice[originDeviceId].orEmpty()
-        val start = records.firstIndexAfterClock(logicalClock)
-        return records.subList(start, records.size)
-            .asSequence()
-            .filter { includeTeacherDrafts || it.record.isPublishable(index.snapshot) }
-            .map { it.encoded.copyOf() }
-            .toList()
+        val captured = synchronized(this) {
+            val index = pageIndex(bookId, pageNumber)
+            val records = index.byDevice[originDeviceId].orEmpty()
+            val start = records.firstIndexAfterClock(logicalClock)
+            records.subList(start, records.size)
+                .asSequence()
+                .filter { includeTeacherDrafts || it.record.isPublishable(index.snapshot) }
+                .map(IndexedOperation::record)
+                .toList()
+        }
+        return captured.map { it.encodeBytes(pointEncoding) }
     }
 
     /**
@@ -641,7 +663,6 @@ class PageOperationLogStore(
      * the caller's frame budget. Unlike [encodedOperationsAfter], a multi-megabyte offline log is
      * never duplicated in full merely to discover that it cannot fit one delta document.
      */
-    @Synchronized
     fun encodedOperationsAfterBounded(
         bookId: String,
         pageNumber: Int,
@@ -651,50 +672,61 @@ class PageOperationLogStore(
         fixedFrameBytes: Int = 0,
         perOperationFrameBytes: Int = 0,
         includeTeacherDrafts: Boolean = true,
+        pointEncoding: AnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
     ): BoundedEncodedOperationBatch {
         require(originDeviceId.isNotBlank()) { "Origin device id cannot be blank" }
         require(logicalClock >= 0L) { "Operation clock cannot be negative" }
         require(maxFramedBytes > 0 && fixedFrameBytes in 0..maxFramedBytes)
         require(perOperationFrameBytes >= 0)
-        val index = pageIndex(bookId, pageNumber)
-        val records = index.byDevice[originDeviceId].orEmpty()
-        val start = records.firstIndexAfterClock(logicalClock)
+        val captured = synchronized(this) {
+            val index = pageIndex(bookId, pageNumber)
+            val records = index.byDevice[originDeviceId].orEmpty()
+            val start = records.firstIndexAfterClock(logicalClock)
+            records.subList(start, records.size)
+                .asSequence()
+                .filter { includeTeacherDrafts || it.record.isPublishable(index.snapshot) }
+                .map(IndexedOperation::record)
+                .toList()
+        }
         val copied = ArrayList<ByteArray>()
         var framedBytes = fixedFrameBytes
         var lastClock: Long? = null
-        for (pending in records.subList(start, records.size)) {
-            if (!includeTeacherDrafts && !pending.record.isPublishable(index.snapshot)) continue
-            val nextSize = perOperationFrameBytes.toLong() + pending.encoded.size.toLong()
+        for (record in captured) {
+            val encoded = record.encodeBytes(pointEncoding)
+            val nextSize = perOperationFrameBytes.toLong() + encoded.size.toLong()
             if (framedBytes.toLong() + nextSize > maxFramedBytes.toLong()) {
                 return BoundedEncodedOperationBatch(copied, framedBytes, false, lastClock)
             }
-            copied += pending.encoded.copyOf()
+            copied += encoded
             framedBytes += nextSize.toInt()
-            lastClock = pending.record.operation.logicalClock
+            lastClock = record.operation.logicalClock
         }
         return BoundedEncodedOperationBatch(copied, framedBytes, true, lastClock)
     }
 
     /** Operations accepted by [appendEncodedStudentOperation], regardless of this device's old role. */
-    @Synchronized
     fun encodedStudentOperationsAfter(
         bookId: String,
         pageNumber: Int,
         originDeviceId: String,
         logicalClock: Long,
+        pointEncoding: AnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
     ): List<ByteArray> {
-        val index = pageIndex(bookId, pageNumber)
-        val records = index.byDevice[originDeviceId].orEmpty()
-        val start = records.firstIndexAfterClock(logicalClock)
-        return records.subList(start, records.size)
-            .asSequence()
-            .filter { indexed ->
-                runCatching {
-                    validateStudentOperationRecord(indexed.record, pageNumber, index.snapshot)
-                }.isSuccess
-            }
-            .map { it.encoded.copyOf() }
-            .toList()
+        val captured = synchronized(this) {
+            val index = pageIndex(bookId, pageNumber)
+            val records = index.byDevice[originDeviceId].orEmpty()
+            val start = records.firstIndexAfterClock(logicalClock)
+            records.subList(start, records.size)
+                .asSequence()
+                .filter { indexed ->
+                    runCatching {
+                        validateStudentOperationRecord(indexed.record, pageNumber, index.snapshot)
+                    }.isSuccess
+                }
+                .map(IndexedOperation::record)
+                .toList()
+        }
+        return captured.map { it.encodeBytes(pointEncoding) }
     }
 
     @Synchronized
@@ -788,6 +820,7 @@ class PageOperationLogStore(
         bookId: String,
         pageNumber: Int,
         originDeviceId: String,
+        pointEncoding: AnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
     ): StudentLayerCheckpointExport {
         require(originDeviceId.isNotBlank() && originDeviceId.length <= MAX_CHECKPOINT_IDENTIFIER_CHARS) {
             "Student checkpoint origin device id is invalid"
@@ -803,15 +836,21 @@ class PageOperationLogStore(
             pageNumber = pageNumber,
             snapshot = captured.snapshot,
             originDeviceHighWater = captured.originDeviceHighWater,
+            pointEncoding = pointEncoding,
         )
     }
 
-    fun encodeStudentLayerCheckpoint(bookId: String, pageNumber: Int): ByteArray {
+    fun encodeStudentLayerCheckpoint(
+        bookId: String,
+        pageNumber: Int,
+        pointEncoding: AnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
+    ): ByteArray {
         val snapshot = synchronized(this) { pageIndex(bookId, pageNumber).snapshot }
         return buildStudentLayerCheckpointExport(
             pageNumber = pageNumber,
             snapshot = snapshot,
             originDeviceHighWater = 0L,
+            pointEncoding = pointEncoding,
         ).copyCheckpointBytes()
     }
 
@@ -920,12 +959,14 @@ class PageOperationLogStore(
         bookId: String,
         pageNumber: Int,
         attemptNo: Int,
+        pointEncoding: AnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
     ): PublishedTeacherLayerCheckpointExport {
         require(attemptNo > 0) { "Published teacher checkpoint attempt must be positive" }
         return buildPublishedTeacherLayerCheckpointExport(
             pageNumber = pageNumber,
             attemptNo = attemptNo,
             snapshot = pageIndex(bookId, pageNumber).snapshot,
+            pointEncoding = pointEncoding,
         )
     }
 
@@ -934,12 +975,14 @@ class PageOperationLogStore(
         bookId: String,
         pageNumber: Int,
         attemptNo: Int,
+        pointEncoding: AnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
     ): ByteArray {
         require(attemptNo > 0) { "Published teacher checkpoint attempt must be positive" }
         return buildPublishedTeacherLayerCheckpointExport(
             pageNumber = pageNumber,
             attemptNo = attemptNo,
             snapshot = pageIndex(bookId, pageNumber).snapshot,
+            pointEncoding = pointEncoding,
         ).copyCheckpointBytes()
     }
 
@@ -1312,7 +1355,7 @@ class PageOperationLogStore(
         val current = index.snapshot
         if (record.operation.id in current.appliedOperationIds) return current.revision
         val localRecord = record.copy(bookId = bookId, revision = current.revision + 1L)
-        val localBytes = encodeRecord(localRecord).toString().toByteArray(Charsets.UTF_8)
+        val localBytes = localRecord.encodeBytes(LOCAL_POINT_ENCODING)
         val file = File(pageDirectory(bookId, pageNumber), LOG_FILE)
         FileOutputStream(file, true).use { output ->
             output.write(localBytes)
@@ -1470,6 +1513,7 @@ class PageOperationLogStore(
             pageNumber = pageNumber,
             attemptNo = attemptNo,
             snapshot = pageIndex(bookId, pageNumber).snapshot,
+            pointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
         )
         val currentCheckpointBytes = currentExport.copyCheckpointBytes()
         if (currentExport.layerSha256 != prepared.resultLayerSha256 ||
@@ -1895,6 +1939,7 @@ class PageOperationLogStore(
         pageNumber: Int,
         snapshot: AnnotationSnapshot,
         originDeviceHighWater: Long,
+        pointEncoding: AnnotationPointEncoding,
     ): StudentLayerCheckpointExport {
         val activeIds = activeStudentStrokeIds(snapshot)
         val layer = portableStudentLayer(
@@ -1914,8 +1959,14 @@ class PageOperationLogStore(
             sourceOperationClockHighWater = highWater,
             assets = layer.assets,
             activeStrokeIds = layer.activeStrokeIds,
+            pointEncoding = pointEncoding,
         )
-        val checkpointId = sha256(body.toString().toByteArray(StandardCharsets.UTF_8))
+        val checkpointId = studentLayerCheckpointId(
+            sourcePageNumber = pageNumber,
+            sourceOperationClockHighWater = highWater,
+            assets = layer.assets,
+            activeStrokeIds = layer.activeStrokeIds,
+        )
         val encoded = body.put("checkpointId", checkpointId)
             .toString()
             .toByteArray(StandardCharsets.UTF_8)
@@ -1933,6 +1984,7 @@ class PageOperationLogStore(
         pageNumber: Int,
         attemptNo: Int,
         snapshot: AnnotationSnapshot,
+        pointEncoding: AnnotationPointEncoding,
     ): PublishedTeacherLayerCheckpointExport {
         val layer = portablePublishedTeacherLayer(snapshot, attemptNo)
         val highWater = layer.assets.maxOfOrNull(StrokeAsset::logicalClock) ?: 0L
@@ -1943,8 +1995,15 @@ class PageOperationLogStore(
             sourceOperationClockHighWater = highWater,
             assets = layer.assets,
             activeStrokeIds = layer.activeStrokeIds,
+            pointEncoding = pointEncoding,
         )
-        val checkpointId = sha256(body.toString().toByteArray(StandardCharsets.UTF_8))
+        val checkpointId = publishedTeacherLayerCheckpointId(
+            sourcePageNumber = pageNumber,
+            attemptNo = attemptNo,
+            sourceOperationClockHighWater = highWater,
+            assets = layer.assets,
+            activeStrokeIds = layer.activeStrokeIds,
+        )
         val encoded = JSONObject(body.toString())
             .put("checkpointId", checkpointId)
             .toString()
@@ -2149,7 +2208,7 @@ class PageOperationLogStore(
     private fun appendSyntheticRecord(index: PageIndex, record: StoredOperationRecord): AnnotationSnapshot {
         val current = index.snapshot
         require(record.revision == current.revision + 1L) { "Synthetic operation revision is stale" }
-        val encoded = encodeRecord(record).toString().toByteArray(StandardCharsets.UTF_8)
+        val encoded = record.encodeBytes(LOCAL_POINT_ENCODING)
         val file = File(pageDirectory(record.bookId, record.pageNumber), LOG_FILE)
         FileOutputStream(file, true).use { output ->
             output.write(encoded)
@@ -2624,6 +2683,7 @@ class PageOperationLogStore(
             pageNumber = intent.pageNumber,
             attemptNo = intent.attemptNo,
             snapshot = snapshot,
+            pointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
         )
         val checkpointBytes = export.copyCheckpointBytes()
         val checkpointSha = sha256(checkpointBytes)
@@ -3185,16 +3245,35 @@ class PageOperationLogStore(
         sourceOperationClockHighWater: Long,
         assets: List<StrokeAsset>,
         activeStrokeIds: Set<StrokeId>,
+        pointEncoding: AnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
     ): JSONObject = JSONObject()
         .put("checkpointFormatVersion", STUDENT_LAYER_CHECKPOINT_FORMAT_VERSION)
         .put("sourcePageNumber", sourcePageNumber)
         .put("sourceOperationClockHighWater", sourceOperationClockHighWater)
         .put("assets", JSONArray().apply {
-            assets.sortedBy { it.id.value }.forEach { put(it.toJson()) }
+            assets.sortedBy { it.id.value }.forEach {
+                put(it.toJson(pointEncoding, MAX_STUDENT_CHECKPOINT_POINTS_PER_STROKE))
+            }
         })
         .put("activeStrokeIds", JSONArray().apply {
             activeStrokeIds.sortedBy(StrokeId::value).forEach { put(it.value) }
         })
+
+    /** Checkpoint identity is semantic and therefore independent of its requested wire encoding. */
+    private fun studentLayerCheckpointId(
+        sourcePageNumber: Int,
+        sourceOperationClockHighWater: Long,
+        assets: List<StrokeAsset>,
+        activeStrokeIds: Set<StrokeId>,
+    ): String = sha256(
+        encodeStudentLayerCheckpointBody(
+            sourcePageNumber = sourcePageNumber,
+            sourceOperationClockHighWater = sourceOperationClockHighWater,
+            assets = assets,
+            activeStrokeIds = activeStrokeIds,
+            pointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
+        ).toString().toByteArray(StandardCharsets.UTF_8)
+    )
 
     private fun encodePublishedTeacherLayerCheckpointBody(
         sourcePageNumber: Int,
@@ -3202,17 +3281,38 @@ class PageOperationLogStore(
         sourceOperationClockHighWater: Long,
         assets: List<StrokeAsset>,
         activeStrokeIds: Set<StrokeId>,
+        pointEncoding: AnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
     ): JSONObject = JSONObject()
         .put("publishedTeacherCheckpointFormatVersion", PUBLISHED_TEACHER_LAYER_CHECKPOINT_FORMAT_VERSION)
         .put("sourcePageNumber", sourcePageNumber)
         .put("attemptNo", attemptNo)
         .put("sourceOperationClockHighWater", sourceOperationClockHighWater)
         .put("assets", JSONArray().apply {
-            assets.sortedBy { it.id.value }.forEach { put(it.toJson()) }
+            assets.sortedBy { it.id.value }.forEach {
+                put(it.toJson(pointEncoding, MAX_PUBLISHED_TEACHER_CHECKPOINT_POINTS_PER_STROKE))
+            }
         })
         .put("activeStrokeIds", JSONArray().apply {
             activeStrokeIds.sortedBy(StrokeId::value).forEach { put(it.value) }
         })
+
+    /** Published checkpoint identity likewise remains stable across representation negotiation. */
+    private fun publishedTeacherLayerCheckpointId(
+        sourcePageNumber: Int,
+        attemptNo: Int,
+        sourceOperationClockHighWater: Long,
+        assets: List<StrokeAsset>,
+        activeStrokeIds: Set<StrokeId>,
+    ): String = sha256(
+        encodePublishedTeacherLayerCheckpointBody(
+            sourcePageNumber = sourcePageNumber,
+            attemptNo = attemptNo,
+            sourceOperationClockHighWater = sourceOperationClockHighWater,
+            assets = assets,
+            activeStrokeIds = activeStrokeIds,
+            pointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
+        ).toString().toByteArray(StandardCharsets.UTF_8)
+    )
 
     private fun encodeStudentLayerDigestBody(
         sourcePageNumber: Int,
@@ -3266,7 +3366,9 @@ class PageOperationLogStore(
         }
         val assets = buildList {
             for (index in 0 until assetsJson.length()) {
-                add(assetsJson.getJSONObject(index).toStrokeAsset().also {
+                add(assetsJson.getJSONObject(index).toStrokeAsset(
+                    maximumCompactPointCount = MAX_STUDENT_CHECKPOINT_POINTS_PER_STROKE,
+                ).also {
                     validateStudentCheckpointAsset(it, sourcePageNumber)
                 })
             }
@@ -3350,7 +3452,9 @@ class PageOperationLogStore(
         }
         val assets = buildList {
             for (index in 0 until assetsJson.length()) {
-                add(assetsJson.getJSONObject(index).toStrokeAsset().also { asset ->
+                add(assetsJson.getJSONObject(index).toStrokeAsset(
+                    maximumCompactPointCount = MAX_PUBLISHED_TEACHER_CHECKPOINT_POINTS_PER_STROKE,
+                ).also { asset ->
                     validatePublishedTeacherCheckpointAsset(asset, sourcePageNumber, attemptNo)
                 })
             }
@@ -3594,6 +3698,15 @@ class PageOperationLogStore(
         val recordedAtEpochMillis: Long = 0L,
     )
 
+    /** Severs the only caller-owned collections before records may be encoded outside the lock. */
+    private fun StoredOperationRecord.immutableCopy(): StoredOperationRecord = copy(
+        operation = operation.copy(
+            removedStrokeIds = operation.removedStrokeIds.toSet(),
+            addedStrokeIds = operation.addedStrokeIds.toSet(),
+        ),
+        addedAssets = addedAssets.map { asset -> asset.copy(points = asset.points.toList()) },
+    )
+
     private data class PageKey(val bookId: String, val pageNumber: Int)
 
     private data class StudentLayerDigest(val revision: Long, val sha256: String)
@@ -3724,13 +3837,26 @@ class PageOperationLogStore(
         )
     }
 
-    private fun encodeRecord(record: StoredOperationRecord) = JSONObject()
+    private fun StoredOperationRecord.encodeBytes(
+        pointEncoding: AnnotationPointEncoding,
+    ): ByteArray = encodeRecord(this, pointEncoding)
+        .toString()
+        .toByteArray(StandardCharsets.UTF_8)
+
+    private fun encodeRecord(
+        record: StoredOperationRecord,
+        pointEncoding: AnnotationPointEncoding,
+    ) = JSONObject()
         .put("formatVersion", ANNOTATION_FORMAT_VERSION)
         .put("bookId", record.bookId)
         .put("pageNumber", record.pageNumber)
         .put("revision", record.revision)
         .put("operation", record.operation.toJson())
-        .put("addedAssets", JSONArray().apply { record.addedAssets.forEach { put(it.toJson()) } })
+        .put("addedAssets", JSONArray().apply {
+            record.addedAssets.forEach {
+                put(it.toJson(pointEncoding, MAX_GENERAL_COMPACT_POINTS_PER_STROKE))
+            }
+        })
         .put("recordedAtEpochMillis", record.recordedAtEpochMillis)
 
     private fun decodeRecord(root: JSONObject): StoredOperationRecord {
@@ -3740,7 +3866,9 @@ class PageOperationLogStore(
             pageNumber = root.getInt("pageNumber"),
             revision = root.getLong("revision"),
             operation = root.getJSONObject("operation").toOperation(),
-            addedAssets = root.getJSONArray("addedAssets").toStrokeAssets(),
+            addedAssets = root.getJSONArray("addedAssets").toStrokeAssets(
+                maximumCompactPointCount = MAX_GENERAL_COMPACT_POINTS_PER_STROKE,
+            ),
             recordedAtEpochMillis = root.optLong("recordedAtEpochMillis").coerceAtLeast(0L),
         )
     }
@@ -3773,7 +3901,14 @@ class PageOperationLogStore(
         }
         writer.endObject()
         writer.name("assets").beginArray()
-        snapshot.assets.values.forEach { asset -> writeStrokeAssetJson(writer, asset) }
+        snapshot.assets.values.forEach { asset ->
+            writeStrokeAssetJson(
+                writer = writer,
+                asset = asset,
+                pointEncoding = LOCAL_POINT_ENCODING,
+                maximumCompactPointCount = MAX_LOCAL_CHECKPOINT_POINTS_PER_STROKE,
+            )
+        }
         writer.endArray()
         writer.name("activeStrokeIds").beginArray()
         snapshot.activeStrokeIds.forEach { id -> writer.value(id.value) }
@@ -3784,7 +3919,48 @@ class PageOperationLogStore(
         writer.endObject()
     }
 
-    private fun writeStrokeAssetJson(writer: JsonWriter, asset: StrokeAsset) {
+    private data class EncodedPointPayload(
+        val fieldName: String,
+        val base64: String,
+        val pointCount: Int,
+    )
+
+    /** Returns null only when legacy arrays were requested or a legacy oversized asset is retained. */
+    private fun encodedPointPayload(
+        points: List<PagePoint>,
+        pointEncoding: AnnotationPointEncoding,
+        maximumCompactPointCount: Int,
+    ): EncodedPointPayload? {
+        require(maximumCompactPointCount in 0..MAX_GENERAL_COMPACT_POINTS_PER_STROKE) {
+            "Compact point limit is invalid"
+        }
+        if (pointEncoding != AnnotationPointEncoding.COMPACT_Q16_DELTA ||
+            points.size > maximumCompactPointCount
+        ) return null
+        require(points.all { it.x.isFinite() && it.y.isFinite() && it.pressure.isFinite() }) {
+            "Compact stroke points must be finite"
+        }
+        val (fieldName, bytes) = if (CompactPagePointCodec.canEncodeExactly(points)) {
+            COMPACT_POINTS_FIELD to CompactPagePointCodec.encode(points)
+        } else {
+            LOSSLESS_F32_POINTS_FIELD to LosslessF32PagePointCodec.encode(
+                points = points,
+                maximumPointCount = maximumCompactPointCount,
+            )
+        }
+        return EncodedPointPayload(
+            fieldName = fieldName,
+            base64 = Base64.getEncoder().encodeToString(bytes),
+            pointCount = points.size,
+        )
+    }
+
+    private fun writeStrokeAssetJson(
+        writer: JsonWriter,
+        asset: StrokeAsset,
+        pointEncoding: AnnotationPointEncoding,
+        maximumCompactPointCount: Int,
+    ) {
         writer.beginObject()
         writer.name("id").value(asset.id.value)
         writer.name("pageNumber").value(asset.pageNumber.toLong())
@@ -3799,15 +3975,25 @@ class PageOperationLogStore(
         asset.itemId?.let(writer::value) ?: writer.nullValue()
         writer.name("publishedAt")
         asset.publishedAtEpochMillis?.let(writer::value) ?: writer.nullValue()
-        writer.name("points").beginArray()
-        asset.points.forEach { point ->
-            writer.beginArray()
-            writer.value(point.x.toDouble())
-            writer.value(point.y.toDouble())
-            writer.value(point.pressure.toDouble())
+        val compact = encodedPointPayload(
+            points = asset.points,
+            pointEncoding = pointEncoding,
+            maximumCompactPointCount = maximumCompactPointCount,
+        )
+        if (compact != null) {
+            writer.name(compact.fieldName).value(compact.base64)
+            writer.name(COMPACT_POINT_COUNT_FIELD).value(compact.pointCount.toLong())
+        } else {
+            writer.name("points").beginArray()
+            asset.points.forEach { point ->
+                writer.beginArray()
+                writer.value(point.x.toDouble())
+                writer.value(point.y.toDouble())
+                writer.value(point.pressure.toDouble())
+                writer.endArray()
+            }
             writer.endArray()
         }
-        writer.endArray()
         writer.name("bounds").beginArray()
         writer.value(asset.bounds.left.toDouble())
         writer.value(asset.bounds.top.toDouble())
@@ -3896,19 +4082,28 @@ class PageOperationLogStore(
         linkedMapOf<StrokeId, StrokeAsset>().apply {
             reader.beginArray()
             while (reader.hasNext()) {
-                val asset = readStrokeAssetJson(reader)
+                val asset = readStrokeAssetJson(
+                    reader = reader,
+                    maximumCompactPointCount = MAX_LOCAL_CHECKPOINT_POINTS_PER_STROKE,
+                )
                 put(asset.id, asset)
             }
             reader.endArray()
         }
 
-    private fun readStrokeAssetJson(reader: JsonReader): StrokeAsset {
+    private fun readStrokeAssetJson(
+        reader: JsonReader,
+        maximumCompactPointCount: Int,
+    ): StrokeAsset {
         var id: String? = null
         var pageNumber: Int? = null
         var tool: String? = null
         var colorArgb: Int? = null
         var width: Float? = null
         var points: List<PagePoint>? = null
+        var compactPoints: String? = null
+        var losslessF32Points: String? = null
+        var compactPointCount: Int? = null
         var authorId: String? = null
         var attemptNo: Int? = null
         var logicalClock: Long? = null
@@ -3929,6 +4124,9 @@ class PageOperationLogStore(
                 "colorArgb" -> colorArgb = reader.nextInt()
                 "width" -> width = reader.nextDouble().toFloat()
                 "points" -> points = readPagePoints(reader)
+                COMPACT_POINTS_FIELD -> compactPoints = reader.nextString()
+                LOSSLESS_F32_POINTS_FIELD -> losslessF32Points = reader.nextString()
+                COMPACT_POINT_COUNT_FIELD -> compactPointCount = reader.nextInt()
                 "authorId" -> authorId = reader.nextString()
                 "attemptNo" -> attemptNo = reader.nextInt()
                 "logicalClock" -> logicalClock = reader.nextLong()
@@ -3946,13 +4144,20 @@ class PageOperationLogStore(
 
         val version = requireNotNull(formatVersion) { "Stroke formatVersion is missing" }
         require(version == ANNOTATION_FORMAT_VERSION) { "Unsupported stroke format" }
+        val decodedPoints = decodePointFields(
+            legacyPoints = points,
+            compactPoints = compactPoints,
+            losslessF32Points = losslessF32Points,
+            compactPointCount = compactPointCount,
+            maximumCompactPointCount = maximumCompactPointCount,
+        )
         return StrokeAsset(
             id = StrokeId(requireNotNull(id) { "Stroke id is missing" }),
             pageNumber = requireNotNull(pageNumber) { "Stroke pageNumber is missing" },
             tool = StrokeTool.valueOf(requireNotNull(tool) { "Stroke tool is missing" }),
             colorArgb = requireNotNull(colorArgb) { "Stroke colorArgb is missing" },
             width = requireNotNull(width) { "Stroke width is missing" },
-            points = requireNotNull(points) { "Stroke points are missing" },
+            points = decodedPoints,
             authorId = requireNotNull(authorId) { "Stroke authorId is missing" },
             attemptNo = requireNotNull(attemptNo) { "Stroke attemptNo is missing" },
             logicalClock = requireNotNull(logicalClock) { "Stroke logicalClock is missing" },
@@ -3984,6 +4189,103 @@ class PageOperationLogStore(
             add(PagePoint(x, y, pressure))
         }
         reader.endArray()
+    }
+
+    private fun decodePointFields(
+        legacyPoints: List<PagePoint>?,
+        compactPoints: String?,
+        losslessF32Points: String?,
+        compactPointCount: Int?,
+        maximumCompactPointCount: Int,
+    ): List<PagePoint> = when {
+        legacyPoints != null -> {
+            require(
+                compactPoints == null && losslessF32Points == null && compactPointCount == null
+            ) {
+                "Stroke contains conflicting point encodings"
+            }
+            legacyPoints
+        }
+        compactPoints != null || losslessF32Points != null || compactPointCount != null -> {
+            require((compactPoints != null) xor (losslessF32Points != null)) {
+                "Stroke contains conflicting compact point encodings"
+            }
+            val pointCount = requireNotNull(compactPointCount) {
+                "Compact stroke point count is missing"
+            }
+            if (compactPoints != null) {
+                decodeCompactPoints(
+                    encoded = compactPoints,
+                    pointCount = pointCount,
+                    maximumPointCount = maximumCompactPointCount,
+                )
+            } else {
+                decodeLosslessF32Points(
+                    encoded = requireNotNull(losslessF32Points),
+                    pointCount = pointCount,
+                    maximumPointCount = maximumCompactPointCount,
+                )
+            }
+        }
+        else -> throw IllegalArgumentException("Stroke points are missing")
+    }
+
+    private fun decodeCompactPoints(
+        encoded: String,
+        pointCount: Int,
+        maximumPointCount: Int,
+    ): List<PagePoint> {
+        require(maximumPointCount in 0..MAX_GENERAL_COMPACT_POINTS_PER_STROKE)
+        require(pointCount in 0..maximumPointCount) {
+            "Compact stroke point count is invalid"
+        }
+        val minimumBytes = pointCount.toLong() * MIN_COMPACT_BYTES_PER_POINT
+        val maximumBytes = pointCount.toLong() * MAX_COMPACT_BYTES_PER_POINT
+        val bytes = decodeBase64Bounded(encoded, maximumBytes, "Compact stroke points")
+        require(bytes.size.toLong() in minimumBytes..maximumBytes) {
+            "Compact stroke points exceed their declared count"
+        }
+        return CompactPagePointCodec.decode(
+            encoded = bytes,
+            pointCount = pointCount,
+            maximumPointCount = maximumPointCount,
+        )
+    }
+
+    private fun decodeLosslessF32Points(
+        encoded: String,
+        pointCount: Int,
+        maximumPointCount: Int,
+    ): List<PagePoint> {
+        require(maximumPointCount in 0..MAX_GENERAL_COMPACT_POINTS_PER_STROKE)
+        require(pointCount in 0..maximumPointCount) {
+            "Lossless stroke point count is invalid"
+        }
+        val maximumBytes = LosslessF32PagePointCodec.maximumEncodedByteCount(pointCount).toLong()
+        val bytes = decodeBase64Bounded(encoded, maximumBytes, "Lossless stroke points")
+        return LosslessF32PagePointCodec.decode(
+            encoded = bytes,
+            pointCount = pointCount,
+            maximumPointCount = maximumPointCount,
+        )
+    }
+
+    private fun decodeBase64Bounded(
+        encoded: String,
+        maximumBytes: Long,
+        label: String,
+    ): ByteArray {
+        val maximumBase64Chars = ((maximumBytes + 2L) / 3L) * 4L
+        require(encoded.length.toLong() <= maximumBase64Chars) {
+            "$label exceed their declared count"
+        }
+        val bytes = try {
+            Base64.getDecoder().decode(encoded)
+        } catch (error: IllegalArgumentException) {
+            throw IllegalArgumentException("$label are not valid Base64", error)
+        }
+        require(bytes.size.toLong() <= maximumBytes) { "$label exceed their declared count" }
+        return bytes
     }
 
     private fun readPageBounds(reader: JsonReader): PageBounds {
@@ -4036,7 +4338,10 @@ class PageOperationLogStore(
         }
     }
 
-    private fun StrokeAsset.toJson() = JSONObject()
+    private fun StrokeAsset.toJson(
+        pointEncoding: AnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
+        maximumCompactPointCount: Int = MAX_GENERAL_COMPACT_POINTS_PER_STROKE,
+    ) = JSONObject()
         .put("id", id.value)
         .put("pageNumber", pageNumber)
         .put("tool", tool.name)
@@ -4048,24 +4353,66 @@ class PageOperationLogStore(
         .put("deviceId", deviceId)
         .put("itemId", itemId ?: JSONObject.NULL)
         .put("publishedAt", publishedAtEpochMillis ?: JSONObject.NULL)
-        .put("points", JSONArray().apply {
-            points.forEach { point ->
-                put(JSONArray().put(point.x.toDouble()).put(point.y.toDouble()).put(point.pressure.toDouble()))
+        .apply {
+            val compact = encodedPointPayload(
+                points = points,
+                pointEncoding = pointEncoding,
+                maximumCompactPointCount = maximumCompactPointCount,
+            )
+            if (compact != null) {
+                put(compact.fieldName, compact.base64)
+                put(COMPACT_POINT_COUNT_FIELD, compact.pointCount)
+            } else {
+                put("points", JSONArray().apply {
+                    points.forEach { point ->
+                        put(JSONArray()
+                            .put(point.x.toDouble())
+                            .put(point.y.toDouble())
+                            .put(point.pressure.toDouble()))
+                    }
+                })
             }
-        })
+        }
         .put("bounds", JSONArray().put(bounds.left).put(bounds.top).put(bounds.right).put(bounds.bottom))
         .put("createdAtEpochMillis", createdAtEpochMillis)
         .put("parentStrokeId", parentStrokeId?.value ?: JSONObject.NULL)
         .put("formatVersion", formatVersion)
 
-    private fun JSONObject.toStrokeAsset(): StrokeAsset {
+    private fun JSONObject.toStrokeAsset(maximumCompactPointCount: Int): StrokeAsset {
         require(getInt("formatVersion") == ANNOTATION_FORMAT_VERSION) { "Unsupported stroke format" }
-        val pointsJson = getJSONArray("points")
-        val points = buildList {
-            for (index in 0 until pointsJson.length()) {
-                val point = pointsJson.getJSONArray(index)
-                add(PagePoint(point.getDouble(0).toFloat(), point.getDouble(1).toFloat(), point.optDouble(2, 1.0).toFloat()))
+        val points = when {
+            has("points") -> {
+                require(
+                    !has(COMPACT_POINTS_FIELD) && !has(LOSSLESS_F32_POINTS_FIELD) &&
+                        !has(COMPACT_POINT_COUNT_FIELD)
+                ) {
+                    "Stroke contains conflicting point encodings"
+                }
+                val pointsJson = getJSONArray("points")
+                buildList {
+                    for (index in 0 until pointsJson.length()) {
+                        val point = pointsJson.getJSONArray(index)
+                        add(PagePoint(
+                            point.getDouble(0).toFloat(),
+                            point.getDouble(1).toFloat(),
+                            point.optDouble(2, 1.0).toFloat(),
+                        ))
+                    }
+                }
             }
+            has(COMPACT_POINTS_FIELD) || has(LOSSLESS_F32_POINTS_FIELD) ||
+                has(COMPACT_POINT_COUNT_FIELD) -> decodePointFields(
+                legacyPoints = null,
+                compactPoints = optionalString(COMPACT_POINTS_FIELD),
+                losslessF32Points = optionalString(LOSSLESS_F32_POINTS_FIELD),
+                compactPointCount = if (has(COMPACT_POINT_COUNT_FIELD)) {
+                    getInt(COMPACT_POINT_COUNT_FIELD)
+                } else {
+                    null
+                },
+                maximumCompactPointCount = maximumCompactPointCount,
+            )
+            else -> throw IllegalArgumentException("Stroke points are missing")
         }
         val boundsJson = getJSONArray("bounds")
         return StrokeAsset(
@@ -4108,8 +4455,12 @@ class PageOperationLogStore(
         deviceId = getString("deviceId"),
     )
 
-    private fun JSONArray.toStrokeAssets(): List<StrokeAsset> = buildList {
-        for (index in 0 until length()) add(getJSONObject(index).toStrokeAsset())
+    private fun JSONArray.toStrokeAssets(
+        maximumCompactPointCount: Int,
+    ): List<StrokeAsset> = buildList {
+        for (index in 0 until length()) {
+            add(getJSONObject(index).toStrokeAsset(maximumCompactPointCount))
+        }
     }
 
     private fun JSONArray.toStrokeIds(): Set<StrokeId> = buildSet {
@@ -4175,6 +4526,12 @@ class PageOperationLogStore(
         }
 
         private const val DEFAULT_CHECKPOINT_INTERVAL = 64
+        private val LOCAL_POINT_ENCODING = AnnotationPointEncoding.COMPACT_Q16_DELTA
+        private const val COMPACT_POINTS_FIELD = "pointsQ16"
+        private const val LOSSLESS_F32_POINTS_FIELD = "pointsF32Gzip"
+        private const val COMPACT_POINT_COUNT_FIELD = "pointCount"
+        private const val MIN_COMPACT_BYTES_PER_POINT = 2L
+        private const val MAX_COMPACT_BYTES_PER_POINT = 10L
         internal const val MAX_CACHED_PAGE_INDEXES = 3
         internal const val MAX_CACHED_STUDENT_LAYER_DIGESTS = 32
         internal const val MAX_CACHED_PUBLISHED_TEACHER_LAYER_DIGESTS = 64
@@ -4198,7 +4555,11 @@ class PageOperationLogStore(
         private const val PUBLISHED_TEACHER_LAYER_DIGEST_KIND = "published-teacher"
         private const val MAX_STUDENT_LAYER_CHECKPOINT_STROKES = 8_192
         private const val MAX_PUBLISHED_TEACHER_LAYER_CHECKPOINT_STROKES = 8_192
-        private const val MAX_STUDENT_CHECKPOINT_POINTS_PER_STROKE = 32_768
+        private const val MAX_GENERAL_COMPACT_POINTS_PER_STROKE = 32_768
+        private const val MAX_LOCAL_CHECKPOINT_POINTS_PER_STROKE =
+            MAX_GENERAL_COMPACT_POINTS_PER_STROKE
+        private const val MAX_STUDENT_CHECKPOINT_POINTS_PER_STROKE =
+            MAX_GENERAL_COMPACT_POINTS_PER_STROKE
         private const val MAX_PUBLISHED_TEACHER_CHECKPOINT_POINTS_PER_STROKE = 8_192
         private const val MAX_STUDENT_LAYER_CHECKPOINT_TOTAL_POINTS = 300_000L
         private const val MAX_PUBLISHED_TEACHER_LAYER_CHECKPOINT_TOTAL_POINTS = 120_000L

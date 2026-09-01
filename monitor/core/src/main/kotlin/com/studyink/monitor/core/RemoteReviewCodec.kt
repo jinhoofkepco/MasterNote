@@ -263,7 +263,18 @@ object RemoteReviewDocumentCodec {
                     val teacherReviewStates = envelope.entries.mapIndexedNotNull { index, entry ->
                         entry.teacherReviewStateSha256?.let { index to it }
                     }
-                    if (teacherReviewStates.isNotEmpty()) {
+                    if (envelope.compactPagePayloadSupported) {
+                        output.writeInt(
+                            envelope.inventoryPageCount ?: PAGE_SYNC_UNKNOWN_INVENTORY_MARKER,
+                        )
+                        output.writeByte(PAGE_SYNC_CAPABILITY_EXTENSION_VERSION)
+                        output.writeInt(PAGE_SYNC_CAPABILITY_COMPACT_PAGE_PAYLOAD)
+                        output.writeInt(teacherReviewStates.size)
+                        teacherReviewStates.forEach { (entryIndex, digest) ->
+                            output.writeInt(entryIndex)
+                            output.writeBoundedString(digest)
+                        }
+                    } else if (teacherReviewStates.isNotEmpty()) {
                         output.writeInt(
                             envelope.inventoryPageCount ?: PAGE_SYNC_UNKNOWN_INVENTORY_MARKER,
                         )
@@ -284,6 +295,10 @@ object RemoteReviewDocumentCodec {
                     output.writeInt(envelope.pageNumber)
                     output.writeNullablePositiveInt(envelope.attemptNo)
                     output.writeLong(envelope.requesterRevision)
+                    if (envelope.acceptsCompactPagePayload) {
+                        output.writeByte(PAGE_SYNC_REQUEST_CAPABILITY_EXTENSION_VERSION)
+                        output.writeInt(PAGE_SYNC_CAPABILITY_COMPACT_PAGE_PAYLOAD)
+                    }
                 }
 
                 is PageAnnotationEnvelope -> {
@@ -560,10 +575,22 @@ object RemoteReviewDocumentCodec {
                         "Page sync inventory marker is invalid."
                     }
                 }
+                var compactPagePayloadSupported = false
                 if (input.available() > 0) {
                     val extensionVersion = input.readUnsignedByte()
-                    if (extensionVersion != PAGE_SYNC_TEACHER_REVIEW_STATE_EXTENSION_VERSION) {
-                        fail(RemoteReviewCodecError.UNSUPPORTED_VERSION) {
+                    when (extensionVersion) {
+                        PAGE_SYNC_TEACHER_REVIEW_STATE_EXTENSION_VERSION -> Unit
+                        PAGE_SYNC_CAPABILITY_EXTENSION_VERSION -> {
+                            val capabilities = input.readInt()
+                            if (capabilities and PAGE_SYNC_CAPABILITY_KNOWN_MASK != capabilities) {
+                                fail(RemoteReviewCodecError.UNSUPPORTED_VERSION) {
+                                    "Unsupported page sync capability flags $capabilities."
+                                }
+                            }
+                            compactPagePayloadSupported = capabilities and
+                                PAGE_SYNC_CAPABILITY_COMPACT_PAGE_PAYLOAD != 0
+                        }
+                        else -> fail(RemoteReviewCodecError.UNSUPPORTED_VERSION) {
                             "Unsupported page sync manifest extension $extensionVersion."
                         }
                     }
@@ -606,18 +633,44 @@ object RemoteReviewDocumentCodec {
                     currentCursor = currentCursor,
                     entries = entries,
                     inventoryPageCount = inventoryPageCount,
+                    compactPagePayloadSupported = compactPagePayloadSupported,
                 )
             }
 
-            RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST -> PageSyncRequestEnvelope(
-                transferId = transferId,
-                createdAtEpochMs = createdAtEpochMs,
-                syncGeneration = input.readLong(),
-                pageToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES),
-                pageNumber = input.readInt(),
-                attemptNo = input.readNullablePositiveInt(),
-                requesterRevision = input.readLong(),
-            )
+            RemoteReviewEnvelopeType.PAGE_SYNC_REQUEST -> {
+                val syncGeneration = input.readLong()
+                val pageToken = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES)
+                val pageNumber = input.readInt()
+                val attemptNo = input.readNullablePositiveInt()
+                val requesterRevision = input.readLong()
+                var acceptsCompactPagePayload = false
+                if (input.available() > 0) {
+                    val extensionVersion = input.readUnsignedByte()
+                    if (extensionVersion != PAGE_SYNC_REQUEST_CAPABILITY_EXTENSION_VERSION) {
+                        fail(RemoteReviewCodecError.UNSUPPORTED_VERSION) {
+                            "Unsupported page sync request extension $extensionVersion."
+                        }
+                    }
+                    val capabilities = input.readInt()
+                    if (capabilities and PAGE_SYNC_CAPABILITY_KNOWN_MASK != capabilities) {
+                        fail(RemoteReviewCodecError.UNSUPPORTED_VERSION) {
+                            "Unsupported page sync request capability flags $capabilities."
+                        }
+                    }
+                    acceptsCompactPagePayload = capabilities and
+                        PAGE_SYNC_CAPABILITY_COMPACT_PAGE_PAYLOAD != 0
+                }
+                PageSyncRequestEnvelope(
+                    transferId = transferId,
+                    createdAtEpochMs = createdAtEpochMs,
+                    syncGeneration = syncGeneration,
+                    pageToken = pageToken,
+                    pageNumber = pageNumber,
+                    attemptNo = attemptNo,
+                    requesterRevision = requesterRevision,
+                    acceptsCompactPagePayload = acceptsCompactPagePayload,
+                )
+            }
 
             RemoteReviewEnvelopeType.PAGE_ANNOTATION -> {
                 val syncGeneration = input.readLong()
@@ -1213,6 +1266,10 @@ object RemoteReviewDocumentCodec {
     private const val MAX_DETAIL_CODE_BYTES: Int = 64
     private const val PAGE_SYNC_UNKNOWN_INVENTORY_MARKER: Int = -1
     private const val PAGE_SYNC_TEACHER_REVIEW_STATE_EXTENSION_VERSION: Int = 1
+    private const val PAGE_SYNC_CAPABILITY_EXTENSION_VERSION: Int = 2
+    private const val PAGE_SYNC_REQUEST_CAPABILITY_EXTENSION_VERSION: Int = 1
+    private const val PAGE_SYNC_CAPABILITY_COMPACT_PAGE_PAYLOAD: Int = 1
+    private const val PAGE_SYNC_CAPABILITY_KNOWN_MASK: Int = PAGE_SYNC_CAPABILITY_COMPACT_PAGE_PAYLOAD
     private const val PAGE_ANNOTATION_CHUNK_EXTENSION_VERSION: Int = 1
     private const val GPT_AUTHORITY_EPOCH_EXTENSION_VERSION: Int = 1
     private const val PNG_CHUNK_OVERHEAD_BYTES: Int = 12

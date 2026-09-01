@@ -29,6 +29,18 @@ debug 앱은 `com.studyink.app.debug`로 분리되어 배포 앱을 덮어쓰지
 
 `main`에 변경 사항이 올라오면 GitHub Actions가 빌드와 단위 테스트를 실행한 뒤 위 파일을 교체합니다. APK는 고정된 테스트 인증서로 서명되며, 인증서 지문이 달라지면 배포 단계가 실패하도록 검사합니다.
 
+### 다른 PC에서 기존 앱 위에 설치
+
+소스를 그 PC에서 다시 서명해 빌드하지 말고, 위 GitHub Release의 `MasterNote.apk`를 받은 뒤 다음처럼 설치합니다.
+
+```powershell
+curl.exe -L "https://github.com/jinhoofkepco/MasterNote/releases/download/dev-latest/MasterNote.apk" -o MasterNote.apk
+adb install -r .\MasterNote.apk
+```
+
+`-r`은 앱 데이터와 기존 필기를 보존하는 업데이트 설치입니다. 앱 삭제, `adb uninstall`, `pm clear`는 사용하지 않습니다. 배포가 허용되는 인증서 SHA-256은
+`d511edca8bcc955e687df75a51e4c741f7636a612238e508d209b0fc1f162983` 하나뿐이며, GitHub Actions가 빌드마다 이를 강제로 확인합니다.
+
 ## 빌드
 
 ```bash

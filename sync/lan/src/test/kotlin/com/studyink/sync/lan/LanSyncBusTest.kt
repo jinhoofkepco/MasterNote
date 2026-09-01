@@ -1,16 +1,28 @@
 package com.studyink.sync.lan
 
+import com.studyink.annotation.engine.AnnotationDocument
+import com.studyink.annotation.engine.AnnotationChange
 import com.studyink.annotation.storage.AppliedTeacherReviewReceipt
+import com.studyink.annotation.storage.AnnotationPointEncoding
+import com.studyink.annotation.storage.PageOperationLogStore
 import com.studyink.annotation.storage.TeacherReviewPublicationOrderDisposition
 import com.studyink.annotation.storage.teacherReviewPublicationOrderDisposition
+import com.studyink.core.model.AnnotationSnapshot
+import com.studyink.core.model.AssetOperation
 import com.studyink.core.model.Attempt
 import com.studyink.core.model.Mark
 import com.studyink.core.model.MarkColor
 import com.studyink.core.model.MarkGroup
+import com.studyink.core.model.OperationId
 import com.studyink.core.model.PagePoint
+import com.studyink.core.model.StrokeAsset
+import com.studyink.core.model.StrokeId
+import com.studyink.core.model.StrokeTool
 import com.studyink.memo.core.MemoTarget
 import java.io.BufferedReader
 import java.io.StringReader
+import java.nio.file.Files
+import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -158,11 +170,118 @@ class LanSyncBusTest {
     }
 
     @Test
-    fun helloAdvertisesTeacherReviewStateWithoutReplacingExistingCapabilities() {
+    fun helloAdvertisesCompactInkWithoutReplacingExistingCapabilities() {
         assertTrue(LAN_CAPABILITY_GPT_EXPLANATION_V2 in lanCapabilities())
         assertTrue(LAN_CAPABILITY_TEACHER_REVIEW_STATE_V1 in lanCapabilities())
         assertTrue(LAN_CAPABILITY_STUDENT_MEMO_V1 in lanCapabilities())
+        assertTrue(LAN_CAPABILITY_ANNOTATION_Q16_DELTA_V1 in lanCapabilities())
         assertEquals(lanCapabilities().size, lanCapabilities().distinct().size)
+    }
+
+    @Test
+    fun compactInkRequiresBothPeersAndOtherwiseFallsBackToLegacy() {
+        val compact = setOf(LAN_CAPABILITY_ANNOTATION_Q16_DELTA_V1)
+
+        assertEquals(
+            AnnotationPointEncoding.COMPACT_Q16_DELTA,
+            negotiatedLanAnnotationPointEncoding(compact, compact),
+        )
+        assertEquals(
+            AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
+            negotiatedLanAnnotationPointEncoding(compact, emptySet()),
+        )
+        assertEquals(
+            AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
+            negotiatedLanAnnotationPointEncoding(emptySet(), compact),
+        )
+    }
+
+    @Test
+    fun negotiatedCompactAndLegacyInkBothRoundTripThroughTheLanReceiverDecoder() {
+        val sourceRoot = Files.createTempDirectory("masternote-lan-compact-source").toFile()
+        val compactTargetRoot = Files.createTempDirectory("masternote-lan-compact-target").toFile()
+        val legacyTargetRoot = Files.createTempDirectory("masternote-lan-legacy-target").toFile()
+        try {
+            val source = PageOperationLogStore(sourceRoot, checkpointInterval = 10_000)
+            val points = List(1_024) { index ->
+                PagePoint(
+                    x = 20f + index.toFloat() / 16f,
+                    y = 30f + (index % 11).toFloat() / 16f,
+                )
+            }
+            val expectedStroke = AnnotationDocument(AnnotationSnapshot.empty("book", 3))
+                .addStroke(
+                    StrokeAsset(
+                        pageNumber = 3,
+                        tool = StrokeTool.PEN,
+                        colorArgb = 0xFF17233C.toInt(),
+                        width = 3f,
+                        points = points,
+                        authorId = "student",
+                        attemptNo = 1,
+                        deviceId = "student-device",
+                    ),
+                )
+                .also(source::append)
+                .addedAssets
+                .single()
+
+            fun payloadFor(peerCapabilities: Set<String>): ByteArray = source
+                .encodedStudentOperationsAfter(
+                    bookId = "book",
+                    pageNumber = 3,
+                    originDeviceId = "student-device",
+                    logicalClock = 0L,
+                    pointEncoding = negotiatedLanAnnotationPointEncoding(
+                        localCapabilities = lanCapabilities(),
+                        peerCapabilities = peerCapabilities,
+                    ),
+                )
+                .single()
+
+            val compactPayload = payloadFor(setOf(LAN_CAPABILITY_ANNOTATION_Q16_DELTA_V1))
+            val legacyPayload = payloadFor(emptySet())
+            assertTrue(compactPayload.size < legacyPayload.size)
+
+            listOf(
+                compactPayload to PageOperationLogStore(compactTargetRoot),
+                legacyPayload to PageOperationLogStore(legacyTargetRoot),
+            ).forEach { (payload, target) ->
+                val line = LanWire.message("OPERATION") {
+                    put("page", 3)
+                    put("payload", Base64.getEncoder().encodeToString(payload))
+                }
+                val receivedPayload = Base64.getDecoder().decode(
+                    LanWire.decode(line).getString("payload"),
+                )
+                assertEquals("student-device", target.operationCursor(receivedPayload).deviceId)
+                assertEquals(1L, target.operationCursor(receivedPayload).logicalClock)
+
+                target.appendEncodedStudentOperation("book", 3, receivedPayload)
+                assertEquals(expectedStroke, target.loadPage("book", 3).activeStrokes.single())
+            }
+        } finally {
+            sourceRoot.deleteRecursively()
+            compactTargetRoot.deleteRecursively()
+            legacyTargetRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun negotiatedCompactCarriesHistoricalSingleStrokeBelowLanLimitsWithoutFloatLoss() {
+        assertHistoricalCompactLanRoundTrip(
+            pageNumber = 8,
+            pointCounts = listOf(17_462),
+        )
+    }
+
+    @Test
+    fun negotiatedCompactCarriesHistoricalMultiAssetOperationBelowLanLimitsWithoutFloatLoss() {
+        assertHistoricalCompactLanRoundTrip(
+            pageNumber = 73,
+            // Mirrors the measured 634 KiB operation: 121 assets, 9,766 total points, max 321.
+            pointCounts = listOf(321, 163) + List(119) { 78 },
+        )
     }
 
     @Test
@@ -871,4 +990,106 @@ class LanSyncBusTest {
         assertEquals(4L, watermarks.clock(3, "teacher"))
         assertEquals(2L, watermarks.clock(4, "teacher"))
     }
+
+    private fun assertHistoricalCompactLanRoundTrip(pageNumber: Int, pointCounts: List<Int>) {
+        val sourceRoot = Files.createTempDirectory("masternote-lan-historical-source").toFile()
+        val targetRoot = Files.createTempDirectory("masternote-lan-historical-target").toFile()
+        try {
+            val bookId = "historical-book"
+            val deviceId = "student-device"
+            val source = PageOperationLogStore(sourceRoot, checkpointInterval = 10_000)
+            val target = PageOperationLogStore(targetRoot, checkpointInterval = 10_000)
+            val assets = pointCounts.mapIndexed { assetIndex, pointCount ->
+                StrokeAsset(
+                    id = StrokeId("historical-$pageNumber-$assetIndex"),
+                    pageNumber = pageNumber,
+                    tool = StrokeTool.PEN,
+                    colorArgb = 0xFF17233C.toInt(),
+                    width = 2.75f,
+                    points = historicalFloatPoints(assetIndex, pointCount),
+                    authorId = "student",
+                    attemptNo = 1,
+                    logicalClock = 1L,
+                    deviceId = deviceId,
+                    createdAtEpochMillis = assetIndex + 1L,
+                )
+            }
+            val operation = AssetOperation(
+                id = OperationId("historical-operation-$pageNumber"),
+                removedStrokeIds = emptySet(),
+                addedStrokeIds = assets.mapTo(linkedSetOf(), StrokeAsset::id),
+                logicalClock = 1L,
+                deviceId = deviceId,
+            )
+            source.append(
+                AnnotationChange(
+                    snapshot = AnnotationSnapshot(
+                        bookId = bookId,
+                        pageNumber = pageNumber,
+                        revision = 1L,
+                        assets = assets.associateBy(StrokeAsset::id),
+                        activeStrokeIds = operation.addedStrokeIds,
+                        appliedOperationIds = setOf(operation.id),
+                    ),
+                    operation = operation,
+                    addedAssets = assets,
+                ),
+            )
+
+            val payload = source.encodedStudentOperationsAfter(
+                bookId = bookId,
+                pageNumber = pageNumber,
+                originDeviceId = deviceId,
+                logicalClock = 0L,
+                pointEncoding = negotiatedLanAnnotationPointEncoding(
+                    localCapabilities = lanCapabilities(),
+                    peerCapabilities = setOf(LAN_CAPABILITY_ANNOTATION_Q16_DELTA_V1),
+                ),
+            ).single()
+            assertEquals(deviceId, source.operationCursor(payload).deviceId)
+            assertEquals(1L, source.operationCursor(payload).logicalClock)
+
+            val line = LanWire.message("OPERATION") {
+                put("page", pageNumber)
+                put("payload", Base64.getEncoder().encodeToString(payload))
+            }
+            assertTrue(
+                "${line.length}-character historical operation exceeds the LAN line limit",
+                line.length <= LanWire.MAX_LINE_CHARS,
+            )
+            val receivedPayload = Base64.getDecoder().decode(
+                LanWire.decode(line).getString("payload"),
+            )
+            assertTrue(payload.contentEquals(receivedPayload))
+            assertEquals(deviceId, target.operationCursor(receivedPayload).deviceId)
+            assertEquals(1L, target.operationCursor(receivedPayload).logicalClock)
+
+            target.appendEncodedStudentOperation(bookId, pageNumber, receivedPayload)
+            val receivedAssets = target.loadPage(bookId, pageNumber).activeStrokes
+                .associateBy(StrokeAsset::id)
+            assertEquals(assets.map(StrokeAsset::id).toSet(), receivedAssets.keys)
+            assets.forEach { expected ->
+                val actual = requireNotNull(receivedAssets[expected.id])
+                assertEquals(expected, actual)
+                expected.points.zip(actual.points).forEach { (expectedPoint, actualPoint) ->
+                    assertEquals(expectedPoint.x.toRawBits(), actualPoint.x.toRawBits())
+                    assertEquals(expectedPoint.y.toRawBits(), actualPoint.y.toRawBits())
+                    assertEquals(expectedPoint.pressure.toRawBits(), actualPoint.pressure.toRawBits())
+                }
+            }
+        } finally {
+            sourceRoot.deleteRecursively()
+            targetRoot.deleteRecursively()
+        }
+    }
+
+    /** Representative old ink: pressure varies and every coordinate is halfway off the Q16 grid. */
+    private fun historicalFloatPoints(assetIndex: Int, pointCount: Int): List<PagePoint> =
+        List(pointCount) { pointIndex ->
+            PagePoint(
+                x = 12.03125f + assetIndex * 0.5f + (pointIndex % 257) * 0.125f,
+                y = 24.03125f + assetIndex * 0.25f + (pointIndex / 257) * 0.0625f,
+                pressure = 0.25f + (pointIndex % 47) * 0.015625f,
+            )
+        }
 }

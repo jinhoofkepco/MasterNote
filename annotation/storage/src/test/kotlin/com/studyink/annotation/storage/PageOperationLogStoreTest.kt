@@ -9,11 +9,14 @@ import com.studyink.core.model.Mark
 import com.studyink.core.model.MarkColor
 import com.studyink.core.model.MarkGroup
 import com.studyink.core.model.OperationId
+import com.studyink.core.model.PageBounds
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeId
 import com.studyink.core.model.StrokeTool
+import com.studyink.core.model.LosslessF32PagePointCodec
 import com.studyink.core.model.teacherReviewMarkGroupsSha256
+import java.util.Base64
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -26,8 +29,419 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONArray
+import org.json.JSONObject
 
 class PageOperationLogStoreTest {
+    @Test
+    fun compactLocalLogAndNegotiatedExportsRoundTripWithoutChangingSemanticDigest() {
+        val sourceRoot = Files.createTempDirectory("masternote-compact-operation-source").toFile()
+        val compactTargetRoot = Files.createTempDirectory("masternote-compact-operation-target").toFile()
+        val legacyTargetRoot = Files.createTempDirectory("masternote-legacy-operation-target").toFile()
+        try {
+            val source = PageOperationLogStore(sourceRoot, checkpointInterval = 10_000)
+            val asset = stroke("student-device").copy(
+                points = listOf(
+                    PagePoint(10f, 20f),
+                    PagePoint(10.0625f, 19.9375f),
+                    PagePoint(10.125f, 19.9375f),
+                ),
+            )
+            source.append(AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE)).addStroke(asset))
+
+            val durableLine = source.operationLogFile(BOOK_ID, PAGE).readLines().single()
+            assertTrue(durableLine.contains("\"pointsQ16\""))
+            assertFalse(durableLine.contains("\"points\":"))
+
+            val compact = source.encodedStudentOperationsAfter(
+                BOOK_ID,
+                PAGE,
+                "student-device",
+                0L,
+                AnnotationPointEncoding.COMPACT_Q16_DELTA,
+            ).single()
+            val legacy = source.encodedStudentOperationsAfter(
+                BOOK_ID,
+                PAGE,
+                "student-device",
+                0L,
+                AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
+            ).single()
+            assertTrue(compact.size < legacy.size)
+            assertTrue(compact.toString(Charsets.UTF_8).contains("\"pointsQ16\""))
+            assertTrue(legacy.toString(Charsets.UTF_8).contains("\"points\":"))
+
+            val compactTarget = PageOperationLogStore(compactTargetRoot)
+            compactTarget.appendEncodedStudentOperation(BOOK_ID, PAGE, compact)
+            val legacyTarget = PageOperationLogStore(legacyTargetRoot)
+            legacyTarget.appendEncodedStudentOperation(BOOK_ID, PAGE, legacy)
+
+            assertEquals(source.loadPage(BOOK_ID, PAGE).activeStrokes, compactTarget.loadPage(BOOK_ID, PAGE).activeStrokes)
+            assertEquals(source.loadPage(BOOK_ID, PAGE).activeStrokes, legacyTarget.loadPage(BOOK_ID, PAGE).activeStrokes)
+            assertEquals(source.studentLayerSha256(BOOK_ID, PAGE), compactTarget.studentLayerSha256(BOOK_ID, PAGE))
+            assertEquals(source.studentLayerSha256(BOOK_ID, PAGE), legacyTarget.studentLayerSha256(BOOK_ID, PAGE))
+        } finally {
+            sourceRoot.deleteRecursively()
+            compactTargetRoot.deleteRecursively()
+            legacyTargetRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun compactRequestUsesBitExactF32FallbackForRealisticLegacyInkUnderWireLimit() {
+        val sourceRoot = Files.createTempDirectory("masternote-lossless-large-source").toFile()
+        val targetRoot = Files.createTempDirectory("masternote-lossless-large-target").toFile()
+        try {
+            val source = PageOperationLogStore(sourceRoot, checkpointInterval = 10_000)
+            val legacyPoints = List(17_462) { index ->
+                PagePoint(
+                    x = index.toFloat() * 0.101_003f + 0.000_17f,
+                    y = (index % 997).toFloat() * 0.203_007f + 0.000_31f,
+                    pressure = 0.15f + (index % 71).toFloat() / 100f,
+                )
+            }
+            source.append(
+                AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE)).addStroke(
+                    stroke("legacy-device").copy(
+                        id = StrokeId("large-legacy-stroke"),
+                        points = legacyPoints,
+                        bounds = PageBounds.from(legacyPoints),
+                    ),
+                ),
+            )
+
+            val compact = source.encodedStudentOperationsAfter(
+                BOOK_ID,
+                PAGE,
+                "legacy-device",
+                0L,
+                AnnotationPointEncoding.COMPACT_Q16_DELTA,
+            ).single()
+            val legacy = source.encodedStudentOperationsAfter(
+                BOOK_ID,
+                PAGE,
+                "legacy-device",
+                0L,
+                AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
+            ).single()
+
+            assertTrue(compact.size < 512 * 1024)
+            assertTrue(compact.toString(Charsets.UTF_8).contains("\"pointsF32Gzip\""))
+            assertFalse(compact.toString(Charsets.UTF_8).contains("\"points\":"))
+            assertTrue(legacy.toString(Charsets.UTF_8).contains("\"points\":"))
+            assertFalse(legacy.toString(Charsets.UTF_8).contains("\"pointsF32Gzip\""))
+
+            val target = PageOperationLogStore(targetRoot)
+            target.appendEncodedStudentOperation(BOOK_ID, PAGE, compact)
+            assertPointBitsEqual(
+                legacyPoints,
+                target.loadPage(BOOK_ID, PAGE).activeStrokes.single().points,
+            )
+        } finally {
+            sourceRoot.deleteRecursively()
+            targetRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun compactOperationWith121LosslessAssetsStaysUnderWireLimit() {
+        val sourceRoot = Files.createTempDirectory("masternote-lossless-many-source").toFile()
+        val targetRoot = Files.createTempDirectory("masternote-lossless-many-target").toFile()
+        try {
+            val deviceId = "many-assets-device"
+            val assets = List(121) { assetIndex ->
+                val points = List(81) { pointIndex ->
+                    val seed = assetIndex * 81 + pointIndex
+                    PagePoint(
+                        x = seed.toFloat() * 0.113_013f + 0.000_11f,
+                        y = (seed % 503).toFloat() * 0.197_021f + 0.000_29f,
+                        pressure = 0.2f + (seed % 61).toFloat() / 100f,
+                    )
+                }
+                stroke(deviceId).copy(
+                    id = StrokeId("many-$assetIndex"),
+                    points = points,
+                    bounds = PageBounds.from(points),
+                    logicalClock = 1L,
+                )
+            }
+            val operation = AssetOperation(
+                id = OperationId("many-assets-operation"),
+                addedStrokeIds = assets.mapTo(linkedSetOf(), StrokeAsset::id),
+                removedStrokeIds = emptySet(),
+                logicalClock = 1L,
+                deviceId = deviceId,
+            )
+            val source = PageOperationLogStore(sourceRoot, checkpointInterval = 10_000)
+            source.append(
+                AnnotationChange(
+                    snapshot = AnnotationSnapshot.empty(BOOK_ID, PAGE),
+                    operation = operation,
+                    addedAssets = assets,
+                ),
+            )
+
+            val compact = source.encodedStudentOperationsAfter(
+                BOOK_ID,
+                PAGE,
+                deviceId,
+                0L,
+                AnnotationPointEncoding.COMPACT_Q16_DELTA,
+            ).single()
+            assertTrue(compact.size < 512 * 1024)
+            assertEquals(
+                121,
+                JSONObject(compact.toString(Charsets.UTF_8)).getJSONArray("addedAssets")
+                    .let { encodedAssets ->
+                        (0 until encodedAssets.length()).count { index ->
+                            encodedAssets.getJSONObject(index).has("pointsF32Gzip")
+                        }
+                    },
+            )
+
+            val target = PageOperationLogStore(targetRoot)
+            target.appendEncodedStudentOperation(BOOK_ID, PAGE, compact)
+            val received = target.loadPage(BOOK_ID, PAGE).assets
+            assets.forEach { expected ->
+                assertPointBitsEqual(expected.points, received.getValue(expected.id).points)
+            }
+        } finally {
+            sourceRoot.deleteRecursively()
+            targetRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun oneOperationMayMixLegacyQ16AndLosslessF32PointFields() {
+        val sourceRoot = Files.createTempDirectory("masternote-mixed-points-source").toFile()
+        val targetRoot = Files.createTempDirectory("masternote-mixed-points-target").toFile()
+        try {
+            val deviceId = "mixed-device"
+            val assets = listOf(
+                stroke(deviceId).copy(
+                    id = StrokeId("mixed-q16"),
+                    points = listOf(PagePoint(1f, 2f), PagePoint(1.0625f, 2.125f)),
+                    logicalClock = 1L,
+                ),
+                stroke(deviceId).copy(
+                    id = StrokeId("mixed-f32"),
+                    points = listOf(PagePoint(3.1f, 4.2f, 0.37f), PagePoint(5.3f, 6.4f, 0.83f)),
+                    logicalClock = 1L,
+                ),
+                stroke(deviceId).copy(
+                    id = StrokeId("mixed-legacy"),
+                    points = listOf(PagePoint(7.1f, 8.2f, 0.41f), PagePoint(9.3f, 10.4f, 0.79f)),
+                    logicalClock = 1L,
+                ),
+            )
+            val source = PageOperationLogStore(sourceRoot, checkpointInterval = 10_000)
+            source.append(
+                AnnotationChange(
+                    snapshot = AnnotationSnapshot.empty(BOOK_ID, PAGE),
+                    operation = AssetOperation(
+                        id = OperationId("mixed-operation"),
+                        removedStrokeIds = emptySet(),
+                        addedStrokeIds = assets.mapTo(linkedSetOf(), StrokeAsset::id),
+                        logicalClock = 1L,
+                        deviceId = deviceId,
+                    ),
+                    addedAssets = assets,
+                ),
+            )
+            val root = JSONObject(
+                source.encodedStudentOperationsAfter(
+                    BOOK_ID,
+                    PAGE,
+                    deviceId,
+                    0L,
+                    AnnotationPointEncoding.COMPACT_Q16_DELTA,
+                ).single().toString(Charsets.UTF_8),
+            )
+            val encodedAssets = root.getJSONArray("addedAssets")
+            val encodedById = (0 until encodedAssets.length()).associate { index ->
+                encodedAssets.getJSONObject(index).let { it.getString("id") to it }
+            }
+            assertTrue(encodedById.getValue("mixed-q16").has("pointsQ16"))
+            assertTrue(encodedById.getValue("mixed-f32").has("pointsF32Gzip"))
+            encodedById.getValue("mixed-legacy").apply {
+                remove("pointsF32Gzip")
+                remove("pointCount")
+                put("points", JSONArray().apply {
+                    assets.single { it.id.value == "mixed-legacy" }.points.forEach { point ->
+                        put(JSONArray().put(point.x.toDouble()).put(point.y.toDouble())
+                            .put(point.pressure.toDouble()))
+                    }
+                })
+            }
+
+            val target = PageOperationLogStore(targetRoot)
+            target.appendEncodedStudentOperation(
+                BOOK_ID,
+                PAGE,
+                root.toString().toByteArray(Charsets.UTF_8),
+            )
+            val received = target.loadPage(BOOK_ID, PAGE).assets
+            assets.forEach { expected ->
+                assertPointBitsEqual(expected.points, received.getValue(expected.id).points)
+            }
+            assertEquals(source.studentLayerSha256(BOOK_ID, PAGE), target.studentLayerSha256(BOOK_ID, PAGE))
+        } finally {
+            sourceRoot.deleteRecursively()
+            targetRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun compactPointCountsUseOperationAndPublishedCheckpointLimitsBeforeDecode() {
+        val sourceRoot = Files.createTempDirectory("masternote-compact-limits-source").toFile()
+        val targetRoot = Files.createTempDirectory("masternote-compact-limits-target").toFile()
+        try {
+            val source = PageOperationLogStore(sourceRoot, checkpointInterval = 10_000)
+            val points = listOf(PagePoint(1.1f, 2.2f, 0.3f), PagePoint(3.3f, 4.4f, 0.7f))
+            source.append(
+                AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE)).addStroke(
+                    stroke("limit-device").copy(
+                        id = StrokeId("limit-student"),
+                        points = points,
+                        bounds = PageBounds.from(points),
+                    ),
+                ),
+            )
+            val operation = JSONObject(
+                source.encodedStudentOperationsAfter(
+                    BOOK_ID,
+                    PAGE,
+                    "limit-device",
+                    0L,
+                    AnnotationPointEncoding.COMPACT_Q16_DELTA,
+                ).single().toString(Charsets.UTF_8),
+            )
+            val operationAsset = operation.getJSONArray("addedAssets").getJSONObject(0)
+            operationAsset.put("pointCount", 32_769)
+            assertThrows(IllegalArgumentException::class.java) {
+                PageOperationLogStore(targetRoot).appendEncodedStudentOperation(
+                    BOOK_ID,
+                    PAGE,
+                    operation.toString().toByteArray(Charsets.UTF_8),
+                )
+            }
+
+            operationAsset.put("pointCount", 1)
+            operationAsset.put(
+                "pointsF32Gzip",
+                Base64.getEncoder().encodeToString(LosslessF32PagePointCodec.encode(points)),
+            )
+            assertThrows(IllegalArgumentException::class.java) {
+                PageOperationLogStore(targetRoot).appendEncodedStudentOperation(
+                    BOOK_ID,
+                    PAGE,
+                    operation.toString().toByteArray(Charsets.UTF_8),
+                )
+            }
+
+            val teacherPoints = listOf(PagePoint(5f, 6f), PagePoint(5.0625f, 6.125f))
+            val teacherSource = PageOperationLogStore(sourceRoot.resolve("teacher"), 10_000)
+            teacherSource.append(
+                AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE)).addStroke(
+                    stroke("teacher-device").copy(
+                        id = StrokeId("limit-teacher"),
+                        authorId = "teacher",
+                        attemptNo = 1,
+                        publishedAtEpochMillis = 1_000L,
+                        points = teacherPoints,
+                        bounds = PageBounds.from(teacherPoints),
+                    ),
+                ),
+            )
+            val teacherCheckpoint = JSONObject(
+                teacherSource.encodePublishedTeacherLayerCheckpoint(
+                    BOOK_ID,
+                    PAGE,
+                    1,
+                    AnnotationPointEncoding.COMPACT_Q16_DELTA,
+                ).toString(Charsets.UTF_8),
+            )
+            teacherCheckpoint.getJSONArray("assets").getJSONObject(0).put("pointCount", 8_193)
+            assertThrows(IllegalArgumentException::class.java) {
+                PageOperationLogStore(targetRoot.resolve("teacher-target"))
+                    .applyPublishedTeacherLayerCheckpoint(
+                        localBookId = BOOK_ID,
+                        pageNumber = PAGE,
+                        attemptNo = 1,
+                        checkpointBytes = teacherCheckpoint.toString().toByteArray(Charsets.UTF_8),
+                    )
+            }
+        } finally {
+            sourceRoot.deleteRecursively()
+            targetRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun compactAndLegacyCheckpointsHaveTheSameIdentityAndMixedLocalAssetsRemainExact() {
+        val sourceRoot = Files.createTempDirectory("masternote-compact-checkpoint-source").toFile()
+        val targetRoot = Files.createTempDirectory("masternote-compact-checkpoint-target").toFile()
+        try {
+            val source = PageOperationLogStore(sourceRoot, checkpointInterval = 10_000)
+            var snapshot = AnnotationSnapshot.empty(BOOK_ID, PAGE)
+            val compactEligible = stroke("student-device").copy(
+                id = StrokeId("compact-eligible"),
+                points = listOf(PagePoint(1f, 2f), PagePoint(1.0625f, 2f)),
+            )
+            val legacyExact = stroke("student-device").copy(
+                id = StrokeId("legacy-pressure"),
+                points = listOf(PagePoint(3.125f, 4.25f, 0.4f)),
+            )
+            snapshot = source.append(AnnotationDocument(snapshot).addStroke(compactEligible))
+            snapshot = source.append(AnnotationDocument(snapshot).addStroke(legacyExact))
+            source.writeCheckpoint(snapshot)
+
+            val localCheckpoint = JSONObject(
+                sourceRoot.resolve("$BOOK_ID/pages/$PAGE/checkpoint.json").readText(Charsets.UTF_8)
+            )
+            val assets = localCheckpoint.getJSONArray("assets")
+            val byId = (0 until assets.length()).associate { index ->
+                assets.getJSONObject(index).let { it.getString("id") to it }
+            }
+            assertTrue(byId.getValue("compact-eligible").has("pointsQ16"))
+            assertFalse(byId.getValue("compact-eligible").has("points"))
+            assertTrue(byId.getValue("legacy-pressure").has("pointsF32Gzip"))
+            assertFalse(byId.getValue("legacy-pressure").has("points"))
+
+            val restarted = PageOperationLogStore(sourceRoot).loadPage(BOOK_ID, PAGE)
+            assertEquals(snapshot.assets, restarted.assets)
+
+            val compact = source.exportStudentLayerCheckpoint(
+                BOOK_ID,
+                PAGE,
+                "student-device",
+                AnnotationPointEncoding.COMPACT_Q16_DELTA,
+            )
+            val legacy = source.exportStudentLayerCheckpoint(
+                BOOK_ID,
+                PAGE,
+                "student-device",
+                AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
+            )
+            val compactJson = JSONObject(compact.copyCheckpointBytes().toString(Charsets.UTF_8))
+            val legacyJson = JSONObject(legacy.copyCheckpointBytes().toString(Charsets.UTF_8))
+            assertEquals(legacyJson.getString("checkpointId"), compactJson.getString("checkpointId"))
+            assertEquals(legacy.layerSha256, compact.layerSha256)
+
+            val applied = PageOperationLogStore(targetRoot).applyStudentLayerCheckpoint(
+                BOOK_ID,
+                PAGE,
+                compact.copyCheckpointBytes(),
+                expectedResultLayerSha256 = compact.layerSha256,
+            )
+            assertEquals(compact.layerSha256, applied.layerSha256)
+            assertEquals(snapshot.activeStrokes, applied.snapshot.activeStrokes)
+        } finally {
+            sourceRoot.deleteRecursively()
+            targetRoot.deleteRecursively()
+        }
+    }
+
     @Test
     fun boundedDeltaCopiesOnlyThePrefixThatFitsItsWireBudget() {
         val root = Files.createTempDirectory("masternote-bounded-delta").toFile()
@@ -57,6 +471,38 @@ class PageOperationLogStoreTest {
             assertEquals(store.operationCursor(all.first()).logicalClock, bounded.lastLogicalClock)
         } finally {
             root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun exportedRecordDoesNotRetainCallerMutablePointList() {
+        val sourceRoot = Files.createTempDirectory("masternote-immutable-record-source").toFile()
+        val targetRoot = Files.createTempDirectory("masternote-immutable-record-target").toFile()
+        try {
+            val callerPoints = mutableListOf(PagePoint(1.1f, 2.2f, 0.3f), PagePoint(3.3f, 4.4f, 0.7f))
+            val expected = callerPoints.toList()
+            val source = PageOperationLogStore(sourceRoot, checkpointInterval = 10_000)
+            source.append(
+                AnnotationDocument(AnnotationSnapshot.empty(BOOK_ID, PAGE)).addStroke(
+                    stroke("immutable-device").copy(points = callerPoints),
+                ),
+            )
+            callerPoints[0] = PagePoint(900f, 901f, 0.99f)
+
+            val encoded = source.encodedStudentOperationsAfter(
+                BOOK_ID,
+                PAGE,
+                "immutable-device",
+                0L,
+                AnnotationPointEncoding.COMPACT_Q16_DELTA,
+            ).single()
+            val target = PageOperationLogStore(targetRoot)
+            target.appendEncodedStudentOperation(BOOK_ID, PAGE, encoded)
+
+            assertPointBitsEqual(expected, target.loadPage(BOOK_ID, PAGE).activeStrokes.single().points)
+        } finally {
+            sourceRoot.deleteRecursively()
+            targetRoot.deleteRecursively()
         }
     }
 
@@ -2782,6 +3228,15 @@ class PageOperationLogStoreTest {
 
     private fun largePath(size: Int): List<PagePoint> = List(size) { index ->
         PagePoint((index % 512).toFloat(), (index / 512).toFloat())
+    }
+
+    private fun assertPointBitsEqual(expected: List<PagePoint>, actual: List<PagePoint>) {
+        assertEquals(expected.size, actual.size)
+        expected.zip(actual).forEach { (left, right) ->
+            assertEquals(left.x.toRawBits(), right.x.toRawBits())
+            assertEquals(left.y.toRawBits(), right.y.toRawBits())
+            assertEquals(left.pressure.toRawBits(), right.pressure.toRawBits())
+        }
     }
 
     private companion object {

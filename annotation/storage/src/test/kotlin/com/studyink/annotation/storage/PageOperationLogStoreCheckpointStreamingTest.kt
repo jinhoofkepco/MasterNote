@@ -80,7 +80,7 @@ class PageOperationLogStoreCheckpointStreamingTest {
     }
 
     @Test
-    fun streamedCheckpointKeepsLegacyJsonShapeAndAtomicallyReplacesPriorFile() {
+    fun streamedCheckpointUsesCompactPointShapeAndAtomicallyReplacesPriorFile() {
         val root = Files.createTempDirectory("masternote-checkpoint-shape").toFile()
         try {
             val strokeId = StrokeId("streamed-stroke")
@@ -139,7 +139,9 @@ class PageOperationLogStoreCheckpointStreamingTest {
             assertEquals("problem-7", legacyAsset.getString("itemId"))
             assertEquals(9876L, legacyAsset.getLong("publishedAt"))
             assertEquals("streamed-parent", legacyAsset.getString("parentStrokeId"))
-            assertEquals(0.75, legacyAsset.getJSONArray("points").getJSONArray(0).getDouble(2), 0.0)
+            assertTrue(legacyAsset.has("pointsF32Gzip"))
+            assertEquals(1, legacyAsset.getInt("pointCount"))
+            assertFalse(legacyAsset.has("points"))
 
             val reloaded = PageOperationLogStore(root).loadPage(BOOK_ID, PAGE)
             assertEquals(11L, reloaded.revision)
@@ -222,7 +224,7 @@ class PageOperationLogStoreCheckpointStreamingTest {
     }
 
     @Test(timeout = 120_000L)
-    fun roundTripsTwentyToFortyMegabyteCheckpointInNinetySixMegabyteHeap() {
+    fun roundTripsLargeCompactCheckpointInNinetySixMegabyteHeap() {
         val root = Files.createTempDirectory("masternote-checkpoint-low-heap").toFile()
         try {
             val javaExecutable = File(
@@ -268,8 +270,8 @@ class PageOperationLogStoreCheckpointStreamingTest {
             assertEquals("Low-heap checkpoint writer failed: $output", 0, process.exitValue())
             val checkpoint = root.resolve("$BOOK_ID/pages/$PAGE/checkpoint.json")
             assertTrue(checkpoint.isFile)
-            assertTrue("Checkpoint was only ${checkpoint.length()} bytes", checkpoint.length() >= 20L * MIB)
-            assertTrue("Checkpoint was ${checkpoint.length()} bytes", checkpoint.length() <= 40L * MIB)
+            assertTrue("Checkpoint was empty", checkpoint.length() >= 1L * MIB)
+            assertTrue("Checkpoint was ${checkpoint.length()} bytes", checkpoint.length() <= 20L * MIB)
             assertFalse(requireNotNull(checkpoint.parentFile).resolve("checkpoint.json.tmp").exists())
         } finally {
             root.deleteRecursively()

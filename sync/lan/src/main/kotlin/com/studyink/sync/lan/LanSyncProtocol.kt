@@ -2,6 +2,7 @@ package com.studyink.sync.lan
 
 import android.net.Uri
 import com.studyink.assistant.core.StudentExplanationLayer
+import com.studyink.annotation.storage.AnnotationPointEncoding
 import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.ByteBuffer
@@ -149,13 +150,29 @@ internal const val LAN_CAPABILITY_GPT_EXPLANATION_V2 = "GPT_EXPLANATION_V2"
 internal const val LAN_CAPABILITY_TEACHER_REVIEW_STATE_V1 = "TEACHER_REVIEW_STATE_V1"
 /** Student-authored attempt memos, transferred as independently replayable full memo states. */
 internal const val LAN_CAPABILITY_STUDENT_MEMO_V1 = "STUDENT_MEMO_V1"
+/** Stroke points encoded as one Q16 absolute point followed by signed relative deltas. */
+internal const val LAN_CAPABILITY_ANNOTATION_Q16_DELTA_V1 = "ANNOTATION_Q16_DELTA_V1"
 private val LAN_SHA256_HEX = Regex("[0-9a-f]{64}")
 
 internal fun lanCapabilities(): List<String> = listOf(
     LAN_CAPABILITY_GPT_EXPLANATION_V2,
     LAN_CAPABILITY_TEACHER_REVIEW_STATE_V1,
     LAN_CAPABILITY_STUDENT_MEMO_V1,
+    LAN_CAPABILITY_ANNOTATION_Q16_DELTA_V1,
 )
+
+/** Mixed-version sessions stay on the legacy representation until both endpoints advertise V1. */
+internal fun negotiatedLanAnnotationPointEncoding(
+    localCapabilities: Collection<String>,
+    peerCapabilities: Collection<String>,
+): AnnotationPointEncoding = if (
+    LAN_CAPABILITY_ANNOTATION_Q16_DELTA_V1 in localCapabilities &&
+    LAN_CAPABILITY_ANNOTATION_Q16_DELTA_V1 in peerCapabilities
+) {
+    AnnotationPointEncoding.COMPACT_Q16_DELTA
+} else {
+    AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS
+}
 
 internal fun isValidLanSha256(value: String): Boolean = LAN_SHA256_HEX.matches(value)
 

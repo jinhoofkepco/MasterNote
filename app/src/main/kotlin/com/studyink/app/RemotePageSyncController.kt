@@ -2,6 +2,7 @@ package com.studyink.app
 
 import android.os.SystemClock
 import android.util.Log
+import com.studyink.annotation.storage.AnnotationPointEncoding
 import com.studyink.annotation.storage.AppliedTeacherReviewReceipt
 import com.studyink.annotation.storage.PageOperationLogStore
 import com.studyink.annotation.storage.TeacherReviewPublicationArtifact
@@ -289,6 +290,14 @@ internal class RemotePageSyncController(
     private var teacherReviewStateProbeGeneration = 0L
     /** Only an actually decoded digest manifest proves that this generation accepts extensions. */
     private var teacherReviewStatePeerGeneration = 0L
+    /** Student emits the v2 manifest only after the teacher's old-wire-compatible probe. */
+    private var studentCompactPayloadCapabilityGeneration = 0L
+    /** One compact capability probe is sufficient for each observed student generation. */
+    private var compactPayloadProbeGeneration = 0L
+    /** Page pulls alone wait briefly for the probed peer to answer; every other lane keeps moving. */
+    private var compactPayloadProbeWaitUntilElapsedMs = 0L
+    /** A decoded v2 manifest is the only authority for sending an extended compact request. */
+    private var compactPayloadPeerGeneration = 0L
     /** UI attachment must never wait behind a multi-megabyte page decode held by this controller. */
     @Volatile private var latestUiState = RemotePageSyncUiState()
 
@@ -326,6 +335,10 @@ internal class RemotePageSyncController(
         studentTeacherReviewStateCapabilityGeneration = 0L
         teacherReviewStateProbeGeneration = 0L
         teacherReviewStatePeerGeneration = 0L
+        studentCompactPayloadCapabilityGeneration = 0L
+        compactPayloadProbeGeneration = 0L
+        compactPayloadProbeWaitUntilElapsedMs = 0L
+        compactPayloadPeerGeneration = 0L
         if (next?.role == RemoteReviewRole.STUDENT && telegramActive) {
             // Transport callbacks may arrive before the peer session is bound on process start.
             // Reconstruct the bounded crash-gap audit here as well as on a live fallback edge.
@@ -696,6 +709,7 @@ internal class RemotePageSyncController(
             pages.filter { it.localBookId != null }.forEach(::applyManifestAttempts)
             bindDeferredTeacherReviews(manifestReviewEvidence(envelope, store.teacherPages()))
             sendTeacherReviewStateCapabilityProbe(envelope)
+            sendCompactPayloadCapabilityProbe(envelope)
             reconcileTeacherReviewState(envelope, store.teacherPages())
             failedPageTokens.retainAll(
                 store.teacherPages().mapTo(linkedSetOf(), TeacherPageSyncRecord::pageToken),
@@ -719,6 +733,7 @@ internal class RemotePageSyncController(
         }
         bindDeferredTeacherReviews(manifestReviewEvidence(envelope, installedPages))
         sendTeacherReviewStateCapabilityProbe(envelope)
+        sendCompactPayloadCapabilityProbe(envelope)
         reconcileTeacherReviewState(envelope, installedPages)
         publishTeacherCursor()
         tickTeacher(requireNotNull(session))
@@ -750,6 +765,38 @@ internal class RemotePageSyncController(
         )
         if (runCatching { sendEnvelope(probe).isDurablyAccepted() }.getOrDefault(false)) {
             teacherReviewStateProbeGeneration = envelope.syncGeneration
+        }
+    }
+
+    /**
+     * The probe itself is an old-format ACK. An old student ignores it; a new student answers with
+     * a v2 manifest, after which this teacher may safely send the request extension.
+     */
+    private fun sendCompactPayloadCapabilityProbe(envelope: PageSyncManifestEnvelope) {
+        if (envelope.compactPagePayloadSupported) {
+            compactPayloadProbeGeneration = envelope.syncGeneration
+            compactPayloadProbeWaitUntilElapsedMs = 0L
+            compactPayloadPeerGeneration = envelope.syncGeneration
+            return
+        }
+        if (compactPayloadProbeGeneration == envelope.syncGeneration) return
+        val first = envelope.entries.firstOrNull() ?: return
+        val probe = pageSyncAck(
+            syncGeneration = envelope.syncGeneration,
+            sourceType = PageSyncAckSourceType.ANNOTATION,
+            sourceTransferId = envelope.transferId,
+            pageToken = first.pageToken,
+            pageNumber = first.pageNumber,
+            sourceRevision = first.revision,
+            disposition = PageSyncAckDisposition.DUPLICATE,
+            reasonCode = COMPACT_PAGE_PAYLOAD_CAPABILITY_REASON,
+        )
+        if (runCatching { sendEnvelope(probe).isDurablyAccepted() }.getOrDefault(false)) {
+            compactPayloadProbeGeneration = envelope.syncGeneration
+            compactPayloadProbeWaitUntilElapsedMs = safeAdd(
+                nowElapsedMs(),
+                COMPACT_PAGE_PAYLOAD_PROBE_WAIT_MS,
+            )
         }
     }
 
@@ -1037,6 +1084,19 @@ internal class RemotePageSyncController(
                         envelope.sourceRevision > page.sourceRevision
                     ) return RemotePageSyncIncomingResult.DROP
                     studentTeacherReviewStateCapabilityGeneration = generation
+                    scheduleInteractiveManifest()
+                    return RemotePageSyncIncomingResult.ACKNOWLEDGE
+                }
+                if (envelope.reasonCode == COMPACT_PAGE_PAYLOAD_CAPABILITY_REASON) {
+                    val generation = store.studentGeneration()
+                    val page = store.studentPage(envelope.pageToken)
+                        ?: return RemotePageSyncIncomingResult.DROP
+                    if (envelope.disposition != PageSyncAckDisposition.DUPLICATE ||
+                        envelope.syncGeneration != generation || page.syncGeneration != generation ||
+                        page.pageNumber + 1 != envelope.pageNumber ||
+                        envelope.sourceRevision > page.sourceRevision
+                    ) return RemotePageSyncIncomingResult.DROP
+                    studentCompactPayloadCapabilityGeneration = generation
                     scheduleInteractiveManifest()
                     return RemotePageSyncIncomingResult.ACKNOWLEDGE
                 }
@@ -1349,6 +1409,8 @@ internal class RemotePageSyncController(
         val ordered = selectedTokens.mapNotNull(pagesByToken::get)
         val advertisesTeacherReviewState =
             studentTeacherReviewStateCapabilityGeneration == reservation.syncGeneration
+        val advertisesCompactPagePayload =
+            studentCompactPayloadCapabilityGeneration == reservation.syncGeneration
         // markGroupsForSync performs whole-book ordering. Read it once per selected book, then
         // reuse page buckets across a 47-row inventory manifest instead of repeating that work.
         val markGroupsByBookAndPage = if (advertisesTeacherReviewState) {
@@ -1407,6 +1469,7 @@ internal class RemotePageSyncController(
             inventoryPageCount = expectedStudentInventoryPageCount().takeIf {
                 studentInventoryCatalogComplete() && unverifiedStudentPageKeys.isEmpty()
             },
+            compactPagePayloadSupported = advertisesCompactPagePayload,
         )
     }
 
@@ -1414,6 +1477,14 @@ internal class RemotePageSyncController(
         if (!telegramOnline) return
         if (sendOnePendingTeacherReview()) return
         if (nowElapsedMs() < requestCooldownUntilElapsedMs) return
+        if (compactPageRequestMode(
+                pageGeneration = store.teacherManifestGeneration(),
+                probeGeneration = compactPayloadProbeGeneration,
+                peerCapabilityGeneration = compactPayloadPeerGeneration,
+                nowElapsedMs = nowElapsedMs(),
+                probeWaitUntilElapsedMs = compactPayloadProbeWaitUntilElapsedMs,
+            ) == CompactPageRequestMode.WAIT
+        ) return
         val active = store.teacherPages().firstOrNull { it.requestTransferId != null }
         if (active != null) {
             val transferId = requireNotNull(active.requestTransferId)
@@ -1492,6 +1563,10 @@ internal class RemotePageSyncController(
         pageNumber = pageNumber + 1,
         attemptNo = null,
         requesterRevision = requesterRevision,
+        acceptsCompactPagePayload = acceptsCompactPagePayloadForPeer(
+            compactPayloadPeerGeneration,
+            syncGeneration,
+        ),
     )
 
     private fun sendOnePendingTeacherReview(): Boolean {
@@ -2089,6 +2164,7 @@ internal class RemotePageSyncController(
         request: PageSyncRequestEnvelope,
         page: StudentPageSyncRecord,
     ): StudentAnnotationResponse {
+        val pointEncoding = pointEncodingForRemotePageRequest(request.acceptsCompactPagePayload)
         val canDelta = request.requesterRevision > 0L &&
             request.requesterRevision == page.acknowledgedRevision &&
             request.requesterRevision < page.sourceRevision &&
@@ -2104,6 +2180,7 @@ internal class RemotePageSyncController(
                 fixedFrameBytes = PAGE_DELTA_HEADER_BYTES,
                 perOperationFrameBytes = PAGE_DELTA_OPERATION_FRAME_BYTES,
                 includeTeacherDrafts = false,
+                pointEncoding = pointEncoding,
             )
             val decoded = batch.operations.takeIf { batch.complete && it.isNotEmpty() }
                 ?.let { runCatching { RemotePageDeltaCodec.encode(it) }.getOrNull() }
@@ -2135,7 +2212,12 @@ internal class RemotePageSyncController(
                 return StudentAnnotationResponse(envelope.transferId, listOf(envelope))
             }
         }
-        val export = annotationStore.exportStudentLayerCheckpoint(page.bookId, page.pageNumber, library.deviceId)
+        val export = annotationStore.exportStudentLayerCheckpoint(
+            page.bookId,
+            page.pageNumber,
+            library.deviceId,
+            pointEncoding = pointEncoding,
+        )
         require(export.layerSha256 == page.studentLayerSha256)
         val checkpoint = export.copyCheckpointBytes()
         val fragments = splitPageCheckpointPayload(
@@ -3330,6 +3412,8 @@ internal class RemotePageSyncController(
         const val PAGE_DELTA_HEADER_BYTES = 8
         const val PAGE_DELTA_OPERATION_FRAME_BYTES = 4
         const val TEACHER_REVIEW_STATE_CAPABILITY_REASON = "CAP_TEACHER_REVIEW_STATE_V1"
+        const val COMPACT_PAGE_PAYLOAD_CAPABILITY_REASON = "CAP_COMPACT_PAGE_PAYLOAD_V1"
+        const val COMPACT_PAGE_PAYLOAD_PROBE_WAIT_MS = 10_000L
     }
 }
 
@@ -3357,6 +3441,41 @@ internal fun teacherReviewPublicationIdForPeer(
     pageGeneration: Long,
 ): String? = publicationId.takeIf {
     publicationId.isNotBlank() && pageGeneration > 0L && peerCapabilityGeneration == pageGeneration
+}
+
+/** Mixed-version fence: an extended request is emitted only for the witnessed generation. */
+internal fun acceptsCompactPagePayloadForPeer(
+    peerCapabilityGeneration: Long,
+    pageGeneration: Long,
+): Boolean = pageGeneration > 0L && peerCapabilityGeneration == pageGeneration
+
+internal enum class CompactPageRequestMode { WAIT, COMPACT, LEGACY }
+
+/**
+ * A freshly probed generation gets one short negotiation window. A witnessed peer proceeds at
+ * once; an old or silent peer falls back after the deadline instead of blocking page sync.
+ */
+internal fun compactPageRequestMode(
+    pageGeneration: Long,
+    probeGeneration: Long,
+    peerCapabilityGeneration: Long,
+    nowElapsedMs: Long,
+    probeWaitUntilElapsedMs: Long,
+): CompactPageRequestMode = when {
+    acceptsCompactPagePayloadForPeer(peerCapabilityGeneration, pageGeneration) ->
+        CompactPageRequestMode.COMPACT
+    pageGeneration > 0L && probeGeneration == pageGeneration &&
+        probeWaitUntilElapsedMs > nowElapsedMs -> CompactPageRequestMode.WAIT
+    else -> CompactPageRequestMode.LEGACY
+}
+
+/** Legacy queued requests continue to ask storage for byte-compatible float-array JSON. */
+internal fun pointEncodingForRemotePageRequest(
+    acceptsCompactPagePayload: Boolean,
+): AnnotationPointEncoding = if (acceptsCompactPagePayload) {
+    AnnotationPointEncoding.COMPACT_Q16_DELTA
+} else {
+    AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS
 }
 
 /** Exact pair/workbook/local-page/attempt authorization for one manifest reconciliation row. */

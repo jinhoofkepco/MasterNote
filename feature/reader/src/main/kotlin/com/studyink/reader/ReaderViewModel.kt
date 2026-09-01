@@ -15,6 +15,7 @@ import com.studyink.core.model.MarkColor
 import com.studyink.core.model.MarkGroup
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
+import com.studyink.core.model.canonicalizedForNewInk
 import com.studyink.core.model.StudentActivitySample
 import com.studyink.core.model.summariseActivity
 import com.studyink.core.model.trimmedTo
@@ -923,7 +924,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                     authorId = authorId,
                     attemptNo = attemptNo,
                     deviceId = library.deviceId,
-                )
+                ).canonicalizedForNewInk()
             )
         }
     }

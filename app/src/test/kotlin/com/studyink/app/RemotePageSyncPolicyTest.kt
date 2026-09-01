@@ -1,5 +1,6 @@
 package com.studyink.app
 
+import com.studyink.annotation.storage.AnnotationPointEncoding
 import com.studyink.annotation.storage.AppliedTeacherReviewReceipt
 import com.studyink.annotation.storage.TeacherReviewPublicationOrderDisposition
 import com.studyink.annotation.storage.TeacherReviewPublishIntent
@@ -21,6 +22,45 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RemotePageSyncPolicyTest {
+    @Test
+    fun `compact page encoding requires an exact generation witness`() {
+        assertTrue(acceptsCompactPagePayloadForPeer(peerCapabilityGeneration = 7L, pageGeneration = 7L))
+        assertFalse(acceptsCompactPagePayloadForPeer(peerCapabilityGeneration = 0L, pageGeneration = 7L))
+        assertFalse(acceptsCompactPagePayloadForPeer(peerCapabilityGeneration = 6L, pageGeneration = 7L))
+        assertFalse(acceptsCompactPagePayloadForPeer(peerCapabilityGeneration = 0L, pageGeneration = 0L))
+        assertEquals(
+            AnnotationPointEncoding.COMPACT_Q16_DELTA,
+            pointEncodingForRemotePageRequest(acceptsCompactPagePayload = true),
+        )
+        assertEquals(
+            AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS,
+            pointEncodingForRemotePageRequest(acceptsCompactPagePayload = false),
+        )
+    }
+
+    @Test
+    fun `compact capability probe waits briefly then witnesses or falls back`() {
+        val generation = 7L
+        val probeDeadline = 20_000L
+
+        assertEquals(
+            CompactPageRequestMode.WAIT,
+            compactPageRequestMode(generation, generation, 0L, 10_000L, probeDeadline),
+        )
+        assertEquals(
+            CompactPageRequestMode.COMPACT,
+            compactPageRequestMode(generation, generation, generation, 10_001L, probeDeadline),
+        )
+        assertEquals(
+            CompactPageRequestMode.LEGACY,
+            compactPageRequestMode(generation, generation, 0L, probeDeadline, probeDeadline),
+        )
+        assertEquals(
+            CompactPageRequestMode.LEGACY,
+            compactPageRequestMode(generation + 1L, generation, generation, 10_000L, probeDeadline),
+        )
+    }
+
     @Test fun legacyRenderedPageMessagesAreRetiredWithoutBlockingPageSyncOrChat() {
         assertTrue(isRetiredLegacyRemoteReviewPayloadType(RemoteReviewEnvelopeType.PAGE_SNAPSHOT.name))
         assertTrue(isRetiredLegacyRemoteReviewPayloadType(RemoteReviewEnvelopeType.TEACHER_FEEDBACK.name))

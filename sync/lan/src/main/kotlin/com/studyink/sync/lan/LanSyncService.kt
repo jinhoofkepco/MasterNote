@@ -30,6 +30,7 @@ import com.studyink.assistant.core.StudentExplanationLayerBus
 import com.studyink.assistant.core.StudentExplanationTarget
 import com.studyink.assistant.core.StudentLayerApplyStatus
 import com.studyink.assistant.core.remapTo
+import com.studyink.annotation.storage.AnnotationPointEncoding
 import com.studyink.annotation.storage.AppliedTeacherReviewReceipt
 import com.studyink.annotation.storage.PageOperationLogStore
 import com.studyink.annotation.storage.TeacherReviewPublicationOrderDisposition
@@ -118,6 +119,8 @@ class LanSyncService : Service(),
     @Volatile private var peerSupportsGptExplanation = false
     @Volatile private var peerSupportsTeacherReviewState = false
     @Volatile private var peerSupportsStudentMemo = false
+    @Volatile private var negotiatedAnnotationPointEncoding =
+        AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS
     /** True only for a session that is visibly offering/consuming a QR pairing payload. */
     @Volatile private var explicitPairingWindow = false
     @Volatile private var subscribedPage = -1
@@ -596,6 +599,18 @@ class LanSyncService : Service(),
                     (0 until announcedCapabilities.length()).any { index ->
                         announcedCapabilities.optString(index) == LAN_CAPABILITY_STUDENT_MEMO_V1
                     }
+                val peerSupportsCompactAnnotation = announcedCapabilities != null &&
+                    (0 until announcedCapabilities.length()).any { index ->
+                        announcedCapabilities.optString(index) == LAN_CAPABILITY_ANNOTATION_Q16_DELTA_V1
+                    }
+                negotiatedAnnotationPointEncoding = negotiatedLanAnnotationPointEncoding(
+                    localCapabilities = lanCapabilities(),
+                    peerCapabilities = if (peerSupportsCompactAnnotation) {
+                        listOf(LAN_CAPABILITY_ANNOTATION_Q16_DELTA_V1)
+                    } else {
+                        emptyList()
+                    },
+                )
                 require(
                     role == LanPeerRole.STUDENT_SERVER && announcedRole == LanPeerRole.TEACHER_CLIENT ||
                     role == LanPeerRole.TEACHER_CLIENT && announcedRole == LanPeerRole.STUDENT_SERVER
@@ -2291,6 +2306,7 @@ class LanSyncService : Service(),
                 pageNumber = page,
                 originDeviceId = library.deviceId,
                 logicalClock = acknowledgedClock,
+                pointEncoding = negotiatedAnnotationPointEncoding,
             )
             val allSent = records.all { record ->
                 send(LanWire.message("OPERATION") {
@@ -2440,6 +2456,7 @@ class LanSyncService : Service(),
         peerSupportsGptExplanation = false
         peerSupportsTeacherReviewState = false
         peerSupportsStudentMemo = false
+        negotiatedAnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS
         authenticatedConnectionGeneration = 0L
         peerDeviceId = ""
         peerHost = ""
@@ -2478,6 +2495,7 @@ class LanSyncService : Service(),
         peerSupportsGptExplanation = false
         peerSupportsTeacherReviewState = false
         peerSupportsStudentMemo = false
+        negotiatedAnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS
         peerDeviceId = ""
         localAuthNonce = ""
         pendingPeerHelloGeneration = 0L
