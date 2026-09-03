@@ -5,11 +5,16 @@ import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.Base64
 
+internal class TelegramPeerInboxCapacityException : IllegalStateException(
+    "Remote-review inbox capacity is exhausted.",
+)
+
 /** Durable inbox. A Telegram update offset is committed only after [offer] has fsynced its PUT. */
 class TelegramPeerDocumentInbox(
     private val journal: File,
     private val ownedDirectory: File,
-    private val maxPendingEntries: Int = 48,
+    private val maxPendingEntries: Int = DEFAULT_MAX_PENDING_ENTRIES,
+    private val maxPendingBytes: Long = DEFAULT_MAX_PENDING_BYTES,
 ) {
     private val pending = linkedMapOf<Long, PendingTelegramPeerDocument>()
     private val completedTransfers = linkedMapOf<String, Long>()
@@ -18,6 +23,7 @@ class TelegramPeerDocumentInbox(
 
     init {
         require(maxPendingEntries > 0)
+        require(maxPendingBytes > 0L)
         require(journal.parentFile?.mkdirs() == true || journal.parentFile?.isDirectory == true)
         require(ownedDirectory.mkdirs() || ownedDirectory.isDirectory)
         replay()
@@ -34,7 +40,12 @@ class TelegramPeerDocumentInbox(
                 deleteOwned(entry.file)
                 return false
             }
-            check(pending.size < maxPendingEntries) { "Remote-review inbox is full." }
+            val pendingBytes = pending.values.sumOf(PendingTelegramPeerDocument::byteCount)
+            if (pending.size >= maxPendingEntries ||
+                entry.byteCount > maxPendingBytes - pendingBytes.coerceAtMost(maxPendingBytes)
+            ) {
+                throw TelegramPeerInboxCapacityException()
+            }
             append(encodePut(entry))
             pending[entry.updateId] = entry
             // PUT is already fsynced. Compaction is only bounded-journal maintenance and a failure
@@ -204,7 +215,14 @@ class TelegramPeerDocumentInbox(
         data class Put(val entry: PendingTelegramPeerDocument) : Record
         data class Done(val updateId: Long, val transferId: String, val atEpochMs: Long) : Record
     }
-    private companion object { const val VERSION = "MNPI1"; const val MAX_COMPLETED = 4_096 }
+    private companion object {
+        const val VERSION = "MNPI1"
+        const val MAX_COMPLETED = 4_096
+        // Relative-coordinate deltas are often tiny. A 48-item count cap filled long before its
+        // intended 96 MiB disk budget and could pin Telegram's single receive offset.
+        const val DEFAULT_MAX_PENDING_ENTRIES = 512
+        const val DEFAULT_MAX_PENDING_BYTES = 96L * 1_024L * 1_024L
+    }
 }
 
 class TelegramPeerReceiptStore(private val journal: File) {

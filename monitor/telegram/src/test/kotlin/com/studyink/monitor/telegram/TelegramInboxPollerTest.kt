@@ -11,6 +11,7 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -244,6 +245,188 @@ class TelegramInboxPollerTest {
 
         assertEquals(2, handlerCalls.get())
         assertEquals(2L, offsetStore.load(botFingerprint(token)))
+    }
+
+    @Test fun connectionControlBehindBlockedDocumentRunsWithoutCommittingTheGap() {
+        val token = "123456:${"y".repeat(24)}"
+        val fingerprint = botFingerprint(token)
+        val credentials = TelegramCredentials(
+            botToken = token,
+            allowedPrivateChatId = 77L,
+            chatLabel = "parent",
+            peerBotId = 202L,
+            peerBotUsername = "teacher_bot",
+        )
+        val document = TelegramInboundUpdate(
+            updateId = 10L,
+            messageId = 10L,
+            chatId = 202L,
+            chatType = "private",
+            text = null,
+            senderIsBot = true,
+            senderDisplayName = "peer",
+            senderUsername = "teacher_bot",
+            sentAtEpochSeconds = 1L,
+            senderId = 202L,
+            caption = "${TelegramPeerProtocol.VERSION} DOC pair_identifier_123 transfer_123 PAGE_ANNOTATION",
+        )
+        val accept = document.copy(
+            updateId = 11L,
+            messageId = 11L,
+            text = "${TelegramPeerProtocol.VERSION} CONNECT_ACCEPT request_123 1 invalid",
+            caption = null,
+        )
+        val pollOffsets = CopyOnWriteArrayList<Long>()
+        val api = object : TelegramBotApi {
+            override fun getMe() = error("unused")
+            override fun deleteWebhook() = Unit
+            override fun getUpdates(offset: Long, timeoutSeconds: Int): List<TelegramInboundUpdate> {
+                pollOffsets += offset
+                return listOf(document, accept).filter { it.updateId >= offset }
+            }
+            override fun sendMessage(chatId: Long, text: String) = error("unused")
+            override fun sendDocument(chatId: Long, document: File, caption: String, mimeType: String, displayName: String) = error("unused")
+            override fun sendVoice(chatId: Long, voice: File, caption: String, mimeType: String, displayName: String) = error("unused")
+        }
+        val offsetStore = TelegramUpdateOffsetStore(temporary.newFile("priority-behind-gap-offset"))
+        offsetStore.commit(fingerprint, document.updateId)
+        val handled = CopyOnWriteArrayList<Long>()
+        val controlHandled = CountDownLatch(1)
+        val failureObserved = CountDownLatch(1)
+        val failures = CopyOnWriteArrayList<TelegramPeerPollFailureEvent>()
+        val poller = TelegramInboxPoller(
+            credentials = credentials,
+            api = api,
+            offsetStore = offsetStore,
+            connectionTracker = TelegramConnectionTracker(
+                TelegramConnectionStateStore(temporary.newFile("priority-behind-gap-connection")),
+            ) {},
+            handler = TelegramInboundHandler { _, _ -> },
+            nowEpochMs = { 1L },
+            jitter = TelegramJitterSource { 0.0 },
+            onFatalError = { throw AssertionError(it) },
+            peerHandler = TelegramPeerInboundHandler { update ->
+                handled += update.updateId
+                if (update.updateId == document.updateId) throw TelegramPeerInboxCapacityException()
+                controlHandled.countDown()
+            },
+            onPollFailureEvent = { event -> failures += event; failureObserved.countDown() },
+        )
+
+        try {
+            assertTrue(poller.start())
+            assertTrue(controlHandled.await(1L, TimeUnit.SECONDS))
+            assertTrue(failureObserved.await(1L, TimeUnit.SECONDS))
+        } finally {
+            poller.close()
+        }
+
+        assertEquals(listOf(10L, 11L), handled)
+        assertEquals(10L, pollOffsets.first())
+        assertEquals(10L, offsetStore.load(fingerprint))
+        assertEquals(TelegramPeerTransportFailure.INBOX_FULL, failures.single().failure)
+    }
+
+    @Test fun handlerFailuresBackOffAcrossSuccessfulHttpPolls() {
+        val token = "123456:${"z".repeat(24)}"
+        val inbound = update(1L, 77L, "private", false, "retry")
+        val firstFailureObserved = CountDownLatch(1)
+        val secondFailureObserved = CountDownLatch(1)
+        val failures = CopyOnWriteArrayList<TelegramPeerPollFailureEvent>()
+        val api = object : TelegramBotApi {
+            override fun getMe() = error("unused")
+            override fun deleteWebhook() = Unit
+            override fun getUpdates(offset: Long, timeoutSeconds: Int) = listOf(inbound)
+            override fun sendMessage(chatId: Long, text: String) = error("unused")
+            override fun sendDocument(chatId: Long, document: File, caption: String, mimeType: String, displayName: String) = error("unused")
+            override fun sendVoice(chatId: Long, voice: File, caption: String, mimeType: String, displayName: String) = error("unused")
+        }
+        val poller = TelegramInboxPoller(
+            credentials = TelegramCredentials(token, 77L, "parent"),
+            api = api,
+            offsetStore = TelegramUpdateOffsetStore(temporary.newFile("handler-backoff-offset")),
+            connectionTracker = TelegramConnectionTracker(
+                TelegramConnectionStateStore(temporary.newFile("handler-backoff-connection")),
+            ) {},
+            handler = TelegramInboundHandler { _, _ -> error("local failure") },
+            nowEpochMs = { 1L },
+            jitter = TelegramJitterSource { 0.0 },
+            onFatalError = { throw AssertionError(it) },
+            onPollFailureEvent = { event ->
+                failures += event
+                if (failures.size == 1) firstFailureObserved.countDown()
+                if (failures.size == 2) secondFailureObserved.countDown()
+            },
+        )
+
+        try {
+            assertTrue(poller.start())
+            assertTrue(firstFailureObserved.await(1L, TimeUnit.SECONDS))
+            assertFalse(secondFailureObserved.await(100L, TimeUnit.MILLISECONDS))
+            poller.wake()
+            assertTrue(secondFailureObserved.await(1L, TimeUnit.SECONDS))
+        } finally {
+            poller.close()
+        }
+
+        assertEquals(listOf(2_000L, 4_000L), failures.map { it.retryDelayMs })
+    }
+
+    @Test fun durableCommitResetsBackoffForADifferentBlockedUpdate() {
+        val token = "123456:${"v".repeat(24)}"
+        val fingerprint = botFingerprint(token)
+        val first = update(10L, 77L, "private", false, "first")
+        val second = update(11L, 77L, "private", false, "second")
+        val firstCalls = AtomicInteger()
+        val firstFailureObserved = CountDownLatch(1)
+        val secondFailureObserved = CountDownLatch(1)
+        val failures = CopyOnWriteArrayList<TelegramPeerPollFailureEvent>()
+        val api = object : TelegramBotApi {
+            override fun getMe() = error("unused")
+            override fun deleteWebhook() = Unit
+            override fun getUpdates(offset: Long, timeoutSeconds: Int) =
+                listOf(first, second).filter { it.updateId >= offset }
+            override fun sendMessage(chatId: Long, text: String) = error("unused")
+            override fun sendDocument(chatId: Long, document: File, caption: String, mimeType: String, displayName: String) = error("unused")
+            override fun sendVoice(chatId: Long, voice: File, caption: String, mimeType: String, displayName: String) = error("unused")
+        }
+        val offsetStore = TelegramUpdateOffsetStore(temporary.newFile("new-barrier-backoff-offset"))
+        offsetStore.commit(fingerprint, first.updateId)
+        val poller = TelegramInboxPoller(
+            credentials = TelegramCredentials(token, 77L, "parent"),
+            api = api,
+            offsetStore = offsetStore,
+            connectionTracker = TelegramConnectionTracker(
+                TelegramConnectionStateStore(temporary.newFile("new-barrier-backoff-connection")),
+            ) {},
+            handler = TelegramInboundHandler { update, _ ->
+                when (update.updateId) {
+                    first.updateId -> if (firstCalls.getAndIncrement() == 0) error("old blocker")
+                    second.updateId -> error("new blocker")
+                }
+            },
+            nowEpochMs = { 1L },
+            jitter = TelegramJitterSource { 0.0 },
+            onFatalError = { throw AssertionError(it) },
+            onPollFailureEvent = { event ->
+                failures += event
+                if (failures.size == 1) firstFailureObserved.countDown()
+                if (failures.size == 2) secondFailureObserved.countDown()
+            },
+        )
+
+        try {
+            assertTrue(poller.start())
+            assertTrue(firstFailureObserved.await(1L, TimeUnit.SECONDS))
+            poller.wake()
+            assertTrue(secondFailureObserved.await(1L, TimeUnit.SECONDS))
+        } finally {
+            poller.close()
+        }
+
+        assertEquals(2, firstCalls.get())
+        assertEquals(11L, offsetStore.load(fingerprint))
+        assertEquals(listOf(2_000L, 2_000L), failures.map { it.retryDelayMs })
     }
 
     private fun update(

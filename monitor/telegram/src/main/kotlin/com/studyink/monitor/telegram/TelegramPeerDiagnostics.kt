@@ -38,6 +38,9 @@ internal enum class TelegramPeerTransportFailure {
     BOT_TO_BOT_DISABLED,
     RATE_LIMITED,
     CONFLICT,
+    INBOX_FULL,
+    RESPONSE_QUEUE_FULL,
+    RESPONSE_UNAVAILABLE,
     UNAUTHORIZED,
     FORBIDDEN,
     BAD_REQUEST,
@@ -115,7 +118,21 @@ internal data class TelegramPeerPollFailureEvent(
     val retryDelayMs: Long?,
 )
 
+internal class TelegramPeerResponseRetryException(
+    val result: TelegramEnqueueResult,
+) : IllegalStateException("Required peer response is temporarily unavailable.")
+
 internal fun telegramPeerTransportFailure(error: Throwable): TelegramPeerTransportFailure {
+    if (error is TelegramPeerInboxCapacityException) {
+        return TelegramPeerTransportFailure.INBOX_FULL
+    }
+    if (error is TelegramPeerResponseRetryException) {
+        return if (error.result == TelegramEnqueueResult.QUEUE_FULL) {
+            TelegramPeerTransportFailure.RESPONSE_QUEUE_FULL
+        } else {
+            TelegramPeerTransportFailure.RESPONSE_UNAVAILABLE
+        }
+    }
     if (error !is TelegramApiException) {
         return if (error is java.io.IOException) {
             TelegramPeerTransportFailure.NETWORK

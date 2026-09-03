@@ -485,12 +485,13 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
     fun acknowledgePeerDocument(updateId: Long): Boolean = synchronized(lifecycleLock) {
         val pending = peerDocumentInbox.pending().firstOrNull { it.updateId == updateId } ?: return false
         val ackResult = enqueuePeerDeliveryAckLocked(pending.transferId, pending.updateId)
-        if (ackResult !in setOf(
-                TelegramEnqueueResult.ENQUEUED,
-                TelegramEnqueueResult.ALREADY_PENDING,
-                TelegramEnqueueResult.ALREADY_DELIVERED,
+        if (ackResult.peerResponseDisposition() == PeerResponseEnqueueDisposition.RETRY) return false
+        if (ackResult.peerResponseDisposition() == PeerResponseEnqueueDisposition.TERMINAL_CONSUME) {
+            Log.w(
+                PEER_CONTROL_LOG_TAG,
+                "event=local_settle kind=RECEIVED result=${ackResult.name}",
             )
-        ) return false
+        }
         peerDocumentInbox.acknowledge(updateId, System.currentTimeMillis()) != null
     }
 
@@ -946,6 +947,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         kind: String,
         text: String,
         nowEpochMs: Long,
+        wakeInbox: Boolean = true,
     ): TelegramEnqueueResult {
         val peer = active.peerBinding ?: return TelegramEnqueueResult.NOT_CONFIGURED
         val pairId = active.peerPairId ?: return TelegramEnqueueResult.NOT_CONFIGURED
@@ -968,9 +970,9 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         val result = outbox.enqueuePeerLinkControl(entry)
         if (result.isDurablyQueued()) {
             if (isPriorityPeerControl(entry)) priorityUploader?.wake() else uploader?.wake()
-            // A manual request can arrive while the inbox poller is in a long network backoff.
-            // Wake its interrupt-safe retry condition so CONNECT_ACCEPT/PONG is observed promptly.
-            poller?.wake()
+            // Only an independently initiated request should interrupt an inbox retry delay.
+            // Responses produced by that poller must not wake their own failed cycle and spin.
+            if (wakeInbox) poller?.wake()
         }
         Log.i(
             PEER_CONTROL_LOG_TAG,
@@ -1084,7 +1086,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             // Pre-delta builds uploaded full pages and immediate feedback envelopes repeatedly.
             // Consume them without downloading obsolete ciphertext during migration. An ACK also
             // settles a mixed-version old sender which still retries until RECEIVED.
-            ensurePeerResponseDurablyQueued(
+            ensurePeerResponseDurablySettled(
                 enqueuePeerDeliveryAckLocked(header.transferId, update.updateId),
             )
             Log.i(PEER_INBOUND_LOG_TAG, "Discarded legacy peer page snapshot; update=${update.updateId}")
@@ -1097,7 +1099,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         }
         if (peerDocumentInbox.hasSeen(update.updateId, header.transferId)) {
             if (peerDocumentInbox.isCompleted(header.transferId)) {
-                ensurePeerResponseDurablyQueued(
+                ensurePeerResponseDurablySettled(
                     enqueuePeerDeliveryAckLocked(header.transferId, update.updateId),
                 )
             }
@@ -1342,13 +1344,14 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                         return
                     }
                     nextLinkState = markPeerObservedLocked(pairId, now)
-                    ensurePeerResponseDurablyQueued(
+                    ensurePeerResponseDurablySettled(
                         enqueuePeerControlLocked(
                             active = requireNotNull(credentials.load()),
                             transferId = peerControlTransferId("accept", control.requestId),
                             kind = "accept",
                             text = TelegramPeerProtocol.connectAccept(control.requestId, now, key),
                             nowEpochMs = now,
+                            wakeInbox = false,
                         ),
                     )
                     handled = true
@@ -1400,13 +1403,14 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                         return
                     }
                     nextLinkState = markPeerObservedLocked(pairId, now)
-                    ensurePeerResponseDurablyQueued(
+                    ensurePeerResponseDurablySettled(
                         enqueuePeerControlLocked(
                             active = requireNotNull(credentials.load()),
                             transferId = peerControlTransferId("pong", control.nonce),
                             kind = "pong",
                             text = TelegramPeerProtocol.pong(control.sessionId, control.nonce, now, key),
                             nowEpochMs = now,
+                            wakeInbox = false,
                         ),
                     )
                     handled = true
@@ -1489,6 +1493,10 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             ),
         )
         if (result == TelegramEnqueueResult.ENQUEUED) uploader?.wake()
+        Log.i(
+            PEER_CONTROL_LOG_TAG,
+            "event=enqueue kind=RECEIVED lane=regular result=${result.name}",
+        )
         return result
     }
 
@@ -1693,10 +1701,26 @@ internal fun TelegramEnqueueResult.isDurablyQueued(): Boolean = this in setOf(
     TelegramEnqueueResult.ALREADY_DELIVERED,
 )
 
+internal enum class PeerResponseEnqueueDisposition { READY, TERMINAL_CONSUME, RETRY }
+
+internal fun TelegramEnqueueResult.peerResponseDisposition(): PeerResponseEnqueueDisposition = when (this) {
+    TelegramEnqueueResult.ENQUEUED,
+    TelegramEnqueueResult.ALREADY_PENDING,
+    TelegramEnqueueResult.ALREADY_DELIVERED,
+    -> PeerResponseEnqueueDisposition.READY
+    TelegramEnqueueResult.PREVIOUSLY_DEAD,
+    TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED,
+    -> PeerResponseEnqueueDisposition.TERMINAL_CONSUME
+    TelegramEnqueueResult.NOT_CONFIGURED,
+    TelegramEnqueueResult.CHAT_CHANGED,
+    TelegramEnqueueResult.QUEUE_FULL,
+    -> PeerResponseEnqueueDisposition.RETRY
+}
+
 /** Returning from an inbound handler commits its Telegram update offset. */
-internal fun ensurePeerResponseDurablyQueued(result: TelegramEnqueueResult) {
-    check(result.isDurablyQueued()) {
-        "Required peer response was not durably queued: $result"
+internal fun ensurePeerResponseDurablySettled(result: TelegramEnqueueResult) {
+    if (result.peerResponseDisposition() == PeerResponseEnqueueDisposition.RETRY) {
+        throw TelegramPeerResponseRetryException(result)
     }
 }
 

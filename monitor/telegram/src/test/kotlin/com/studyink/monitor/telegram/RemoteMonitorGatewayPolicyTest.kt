@@ -90,21 +90,31 @@ class RemoteMonitorGatewayPolicyTest {
         assertTrue(shouldAcceptParentInbound(true, null))
     }
 
-    @Test fun inboundPeerResponseRequiresDurableQueueStateBeforeOffsetCommit() {
+    @Test fun inboundPeerResponseConsumesTerminalTombstonesButRetriesRecoverableFailures() {
         listOf(
             TelegramEnqueueResult.ENQUEUED,
             TelegramEnqueueResult.ALREADY_PENDING,
             TelegramEnqueueResult.ALREADY_DELIVERED,
-        ).forEach(::ensurePeerResponseDurablyQueued)
-        listOf(
-            TelegramEnqueueResult.QUEUE_FULL,
             TelegramEnqueueResult.PREVIOUSLY_DEAD,
             TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED,
+        ).forEach(::ensurePeerResponseDurablySettled)
+        listOf(
+            TelegramEnqueueResult.QUEUE_FULL,
             TelegramEnqueueResult.NOT_CONFIGURED,
+            TelegramEnqueueResult.CHAT_CHANGED,
         ).forEach { result ->
-            assertThrows(IllegalStateException::class.java) {
-                ensurePeerResponseDurablyQueued(result)
+            val error = assertThrows(TelegramPeerResponseRetryException::class.java) {
+                ensurePeerResponseDurablySettled(result)
             }
+            assertEquals(result, error.result)
+            assertEquals(
+                if (result == TelegramEnqueueResult.QUEUE_FULL) {
+                    TelegramPeerTransportFailure.RESPONSE_QUEUE_FULL
+                } else {
+                    TelegramPeerTransportFailure.RESPONSE_UNAVAILABLE
+                },
+                telegramPeerTransportFailure(error),
+            )
         }
     }
 

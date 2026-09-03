@@ -2,6 +2,7 @@ package com.studyink.monitor.telegram
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -56,6 +57,52 @@ class TelegramPeerInboxTest {
         assertTrue(inbox.offer(pending))
         assertTrue(payload.isFile)
         assertEquals(listOf(pending), TelegramPeerDocumentInbox(journal, owned).pending())
+    }
+
+    @Test fun relativeCoordinateBacklogCanExceedTheOldFortyEightItemLimit() {
+        val root = temporary.newFolder()
+        val owned = root.resolve("inbox").apply { mkdirs() }
+        val inbox = TelegramPeerDocumentInbox(root.resolve("journal"), owned)
+
+        repeat(49) { index ->
+            val payload = owned.resolve("payload-$index").apply { writeText("d") }
+            assertTrue(
+                inbox.offer(
+                    entry(payload).copy(
+                        updateId = 100L + index,
+                        transferId = "transfer_${index}_12345678",
+                        localFilePath = payload.absolutePath,
+                    ),
+                ),
+            )
+        }
+
+        assertEquals(49, inbox.pending().size)
+    }
+
+    @Test fun inboxByteBudgetFailsWithATypedRetryableCapacitySignal() {
+        val root = temporary.newFolder()
+        val owned = root.resolve("inbox").apply { mkdirs() }
+        val inbox = TelegramPeerDocumentInbox(
+            journal = root.resolve("journal"),
+            ownedDirectory = owned,
+            maxPendingEntries = 2,
+            maxPendingBytes = 5L,
+        )
+        val first = owned.resolve("first").apply { writeText("abc") }
+        val second = owned.resolve("second").apply { writeText("def") }
+        assertTrue(inbox.offer(entry(first)))
+
+        assertThrows(TelegramPeerInboxCapacityException::class.java) {
+            inbox.offer(
+                entry(second).copy(
+                    updateId = 8L,
+                    transferId = "transfer_456",
+                    localFilePath = second.absolutePath,
+                ),
+            )
+        }
+        assertEquals(1, inbox.pending().size)
     }
 
     @Test fun serverAcceptedAndPeerAcknowledgedReceiptStagesSurviveRestart() {

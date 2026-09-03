@@ -86,19 +86,46 @@ internal class TelegramInboxPoller(
                     val updates = api.getUpdates(offset, POLL_TIMEOUT_SECONDS)
                         .sortedBy(TelegramInboundUpdate::updateId)
                     connectionTracker.success(nowEpochMs())
-                    consecutiveFailures = 0
+                    var blockingFailure: Throwable? = null
                     for (update in updates) {
                         if (!running.get()) break
                         if (update.updateId < offset) continue
-                        if (isAllowedParent(update)) {
-                            val action = update.text?.let(ParentCommandParser::parse)
-                            if (action != null) handler.handle(update, action)
-                        } else if (isAllowedPeerOrHandshake(update)) {
-                            peerHandler?.handle(update)
+                        val barrier = blockingFailure
+                        if (barrier != null) {
+                            // Telegram exposes one ordered update stream per bot. A document which
+                            // must retry keeps ownership of the durable offset, while established,
+                            // idempotent connection controls later in the same fetched batch can
+                            // still repair liveness. Never commit across this gap.
+                            if (isPriorityPeerControlUpdate(update) &&
+                                isAllowedPeerOrHandshake(update)
+                            ) {
+                                runCatching { peerHandler?.handle(update) }
+                                    .exceptionOrNull()
+                                    ?.let(barrier::addSuppressed)
+                            }
+                            continue
                         }
-                        offset = update.updateId + 1L
-                        offsetStore.commit(fingerprint, offset)
+                        try {
+                            if (isAllowedParent(update)) {
+                                val action = update.text?.let(ParentCommandParser::parse)
+                                if (action != null) handler.handle(update, action)
+                            } else if (isAllowedPeerOrHandshake(update)) {
+                                peerHandler?.handle(update)
+                            }
+                            val nextOffset = update.updateId + 1L
+                            offsetStore.commit(fingerprint, nextOffset)
+                            offset = nextOffset
+                            // A durable commit means any later failure belongs to a new barrier.
+                            consecutiveFailures = 0
+                        } catch (error: Throwable) {
+                            if (error is InterruptedException) throw error
+                            blockingFailure = error
+                        }
                     }
+                    blockingFailure?.let { throw it }
+                    // A successful HTTP response is not a successful poll cycle when a handler
+                    // failed. Reset only after every update in the batch reached a durable state.
+                    consecutiveFailures = 0
                 } catch (error: Throwable) {
                     if (!running.get() || error is InterruptedException) break
                     connectionTracker.failure(error, nowEpochMs())
@@ -131,6 +158,19 @@ internal class TelegramInboxPoller(
             update.chatId == credentials.allowedPrivateChatId &&
             !update.senderIsBot &&
             !update.text.isNullOrBlank()
+
+    private fun isPriorityPeerControlUpdate(update: TelegramInboundUpdate): Boolean =
+        when (telegramPeerControlKindHint(update.text)) {
+            TelegramPeerControlKind.RECEIVED,
+            TelegramPeerControlKind.CONNECT_REQUEST,
+            TelegramPeerControlKind.CONNECT_ACCEPT,
+            TelegramPeerControlKind.PING,
+            TelegramPeerControlKind.PONG -> true
+            TelegramPeerControlKind.HELLO,
+            TelegramPeerControlKind.PAIR_ACK,
+            TelegramPeerControlKind.DOCUMENT,
+            TelegramPeerControlKind.OTHER -> false
+        }
 
     private fun isAllowedPeerOrHandshake(update: TelegramInboundUpdate): Boolean {
         if (peerHandler == null) return false
