@@ -11,6 +11,29 @@ internal data class TelegramLatestEnqueueOutcome(
 )
 
 /**
+ * Process-local claim lanes over one durable journal. Keeping the journal shared lets an app
+ * update immediately route already-persisted CONNECT_ACCEPT/PONG entries through the priority
+ * transport without migrating or duplicating durable state.
+ */
+internal enum class TelegramOutboxLane {
+    ALL,
+    REGULAR,
+    PRIORITY_PEER_RESPONSE,
+}
+
+internal fun isPriorityPeerResponse(entry: TelegramOutboxEntry): Boolean =
+    entry.route == TelegramOutboxRoute.PEER &&
+        entry.kind == TelegramOutboxKind.TEXT &&
+        entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_KEY_PREFIX) &&
+        (":accept:" in entry.idempotencyKey || ":pong:" in entry.idempotencyKey)
+
+private fun TelegramOutboxLane.accepts(entry: TelegramOutboxEntry): Boolean = when (this) {
+    TelegramOutboxLane.ALL -> true
+    TelegramOutboxLane.REGULAR -> !isPriorityPeerResponse(entry)
+    TelegramOutboxLane.PRIORITY_PEER_RESPONSE -> isPriorityPeerResponse(entry)
+}
+
+/**
  * Durable append journal adapted from FocusMonitor2 DiskUploadQueue at commit e5809ebc.
  * Stable caller keys survive process death; DONE and DEAD records prevent accidental resends.
  */
@@ -18,6 +41,7 @@ class TelegramOutbox(
     private val journal: File,
     private val maxPendingEntries: Int = DEFAULT_MAX_PENDING,
     private val reservedPeerTextEntries: Int = DEFAULT_RESERVED_PEER_TEXT_ENTRIES,
+    private val reservedPriorityPeerResponseEntries: Int = DEFAULT_RESERVED_PRIORITY_PEER_RESPONSE_ENTRIES,
 ) {
     private val pending = linkedMapOf<String, TelegramOutboxEntry>()
     private val delivered = linkedMapOf<String, Long>()
@@ -29,6 +53,7 @@ class TelegramOutbox(
     init {
         require(maxPendingEntries > 0)
         require(reservedPeerTextEntries >= 0)
+        require(reservedPriorityPeerResponseEntries >= 0)
         require(journal.parentFile?.mkdirs() == true || journal.parentFile?.isDirectory == true)
         replay()
     }
@@ -56,10 +81,21 @@ class TelegramOutbox(
         validate(entry)
         require(isReservedPeerText(entry))
         priorResult(entry.idempotencyKey)?.let { return it }
+        if (isPriorityPeerResponse(entry)) {
+            if (reservedPriorityPeerResponseEntries == 0 ||
+                priorityPeerResponseCount() >= reservedPriorityPeerResponseEntries
+            ) {
+                return TelegramEnqueueResult.QUEUE_FULL
+            }
+            append(encodePut(entry))
+            pending[entry.idempotencyKey] = entry
+            compactIfNeeded()
+            return TelegramEnqueueResult.ENQUEUED
+        }
         if (reservedPeerTextEntries == 0) return TelegramEnqueueResult.QUEUE_FULL
-        if (reservedPeerTextCount() >= reservedPeerTextEntries) {
+        if (regularReservedPeerTextCount() >= reservedPeerTextEntries) {
             val replaceable = pending.values.asSequence()
-                .filter(::isReservedPeerText)
+                .filter(::isRegularReservedPeerText)
                 .filter { it.idempotencyKey !in inFlight }
                 .filter(::isReplaceablePeerProbe)
                 .minWithOrNull(
@@ -259,9 +295,16 @@ class TelegramOutbox(
         )
 
     @Synchronized
-    internal fun claimDue(nowEpochMs: Long): TelegramOutboxEntry? {
+    internal fun claimDue(
+        nowEpochMs: Long,
+        lane: TelegramOutboxLane = TelegramOutboxLane.ALL,
+    ): TelegramOutboxEntry? {
         val entry = pending.values.asSequence()
-            .filter { it.idempotencyKey !in inFlight && it.nextAttemptEpochMs <= nowEpochMs }
+            .filter {
+                lane.accepts(it) &&
+                    it.idempotencyKey !in inFlight &&
+                    it.nextAttemptEpochMs <= nowEpochMs
+            }
             .minWithOrNull(compareBy<TelegramOutboxEntry>({ priority(it) }, { it.createdAtEpochMs }))
             ?: return null
         inFlight += entry.idempotencyKey
@@ -273,7 +316,11 @@ class TelegramOutbox(
     internal fun releaseClaim(idempotencyKey: String): Boolean = inFlight.remove(idempotencyKey)
 
     @Synchronized
-    fun nextWakeEpochMs(): Long? = pending.values.minOfOrNull(TelegramOutboxEntry::nextAttemptEpochMs)
+    internal fun nextWakeEpochMs(
+        lane: TelegramOutboxLane = TelegramOutboxLane.ALL,
+    ): Long? = pending.values.asSequence()
+        .filter(lane::accepts)
+        .minOfOrNull(TelegramOutboxEntry::nextAttemptEpochMs)
 
     @Synchronized
     fun acknowledge(idempotencyKey: String, deliveredAtEpochMs: Long): TelegramOutboxEntry? {
@@ -480,31 +527,38 @@ class TelegramOutbox(
         else -> null
     }
 
-    private fun hasCapacityFor(entry: TelegramOutboxEntry): Boolean = if (isReservedPeerText(entry)) {
-        reservedPeerTextCount() < reservedPeerTextEntries
-    } else {
-        regularPendingCount() < maxPendingEntries
+    private fun hasCapacityFor(entry: TelegramOutboxEntry): Boolean = when {
+        isPriorityPeerResponse(entry) ->
+            priorityPeerResponseCount() < reservedPriorityPeerResponseEntries
+        isReservedPeerText(entry) ->
+            regularReservedPeerTextCount() < reservedPeerTextEntries
+        else -> regularPendingCount() < maxPendingEntries
     }
 
     private fun regularPendingCount(): Int = pending.values.count { !isReservedPeerText(it) }
 
-    private fun reservedPeerTextCount(): Int = pending.values.count(::isReservedPeerText)
+    private fun regularReservedPeerTextCount(): Int = pending.values.count(::isRegularReservedPeerText)
+
+    private fun priorityPeerResponseCount(): Int = pending.values.count(::isPriorityPeerResponse)
 
     private fun isReservedPeerText(entry: TelegramOutboxEntry): Boolean =
         entry.route == TelegramOutboxRoute.PEER && entry.kind == TelegramOutboxKind.TEXT &&
-            (entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_PREFIX) ||
+            (entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_KEY_PREFIX) ||
                 entry.idempotencyKey.startsWith(PEER_DELIVERY_ACK_PREFIX))
 
+    private fun isRegularReservedPeerText(entry: TelegramOutboxEntry): Boolean =
+        isReservedPeerText(entry) && !isPriorityPeerResponse(entry)
+
     private fun peerTextReplacementPriority(entry: TelegramOutboxEntry): Int = when {
-        entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_PREFIX) &&
+        entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_KEY_PREFIX) &&
             (":ping:" in entry.idempotencyKey || ":connect:" in entry.idempotencyKey) -> 0
         entry.idempotencyKey.startsWith(PEER_DELIVERY_ACK_PREFIX) -> 1
-        entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_PREFIX) -> 2
+        entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_KEY_PREFIX) -> 2
         else -> 3
     }
 
     private fun isReplaceablePeerProbe(entry: TelegramOutboxEntry): Boolean =
-        entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_PREFIX) &&
+        entry.idempotencyKey.startsWith(PEER_LINK_CONTROL_KEY_PREFIX) &&
             (":ping:" in entry.idempotencyKey || ":connect:" in entry.idempotencyKey)
 
     private fun isImmutableLatestEntry(entry: TelegramOutboxEntry): Boolean =
@@ -695,13 +749,15 @@ class TelegramOutbox(
         const val PUT_FIELD_COUNT = 18
         const val DEFAULT_MAX_PENDING = 512
         const val DEFAULT_RESERVED_PEER_TEXT_ENTRIES = 4
+        const val DEFAULT_RESERVED_PRIORITY_PEER_RESPONSE_ENTRIES = 8
         const val MAX_DELIVERED_KEYS = 10_000
         const val MAX_DEAD_LETTERS = 512
         const val MAX_SUPERSEDED_KEYS = 10_000
         const val MAX_REASON_CHARS = 240
         const val MAX_COALESCE_KEY_CHARS = 120
         const val COMPACT_AFTER_RECORDS = 256
-        const val PEER_LINK_CONTROL_PREFIX = "telegram-peer-control:"
         const val PEER_DELIVERY_ACK_PREFIX = "telegram-peer-received:"
     }
 }
+
+private const val PEER_LINK_CONTROL_KEY_PREFIX = "telegram-peer-control:"

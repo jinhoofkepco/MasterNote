@@ -202,6 +202,9 @@ internal class TelegramOutboxProcessor(
     private val jitter: TelegramJitterSource,
     private val credentialsProvider: () -> TelegramCredentials = { credentials },
     private val peerReceipts: TelegramPeerReceiptStore? = null,
+    private val lane: TelegramOutboxLane = TelegramOutboxLane.ALL,
+    private val rateLimitPropagationGate: TelegramRetryGate? = null,
+    private val onPermanentFailure: (String) -> Unit = {},
 ) : AutoCloseable {
     private val claimStateLock = Any()
     private var closed = false
@@ -211,7 +214,7 @@ internal class TelegramOutboxProcessor(
         val gate = retryGate.nextAllowedEpochMs()
         if (gate > nowEpochMs) return OutboxProcessResult.Waiting(gate)
         retryGate.clearIfElapsed(nowEpochMs)
-        val entry = outbox.claimDue(nowEpochMs) ?: return outbox.nextWakeEpochMs()
+        val entry = outbox.claimDue(nowEpochMs, lane) ?: return outbox.nextWakeEpochMs(lane)
             ?.let(OutboxProcessResult::Waiting) ?: OutboxProcessResult.Idle
         if (!registerPreTransportClaim(entry.idempotencyKey)) {
             outbox.releaseClaim(entry.idempotencyKey)
@@ -377,6 +380,7 @@ internal class TelegramOutboxProcessor(
             return if (TelegramRetryPolicy.isPermanent(error)) {
                 val dead = outbox.deadLetter(entry.idempotencyKey, reason, nowEpochMs)
                 if (dead?.entry?.deleteAfterSend == true) deleteOwnedFile(dead.entry.file)
+                if (dead != null) runCatching { onPermanentFailure(reason) }
                 OutboxProcessResult.Dead(entry.idempotencyKey)
             } else {
                 val delay = TelegramRetryPolicy.retryDelayMs(
@@ -388,6 +392,7 @@ internal class TelegramOutboxProcessor(
                 outbox.retry(entry.idempotencyKey, nowEpochMs, delay, reason)
                 if (error is TelegramApiException && error.statusCode == 429) {
                     retryGate.deferUntil(next)
+                    rateLimitPropagationGate?.deferUntil(next)
                 }
                 OutboxProcessResult.Retried(entry.idempotencyKey, next)
             }
@@ -498,11 +503,15 @@ internal class TelegramOutboxWorker(
     private val processor: TelegramOutboxProcessor,
     private val nowEpochMs: () -> Long,
     private val onFatalError: (Throwable) -> Unit = {},
+    private val lane: TelegramOutboxLane = TelegramOutboxLane.ALL,
 ) : AutoCloseable {
     private val running = AtomicBoolean(false)
     private val signalLock = ReentrantLock()
     private val signal = signalLock.newCondition()
-    private val executor = Executors.newSingleThreadExecutor(namedThreadFactory("telegram-outbox"))
+    private var wakeRequested = false
+    private val executor = Executors.newSingleThreadExecutor(
+        namedThreadFactory("telegram-outbox-${lane.name.lowercase()}"),
+    )
     val isRunning: Boolean get() = running.get()
 
     fun start() {
@@ -510,7 +519,10 @@ internal class TelegramOutboxWorker(
         executor.execute(::loop)
     }
 
-    fun wake() = signalLock.withLock { signal.signalAll() }
+    fun wake() = signalLock.withLock {
+        wakeRequested = true
+        signal.signalAll()
+    }
 
     private fun loop() {
         try {
@@ -522,7 +534,7 @@ internal class TelegramOutboxWorker(
                         .coerceIn(MIN_WAKE_MS, IDLE_WAKE_MS)
                     is OutboxProcessResult.Sent, is OutboxProcessResult.Dead -> 0L
                     is OutboxProcessResult.Retried -> {
-                        val queueWake = outbox.nextWakeEpochMs() ?: result.atEpochMs
+                        val queueWake = outbox.nextWakeEpochMs(lane) ?: result.atEpochMs
                         val gateWake = retryGate.nextAllowedEpochMs()
                         (maxOf(queueWake, gateWake) - nowEpochMs()).coerceIn(MIN_WAKE_MS, IDLE_WAKE_MS)
                     }
@@ -530,7 +542,10 @@ internal class TelegramOutboxWorker(
                 if (waitMs <= 0L) continue
                 try {
                     signalLock.withLock {
-                        if (running.get()) signal.awaitNanos(waitMs * 1_000_000L)
+                        if (running.get() && !wakeRequested) {
+                            signal.awaitNanos(waitMs * 1_000_000L)
+                        }
+                        wakeRequested = false
                     }
                 } catch (_: InterruptedException) {
                     break

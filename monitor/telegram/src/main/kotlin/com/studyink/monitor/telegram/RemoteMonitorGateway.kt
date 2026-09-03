@@ -12,8 +12,8 @@ import com.studyink.monitor.core.StudentStudyPresenceBus
 import java.io.File
 
 /**
- * Process singleton used by the app coordinator. It owns exactly one long poller and one serialized
- * upload worker, while Reader/Library integrations communicate only through monitor:core buses.
+ * Process singleton used by the app coordinator. It owns one long poller plus isolated regular and
+ * priority-response upload workers, while Reader/Library integrations use monitor:core buses.
  */
 class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable {
     private val paths = TelegramStoragePaths.from(context)
@@ -21,6 +21,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
     private val offsets = TelegramUpdateOffsetStore(paths.offsetFile)
     private val outbox = TelegramOutbox(paths.outboxJournal)
     private val retryGate = TelegramRetryGate(paths.retryGateFile)
+    private val priorityRetryGate = TelegramRetryGate(paths.priorityRetryGateFile)
     private val preferenceStore = RemoteMonitorPreferencesStore(paths)
     private val parentMessageInbox = TelegramParentMessageInbox(paths.parentMessageInboxFile)
     private val screenRequestInbox = TelegramScreenRequestInbox(paths.screenRequestInboxFile)
@@ -35,6 +36,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
     private val peerLinkListeners = linkedSetOf<(TelegramPeerLinkState) -> Unit>()
     private var poller: TelegramInboxPoller? = null
     private var uploader: TelegramOutboxWorker? = null
+    private var priorityUploader: TelegramOutboxWorker? = null
     private var currentStatus: RemoteMonitorStatus = if (credentials.load() == null) {
         RemoteMonitorStatus.NotConfigured
     } else {
@@ -553,7 +555,9 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
     }
 
     fun start(): Boolean = synchronized(lifecycleLock) {
-        if (poller?.isRunning == true && uploader?.isRunning == true) return true
+        if (poller?.isRunning == true && uploader?.isRunning == true &&
+            priorityUploader?.isRunning == true
+        ) return true
         val activeCredentials = credentials.load() ?: run {
             updateStatus(RemoteMonitorStatus.NotConfigured)
             return false
@@ -587,6 +591,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         }
         val pollApi = HttpTelegramBotApi(activeCredentials.botToken)
         val uploadApi = HttpTelegramBotApi(activeCredentials.botToken)
+        val priorityUploadApi = HttpTelegramBotApi(activeCredentials.botToken)
         val nextPoller = TelegramInboxPoller(
             credentials = activeCredentials,
             api = pollApi,
@@ -618,6 +623,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             jitter = defaultTelegramJitter,
             credentialsProvider = { credentials.load() ?: activeCredentials },
             peerReceipts = peerReceipts,
+            lane = TelegramOutboxLane.REGULAR,
         )
         val nextUploader = TelegramOutboxWorker(
             outbox = outbox,
@@ -632,15 +638,64 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                     ),
                 )
             },
+            lane = TelegramOutboxLane.REGULAR,
+        )
+        val priorityProcessor = TelegramOutboxProcessor(
+            credentials = activeCredentials,
+            api = priorityUploadApi,
+            outbox = outbox,
+            retryGate = priorityRetryGate,
+            connectionTracker = connectionTracker,
+            ownedMediaRoot = paths.mediaDirectory,
+            jitter = defaultTelegramJitter,
+            credentialsProvider = { credentials.load() ?: activeCredentials },
+            peerReceipts = peerReceipts,
+            lane = TelegramOutboxLane.PRIORITY_PEER_RESPONSE,
+            // A priority-lane 429 is useful pressure information for bulk traffic too. The inverse
+            // is intentionally not propagated, so a document throttle cannot delay ACCEPT/PONG.
+            rateLimitPropagationGate = retryGate,
+            onPermanentFailure = { reason ->
+                // Keep this observable even if a subsequent successful long-poll changes the
+                // aggregate connection status back to Connected.
+                Log.e(PRIORITY_OUTBOX_LOG_TAG, "Priority peer response permanently rejected")
+                updateStatus(
+                    RemoteMonitorStatus.Error(
+                        activeCredentials.chatLabel,
+                        "우선 응답 전송 실패 · $reason",
+                    ),
+                )
+            },
+        )
+        val nextPriorityUploader = TelegramOutboxWorker(
+            outbox = outbox,
+            retryGate = priorityRetryGate,
+            processor = priorityProcessor,
+            nowEpochMs = System::currentTimeMillis,
+            onFatalError = { error ->
+                updateStatus(
+                    RemoteMonitorStatus.Error(
+                        activeCredentials.chatLabel,
+                        "우선 응답 큐 오류 · ${TelegramRetryPolicy.shortReason(error)}",
+                    ),
+                )
+            },
+            lane = TelegramOutboxLane.PRIORITY_PEER_RESPONSE,
         )
         if (!nextPoller.start()) {
             nextPoller.close()
+            nextUploader.close()
+            nextPriorityUploader.close()
             updateStatus(RemoteMonitorStatus.Error(activeCredentials.chatLabel, "이 봇의 수신기가 이미 실행 중입니다."))
             return false
         }
-        nextUploader.start()
+        // Publish both references before either sender can become idle. If the already-running
+        // poller enqueues a response in this narrow startup window, wake() is remembered even
+        // though the corresponding sender thread has not started yet.
         poller = nextPoller
         uploader = nextUploader
+        priorityUploader = nextPriorityUploader
+        nextPriorityUploader.start()
+        nextUploader.start()
         true
     }
 
@@ -876,26 +931,25 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
     ): TelegramEnqueueResult {
         val peer = active.peerBinding ?: return TelegramEnqueueResult.NOT_CONFIGURED
         val pairId = active.peerPairId ?: return TelegramEnqueueResult.NOT_CONFIGURED
-        val result = outbox.enqueuePeerLinkControl(
-            TelegramOutboxEntry(
-                idempotencyKey = "telegram-peer-control:$pairId:$kind:$transferId",
-                destinationChatId = peer.botId,
-                kind = TelegramOutboxKind.TEXT,
-                filePath = null,
-                text = text,
-                mimeType = null,
-                displayName = null,
-                attempts = 0,
-                nextAttemptEpochMs = nowEpochMs,
-                createdAtEpochMs = nowEpochMs,
-                deleteAfterSend = false,
-                route = TelegramOutboxRoute.PEER,
-                destinationUsername = peer.username,
-                peerTransferId = transferId,
-            ),
+        val entry = TelegramOutboxEntry(
+            idempotencyKey = "telegram-peer-control:$pairId:$kind:$transferId",
+            destinationChatId = peer.botId,
+            kind = TelegramOutboxKind.TEXT,
+            filePath = null,
+            text = text,
+            mimeType = null,
+            displayName = null,
+            attempts = 0,
+            nextAttemptEpochMs = nowEpochMs,
+            createdAtEpochMs = nowEpochMs,
+            deleteAfterSend = false,
+            route = TelegramOutboxRoute.PEER,
+            destinationUsername = peer.username,
+            peerTransferId = transferId,
         )
+        val result = outbox.enqueuePeerLinkControl(entry)
         if (result.isDurablyQueued()) {
-            uploader?.wake()
+            if (isPriorityPeerResponse(entry)) priorityUploader?.wake() else uploader?.wake()
             // A manual request can arrive while the inbox poller is in a long network backoff.
             // Wake its interrupt-safe retry condition so CONNECT_ACCEPT/PONG is observed promptly.
             poller?.wake()
@@ -1297,7 +1351,8 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
 
     /** Stops a possible in-flight upload before revoking its key/destination, then resumes. */
     private inline fun <T> mutatePeerWorkersLocked(block: () -> T): T {
-        val restart = poller?.isRunning == true || uploader?.isRunning == true
+        val restart = poller?.isRunning == true || uploader?.isRunning == true ||
+            priorityUploader?.isRunning == true
         if (restart) stopLocked(updateStoppedStatus = false)
         return try {
             block()
@@ -1414,8 +1469,10 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
 
     private fun stopLocked(updateStoppedStatus: Boolean) {
         poller?.close()
+        priorityUploader?.close()
         uploader?.close()
         poller = null
+        priorityUploader = null
         uploader = null
         if (updateStoppedStatus) {
             updateStatus(if (credentials.load() == null) RemoteMonitorStatus.NotConfigured else RemoteMonitorStatus.Stopped)
@@ -1694,6 +1751,7 @@ internal fun withinPeerDocumentDiskQuota(
 private const val MAX_PENDING_PEER_DOCUMENTS = 48
 private const val MAX_PENDING_PEER_DOCUMENT_BYTES = 96L * 1_024L * 1_024L
 private const val PEER_INBOUND_LOG_TAG = "MasterNotePeerInbound"
+private const val PRIORITY_OUTBOX_LOG_TAG = "MasterNotePeerOut"
 
 /** A retransmitted document gets a fresh ACK while duplicate handling stays idempotent per update. */
 internal fun peerDeliveryAckInstanceId(pairId: String, transferId: String, updateId: Long): String {

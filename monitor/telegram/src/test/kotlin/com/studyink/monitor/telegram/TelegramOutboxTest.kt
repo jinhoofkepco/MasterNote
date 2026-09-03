@@ -73,6 +73,74 @@ class TelegramOutboxTest {
         }
     }
 
+    @Test fun regularAndPriorityPeerResponseLanesClaimOnlyTheirOwnEntries() {
+        val queue = TelegramOutbox(temporary.newFile("isolated-lanes.v1"))
+        val accept = peerControl(
+            "telegram-peer-control:pair_identifier_123:accept:accept_request_001",
+            "accept_request_001",
+            1L,
+        )
+        val pong = peerControl(
+            "telegram-peer-control:pair_identifier_123:pong:pong_nonce_001",
+            "pong_nonce_001",
+            2L,
+        )
+        val connect = peerControl(
+            "telegram-peer-control:pair_identifier_123:connect:request_001",
+            "request_001",
+            10L,
+        )
+        val ping = peerControl(
+            "telegram-peer-control:pair_identifier_123:ping:nonce_001",
+            "nonce_001",
+            20L,
+        )
+        val parentText = textEntry("ordinary-parent", 30L)
+        listOf(accept, pong, connect, ping).forEach {
+            assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueuePeerLinkControl(it))
+        }
+        assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueue(parentText))
+
+        assertEquals(1L, queue.nextWakeEpochMs(TelegramOutboxLane.PRIORITY_PEER_RESPONSE))
+        assertEquals(10L, queue.nextWakeEpochMs(TelegramOutboxLane.REGULAR))
+
+        assertEquals(connect, queue.claimDue(100L, TelegramOutboxLane.REGULAR))
+        queue.acknowledge(connect.idempotencyKey, 101L)
+        assertEquals(accept, queue.claimDue(100L, TelegramOutboxLane.PRIORITY_PEER_RESPONSE))
+        queue.acknowledge(accept.idempotencyKey, 102L)
+        assertEquals(ping, queue.claimDue(100L, TelegramOutboxLane.REGULAR))
+        queue.acknowledge(ping.idempotencyKey, 103L)
+        assertEquals(pong, queue.claimDue(100L, TelegramOutboxLane.PRIORITY_PEER_RESPONSE))
+        queue.acknowledge(pong.idempotencyKey, 104L)
+        assertEquals(parentText, queue.claimDue(100L, TelegramOutboxLane.REGULAR))
+        assertNull(queue.claimDue(100L, TelegramOutboxLane.PRIORITY_PEER_RESPONSE))
+    }
+
+    @Test fun replayedLegacyPeerResponsesAreRecoveredIntoPriorityLane() {
+        val journal = temporary.newFile("replayed-priority-peer-responses.v1")
+        val accept = peerControl(
+            "telegram-peer-control:pair_identifier_123:accept:accept_request_002",
+            "accept_request_002",
+            5L,
+        )
+        val pong = peerControl(
+            "telegram-peer-control:pair_identifier_123:pong:pong_nonce_002",
+            "pong_nonce_002",
+            6L,
+        )
+        TelegramOutbox(journal).also { queue ->
+            assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueuePeerLinkControl(accept))
+            assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueuePeerLinkControl(pong))
+        }
+
+        val replayed = TelegramOutbox(journal)
+        assertNull(replayed.claimDue(100L, TelegramOutboxLane.REGULAR))
+        assertEquals(5L, replayed.nextWakeEpochMs(TelegramOutboxLane.PRIORITY_PEER_RESPONSE))
+        assertEquals(accept, replayed.claimDue(100L, TelegramOutboxLane.PRIORITY_PEER_RESPONSE))
+        replayed.acknowledge(accept.idempotencyKey, 101L)
+        assertEquals(pong, replayed.claimDue(100L, TelegramOutboxLane.PRIORITY_PEER_RESPONSE))
+    }
+
     private fun documentEntry(key: String, name: String, createdAt: Long) = TelegramOutboxEntry(
             idempotencyKey = key,
             destinationChatId = 7L,
@@ -224,22 +292,38 @@ class TelegramOutboxTest {
         assertFalse(queue.hasSeen("never-seen"))
     }
 
-    @Test fun peerLinkControlsUseReservedCapacityAndSupersedeOldProbeFirst() {
+    @Test fun regularControlsAndPriorityResponsesUseIndependentReservedCapacity() {
         val journal = temporary.newFile("reserved-controls.v1")
-        val queue = TelegramOutbox(journal, maxPendingEntries = 1, reservedPeerTextEntries = 2)
+        val queue = TelegramOutbox(
+            journal,
+            maxPendingEntries = 1,
+            reservedPeerTextEntries = 1,
+            reservedPriorityPeerResponseEntries = 2,
+        )
         assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueue(textEntry("ordinary", 1L)))
         assertEquals(TelegramEnqueueResult.QUEUE_FULL, queue.enqueue(textEntry("ordinary-2", 2L)))
 
         val ping = peerControl("telegram-peer-control:pair:ping:nonce_123", "nonce_123", 3L)
         val accept = peerControl("telegram-peer-control:pair:accept:request_123", "accept_request_123", 4L)
         val pong = peerControl("telegram-peer-control:pair:pong:nonce_456", "pong_nonce_456", 5L)
+        val received = peerControl(
+            "telegram-peer-received:pair_transfer_update_123",
+            "received_transfer_123",
+            6L,
+        )
         assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueuePeerLinkControl(ping))
         assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueuePeerLinkControl(accept))
         assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueuePeerLinkControl(pong))
+        assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueuePeerLinkControl(received))
 
         assertEquals(
-            setOf("ordinary", accept.idempotencyKey, pong.idempotencyKey),
-            TelegramOutbox(journal, maxPendingEntries = 1, reservedPeerTextEntries = 2)
+            setOf("ordinary", received.idempotencyKey, accept.idempotencyKey, pong.idempotencyKey),
+            TelegramOutbox(
+                journal,
+                maxPendingEntries = 1,
+                reservedPeerTextEntries = 1,
+                reservedPriorityPeerResponseEntries = 2,
+            )
                 .pendingSnapshot().mapTo(linkedSetOf(), TelegramOutboxEntry::idempotencyKey),
         )
         assertEquals(TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED, queue.enqueuePeerLinkControl(ping))
@@ -259,7 +343,7 @@ class TelegramOutboxTest {
         assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueuePeerLinkControl(ping))
         assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueuePeerLinkControl(pong))
         assertEquals(
-            setOf(peerChat.idempotencyKey, pong.idempotencyKey),
+            setOf(peerChat.idempotencyKey, ping.idempotencyKey, pong.idempotencyKey),
             queue.pendingSnapshot().mapTo(linkedSetOf(), TelegramOutboxEntry::idempotencyKey),
         )
     }
@@ -283,11 +367,12 @@ class TelegramOutboxTest {
         assertEquals(TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED, queue.enqueuePeerLinkControl(ping))
     }
 
-    @Test fun essentialReservedResponsesCannotSupersedeEachOther() {
+    @Test fun priorityResponseCapacityIsIndependentFromDeliveryAcknowledgements() {
         val queue = TelegramOutbox(
             temporary.newFile("essential-response-reserve.v1"),
             maxPendingEntries = 1,
             reservedPeerTextEntries = 1,
+            reservedPriorityPeerResponseEntries = 1,
         )
         val received = peerControl(
             "telegram-peer-received:pair_transfer_update_123",
@@ -295,10 +380,15 @@ class TelegramOutboxTest {
             1L,
         )
         val pong = peerControl("telegram-peer-control:pair:pong:nonce_456", "pong_nonce_456", 2L)
+        val accept = peerControl("telegram-peer-control:pair:accept:request_456", "accept_request_456", 3L)
 
         assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueuePeerLinkControl(received))
-        assertEquals(TelegramEnqueueResult.QUEUE_FULL, queue.enqueuePeerLinkControl(pong))
-        assertEquals(listOf(received.idempotencyKey), queue.pendingSnapshot().map { it.idempotencyKey })
+        assertEquals(TelegramEnqueueResult.ENQUEUED, queue.enqueuePeerLinkControl(pong))
+        assertEquals(TelegramEnqueueResult.QUEUE_FULL, queue.enqueuePeerLinkControl(accept))
+        assertEquals(
+            setOf(received.idempotencyKey, pong.idempotencyKey),
+            queue.pendingSnapshot().mapTo(linkedSetOf(), TelegramOutboxEntry::idempotencyKey),
+        )
     }
 
     @Test fun parentRoleCancellationRemovesEveryParentKindButLeavesPeerTraffic() {

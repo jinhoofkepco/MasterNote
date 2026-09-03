@@ -15,6 +15,7 @@ class TelegramStoragePaths private constructor(val root: File) {
     val outboxJournal = root.resolve("outbox-journal.v1")
     val connectionStateFile = root.resolve("connection-state.v1")
     val retryGateFile = root.resolve("retry-gate.v1")
+    val priorityRetryGateFile = root.resolve("priority-retry-gate.v1")
     val preferencesFile = root.resolve("preferences.v1")
     val parentMessageInboxFile = root.resolve("parent-message-inbox.v1")
     val screenRequestInboxFile = root.resolve("screen-request-inbox.v1")

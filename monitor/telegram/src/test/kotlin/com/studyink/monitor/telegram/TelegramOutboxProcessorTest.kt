@@ -26,6 +26,152 @@ class TelegramOutboxProcessorTest {
         assertEquals(1, fixture.outbox.pendingSnapshot().single().attempts)
     }
 
+    @Test fun regularRateLimitGateDoesNotBlockPriorityPeerResponseProcessor() {
+        val root = temporary.newFolder()
+        val outbox = TelegramOutbox(root.resolve("outbox"))
+        val regularGate = TelegramRetryGate(root.resolve("regular-gate"))
+        val priorityGate = TelegramRetryGate(root.resolve("priority-gate"))
+        val tracker = TelegramConnectionTracker(
+            TelegramConnectionStateStore(root.resolve("connection")),
+        ) {}
+        val credentials = peerCredentials()
+        val regularApi = FakeApi(TelegramApiException(429, "rate limited", retryAfterSeconds = 17L))
+        val priorityApi = FakeApi(null)
+        val regularProcessor = TelegramOutboxProcessor(
+            credentials,
+            regularApi,
+            outbox,
+            regularGate,
+            tracker,
+            root,
+            TelegramJitterSource { 0.0 },
+            lane = TelegramOutboxLane.REGULAR,
+        )
+        val priorityProcessor = TelegramOutboxProcessor(
+            credentials,
+            priorityApi,
+            outbox,
+            priorityGate,
+            tracker,
+            root,
+            TelegramJitterSource { 0.0 },
+            lane = TelegramOutboxLane.PRIORITY_PEER_RESPONSE,
+        )
+        val response = priorityPeerResponse("accept", "accept_request_001", "CONNECT_ACCEPT")
+        outbox.enqueue(textEntry("ordinary-rate-limited"))
+
+        assertEquals(
+            OutboxProcessResult.Retried("ordinary-rate-limited", 18_000L),
+            regularProcessor.processOne(1_000L),
+        )
+        assertEquals(18_000L, regularGate.nextAllowedEpochMs())
+        assertEquals(TelegramEnqueueResult.ENQUEUED, outbox.enqueuePeerLinkControl(response))
+
+        assertEquals(
+            OutboxProcessResult.Sent(response.idempotencyKey),
+            priorityProcessor.processOne(1_000L),
+        )
+        assertEquals(listOf("CONNECT_ACCEPT"), priorityApi.sentPeerTexts)
+        assertEquals(0L, priorityGate.nextAllowedEpochMs())
+        assertEquals(18_000L, regularGate.nextAllowedEpochMs())
+    }
+
+    @Test fun priorityRateLimitIsPersistedAndAlsoThrottlesRegularTraffic() {
+        val root = temporary.newFolder()
+        val outbox = TelegramOutbox(root.resolve("outbox"))
+        val regularGateFile = root.resolve("regular-gate")
+        val priorityGateFile = root.resolve("priority-gate")
+        val regularGate = TelegramRetryGate(regularGateFile)
+        val priorityGate = TelegramRetryGate(priorityGateFile)
+        val tracker = TelegramConnectionTracker(
+            TelegramConnectionStateStore(root.resolve("connection")),
+        ) {}
+        val processor = TelegramOutboxProcessor(
+            peerCredentials(),
+            FakeApi(TelegramApiException(429, "rate limited", retryAfterSeconds = 17L)),
+            outbox,
+            priorityGate,
+            tracker,
+            root,
+            TelegramJitterSource { 0.0 },
+            lane = TelegramOutboxLane.PRIORITY_PEER_RESPONSE,
+            rateLimitPropagationGate = regularGate,
+        )
+        val response = priorityPeerResponse("pong", "pong_nonce_429", "PONG")
+        assertEquals(TelegramEnqueueResult.ENQUEUED, outbox.enqueuePeerLinkControl(response))
+
+        assertEquals(
+            OutboxProcessResult.Retried(response.idempotencyKey, 18_000L),
+            processor.processOne(1_000L),
+        )
+        assertEquals(18_000L, TelegramRetryGate(priorityGateFile).nextAllowedEpochMs())
+        assertEquals(18_000L, TelegramRetryGate(regularGateFile).nextAllowedEpochMs())
+    }
+
+    @Test fun blockedRegularDocumentUploadDoesNotDelayPriorityAcceptOnSeparateProcessor() {
+        val root = temporary.newFolder()
+        val payload = root.resolve("blocked-payload.mne").apply { writeText("encrypted") }
+        val outbox = TelegramOutbox(root.resolve("outbox"))
+        val receipts = TelegramPeerReceiptStore(root.resolve("receipts"))
+        val tracker = TelegramConnectionTracker(
+            TelegramConnectionStateStore(root.resolve("connection")),
+        ) {}
+        val documentStarted = CountDownLatch(1)
+        val releaseDocument = CountDownLatch(1)
+        val regularApi = FakeApi(
+            failure = null,
+            peerDocumentStarted = documentStarted,
+            releasePeerDocument = releaseDocument,
+        )
+        val priorityApi = FakeApi(null)
+        val credentials = peerCredentials()
+        val regularProcessor = TelegramOutboxProcessor(
+            credentials,
+            regularApi,
+            outbox,
+            TelegramRetryGate(root.resolve("regular-gate")),
+            tracker,
+            root,
+            TelegramJitterSource { 0.0 },
+            peerReceipts = receipts,
+            lane = TelegramOutboxLane.REGULAR,
+        )
+        val priorityProcessor = TelegramOutboxProcessor(
+            credentials,
+            priorityApi,
+            outbox,
+            TelegramRetryGate(root.resolve("priority-gate")),
+            tracker,
+            root,
+            TelegramJitterSource { 0.0 },
+            lane = TelegramOutboxLane.PRIORITY_PEER_RESPONSE,
+        )
+        val document = peerEntry("peer:blocked", "transfer_blocked", payload)
+        val accept = priorityPeerResponse("accept", "accept_request_002", "CONNECT_ACCEPT")
+        assertEquals(TelegramEnqueueResult.ENQUEUED, outbox.enqueue(document))
+        assertEquals(TelegramEnqueueResult.ENQUEUED, outbox.enqueuePeerLinkControl(accept))
+        val executor = Executors.newSingleThreadExecutor()
+        val regularResult = executor.submit<OutboxProcessResult> {
+            regularProcessor.processOne(1_000L)
+        }
+
+        assertTrue(documentStarted.await(1L, TimeUnit.SECONDS))
+        try {
+            assertEquals(
+                OutboxProcessResult.Sent(accept.idempotencyKey),
+                priorityProcessor.processOne(1_000L),
+            )
+            assertEquals(listOf("CONNECT_ACCEPT"), priorityApi.sentPeerTexts)
+        } finally {
+            releaseDocument.countDown()
+        }
+        assertEquals(
+            OutboxProcessResult.Retried(document.idempotencyKey, 1_000L + PEER_ACK_RETENTION_MS),
+            regularResult.get(2L, TimeUnit.SECONDS),
+        )
+        executor.shutdownNow()
+    }
+
     @Test fun permanentFailureMovesEntryToDeadLetter() {
         val fixture = fixture(TelegramApiException(401, "Unauthorized"))
         fixture.outbox.enqueue(textEntry("message:4"))
@@ -33,6 +179,34 @@ class TelegramOutboxProcessorTest {
         assertEquals(OutboxProcessResult.Dead("message:4"), fixture.processor.processOne(1_000L))
         assertEquals(0, fixture.outbox.size())
         assertEquals("message:4", fixture.outbox.deadLetters().single().entry.idempotencyKey)
+    }
+
+    @Test fun permanentPriorityFailureIsReportedImmediately() {
+        val root = temporary.newFolder()
+        val outbox = TelegramOutbox(root.resolve("outbox"))
+        var reportedReason: String? = null
+        val processor = TelegramOutboxProcessor(
+            peerCredentials(),
+            FakeApi(TelegramApiException(400, "USER_BOT_TO_BOT_DISABLED")),
+            outbox,
+            TelegramRetryGate(root.resolve("priority-gate")),
+            TelegramConnectionTracker(
+                TelegramConnectionStateStore(root.resolve("connection")),
+            ) {},
+            root,
+            TelegramJitterSource { 0.0 },
+            lane = TelegramOutboxLane.PRIORITY_PEER_RESPONSE,
+            onPermanentFailure = { reportedReason = it },
+        )
+        val response = priorityPeerResponse("accept", "accept_request_400", "CONNECT_ACCEPT")
+        assertEquals(TelegramEnqueueResult.ENQUEUED, outbox.enqueuePeerLinkControl(response))
+
+        assertEquals(
+            OutboxProcessResult.Dead(response.idempotencyKey),
+            processor.processOne(1_000L),
+        )
+        assertEquals("Telegram 400 · USER_BOT_TO_BOT_DISABLED", reportedReason)
+        assertEquals("Telegram 400 · USER_BOT_TO_BOT_DISABLED", outbox.deadLetters().single().reason)
     }
 
     @Test fun successAcknowledgesWithoutKeepingPayloadInMemory() {
@@ -485,6 +659,23 @@ class TelegramOutboxProcessorTest {
         peerTransferId = transferId,
     )
 
+    private fun priorityPeerResponse(kind: String, transferId: String, text: String) = TelegramOutboxEntry(
+        idempotencyKey = "telegram-peer-control:pair_identifier_123:$kind:$transferId",
+        destinationChatId = 202L,
+        kind = TelegramOutboxKind.TEXT,
+        filePath = null,
+        text = text,
+        mimeType = null,
+        displayName = null,
+        attempts = 0,
+        nextAttemptEpochMs = 0L,
+        createdAtEpochMs = 0L,
+        deleteAfterSend = false,
+        route = TelegramOutboxRoute.PEER,
+        destinationUsername = "teacher_bot",
+        peerTransferId = transferId,
+    )
+
     private data class Fixture(
         val outbox: TelegramOutbox,
         val gate: TelegramRetryGate,
@@ -492,8 +683,13 @@ class TelegramOutboxProcessorTest {
         val processor: TelegramOutboxProcessor,
     )
 
-    private class FakeApi(var failure: Throwable?) : TelegramBotApi {
+    private class FakeApi(
+        var failure: Throwable?,
+        private val peerDocumentStarted: CountDownLatch? = null,
+        private val releasePeerDocument: CountDownLatch? = null,
+    ) : TelegramBotApi {
         val sentTexts = mutableListOf<String>()
+        val sentPeerTexts = mutableListOf<String>()
         var sentPeerDocuments = 0
         override fun getMe() = error("unused")
         override fun deleteWebhook() = Unit
@@ -502,6 +698,11 @@ class TelegramOutboxProcessorTest {
             failure?.let { throw it }
             sentTexts += text
             return TelegramSendResult(1L)
+        }
+        override fun sendPeerMessage(peerUsername: String, text: String): TelegramSendResult {
+            failure?.let { throw it }
+            sentPeerTexts += text
+            return TelegramSendResult(2L)
         }
         override fun sendDocument(chatId: Long, document: File, caption: String, mimeType: String, displayName: String) = error("unused")
         override fun sendVoice(chatId: Long, voice: File, caption: String, mimeType: String, displayName: String) = error("unused")
@@ -512,6 +713,8 @@ class TelegramOutboxProcessorTest {
             mimeType: String,
             displayName: String,
         ): TelegramSendResult {
+            peerDocumentStarted?.countDown()
+            releasePeerDocument?.let { check(it.await(5L, TimeUnit.SECONDS)) }
             failure?.let { throw it }
             sentPeerDocuments++
             return TelegramSendResult(91L)
