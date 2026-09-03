@@ -48,6 +48,8 @@ internal class TelegramInboxPoller(
     private val onFatalError: (Throwable) -> Unit,
     private val credentialsProvider: () -> TelegramCredentials = { credentials },
     private val peerHandler: TelegramPeerInboundHandler? = null,
+    private val onPeerUpdateEvent: (TelegramPeerUpdateEvent) -> Unit = {},
+    private val onPollFailureEvent: (TelegramPeerPollFailureEvent) -> Unit = {},
 ) : AutoCloseable {
     private val running = AtomicBoolean(false)
     private val executor = Executors.newSingleThreadExecutor(namedThreadFactory("telegram-inbox"))
@@ -100,7 +102,9 @@ internal class TelegramInboxPoller(
                 } catch (error: Throwable) {
                     if (!running.get() || error is InterruptedException) break
                     connectionTracker.failure(error, nowEpochMs())
-                    if (TelegramRetryPolicy.isPermanent(error)) {
+                    val permanent = TelegramRetryPolicy.isPermanent(error)
+                    if (permanent) {
+                        emitPollFailure(error, permanent = true, retryDelayMs = null)
                         onFatalError(error)
                         break
                     }
@@ -109,6 +113,7 @@ internal class TelegramInboxPoller(
                         consecutiveFailures++,
                         jitter.nextFraction().coerceIn(0.0, 1.0),
                     )
+                    emitPollFailure(error, permanent = false, retryDelayMs = delayMs)
                     if (!awaitRetryDelay(delayMs)) break
                 }
             }
@@ -128,19 +133,55 @@ internal class TelegramInboxPoller(
             !update.text.isNullOrBlank()
 
     private fun isAllowedPeerOrHandshake(update: TelegramInboundUpdate): Boolean {
-        if (peerHandler == null || update.chatType != "private" || !update.senderIsBot) return false
-        val senderId = update.senderId ?: return false
+        if (peerHandler == null) return false
+        val kind = telegramPeerControlKindHint(update.text ?: update.caption)
+        val isCandidate = update.senderIsBot || kind != TelegramPeerControlKind.OTHER
+        fun decide(decision: TelegramPeerUpdateDecision): Boolean {
+            if (isCandidate) {
+                runCatching { onPeerUpdateEvent(TelegramPeerUpdateEvent(update.updateId, kind, decision)) }
+            }
+            return decision == TelegramPeerUpdateDecision.ACCEPTED
+        }
+        if (update.chatType != "private") return decide(TelegramPeerUpdateDecision.DROP_NOT_PRIVATE)
+        if (!update.senderIsBot) return decide(TelegramPeerUpdateDecision.DROP_SENDER_NOT_BOT)
+        val senderId = update.senderId
+            ?: return decide(TelegramPeerUpdateDecision.DROP_MISSING_SENDER)
         val username = runCatching { normalizeTelegramUsername(update.senderUsername.orEmpty()) }.getOrNull()
-            ?: return false
+            ?: return decide(TelegramPeerUpdateDecision.DROP_INVALID_USERNAME)
         // Bot-to-bot private chats use the sender bot id as chat id. Requiring both fields avoids
         // accepting a forwarded/copy-shaped update from a group or a different bot identity.
-        if (update.chatId != senderId) return false
+        if (update.chatId != senderId) return decide(TelegramPeerUpdateDecision.DROP_CHAT_MISMATCH)
         val active = credentialsProvider()
         val pinned = active.peerBinding
-        if (pinned != null) return senderId == pinned.botId && username == pinned.username
+        if (pinned != null) {
+            if (senderId != pinned.botId) {
+                return decide(TelegramPeerUpdateDecision.DROP_PEER_ID_MISMATCH)
+            }
+            if (username != pinned.username) {
+                return decide(TelegramPeerUpdateDecision.DROP_PEER_USERNAME_MISMATCH)
+            }
+            return decide(TelegramPeerUpdateDecision.ACCEPTED)
+        }
         val isHandshake = update.text?.startsWith("${TelegramPeerProtocol.VERSION} HELLO ") == true ||
             update.text?.startsWith("${TelegramPeerProtocol.VERSION} PAIR_ACK ") == true
-        return active.peerPairId != null && isHandshake
+        if (active.peerPairId == null) return decide(TelegramPeerUpdateDecision.DROP_NO_PAIR)
+        return decide(
+            if (isHandshake) TelegramPeerUpdateDecision.ACCEPTED
+            else TelegramPeerUpdateDecision.DROP_NOT_HANDSHAKE,
+        )
+    }
+
+    private fun emitPollFailure(error: Throwable, permanent: Boolean, retryDelayMs: Long?) {
+        runCatching {
+            onPollFailureEvent(
+                TelegramPeerPollFailureEvent(
+                    failure = telegramPeerTransportFailure(error),
+                    httpStatus = (error as? TelegramApiException)?.statusCode,
+                    permanent = permanent,
+                    retryDelayMs = retryDelayMs,
+                ),
+            )
+        }
     }
 
     /**
@@ -205,6 +246,7 @@ internal class TelegramOutboxProcessor(
     private val lane: TelegramOutboxLane = TelegramOutboxLane.ALL,
     private val rateLimitPropagationGate: TelegramRetryGate? = null,
     private val onPermanentFailure: (String) -> Unit = {},
+    private val onPeerControlTransportEvent: (TelegramPeerControlTransportEvent) -> Unit = {},
 ) : AutoCloseable {
     private val claimStateLock = Any()
     private var closed = false
@@ -250,6 +292,19 @@ internal class TelegramOutboxProcessor(
                         nowEpochMs,
                     )
                     if (dead?.entry?.deleteAfterSend == true) deleteOwnedFile(dead.entry.file)
+                    if (dead != null) {
+                        emitPeerControlTransport(
+                            TelegramPeerControlTransportEvent(
+                                phase = TelegramPeerTransportPhase.DEAD,
+                                kind = telegramPeerControlKind(entry),
+                                attempt = entry.attempts,
+                                correlationId = telegramPeerCorrelationId(entry),
+                                failure = TelegramPeerTransportFailure.DESTINATION_CHANGED,
+                                permanent = true,
+                            ),
+                            entry,
+                        )
+                    }
                     return OutboxProcessResult.Dead(entry.idempotencyKey)
                 }
                 val transferId = requireNotNull(entry.peerTransferId)
@@ -334,6 +389,15 @@ internal class TelegramOutboxProcessor(
             // claim through the preflight recovery path after transport has started.
             markTransportAttemptStarted(entry.idempotencyKey)
             transportAttemptStarted = true
+            emitPeerControlTransport(
+                TelegramPeerControlTransportEvent(
+                    phase = TelegramPeerTransportPhase.ATTEMPT,
+                    kind = telegramPeerControlKind(entry),
+                    attempt = entry.attempts + 1,
+                    correlationId = telegramPeerCorrelationId(entry),
+                ),
+                entry,
+            )
             val sendResult: TelegramSendResult = try {
             when (entry.route) {
                 TelegramOutboxRoute.PARENT -> when (entry.kind) {
@@ -380,6 +444,20 @@ internal class TelegramOutboxProcessor(
             return if (TelegramRetryPolicy.isPermanent(error)) {
                 val dead = outbox.deadLetter(entry.idempotencyKey, reason, nowEpochMs)
                 if (dead?.entry?.deleteAfterSend == true) deleteOwnedFile(dead.entry.file)
+                if (dead != null) {
+                    emitPeerControlTransport(
+                        TelegramPeerControlTransportEvent(
+                            phase = TelegramPeerTransportPhase.DEAD,
+                            kind = telegramPeerControlKind(entry),
+                            attempt = entry.attempts + 1,
+                            correlationId = telegramPeerCorrelationId(entry),
+                            failure = telegramPeerTransportFailure(error),
+                            httpStatus = (error as? TelegramApiException)?.statusCode,
+                            permanent = true,
+                        ),
+                        entry,
+                    )
+                }
                 if (dead != null) runCatching { onPermanentFailure(reason) }
                 OutboxProcessResult.Dead(entry.idempotencyKey)
             } else {
@@ -394,9 +472,32 @@ internal class TelegramOutboxProcessor(
                     retryGate.deferUntil(next)
                     rateLimitPropagationGate?.deferUntil(next)
                 }
+                emitPeerControlTransport(
+                    TelegramPeerControlTransportEvent(
+                        phase = TelegramPeerTransportPhase.RETRY,
+                        kind = telegramPeerControlKind(entry),
+                        attempt = entry.attempts + 1,
+                        correlationId = telegramPeerCorrelationId(entry),
+                        failure = telegramPeerTransportFailure(error),
+                        httpStatus = (error as? TelegramApiException)?.statusCode,
+                        retryDelayMs = delay,
+                    ),
+                    entry,
+                )
                 OutboxProcessResult.Retried(entry.idempotencyKey, next)
             }
         }
+
+            emitPeerControlTransport(
+                TelegramPeerControlTransportEvent(
+                    phase = TelegramPeerTransportPhase.SENT,
+                    kind = telegramPeerControlKind(entry),
+                    attempt = entry.attempts + 1,
+                    correlationId = telegramPeerCorrelationId(entry),
+                    messageId = sendResult.messageId,
+                ),
+                entry,
+            )
 
             if (entry.route == TelegramOutboxRoute.PEER && entry.kind == TelegramOutboxKind.DOCUMENT) {
             val transferId = requireNotNull(entry.peerTransferId)
@@ -462,6 +563,14 @@ internal class TelegramOutboxProcessor(
 
     private fun clearPreTransportClaim(idempotencyKey: String) = synchronized(claimStateLock) {
         if (activePreTransportClaim == idempotencyKey) activePreTransportClaim = null
+    }
+
+    private fun emitPeerControlTransport(
+        event: TelegramPeerControlTransportEvent,
+        entry: TelegramOutboxEntry,
+    ) {
+        if (!isPriorityPeerControl(entry)) return
+        runCatching { onPeerControlTransportEvent(event) }
     }
 
     private fun requireFile(entry: TelegramOutboxEntry): File = entry.file

@@ -13,7 +13,7 @@ import java.io.File
 
 /**
  * Process singleton used by the app coordinator. It owns one long poller plus isolated regular and
- * priority-response upload workers, while Reader/Library integrations use monitor:core buses.
+ * priority-control upload workers, while Reader/Library integrations use monitor:core buses.
  */
 class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable {
     private val paths = TelegramStoragePaths.from(context)
@@ -215,10 +215,18 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             val now = System.currentTimeMillis()
             var record = ensurePeerLinkRecordLocked(connected.pairId)
             val existingRequestId = record.pendingRequestId
-            if (existingRequestId != null && hasUsablePendingConnectionRequest(record, now)) {
+            val existingRequestKey = existingRequestId?.let {
+                peerControlOutboxKey(connected.pairId, "connect", it)
+            }
+            if (existingRequestId != null &&
+                existingRequestKey != null &&
+                hasUsablePendingConnectionRequest(record, now) &&
+                outbox.isPendingOrDelivered(existingRequestKey)
+            ) {
                 // Repeated UI taps refer to the same outstanding request. Do not create another
                 // Telegram server update which could be replayed after a long offline period.
-                uploader?.wake()
+                outbox.makeDueNow(existingRequestKey, now)
+                priorityUploader?.wake()
                 poller?.wake()
                 return@synchronized TelegramEnqueueResult.ALREADY_PENDING to
                     resolvePeerLinkStateLocked(now)
@@ -271,20 +279,28 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                 val key = active?.peerSharedKey()
                 var record = ensurePeerLinkRecordLocked(connected.pairId)
                 var persistedRecord = record
-                if (record.pendingRequestId != null &&
-                    !hasUsablePendingConnectionRequest(record, nowEpochMs)
-                ) {
-                    outbox.cancelPeerTextTransfers(setOf(requireNotNull(record.pendingRequestId)), nowEpochMs)
-                    record = record.withoutRequest()
-                }
-                if (record.pendingPingNonce != null && !isUsablePeerControlWindow(
-                        record.pendingPingSentAtEpochMs,
-                        record.pendingPingExpiresAtEpochMs,
-                        nowEpochMs,
+                record.pendingRequestId?.let { requestId ->
+                    val requestIsAlive = outbox.isPendingOrDelivered(
+                        peerControlOutboxKey(connected.pairId, "connect", requestId),
                     )
-                ) {
-                    outbox.cancelPeerTextTransfers(setOf(requireNotNull(record.pendingPingNonce)), nowEpochMs)
-                    record = record.withoutPing()
+                    if (!hasUsablePendingConnectionRequest(record, nowEpochMs) || !requestIsAlive) {
+                        outbox.cancelPeerTextTransfers(setOf(requestId), nowEpochMs)
+                        record = record.withoutRequest()
+                    }
+                }
+                record.pendingPingNonce?.let { nonce ->
+                    val pingIsAlive = outbox.isPendingOrDelivered(
+                        peerControlOutboxKey(connected.pairId, "ping", nonce),
+                    )
+                    if (!isUsablePeerControlWindow(
+                            record.pendingPingSentAtEpochMs,
+                            record.pendingPingExpiresAtEpochMs,
+                            nowEpochMs,
+                        ) || !pingIsAlive
+                    ) {
+                        outbox.cancelPeerTextTransfers(setOf(nonce), nowEpochMs)
+                        record = record.withoutPing()
+                    }
                 }
                 val shouldPing = connected.role == RemoteReviewRole.TEACHER &&
                     active != null && key != null &&
@@ -612,6 +628,8 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             peerHandler = TelegramPeerInboundHandler { update ->
                 handlePeerInbound(pollApi, update)
             },
+            onPeerUpdateEvent = ::logPeerUpdateEvent,
+            onPollFailureEvent = ::logPeerPollFailureEvent,
         )
         val processor = TelegramOutboxProcessor(
             credentials = activeCredentials,
@@ -650,21 +668,21 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             jitter = defaultTelegramJitter,
             credentialsProvider = { credentials.load() ?: activeCredentials },
             peerReceipts = peerReceipts,
-            lane = TelegramOutboxLane.PRIORITY_PEER_RESPONSE,
+            lane = TelegramOutboxLane.PRIORITY_PEER_CONTROL,
             // A priority-lane 429 is useful pressure information for bulk traffic too. The inverse
-            // is intentionally not propagated, so a document throttle cannot delay ACCEPT/PONG.
+            // is intentionally not propagated, so bulk traffic cannot delay peer link controls.
             rateLimitPropagationGate = retryGate,
             onPermanentFailure = { reason ->
                 // Keep this observable even if a subsequent successful long-poll changes the
                 // aggregate connection status back to Connected.
-                Log.e(PRIORITY_OUTBOX_LOG_TAG, "Priority peer response permanently rejected")
                 updateStatus(
                     RemoteMonitorStatus.Error(
                         activeCredentials.chatLabel,
-                        "우선 응답 전송 실패 · $reason",
+                        "우선 연결 제어 전송 실패 · $reason",
                     ),
                 )
             },
+            onPeerControlTransportEvent = ::handlePeerControlTransportEvent,
         )
         val nextPriorityUploader = TelegramOutboxWorker(
             outbox = outbox,
@@ -675,11 +693,11 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                 updateStatus(
                     RemoteMonitorStatus.Error(
                         activeCredentials.chatLabel,
-                        "우선 응답 큐 오류 · ${TelegramRetryPolicy.shortReason(error)}",
+                        "우선 연결 제어 큐 오류 · ${TelegramRetryPolicy.shortReason(error)}",
                     ),
                 )
             },
-            lane = TelegramOutboxLane.PRIORITY_PEER_RESPONSE,
+            lane = TelegramOutboxLane.PRIORITY_PEER_CONTROL,
         )
         if (!nextPoller.start()) {
             nextPoller.close()
@@ -689,7 +707,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
             return false
         }
         // Publish both references before either sender can become idle. If the already-running
-        // poller enqueues a response in this narrow startup window, wake() is remembered even
+        // poller enqueues a control in this narrow startup window, wake() is remembered even
         // though the corresponding sender thread has not started yet.
         poller = nextPoller
         uploader = nextUploader
@@ -932,7 +950,7 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         val peer = active.peerBinding ?: return TelegramEnqueueResult.NOT_CONFIGURED
         val pairId = active.peerPairId ?: return TelegramEnqueueResult.NOT_CONFIGURED
         val entry = TelegramOutboxEntry(
-            idempotencyKey = "telegram-peer-control:$pairId:$kind:$transferId",
+            idempotencyKey = peerControlOutboxKey(pairId, kind, transferId),
             destinationChatId = peer.botId,
             kind = TelegramOutboxKind.TEXT,
             filePath = null,
@@ -949,11 +967,16 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         )
         val result = outbox.enqueuePeerLinkControl(entry)
         if (result.isDurablyQueued()) {
-            if (isPriorityPeerResponse(entry)) priorityUploader?.wake() else uploader?.wake()
+            if (isPriorityPeerControl(entry)) priorityUploader?.wake() else uploader?.wake()
             // A manual request can arrive while the inbox poller is in a long network backoff.
             // Wake its interrupt-safe retry condition so CONNECT_ACCEPT/PONG is observed promptly.
             poller?.wake()
         }
+        Log.i(
+            PEER_CONTROL_LOG_TAG,
+            "event=enqueue kind=${telegramPeerControlKind(entry).name} " +
+                "lane=${if (isPriorityPeerControl(entry)) "priority" else "regular"} result=${result.name}",
+        )
         return result
     }
 
@@ -1011,6 +1034,19 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         listeners.forEach { listener -> runCatching { listener(state) } }
     }
 
+    private fun handlePeerControlTransportEvent(event: TelegramPeerControlTransportEvent) {
+        logPeerControlTransportEvent(event)
+        if (event.phase != TelegramPeerTransportPhase.DEAD || event.correlationId == null) return
+        val nextState = synchronized(lifecycleLock) {
+            val current = peerLink.load() ?: return@synchronized null
+            val updated = clearFailedPeerControlState(current, event)
+            if (updated == current) return@synchronized null
+            peerLink.save(updated)
+            resolvePeerLinkStateLocked(System.currentTimeMillis())
+        }
+        nextState?.let(::publishPeerLinkState)
+    }
+
     private fun handlePeerInbound(api: TelegramBotApi, update: TelegramInboundUpdate) {
         val active = credentials.load() ?: return
         val key = active.peerSharedKey() ?: return
@@ -1019,9 +1055,18 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         val senderUsername = runCatching { normalizeTelegramUsername(update.senderUsername.orEmpty()) }
             .getOrNull() ?: return
 
+        val controlKindHint = telegramPeerControlKindHint(update.text)
         val control = TelegramPeerProtocol.parseControl(update.text, key)
         if (control != null) {
             handlePeerControl(api, active, update, senderId, senderUsername, pairId, key, control)
+            return
+        }
+        if (controlKindHint != TelegramPeerControlKind.OTHER) {
+            logPeerControlDrop(
+                update.updateId,
+                controlKindHint,
+                PeerControlDropReason.AUTH_OR_FORMAT,
+            )
             return
         }
 
@@ -1146,15 +1191,25 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         key: ByteArray,
         control: TelegramPeerProtocol.PeerControl,
     ) {
-        if (update.chatId != senderId) return
+        val kind = telegramPeerControlKind(control)
+        if (update.chatId != senderId) {
+            logPeerControlDrop(update.updateId, kind, PeerControlDropReason.CHAT_MISMATCH)
+            return
+        }
         var nextLinkState: TelegramPeerLinkState? = null
+        var handled = false
         synchronized(lifecycleLock) {
             val now = System.currentTimeMillis()
             when (control) {
                 is TelegramPeerProtocol.PeerControl.Received -> {
-                    if (control.pairId != pairId ||
-                        !currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername)
-                    ) return
+                    if (control.pairId != pairId) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PAIR_MISMATCH)
+                        return
+                    }
+                    if (!currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername)) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PEER_MISMATCH)
+                        return
+                    }
                     if (peerReceipts.recordAcknowledged(
                             control.transferId,
                             update.messageId,
@@ -1177,19 +1232,47 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                             resolveAtEpochMs = now,
                         )
                     }
+                    handled = true
                 }
                 is TelegramPeerProtocol.PeerControl.Hello -> {
-                    if (active.remoteReviewRole != RemoteReviewRole.STUDENT || control.pairId != pairId) return
-                    if (control.botId != senderId || control.username != senderUsername) return
-                    val state = peerHandshake.load() ?: return
-                    if (state.role != RemoteReviewRole.STUDENT || state.pairId != pairId ||
-                        now > state.expiresAtEpochMs
-                    ) return
-                    active.peerBinding?.let { pinned ->
-                        if (pinned.botId != senderId || pinned.username != senderUsername) return
+                    if (active.remoteReviewRole != RemoteReviewRole.STUDENT) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.ROLE_MISMATCH)
+                        return
                     }
-                    val localId = active.localBotId ?: return
-                    val localUsername = active.localBotUsername ?: return
+                    if (control.pairId != pairId) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PAIR_MISMATCH)
+                        return
+                    }
+                    if (control.botId != senderId || control.username != senderUsername) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PEER_MISMATCH)
+                        return
+                    }
+                    val state = peerHandshake.load() ?: run {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.NO_PENDING_STATE)
+                        return
+                    }
+                    if (state.role != RemoteReviewRole.STUDENT || state.pairId != pairId) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PENDING_STATE_MISMATCH)
+                        return
+                    }
+                    if (now > state.expiresAtEpochMs) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.EXPIRED)
+                        return
+                    }
+                    active.peerBinding?.let { pinned ->
+                        if (pinned.botId != senderId || pinned.username != senderUsername) {
+                            logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PEER_MISMATCH)
+                            return
+                        }
+                    }
+                    val localId = active.localBotId ?: run {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.LOCAL_IDENTITY_MISSING)
+                        return
+                    }
+                    val localUsername = active.localBotUsername ?: run {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.LOCAL_IDENTITY_MISSING)
+                        return
+                    }
                     val binding = TelegramPeerBinding(senderId, senderUsername)
                     credentials.save(active.withPeer(binding))
                     peerHandshake.save(
@@ -1209,27 +1292,55 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                         ),
                     )
                     nextLinkState = markPeerObservedLocked(pairId, now)
+                    handled = true
                 }
                 is TelegramPeerProtocol.PeerControl.PairAck -> {
-                    if (active.remoteReviewRole != RemoteReviewRole.TEACHER || control.pairId != pairId) return
-                    val state = peerHandshake.load() ?: return
+                    if (active.remoteReviewRole != RemoteReviewRole.TEACHER) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.ROLE_MISMATCH)
+                        return
+                    }
+                    if (control.pairId != pairId) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PAIR_MISMATCH)
+                        return
+                    }
+                    val state = peerHandshake.load() ?: run {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.NO_PENDING_STATE)
+                        return
+                    }
                     if (state.role != RemoteReviewRole.TEACHER || state.pairId != pairId ||
                         state.nonce != control.nonce || state.expectedPeerBotId != senderId ||
                         state.expectedPeerUsername != senderUsername || control.botId != senderId ||
-                        control.username != senderUsername || now > state.expiresAtEpochMs
-                    ) return
+                        control.username != senderUsername
+                    ) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PENDING_STATE_MISMATCH)
+                        return
+                    }
+                    if (now > state.expiresAtEpochMs) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.EXPIRED)
+                        return
+                    }
                     credentials.save(active.withPeer(TelegramPeerBinding(senderId, senderUsername)))
                     nextLinkState = markPeerObservedLocked(pairId, now)
+                    handled = true
                 }
                 is TelegramPeerProtocol.PeerControl.ConnectRequest -> {
-                    if (active.remoteReviewRole != RemoteReviewRole.STUDENT ||
-                        !currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername) ||
-                        !isUsablePeerControlWindow(
+                    if (active.remoteReviewRole != RemoteReviewRole.STUDENT) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.ROLE_MISMATCH)
+                        return
+                    }
+                    if (!currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername)) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PEER_MISMATCH)
+                        return
+                    }
+                    if (!isUsablePeerControlWindow(
                             control.sentAtEpochMs,
                             control.expiresAtEpochMs,
                             now,
                         )
-                    ) return
+                    ) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.EXPIRED_OR_CLOCK_SKEW)
+                        return
+                    }
                     nextLinkState = markPeerObservedLocked(pairId, now)
                     ensurePeerResponseDurablyQueued(
                         enqueuePeerControlLocked(
@@ -1240,27 +1351,54 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                             nowEpochMs = now,
                         ),
                     )
+                    handled = true
                 }
                 is TelegramPeerProtocol.PeerControl.ConnectAccept -> {
-                    if (active.remoteReviewRole != RemoteReviewRole.TEACHER ||
-                        !currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername) ||
-                        !isFreshPeerControlResponse(control.sentAtEpochMs, now)
-                    ) return
-                    val record = peerLink.load()?.takeIf { it.pairId == pairId } ?: return
-                    if (record.pendingRequestId != control.requestId ||
-                        now > record.pendingRequestExpiresAtEpochMs
-                    ) return
+                    if (active.remoteReviewRole != RemoteReviewRole.TEACHER) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.ROLE_MISMATCH)
+                        return
+                    }
+                    if (!currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername)) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PEER_MISMATCH)
+                        return
+                    }
+                    if (!isFreshPeerControlResponse(control.sentAtEpochMs, now)) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.STALE_RESPONSE)
+                        return
+                    }
+                    val record = peerLink.load()?.takeIf { it.pairId == pairId } ?: run {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.NO_PENDING_STATE)
+                        return
+                    }
+                    if (record.pendingRequestId != control.requestId) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.REQUEST_MISMATCH)
+                        return
+                    }
+                    if (now > record.pendingRequestExpiresAtEpochMs) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.EXPIRED)
+                        return
+                    }
                     nextLinkState = markPeerObservedLocked(pairId, now) { it.withoutRequest() }
+                    handled = true
                 }
                 is TelegramPeerProtocol.PeerControl.Ping -> {
-                    if (active.remoteReviewRole != RemoteReviewRole.STUDENT ||
-                        !currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername) ||
-                        !isUsablePeerControlWindow(
+                    if (active.remoteReviewRole != RemoteReviewRole.STUDENT) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.ROLE_MISMATCH)
+                        return
+                    }
+                    if (!currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername)) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PEER_MISMATCH)
+                        return
+                    }
+                    if (!isUsablePeerControlWindow(
                             control.sentAtEpochMs,
                             control.expiresAtEpochMs,
                             now,
                         )
-                    ) return
+                    ) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.EXPIRED_OR_CLOCK_SKEW)
+                        return
+                    }
                     nextLinkState = markPeerObservedLocked(pairId, now)
                     ensurePeerResponseDurablyQueued(
                         enqueuePeerControlLocked(
@@ -1271,22 +1409,53 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
                             nowEpochMs = now,
                         ),
                     )
+                    handled = true
                 }
                 is TelegramPeerProtocol.PeerControl.Pong -> {
-                    if (active.remoteReviewRole != RemoteReviewRole.TEACHER ||
-                        !currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername) ||
-                        !isFreshPeerControlResponse(control.sentAtEpochMs, now)
-                    ) return
-                    val record = peerLink.load()?.takeIf { it.pairId == pairId } ?: return
-                    if (record.sessionId != control.sessionId ||
-                        record.pendingPingNonce != control.nonce ||
-                        now > record.pendingPingExpiresAtEpochMs ||
-                        control.sentAtEpochMs + TelegramPeerProtocol.MAX_CONTROL_CLOCK_SKEW_MS <
+                    if (active.remoteReviewRole != RemoteReviewRole.TEACHER) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.ROLE_MISMATCH)
+                        return
+                    }
+                    if (!currentPinnedPeerMatchesLocked(pairId, senderId, senderUsername)) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.PEER_MISMATCH)
+                        return
+                    }
+                    if (!isFreshPeerControlResponse(control.sentAtEpochMs, now)) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.STALE_RESPONSE)
+                        return
+                    }
+                    val record = peerLink.load()?.takeIf { it.pairId == pairId } ?: run {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.NO_PENDING_STATE)
+                        return
+                    }
+                    if (record.sessionId != control.sessionId) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.SESSION_MISMATCH)
+                        return
+                    }
+                    if (record.pendingPingNonce != control.nonce) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.NONCE_MISMATCH)
+                        return
+                    }
+                    if (now > record.pendingPingExpiresAtEpochMs) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.EXPIRED)
+                        return
+                    }
+                    if (control.sentAtEpochMs + TelegramPeerProtocol.MAX_CONTROL_CLOCK_SKEW_MS <
                         record.pendingPingSentAtEpochMs
-                    ) return
+                    ) {
+                        logPeerControlDrop(update.updateId, kind, PeerControlDropReason.STALE_RESPONSE)
+                        return
+                    }
                     nextLinkState = markPeerObservedLocked(pairId, now) { it.withoutPing() }
+                    handled = true
                 }
             }
+        }
+        if (handled) {
+            Log.i(
+                PEER_CONTROL_LOG_TAG,
+                "event=handled kind=${kind.name} update=${update.updateId}",
+            )
         }
         nextLinkState?.let(::publishPeerLinkState)
     }
@@ -1383,6 +1552,12 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
 
     private fun peerControlTransferId(prefix: String, id: String): String =
         "${prefix}_$id".also { require(PEER_IDENTIFIER.matches(it)) }
+
+    private fun peerControlOutboxKey(pairId: String, kind: String, transferId: String): String {
+        require(PEER_IDENTIFIER.matches(pairId) && PEER_IDENTIFIER.matches(transferId))
+        require(kind == "connect" || kind == "accept" || kind == "ping" || kind == "pong")
+        return "telegram-peer-control:$pairId:$kind:$transferId"
+    }
 
     private fun safeEpochAdd(left: Long, right: Long): Long =
         if (left > Long.MAX_VALUE - right) Long.MAX_VALUE else left + right
@@ -1653,6 +1828,90 @@ private fun logPeerDocumentRejection(updateId: Long, reason: PeerDocumentRejecti
     Log.w(PEER_INBOUND_LOG_TAG, "Peer document rejected: reason=${reason.name} update=$updateId")
 }
 
+private enum class PeerControlDropReason {
+    AUTH_OR_FORMAT,
+    CHAT_MISMATCH,
+    ROLE_MISMATCH,
+    PAIR_MISMATCH,
+    PEER_MISMATCH,
+    NO_PENDING_STATE,
+    PENDING_STATE_MISMATCH,
+    LOCAL_IDENTITY_MISSING,
+    EXPIRED,
+    EXPIRED_OR_CLOCK_SKEW,
+    STALE_RESPONSE,
+    REQUEST_MISMATCH,
+    SESSION_MISMATCH,
+    NONCE_MISMATCH,
+}
+
+private fun telegramPeerControlKind(
+    control: TelegramPeerProtocol.PeerControl,
+): TelegramPeerControlKind = when (control) {
+    is TelegramPeerProtocol.PeerControl.Hello -> TelegramPeerControlKind.HELLO
+    is TelegramPeerProtocol.PeerControl.PairAck -> TelegramPeerControlKind.PAIR_ACK
+    is TelegramPeerProtocol.PeerControl.Received -> TelegramPeerControlKind.RECEIVED
+    is TelegramPeerProtocol.PeerControl.ConnectRequest -> TelegramPeerControlKind.CONNECT_REQUEST
+    is TelegramPeerProtocol.PeerControl.ConnectAccept -> TelegramPeerControlKind.CONNECT_ACCEPT
+    is TelegramPeerProtocol.PeerControl.Ping -> TelegramPeerControlKind.PING
+    is TelegramPeerProtocol.PeerControl.Pong -> TelegramPeerControlKind.PONG
+}
+
+private fun logPeerControlDrop(
+    updateId: Long,
+    kind: TelegramPeerControlKind,
+    reason: PeerControlDropReason,
+) {
+    Log.w(
+        PEER_CONTROL_LOG_TAG,
+        "event=drop kind=${kind.name} decision=${reason.name} update=$updateId",
+    )
+}
+
+private fun logPeerUpdateEvent(event: TelegramPeerUpdateEvent) {
+    val message = "event=${if (event.decision == TelegramPeerUpdateDecision.ACCEPTED) "recv" else "drop"} " +
+        "kind=${event.kind.name} decision=${event.decision.name} update=${event.updateId}"
+    if (event.decision == TelegramPeerUpdateDecision.ACCEPTED) {
+        Log.i(PEER_CONTROL_LOG_TAG, message)
+    } else {
+        Log.w(PEER_CONTROL_LOG_TAG, message)
+    }
+}
+
+private fun logPeerPollFailureEvent(event: TelegramPeerPollFailureEvent) {
+    val fields = mutableListOf(
+        "event=poll_fail",
+        "failure=${event.failure.name}",
+        "permanent=${event.permanent}",
+    )
+    event.httpStatus?.let { fields += "httpStatus=$it" }
+    event.retryDelayMs?.let { fields += "retryDelayMs=$it" }
+    val message = fields.joinToString(" ")
+    if (event.permanent) Log.e(PEER_CONTROL_LOG_TAG, message)
+    else Log.w(PEER_CONTROL_LOG_TAG, message)
+}
+
+private fun logPeerControlTransportEvent(event: TelegramPeerControlTransportEvent) {
+    val fields = mutableListOf(
+        "event=${event.phase.name.lowercase()}",
+        "kind=${event.kind.name}",
+        "lane=priority",
+        "attempt=${event.attempt}",
+    )
+    event.correlationId?.let { fields += "cid=$it" }
+    event.failure?.let { fields += "failure=${it.name}" }
+    event.httpStatus?.let { fields += "httpStatus=$it" }
+    event.retryDelayMs?.let { fields += "retryDelayMs=$it" }
+    val message = fields.joinToString(" ")
+    when (event.phase) {
+        TelegramPeerTransportPhase.ATTEMPT,
+        TelegramPeerTransportPhase.SENT,
+        -> Log.i(PEER_CONTROL_LOG_TAG, message)
+        TelegramPeerTransportPhase.RETRY -> Log.w(PEER_CONTROL_LOG_TAG, message)
+        TelegramPeerTransportPhase.DEAD -> Log.e(PEER_CONTROL_LOG_TAG, message)
+    }
+}
+
 /** Queue-full means the caller still owns the only copy and may retry once capacity is available. */
 internal fun shouldDeleteRejectedOwnedMedia(result: TelegramEnqueueResult): Boolean = when (result) {
     TelegramEnqueueResult.ENQUEUED,
@@ -1751,7 +2010,7 @@ internal fun withinPeerDocumentDiskQuota(
 private const val MAX_PENDING_PEER_DOCUMENTS = 48
 private const val MAX_PENDING_PEER_DOCUMENT_BYTES = 96L * 1_024L * 1_024L
 private const val PEER_INBOUND_LOG_TAG = "MasterNotePeerInbound"
-private const val PRIORITY_OUTBOX_LOG_TAG = "MasterNotePeerOut"
+private const val PEER_CONTROL_LOG_TAG = "MasterNotePeerCtl"
 
 /** A retransmitted document gets a fresh ACK while duplicate handling stays idempotent per update. */
 internal fun peerDeliveryAckInstanceId(pairId: String, transferId: String, updateId: Long): String {

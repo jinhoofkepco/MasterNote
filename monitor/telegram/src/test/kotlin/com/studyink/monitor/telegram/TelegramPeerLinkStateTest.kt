@@ -83,6 +83,69 @@ class TelegramPeerLinkStateTest {
         assertNull(TelegramPeerLinkStateStore(file).load())
     }
 
+    @Test fun peerControlCorrelationIdIsStableBoundedAndOpaque() {
+        val first = telegramPeerCorrelationId("request_identifier_123")
+
+        assertEquals(first, telegramPeerCorrelationId("request_identifier_123"))
+        assertTrue(first.matches(Regex("[0-9a-f]{10}")))
+        assertFalse(first == telegramPeerCorrelationId("request_identifier_124"))
+        assertFalse(first.contains("request"))
+    }
+
+    @Test fun telegramPollingConflictHasADistinctSafeDiagnosis() {
+        assertEquals(
+            TelegramPeerTransportFailure.CONFLICT,
+            telegramPeerTransportFailure(TelegramApiException(409, "Conflict")),
+        )
+        assertFalse(TelegramRetryPolicy.isPermanent(TelegramApiException(409, "Conflict")))
+    }
+
+    @Test fun deadControlClearsOnlyTheMatchingPendingState() {
+        val original = record().copy(
+            pendingRequestId = "request_identifier_123",
+            pendingRequestExpiresAtEpochMs = NOW + 60_000L,
+            pendingPingNonce = "nonce_identifier_123",
+            pendingPingSentAtEpochMs = NOW,
+            pendingPingExpiresAtEpochMs = NOW + 30_000L,
+        )
+        val deadConnect = TelegramPeerControlTransportEvent(
+            phase = TelegramPeerTransportPhase.DEAD,
+            kind = TelegramPeerControlKind.CONNECT_REQUEST,
+            attempt = 1,
+            correlationId = telegramPeerCorrelationId("request_identifier_123"),
+        )
+        val deadPing = TelegramPeerControlTransportEvent(
+            phase = TelegramPeerTransportPhase.DEAD,
+            kind = TelegramPeerControlKind.PING,
+            attempt = 1,
+            correlationId = telegramPeerCorrelationId("nonce_identifier_123"),
+        )
+
+        assertEquals(original.withoutRequest(), clearFailedPeerControlState(original, deadConnect))
+        assertEquals(original.withoutPing(), clearFailedPeerControlState(original, deadPing))
+        assertEquals(
+            original,
+            clearFailedPeerControlState(
+                original,
+                deadConnect.copy(correlationId = telegramPeerCorrelationId("different_request_123")),
+            ),
+        )
+        assertEquals(
+            original,
+            clearFailedPeerControlState(
+                original,
+                deadConnect.copy(phase = TelegramPeerTransportPhase.RETRY),
+            ),
+        )
+        assertEquals(
+            original,
+            clearFailedPeerControlState(
+                original,
+                deadConnect.copy(kind = TelegramPeerControlKind.CONNECT_ACCEPT),
+            ),
+        )
+    }
+
     @Test fun aRecordFromAnOldPairNeverMakesTheNewPairGreen() {
         val old = record().copy(
             pairId = "old_pair_identifier_123",

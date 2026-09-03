@@ -101,6 +101,7 @@ class TelegramInboxPollerTest {
         )
         val latch = CountDownLatch(1)
         val handled = mutableListOf<Long>()
+        val peerEvents = mutableListOf<TelegramPeerUpdateEvent>()
         val poller = TelegramInboxPoller(
             credentials = credentials,
             api = api,
@@ -113,6 +114,7 @@ class TelegramInboxPollerTest {
             jitter = TelegramJitterSource { 0.0 },
             onFatalError = { throw AssertionError(it) },
             peerHandler = TelegramPeerInboundHandler { update -> handled += update.updateId; latch.countDown() },
+            onPeerUpdateEvent = peerEvents::add,
         )
 
         assertTrue(poller.start())
@@ -120,6 +122,16 @@ class TelegramInboxPollerTest {
         poller.close()
 
         assertEquals(listOf(4L), handled)
+        assertEquals(
+            listOf(
+                TelegramPeerUpdateDecision.DROP_PEER_ID_MISMATCH,
+                TelegramPeerUpdateDecision.DROP_PEER_USERNAME_MISMATCH,
+                TelegramPeerUpdateDecision.DROP_CHAT_MISMATCH,
+                TelegramPeerUpdateDecision.ACCEPTED,
+            ),
+            peerEvents.map(TelegramPeerUpdateEvent::decision),
+        )
+        assertTrue(peerEvents.all { it.kind == TelegramPeerControlKind.RECEIVED })
     }
 
     @Test fun wakeInterruptsRetryBackoffWithoutLosingAnEarlySignal() {
@@ -127,6 +139,8 @@ class TelegramInboxPollerTest {
         val firstFailure = CountDownLatch(1)
         val secondPoll = CountDownLatch(1)
         val releaseSecondPoll = CountDownLatch(1)
+        val failureObserved = CountDownLatch(1)
+        val failures = mutableListOf<TelegramPeerPollFailureEvent>()
         val calls = AtomicInteger()
         val api = object : TelegramBotApi {
             override fun getMe() = error("unused")
@@ -156,10 +170,21 @@ class TelegramInboxPollerTest {
             nowEpochMs = { 1L },
             jitter = TelegramJitterSource { 0.0 },
             onFatalError = { throw AssertionError(it) },
+            onPollFailureEvent = { event -> failures += event; failureObserved.countDown() },
         )
 
         assertTrue(poller.start())
         assertTrue(firstFailure.await(1L, TimeUnit.SECONDS))
+        assertTrue(failureObserved.await(1L, TimeUnit.SECONDS))
+        assertEquals(
+            TelegramPeerPollFailureEvent(
+                failure = TelegramPeerTransportFailure.SERVER,
+                httpStatus = 500,
+                permanent = false,
+                retryDelayMs = 2_000L,
+            ),
+            failures.single(),
+        )
         assertFalse(secondPoll.await(100L, TimeUnit.MILLISECONDS))
         poller.wake()
         assertTrue(secondPoll.await(1L, TimeUnit.SECONDS))
