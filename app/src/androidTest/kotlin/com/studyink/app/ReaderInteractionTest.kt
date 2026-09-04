@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
+import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -29,10 +30,13 @@ import com.studyink.reader.DryInkView
 import com.studyink.reader.EraserGesture
 import com.studyink.reader.EraserPreview
 import com.studyink.reader.InkInputView
+import com.studyink.reader.QuickShapePreview
 import com.studyink.reader.ReaderActivity
 import com.studyink.reader.ReaderDebugSessionStore
 import com.studyink.reader.ReaderRole
 import com.studyink.reader.ReaderTool
+import com.studyink.reader.ReaderUiState
+import com.studyink.reader.ReaderViewModel
 import com.studyink.reader.ReaderWorkflow
 import com.studyink.sync.lan.PairingPayload
 import org.junit.After
@@ -78,6 +82,162 @@ class ReaderInteractionTest {
         assertEquals(before, revision())
         dispatchStroke(InputDevice.SOURCE_STYLUS, MotionEvent.TOOL_TYPE_STYLUS, 360f, 820f, 520f, 870f)
         assertTrue(waitForRevisionAfter(before))
+    }
+
+    @Test
+    fun penLineHeldForTwoSecondsCommitsOneSnappedStroke() {
+        val committed = mutableListOf<StrokeAsset>()
+        val previews = mutableListOf<QuickShapePreview?>()
+        scenario.onActivity { activity ->
+            activity.findInkInputView().apply {
+                tool = ReaderTool.PEN
+                quickShapeEnabled = true
+                onQuickShapePreview = previews::add
+                onStrokeAwaitingPersistence = { stroke, complete ->
+                    committed += stroke
+                    complete()
+                }
+            }
+        }
+
+        val downAt = SystemClock.uptimeMillis()
+        val events = buildList {
+            add(
+                motionEvent(
+                    MotionEvent.ACTION_DOWN,
+                    InputDevice.SOURCE_STYLUS,
+                    MotionEvent.TOOL_TYPE_STYLUS,
+                    360f,
+                    820f,
+                    eventTime = downAt,
+                )
+            )
+            repeat(20) { index ->
+                val progress = (index + 1) / 20f
+                add(
+                    motionEvent(
+                        MotionEvent.ACTION_MOVE,
+                        InputDevice.SOURCE_STYLUS,
+                        MotionEvent.TOOL_TYPE_STYLUS,
+                        360f + 260f * progress,
+                        820f + 50f * progress,
+                        eventTime = downAt + (index + 1) * 20L,
+                    )
+                )
+            }
+            // Drawing ends at +400 ms, so this UP is at least 2,000 ms after the last meaningful
+            // movement on every screen density. Synchronous dispatch exercises ACTION_UP settling.
+            add(
+                motionEvent(
+                    MotionEvent.ACTION_UP,
+                    InputDevice.SOURCE_STYLUS,
+                    MotionEvent.TOOL_TYPE_STYLUS,
+                    620f,
+                    870f,
+                    eventTime = downAt + 2_400L,
+                )
+            )
+        }
+        scenario.onActivity { activity -> events.forEach(activity::dispatchTouchEvent) }
+        events.forEach(MotionEvent::recycle)
+
+        assertEquals(1, committed.size)
+        assertEquals(StrokeTool.PEN, committed.single().tool)
+        assertEquals(2, committed.single().points.size)
+        assertTrue(previews.filterNotNull().any { it.path.size == 2 })
+    }
+
+    @Test
+    fun rapidStrokesAfterSubmissionBothLandInTheSameNewAttempt() {
+        val repository = LibraryRepository.get(context)
+        val submitted = requireNotNull(repository.writableAttempt(bookId, 0, create = true))
+        repository.lockAttempt(bookId, 0, submitted.attemptNo)
+        scenario.close()
+        scenario = ActivityScenario.launch(ReaderActivity.intent(context, bookId, 0))
+        assertTrue(
+            waitForReaderState { state ->
+                state.documentReady && state.attemptNo == submitted.attemptNo &&
+                    state.currentAttemptSubmitted
+            }
+        )
+
+        val startedAt = SystemClock.uptimeMillis()
+        val firstStroke = listOf(
+            motionEvent(
+                MotionEvent.ACTION_DOWN,
+                InputDevice.SOURCE_STYLUS,
+                MotionEvent.TOOL_TYPE_STYLUS,
+                360f,
+                820f,
+                eventTime = startedAt,
+            ),
+            motionEvent(
+                MotionEvent.ACTION_MOVE,
+                InputDevice.SOURCE_STYLUS,
+                MotionEvent.TOOL_TYPE_STYLUS,
+                500f,
+                850f,
+                eventTime = startedAt + 20L,
+            ),
+            motionEvent(
+                MotionEvent.ACTION_UP,
+                InputDevice.SOURCE_STYLUS,
+                MotionEvent.TOOL_TYPE_STYLUS,
+                500f,
+                850f,
+                eventTime = startedAt + 40L,
+            ),
+        )
+        val secondDown = motionEvent(
+            MotionEvent.ACTION_DOWN,
+            InputDevice.SOURCE_STYLUS,
+            MotionEvent.TOOL_TYPE_STYLUS,
+            390f,
+            900f,
+            eventTime = startedAt + 60L,
+        )
+        // The UI collector cannot publish N+1 in the middle of this main-loop callback, so the
+        // second gesture deterministically captures submitted N while the first append is queued.
+        scenario.onActivity { activity ->
+            firstStroke.forEach(activity::dispatchTouchEvent)
+            activity.dispatchTouchEvent(secondDown)
+        }
+        firstStroke.forEach(MotionEvent::recycle)
+        secondDown.recycle()
+
+        assertTrue(
+            waitForReaderState { state ->
+                state.attemptNo == submitted.attemptNo + 1 && state.currentAttemptWritable
+            }
+        )
+        scenario.onActivity { activity -> assertTrue(activity.findInkInputView().hasActiveGesture) }
+
+        val secondFinishedAt = SystemClock.uptimeMillis()
+        val secondTail = listOf(
+            motionEvent(
+                MotionEvent.ACTION_MOVE,
+                InputDevice.SOURCE_STYLUS,
+                MotionEvent.TOOL_TYPE_STYLUS,
+                560f,
+                930f,
+                eventTime = secondFinishedAt,
+            ),
+            motionEvent(
+                MotionEvent.ACTION_UP,
+                InputDevice.SOURCE_STYLUS,
+                MotionEvent.TOOL_TYPE_STYLUS,
+                560f,
+                930f,
+                eventTime = secondFinishedAt + 20L,
+            ),
+        )
+        scenario.onActivity { activity -> secondTail.forEach(activity::dispatchTouchEvent) }
+        secondTail.forEach(MotionEvent::recycle)
+
+        assertTrue(waitForStudentStrokeCount(attemptNo = submitted.attemptNo + 1, count = 2))
+        assertEquals(listOf(submitted.attemptNo, submitted.attemptNo + 1), repository
+            .attempts(bookId, 0)
+            .map { it.attemptNo })
     }
 
     @Test
@@ -814,6 +974,30 @@ class ReaderInteractionTest {
 
     private fun waitForRevisionAfter(before: Long): Boolean {
         repeat(60) { if (revision() > before) return true else SystemClock.sleep(100) }
+        return false
+    }
+
+    private fun waitForReaderState(predicate: (ReaderUiState) -> Boolean): Boolean {
+        repeat(60) {
+            var matches = false
+            scenario.onActivity { activity ->
+                matches = predicate(ViewModelProvider(activity)[ReaderViewModel::class.java].uiState.value)
+            }
+            if (matches) return true
+            SystemClock.sleep(100)
+        }
+        return false
+    }
+
+    private fun waitForStudentStrokeCount(attemptNo: Int, count: Int): Boolean {
+        val store = PageOperationLogStore.get(context)
+        repeat(60) {
+            val actual = store.loadPage(bookId, 0).activeStrokes.count { stroke ->
+                stroke.authorId == "student" && stroke.attemptNo == attemptNo
+            }
+            if (actual == count) return true
+            SystemClock.sleep(100)
+        }
         return false
     }
 

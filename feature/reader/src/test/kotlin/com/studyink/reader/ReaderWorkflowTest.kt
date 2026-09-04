@@ -315,6 +315,39 @@ class ReaderWorkflowTest {
     }
 
     @Test
+    fun studentStrokeSurvivesOnlyTheSamePageAttemptAdvance() {
+        val downState = ReaderUiState(
+            bookId = "book-a",
+            pageNumber = 3,
+            attemptNo = 1,
+            role = ReaderRole.STUDENT,
+        )
+        val target = downState.annotationTarget()
+
+        assertTrue(target.acceptsStrokeContinuation(downState.copy(attemptNo = 2)))
+        assertFalse(target.acceptsStrokeContinuation(downState.copy(pageNumber = 4, attemptNo = 2)))
+        assertFalse(
+            target.acceptsStrokeContinuation(
+                downState.copy(role = ReaderRole.TEACHER_TABLET, attemptNo = 2),
+            )
+        )
+    }
+
+    @Test
+    fun teacherStrokeRemainsBoundToTheExactAttempt() {
+        val downState = ReaderUiState(
+            bookId = "book-a",
+            pageNumber = 3,
+            attemptNo = 2,
+            role = ReaderRole.TEACHER_TABLET,
+        )
+        val target = downState.annotationTarget()
+
+        assertTrue(target.acceptsStrokeContinuation(downState))
+        assertFalse(target.acceptsStrokeContinuation(downState.copy(attemptNo = 3)))
+    }
+
+    @Test
     fun studentMutationRequiresTheExactOpenAttemptShownOnScreen() {
         val state = ReaderUiState(
             attemptNo = 2,

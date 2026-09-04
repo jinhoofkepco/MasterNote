@@ -241,11 +241,23 @@ internal data class ReaderAnnotationTarget(
     val bookId: String,
     val pageNumber: Int,
     val attemptNo: Int,
+    val role: ReaderRole,
 ) {
     fun matches(state: ReaderUiState): Boolean =
         state.bookId == bookId &&
             state.pageNumber == pageNumber &&
-            state.attemptNo == attemptNo
+            state.attemptNo == attemptNo &&
+            state.role == role
+
+    /**
+     * Student ink may legitimately outlive the N -> N+1 transition caused by an earlier stroke.
+     * Teachers can browse attempts, so their in-flight stroke remains tied to the exact attempt.
+     */
+    fun acceptsStrokeContinuation(state: ReaderUiState): Boolean =
+        state.bookId == bookId &&
+            state.pageNumber == pageNumber &&
+            state.role == role &&
+            (role == ReaderRole.STUDENT || state.attemptNo == attemptNo)
 }
 
 internal data class PendingMarkMove(
@@ -256,7 +268,7 @@ internal data class PendingMarkMove(
         target.matches(state) && state.documentReady && state.storageAvailable
 }
 
-internal fun ReaderUiState.annotationTarget() = ReaderAnnotationTarget(bookId, pageNumber, attemptNo)
+internal fun ReaderUiState.annotationTarget() = ReaderAnnotationTarget(bookId, pageNumber, attemptNo, role)
 
 internal fun ReaderUiState.gradeDraftTargetOrNull(): TeacherGradeDraftTarget? =
     if (
@@ -896,8 +908,8 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun addStroke(stroke: StrokeAsset, onComplete: (() -> Unit)? = null) {
-        // writableAttempt opens a new attempt once the previous one is submitted, so the number a
-        // stroke is written into is not always the one on screen. Report it back to mutate.
+        // Kept for callers that do not own a pen-down target. ReaderActivity uses the targeted
+        // overload below so a completed gesture can survive an immediate page transition.
         var writtenAttemptNo: Int? = null
         mutate(onComplete, attemptNoAfterChange = { writtenAttemptNo }) { state ->
             val authorId = if (state.role == ReaderRole.STUDENT) "student" else "teacher"
@@ -927,6 +939,31 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 ).canonicalizedForNewInk()
             )
         }
+    }
+
+    internal fun addStroke(
+        target: ReaderAnnotationTarget,
+        stroke: StrokeAsset,
+        onComplete: (() -> Unit)? = null,
+    ) {
+        val requested = _uiState.value
+        if (
+            !target.acceptsStrokeContinuation(requested) ||
+            stroke.pageNumber != target.pageNumber ||
+            !requested.documentReady ||
+            !requested.storageAvailable ||
+            requested.submissionInProgress ||
+            !requested.capabilities.canWrite
+        ) {
+            onComplete?.invoke()
+            return
+        }
+        persistTargetedStroke(
+            target = target,
+            workflow = requested.workflow,
+            stroke = stroke,
+            onComplete = onComplete,
+        )
     }
 
     internal fun erase(
@@ -1414,6 +1451,200 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                                 snapshot = durable?.snapshot ?: beforeSnapshot,
                                 marks = readerMarks(latest),
                                 dataError = "첨삭 발행을 완료하지 못했습니다. 임시 채점은 유지되며 다시 누르면 이어서 처리합니다.",
+                            )
+                        }
+                    }
+                }
+            } finally {
+                val remaining = pendingDocumentMutations.decrementAndGet().coerceAtLeast(0)
+                _uiState.update { latest -> latest.copy(pendingDocumentMutations = remaining) }
+                withContext(Dispatchers.Main.immediate) { onComplete?.invoke() }
+            }
+        }
+    }
+
+    /**
+     * Persists a stroke against the immutable pen-down page instead of whichever page happens to
+     * be visible when this coroutine gets the mutation lock. This matters both when the first
+     * stroke after submission advances N to N+1 and when navigation races a completed ACTION_UP.
+     */
+    private fun persistTargetedStroke(
+        target: ReaderAnnotationTarget,
+        workflow: ReaderWorkflow,
+        stroke: StrokeAsset,
+        onComplete: (() -> Unit)?,
+    ) {
+        val pending = pendingDocumentMutations.incrementAndGet()
+        _uiState.update { latest -> latest.copy(pendingDocumentMutations = pending) }
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                mutationMutex.withLock {
+                    var editsVisibleDocument = false
+                    var visibleBeforeSnapshot: AnnotationSnapshot? = null
+                    var visibleBeforeClockHighWater = 0L
+                    try {
+                        val currentDocument = document
+                        val currentSnapshot = currentDocument.snapshot()
+                        val stateAtLock = _uiState.value
+                        editsVisibleDocument = currentSnapshot.bookId == target.bookId &&
+                            currentSnapshot.pageNumber == target.pageNumber &&
+                            stateAtLock.documentReady &&
+                            target.acceptsStrokeContinuation(stateAtLock)
+                        val editor = if (editsVisibleDocument) {
+                            visibleBeforeSnapshot = currentSnapshot
+                            visibleBeforeClockHighWater = currentDocument.operationClockHighWater
+                            currentDocument
+                        } else {
+                            val loaded = withContext(Dispatchers.IO) {
+                                store.loadPageState(target.bookId, target.pageNumber)
+                            }
+                            AnnotationDocument(loaded.snapshot, loaded.operationClockHighWater)
+                        }
+                        val attemptNo = when {
+                            target.role == ReaderRole.STUDENT -> library
+                                .writableAttempt(target.bookId, target.pageNumber, create = true)
+                                ?.attemptNo
+                                ?: error("풀이 회차를 만들 수 없습니다.")
+
+                            target.attemptNo == TEACHER_PAGE_REVIEW_ATTEMPT_NO ->
+                                TEACHER_PAGE_REVIEW_ATTEMPT_NO
+
+                            workflow == ReaderWorkflow.LIVE_MONITOR && editor.snapshot().activeStrokes.any {
+                                it.authorId == "student" && it.attemptNo == target.attemptNo
+                            } -> target.attemptNo
+
+                            else -> library.attempts(target.bookId, target.pageNumber)
+                                .firstOrNull { it.attemptNo == target.attemptNo }
+                                ?.attemptNo
+                                ?: error("학생 풀이 회차가 없습니다.")
+                        }
+                        val change = editor.addStroke(
+                            stroke.copy(
+                                authorId = if (target.role == ReaderRole.STUDENT) "student" else "teacher",
+                                attemptNo = attemptNo,
+                                deviceId = library.deviceId,
+                            ).canonicalizedForNewInk()
+                        )
+                        val persisted = withContext(Dispatchers.IO) { store.append(change) }
+                        val mergedConcurrentOperation = persisted.appliedOperationIds !=
+                            change.snapshot.appliedOperationIds
+                        val mergedPage = if (mergedConcurrentOperation) {
+                            withContext(Dispatchers.IO) {
+                                store.loadPageState(target.bookId, target.pageNumber)
+                            }
+                        } else {
+                            null
+                        }
+                        val persistedSnapshot = mergedPage?.snapshot ?: persisted
+                        if (editsVisibleDocument && mergedPage != null) {
+                            document = AnnotationDocument(
+                                initial = mergedPage.snapshot,
+                                operationClockHighWater = mergedPage.operationClockHighWater,
+                            )
+                        }
+
+                        val latest = _uiState.value
+                        if (
+                            editsVisibleDocument &&
+                            latest.bookId == target.bookId &&
+                            latest.pageNumber == target.pageNumber &&
+                            latest.role == target.role &&
+                            latest.documentReady
+                        ) {
+                            // A student target captured on submitted N advances only while N is
+                            // still selected. A later explicit selection must not be overwritten.
+                            val displayedAttemptNo = if (
+                                target.role == ReaderRole.STUDENT && latest.attemptNo == target.attemptNo
+                            ) {
+                                attemptNo
+                            } else {
+                                latest.attemptNo
+                            }
+                            val attempts = library.attempts(target.bookId, target.pageNumber)
+                            val historyMatchesVisibleAttempt = displayedAttemptNo == attemptNo
+                            _uiState.value = latest.copy(
+                                snapshot = persistedSnapshot,
+                                attemptNo = displayedAttemptNo,
+                                capabilities = if (displayedAttemptNo == latest.attemptNo) {
+                                    latest.capabilities
+                                } else {
+                                    ReaderCapabilities.forSession(
+                                        latest.role,
+                                        latest.workflow,
+                                        displayedAttemptNo,
+                                    )
+                                },
+                                currentAttemptWritable = if (latest.role == ReaderRole.STUDENT) {
+                                    attempts.any { it.attemptNo == displayedAttemptNo && !it.locked }
+                                } else {
+                                    false
+                                },
+                                currentAttemptSubmitted = if (latest.role == ReaderRole.STUDENT) {
+                                    attempts.any { it.attemptNo == displayedAttemptNo && it.locked }
+                                } else {
+                                    false
+                                },
+                                pageAttemptNos = attempts.map { it.attemptNo },
+                                canUndo = historyMatchesVisibleAttempt &&
+                                    !mergedConcurrentOperation && document.canUndo,
+                                canRedo = historyMatchesVisibleAttempt &&
+                                    !mergedConcurrentOperation && document.canRedo,
+                            )
+                        }
+
+                        if (target.role == ReaderRole.STUDENT) {
+                            LanSyncBus.operationWritten(target.bookId, target.pageNumber)
+                            val current = _uiState.value
+                            if (
+                                attemptNo != target.attemptNo &&
+                                current.bookId == target.bookId &&
+                                current.pageNumber == target.pageNumber &&
+                                current.role == target.role &&
+                                current.attemptNo == attemptNo
+                            ) {
+                                // Presence follows the screen, not an off-screen page that happened
+                                // to finish saving after navigation.
+                                LanSyncBus.pageChanged(
+                                    bookId = target.bookId,
+                                    pageNumber = target.pageNumber,
+                                    revision = persistedSnapshot.revision,
+                                    attemptNo = attemptNo,
+                                )
+                            }
+                        }
+                    } catch (_: Throwable) {
+                        val durable = if (editsVisibleDocument) {
+                            runCatching {
+                                withContext(Dispatchers.IO) {
+                                    store.loadPageState(target.bookId, target.pageNumber)
+                                }
+                            }.getOrNull()
+                        } else {
+                            null
+                        }
+                        if (editsVisibleDocument) {
+                            val fallback = requireNotNull(visibleBeforeSnapshot)
+                            document = if (durable != null) {
+                                AnnotationDocument(durable.snapshot, durable.operationClockHighWater)
+                            } else {
+                                AnnotationDocument(fallback, visibleBeforeClockHighWater)
+                            }
+                        }
+                        val latest = _uiState.value
+                        if (
+                            latest.bookId == target.bookId &&
+                            latest.pageNumber == target.pageNumber &&
+                            latest.role == target.role
+                        ) {
+                            _uiState.value = latest.copy(
+                                snapshot = durable?.snapshot ?: latest.snapshot,
+                                canUndo = if (editsVisibleDocument) false else latest.canUndo,
+                                canRedo = if (editsVisibleDocument) false else latest.canRedo,
+                                dataError = "필기를 저장하지 못했습니다. 기존 저장 내용은 유지됩니다.",
+                            )
+                        } else {
+                            _uiState.value = latest.copy(
+                                dataError = "이전 페이지의 필기를 저장하지 못했습니다. 기존 저장 내용은 유지됩니다.",
                             )
                         }
                     }

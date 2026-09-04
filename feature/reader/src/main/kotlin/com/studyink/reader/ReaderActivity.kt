@@ -199,6 +199,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private var stylusMenuAnchorInHost by mutableStateOf(Offset.Zero)
     private var activeEraserPreviewId: Long? = null
     private val eraserTargets = mutableMapOf<Long, ReaderAnnotationTarget>()
+    private var activeStrokeTarget: ReaderAnnotationTarget? = null
+    private var activeQuickShapePreviewTarget: ReaderAnnotationTarget? = null
     private var submittedBlurApplied = false
     private var studentActivityVisible by mutableStateOf(false)
     private var displayedPdfPage = -1
@@ -337,6 +339,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             input.penColorArgb = selectedPenColor
             input.penWidthDp = selectedPenWidthDp
             input.penOpacity = selectedPenOpacity
+            input.quickShapeEnabled = true
             input.onStylusContact = {
                 if (stylusMenuExpanded) {
                     closeStylusMenu()
@@ -346,7 +349,30 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             input.onWorkActivity = {
                 publishStudentHeartbeat(StudentWorkKind.PEN_CONTACT)
             }
-            input.onStroke = { stroke -> viewModel.addStroke(stroke) }
+            input.onStrokeStart = { page ->
+                activeStrokeTarget = latestState.annotationTarget().takeIf { it.pageNumber == page }
+            }
+            input.onStroke = { stroke ->
+                val target = activeStrokeTarget.also { activeStrokeTarget = null }
+                if (target != null) viewModel.addStroke(target, stroke)
+            }
+            input.onStrokeAwaitingPersistence = { stroke, onComplete ->
+                val target = activeStrokeTarget.also { activeStrokeTarget = null }
+                if (target == null) {
+                    onComplete()
+                } else {
+                    viewModel.addStroke(target, stroke, onComplete)
+                }
+            }
+            input.onQuickShapePreview = { preview ->
+                if (preview == null) {
+                    activeQuickShapePreviewTarget = null
+                } else if (activeQuickShapePreviewTarget == null) {
+                    activeQuickShapePreviewTarget = activeStrokeTarget
+                        ?: latestState.annotationTarget().takeIf { it.pageNumber == preview.pageNumber }
+                }
+                dryInkView.quickShapePreview = preview
+            }
             input.canStartErase = { page -> canErase(state = latestState, page = page) }
             input.onEraserPreview = { preview ->
                 if (preview == null) {
@@ -534,6 +560,15 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                     dismissAnswerPopupIfTargetChanged(state)
                     deliverPendingParentMessageIfStudent()
                     ensureS23StripStartsExpanded()
+                    if (
+                        inputView.hasActiveGesture &&
+                        activeStrokeTarget?.acceptsStrokeContinuation(state) == false
+                    ) {
+                        cancelActiveInkInput()
+                    }
+                    if (activeQuickShapePreviewTarget?.acceptsStrokeContinuation(state) == false) {
+                        inputView.clearQuickShapePreview()
+                    }
                     activeEraserPreviewId?.takeIf { inputView.hasActiveEraserGesture }?.let { gestureId ->
                         val target = eraserTargets[gestureId]
                         if (target == null || !target.matches(state) || !canErase(state, target.pageNumber)) {
@@ -745,6 +780,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private fun selectTool(tool: ReaderTool) {
+        if (::inputView.isInitialized && inputView.hasActiveGesture) cancelActiveInkInput()
         selectedTool = tool
         inputView.tool = tool
         memoOverlay.setTool(tool)
@@ -752,6 +788,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private fun selectPenColor(colorArgb: Int) {
+        if (::inputView.isInitialized && inputView.hasActiveGesture) cancelActiveInkInput()
         selectedPenColor = colorArgb
         penPreferences.saveColor(colorArgb)
         selectedTool = ReaderTool.PEN
@@ -762,6 +799,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private fun selectPenWidth(widthDp: Float) {
+        if (::inputView.isInitialized && inputView.hasActiveGesture) cancelActiveInkInput()
         selectedPenWidthDp = widthDp
         penPreferences.saveWidth(widthDp)
         selectedTool = ReaderTool.PEN
@@ -772,6 +810,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private fun selectPenOpacity(opacity: Float) {
+        if (::inputView.isInitialized && inputView.hasActiveGesture) cancelActiveInkInput()
         selectedPenOpacity = opacity.coerceIn(0.15f, 1f)
         selectedTool = ReaderTool.PEN
         inputView.penOpacity = selectedPenOpacity
@@ -785,13 +824,15 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         val state = latestState
         val selectingAssistantRegion = ::pageRegionSelectionView.isInitialized &&
             pageRegionSelectionView.visibility == View.VISIBLE
-        inputView.isEnabled = state.documentReady &&
+        val enabled = state.documentReady &&
             state.capabilities.canWrite &&
             state.storageAvailable &&
             !state.submissionInProgress &&
             !selectingAssistantRegion &&
             !assistantCaptureInProgress &&
             !memoEditorVisible
+        if (!enabled && inputView.hasActiveGesture) cancelActiveInkInput()
+        inputView.isEnabled = enabled
     }
 
     private fun currentStudentExplanationTarget(
@@ -2087,7 +2128,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         if (::studentVoiceController.isInitialized) studentVoiceController.onPause()
         if (::parentMessageSpeaker.isInitialized) parentMessageSpeaker.stop()
         if (::stylusMenuOverlay.isInitialized) closeStylusMenu()
-        if (::inputView.isInitialized) cancelActiveEraserInput()
+        if (::inputView.isInitialized) cancelActiveInkInput()
         if (::memoOverlay.isInitialized) memoOverlay.cancelActiveGesture()
         stylusButtonPressed = false
         lastStylusButtonPressEventTime = Long.MIN_VALUE
@@ -2134,7 +2175,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
-        if (!hasFocus && ::inputView.isInitialized) cancelActiveEraserInput()
+        if (!hasFocus && ::inputView.isInitialized) cancelActiveInkInput()
         if (!hasFocus && ::memoOverlay.isInitialized) memoOverlay.cancelActiveGesture()
         super.onWindowFocusChanged(hasFocus)
     }
@@ -2180,6 +2221,16 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun cancelActiveEraserInput() {
         inputView.cancelActiveEraserGesture()
+        activeEraserPreviewId?.let(eraserTargets::remove)
+        activeEraserPreviewId = null
+        dryInkView.eraserPreview = null
+    }
+
+    private fun cancelActiveInkInput() {
+        inputView.cancelActiveGesture()
+        inputView.clearQuickShapePreview()
+        activeStrokeTarget = null
+        activeQuickShapePreviewTarget = null
         activeEraserPreviewId?.let(eraserTargets::remove)
         activeEraserPreviewId = null
         dryInkView.eraserPreview = null

@@ -27,6 +27,19 @@ data class EraserPreview(
     val radius: Float,
 )
 
+/**
+ * Transient quick-shape ink shown after the AndroidX wet stroke has been detached.
+ *
+ * It is deliberately the same point-list geometry as [StrokeAsset]. Nothing here is persisted;
+ * the owning [InkInputView] keeps it alive only until the single final stroke is durable.
+ */
+data class QuickShapePreview(
+    val pageNumber: Int,
+    val path: List<PagePoint>,
+    val colorArgb: Int,
+    val width: Float,
+)
+
 /** Immutable eraser request emitted once, after the S Pen leaves the screen. */
 data class EraserGesture(
     val id: Long,
@@ -59,6 +72,8 @@ class DryInkView(context: Context) : View(context) {
             invalidate()
         }
     var eraserPreview: EraserPreview? = null
+        set(value) { field = value; invalidate() }
+    var quickShapePreview: QuickShapePreview? = null
         set(value) { field = value; invalidate() }
     var hoverPreview: StylusHoverPreview? = null
         set(value) { field = value; invalidate() }
@@ -119,6 +134,9 @@ class DryInkView(context: Context) : View(context) {
         ).filter { stroke -> isOnScreen(adapter, stroke, visibleBounds) }
         active.forEach { drawStroke(canvas, adapter, it, false) }
 
+        quickShapePreview?.takeIf { it.pageNumber == activePage }?.let { preview ->
+            drawQuickShapePreview(canvas, adapter, preview)
+        }
         eraserPreview?.let { preview ->
             drawEraserPath(canvas, adapter, preview)
         }
@@ -210,6 +228,27 @@ class DryInkView(context: Context) : View(context) {
         }
         if (preview.path.size == 1) canvas.drawCircle(first.x, first.y, paint.strokeWidth / 2f, paint)
         else canvas.drawPath(path, paint)
+    }
+
+    private fun drawQuickShapePreview(
+        canvas: Canvas,
+        adapter: InkViewport,
+        preview: QuickShapePreview,
+    ) {
+        if (preview.path.isEmpty()) return
+        paint.color = preview.colorArgb
+        paint.alpha = Color.alpha(preview.colorArgb)
+        paint.strokeWidth = max(1f, adapter.canonicalWidthToView(preview.pageNumber, preview.width))
+        val first = adapter.canonicalToView(preview.pageNumber, preview.path.first()) ?: return
+        if (preview.path.size == 1) {
+            canvas.drawCircle(first.x, first.y, paint.strokeWidth / 2f, paint)
+            return
+        }
+        val path = Path().apply { moveTo(first.x, first.y) }
+        preview.path.drop(1).forEach { point ->
+            adapter.canonicalToView(preview.pageNumber, point)?.let { path.lineTo(it.x, it.y) }
+        }
+        canvas.drawPath(path, paint)
     }
 
     private fun drawMarks(canvas: Canvas, adapter: InkViewport) {

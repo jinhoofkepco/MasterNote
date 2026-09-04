@@ -3,11 +3,14 @@ package com.studyink.reader
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Matrix
+import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
 import androidx.ink.authoring.InProgressStrokesView
 import androidx.ink.brush.Brush
 import androidx.ink.brush.StockBrushes
+import com.studyink.annotation.engine.QuickShapeRecognition
+import com.studyink.annotation.engine.QuickShapeRecognizer
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeTool
@@ -23,6 +26,15 @@ class InkInputView(context: Context) : View(context) {
     var penWidthDp: Float = DEFAULT_PEN_WIDTH_DP
     var penOpacity: Float = 1f
     var onStroke: (StrokeAsset) -> Unit = {}
+    /**
+     * Main-page owner hook used only when a quick-shape preview replaced AndroidX wet ink.
+     * The owner invokes the completion after its durable mutation attempt, allowing this view to
+     * bridge the preview until dry ink has caught up without publishing a second stroke.
+     */
+    var onStrokeAwaitingPersistence: ((StrokeAsset, () -> Unit) -> Unit)? = null
+    var quickShapeEnabled: Boolean = false
+    var onQuickShapePreview: (QuickShapePreview?) -> Unit = {}
+    var onStrokeStart: (Int) -> Unit = {}
     var onStylusContact: () -> Unit = {}
     /**
      * Contact activity for the lightweight study-idle monitor. This is emitted only while a pen,
@@ -48,6 +60,7 @@ class InkInputView(context: Context) : View(context) {
     private var currentPage = -1
     private var currentPointer = -1
     private var activeTool = ReaderTool.PEN
+    private var activeStrokeColorArgb = DEFAULT_PEN_COLOR_ARGB
     private var strokeWidthCanonical = 4f
     private var eraserRadiusCanonical = 18f
     private var nextEraserGestureId = 0L
@@ -69,6 +82,25 @@ class InkInputView(context: Context) : View(context) {
     private var markHistoryLastX = 0f
     private var draggingMarkHistory = false
     private var lastWorkActivityEventTime = Long.MIN_VALUE
+    private val quickShapeSession by lazy {
+        QuickShapeSession<QuickShapeRecognition>(
+            holdSlopPx = dp(QUICK_SHAPE_HOLD_SLOP_DP),
+            rawResumeSlopPx = dp(QUICK_SHAPE_RAW_RESUME_SLOP_DP),
+        )
+    }
+    private var quickShapeActive = false
+    private var quickShapeWetInkDetached = false
+    private var quickShapeHoldRunnable: Runnable? = null
+    private var quickShapeScheduledGeneration = NO_QUICK_SHAPE_GENERATION
+    private var quickShapeRecognitionPointCount = 0
+    private var quickShapeMinimumDiagonalCanonical = 0f
+    private var quickShapeMinViewX = Float.POSITIVE_INFINITY
+    private var quickShapeMinViewY = Float.POSITIVE_INFINITY
+    private var quickShapeMaxViewX = Float.NEGATIVE_INFINITY
+    private var quickShapeMaxViewY = Float.NEGATIVE_INFINITY
+    private var nextQuickShapePreviewToken = 0L
+    private var activeQuickShapePreviewToken = NO_QUICK_SHAPE_PREVIEW
+    private var displayedQuickShapePreviewToken = NO_QUICK_SHAPE_PREVIEW
 
     val hasActiveGesture: Boolean
         get() = currentPointer >= 0
@@ -90,7 +122,11 @@ class InkInputView(context: Context) : View(context) {
         if (currentPointer < 0) return false
         cancelGradeLongPress()
         markHistoryGroupId?.let(onEndMarkHistoryDrag)
-        if (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) {
+        cancelQuickShapeGesture()
+        if (
+            (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) &&
+            !quickShapeWetInkDetached
+        ) {
             wetInkView.cancelUnfinishedStrokes()
         }
         if (activeEraserGestureId != NO_ERASER_GESTURE) onEraserPreview(null)
@@ -99,14 +135,32 @@ class InkInputView(context: Context) : View(context) {
         return true
     }
 
+    /** Clears a post-UP quick-shape bridge when its captured document target is no longer visible. */
+    fun clearQuickShapePreview() {
+        clearQuickShapePreview(displayedQuickShapePreviewToken)
+    }
+
     init {
         setBackgroundColor(Color.TRANSPARENT)
         isClickable = true
         contentDescription = "필기 입력 영역"
     }
 
+    override fun onDetachedFromWindow() {
+        if (currentPointer >= 0) cancelActiveGesture()
+        cancelQuickShapeHoldTimer()
+        if (displayedQuickShapePreviewToken != NO_QUICK_SHAPE_PREVIEW) {
+            onQuickShapePreview(null)
+            displayedQuickShapePreviewToken = NO_QUICK_SHAPE_PREVIEW
+        }
+        super.onDetachedFromWindow()
+    }
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (!isEnabled) return false
+        if (!isEnabled) {
+            if (currentPointer >= 0) cancelActiveGesture()
+            return false
+        }
         if (currentPointer < 0 && !event.isStylusEvent()) return false
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> return start(event)
@@ -205,9 +259,18 @@ class InkInputView(context: Context) : View(context) {
         eraserRadiusCanonical = viewport.viewWidthToCanonical(currentPage, dp(18f))
 
         if (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) {
-            val color = if (activeTool == ReaderTool.HIGHLIGHTER) 0x66FFE45C else penColorWithOpacity()
+            activeStrokeColorArgb = if (activeTool == ReaderTool.HIGHLIGHTER) {
+                0x66FFE45C
+            } else {
+                penColorWithOpacity()
+            }
+            onStrokeStart(currentPage)
+            if (quickShapeEnabled && activeTool == ReaderTool.PEN) beginQuickShapeGesture(event)
             val brush = Brush.createWithColorIntArgb(
-                StockBrushes.marker(), color, if (activeTool == ReaderTool.HIGHLIGHTER) dp(18f) else dp(penWidthDp), 0.1f
+                StockBrushes.marker(),
+                activeStrokeColorArgb,
+                if (activeTool == ReaderTool.HIGHLIGHTER) dp(18f) else dp(penWidthDp),
+                0.1f,
             )
             wetInkView.startStroke(event, currentPointer, brush, Matrix(), Matrix())
         } else {
@@ -257,8 +320,16 @@ class InkInputView(context: Context) : View(context) {
         }
         publishWorkActivity(event.eventTime)
         collectHistory(event)
+        if (quickShapeActive) {
+            updateQuickShapeViewBounds(event)
+            advanceQuickShapeSession(event)
+        }
         if (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) {
-            wetInkView.addToStroke(event, currentPointer, null)
+            if (!quickShapeWetInkDetached) {
+                wetInkView.addToStroke(event, currentPointer, null)
+            } else if (quickShapeSession.snapshot.phase != QuickShapePhase.SNAPPED) {
+                publishQuickShapePreview(currentPoints)
+            }
         } else {
             publishEraserPreview()
         }
@@ -279,6 +350,10 @@ class InkInputView(context: Context) : View(context) {
 
     private fun finish(event: MotionEvent): Boolean {
         if (currentPointer < 0) return false
+        if (currentPage >= 0 && currentPage != viewport.activePage()) {
+            cancel(event)
+            return true
+        }
         if (eraseGestureBlocked) {
             reset()
             return true
@@ -305,20 +380,9 @@ class InkInputView(context: Context) : View(context) {
             reset()
             return true
         }
-        collectPoint(event.x, event.y, event.pressure)
+        collectHistory(event)
         if (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) {
-            wetInkView.finishStroke(event, currentPointer)
-            if (currentPoints.isNotEmpty()) {
-                onStroke(
-                    StrokeAsset(
-                        pageNumber = currentPage,
-                        tool = if (activeTool == ReaderTool.PEN) StrokeTool.PEN else StrokeTool.HIGHLIGHTER,
-                        colorArgb = if (activeTool == ReaderTool.PEN) penColorWithOpacity() else 0x66FFE45C,
-                        width = strokeWidthCanonical,
-                        points = currentPoints.toList(),
-                    )
-                )
-            }
+            if (quickShapeActive) finishQuickShapeStroke(event) else finishOrdinaryStroke(event)
         } else {
             val gesture = EraserGesture(
                 id = activeEraserGestureId,
@@ -358,10 +422,275 @@ class InkInputView(context: Context) : View(context) {
         }
     }
 
+    private fun finishOrdinaryStroke(event: MotionEvent) {
+        wetInkView.finishStroke(event, currentPointer)
+        if (currentPoints.isNotEmpty()) onStroke(newStroke(currentPoints.toList()))
+    }
+
+    private fun finishQuickShapeStroke(event: MotionEvent) {
+        updateQuickShapeViewBounds(event)
+        advanceQuickShapeSession(event)
+        settleDueQuickShapeHold(event.eventTime)
+
+        val commit = quickShapeSession.onUp(event.eventTime)
+            .filterIsInstance<QuickShapeEffect.Commit<QuickShapeRecognition>>()
+            .single()
+            .stroke
+        cancelQuickShapeHoldTimer()
+        val points = when (commit) {
+            QuickShapeCommit.Raw -> currentPoints.toList()
+            is QuickShapeCommit.Snapped -> commit.candidate.points
+        }
+        if (!quickShapeWetInkDetached) wetInkView.finishStroke(event, currentPointer)
+        if (points.isEmpty()) {
+            clearQuickShapePreview(activeQuickShapePreviewToken)
+            return
+        }
+
+        val stroke = newStroke(points)
+        if (!quickShapeWetInkDetached) {
+            onStroke(stroke)
+            return
+        }
+
+        // Keep custom preview ink across the asynchronous fsync/state publication boundary, just
+        // as InProgressStrokesView keeps an ordinary finished stroke alive for a short hand-off.
+        publishQuickShapePreview(points)
+        val previewToken = activeQuickShapePreviewToken
+        val releasePreview = {
+            postDelayed(
+                { clearQuickShapePreview(previewToken) },
+                QUICK_SHAPE_COMMIT_HOLD_MILLIS,
+            )
+            Unit
+        }
+        val durableOwner = onStrokeAwaitingPersistence
+        if (durableOwner == null) {
+            onStroke(stroke)
+            releasePreview()
+        } else {
+            try {
+                durableOwner(stroke, releasePreview)
+            } catch (error: Throwable) {
+                releasePreview()
+                throw error
+            }
+        }
+    }
+
+    private fun newStroke(points: List<PagePoint>) = StrokeAsset(
+        pageNumber = currentPage,
+        tool = if (activeTool == ReaderTool.PEN) StrokeTool.PEN else StrokeTool.HIGHLIGHTER,
+        colorArgb = activeStrokeColorArgb,
+        width = strokeWidthCanonical,
+        points = points,
+    )
+
+    private fun beginQuickShapeGesture(event: MotionEvent) {
+        cancelQuickShapeHoldTimer()
+        if (activeQuickShapePreviewToken != NO_QUICK_SHAPE_PREVIEW) {
+            clearQuickShapePreview(activeQuickShapePreviewToken)
+        }
+        quickShapeSession.onDown(event.x, event.y, event.eventTime)
+        quickShapeActive = true
+        quickShapeWetInkDetached = false
+        quickShapeRecognitionPointCount = currentPoints.size
+        quickShapeMinimumDiagonalCanonical = viewport.viewWidthToCanonical(
+            currentPage,
+            dp(QUICK_SHAPE_MINIMUM_SIZE_DP),
+        )
+        quickShapeMinViewX = event.x
+        quickShapeMinViewY = event.y
+        quickShapeMaxViewX = event.x
+        quickShapeMaxViewY = event.y
+        activeQuickShapePreviewToken = nextQuickShapePreviewToken()
+    }
+
+    private fun handleQuickShapeEffects(effects: List<QuickShapeEffect<QuickShapeRecognition>>) {
+        effects.forEach { effect ->
+            when (effect) {
+                is QuickShapeEffect.ScheduleHoldTimer -> scheduleQuickShapeHold(effect)
+                QuickShapeEffect.CancelHoldTimer -> cancelQuickShapeHoldTimer()
+                is QuickShapeEffect.ShowSnappedPreview -> showSnappedQuickShape(effect.candidate)
+                QuickShapeEffect.ResumeRawPreview -> resumeRawQuickShapePreview()
+                is QuickShapeEffect.Commit -> Unit
+                QuickShapeEffect.CleanupPreview -> clearQuickShapePreview(activeQuickShapePreviewToken)
+            }
+        }
+    }
+
+    private fun advanceQuickShapeSession(event: MotionEvent) {
+        val pointerIndex = event.findPointerIndex(currentPointer)
+        if (pointerIndex < 0) return
+        val candidateAvailable = quickShapeCandidateAvailable()
+        for (history in 0 until event.historySize) {
+            handleQuickShapeEffects(
+                quickShapeSession.onMove(
+                    x = event.getHistoricalX(pointerIndex, history),
+                    y = event.getHistoricalY(pointerIndex, history),
+                    eventTimeMs = event.getHistoricalEventTime(history),
+                    candidateAvailable = candidateAvailable,
+                )
+            )
+        }
+        handleQuickShapeEffects(
+            quickShapeSession.onMove(
+                x = event.getX(pointerIndex),
+                y = event.getY(pointerIndex),
+                eventTimeMs = event.eventTime,
+                candidateAvailable = candidateAvailable,
+            ),
+        )
+    }
+
+    /** Resolves the exact 2 s boundary even when ACTION_UP is dequeued before its due Runnable. */
+    private fun settleDueQuickShapeHold(eventTimeMs: Long) {
+        val snapshot = quickShapeSession.snapshot
+        val dueAt = snapshot.holdDueAtMs ?: return
+        if (snapshot.phase != QuickShapePhase.HOLD_ARMED || eventTimeMs < dueAt) return
+        handleQuickShapeEffects(
+            quickShapeSession.onHoldTimer(
+                timerGeneration = snapshot.timerGeneration,
+                nowMs = eventTimeMs,
+                candidate = recognizeQuickShapePrefix(),
+            )
+        )
+    }
+
+    private fun recognizeQuickShapePrefix(): QuickShapeRecognition? {
+        val prefixSize = quickShapeRecognitionPointCount.coerceIn(0, currentPoints.size)
+        return QuickShapeRecognizer.recognize(
+            currentPoints.take(prefixSize),
+            minimumDiagonal = quickShapeMinimumDiagonalCanonical,
+        )
+    }
+
+    private fun scheduleQuickShapeHold(effect: QuickShapeEffect.ScheduleHoldTimer) {
+        quickShapeHoldRunnable?.let(::removeCallbacks)
+        quickShapeHoldRunnable = null
+        if (quickShapeScheduledGeneration != effect.generation) {
+            quickShapeScheduledGeneration = effect.generation
+            quickShapeRecognitionPointCount = currentPoints.size
+        }
+        var scheduled: Runnable? = null
+        scheduled = Runnable {
+            if (quickShapeHoldRunnable !== scheduled) return@Runnable
+            quickShapeHoldRunnable = null
+            if (
+                !quickShapeActive || currentPointer < 0 || !isEnabled ||
+                currentPage != viewport.activePage()
+            ) {
+                if (currentPointer >= 0) cancelActiveGesture()
+                return@Runnable
+            }
+            handleQuickShapeEffects(
+                quickShapeSession.onHoldTimer(
+                    timerGeneration = effect.generation,
+                    nowMs = SystemClock.uptimeMillis(),
+                    candidate = recognizeQuickShapePrefix(),
+                )
+            )
+        }
+        quickShapeHoldRunnable = scheduled
+        postDelayed(scheduled, (effect.dueAtMs - SystemClock.uptimeMillis()).coerceAtLeast(0L))
+    }
+
+    private fun cancelQuickShapeHoldTimer() {
+        quickShapeHoldRunnable?.let(::removeCallbacks)
+        quickShapeHoldRunnable = null
+        quickShapeScheduledGeneration = NO_QUICK_SHAPE_GENERATION
+    }
+
+    private fun showSnappedQuickShape(candidate: QuickShapeRecognition) {
+        if (!quickShapeWetInkDetached) {
+            wetInkView.cancelUnfinishedStrokes()
+            quickShapeWetInkDetached = true
+        }
+        publishQuickShapePreview(candidate.points)
+    }
+
+    private fun resumeRawQuickShapePreview() {
+        // currentPoints is an append-only record of the physical contact. Snapping only swaps the
+        // visible geometry, so an early-UP downgrade or deliberate post-snap move can restore every
+        // raw sample without attempting to reconstruct an Android MotionEvent batch.
+        publishQuickShapePreview(currentPoints)
+    }
+
+    private fun publishQuickShapePreview(points: List<PagePoint>) {
+        if (activeQuickShapePreviewToken == NO_QUICK_SHAPE_PREVIEW || currentPage < 0) return
+        displayedQuickShapePreviewToken = activeQuickShapePreviewToken
+        onQuickShapePreview(
+            QuickShapePreview(
+                pageNumber = currentPage,
+                path = points.toList(),
+                colorArgb = activeStrokeColorArgb,
+                width = strokeWidthCanonical,
+            )
+        )
+    }
+
+    private fun clearQuickShapePreview(expectedToken: Long) {
+        if (
+            expectedToken == NO_QUICK_SHAPE_PREVIEW ||
+            displayedQuickShapePreviewToken != expectedToken
+        ) return
+        displayedQuickShapePreviewToken = NO_QUICK_SHAPE_PREVIEW
+        onQuickShapePreview(null)
+    }
+
+    private fun cancelQuickShapeGesture() {
+        if (!quickShapeActive) return
+        quickShapeSession.onCancel()
+        cancelQuickShapeHoldTimer()
+        clearQuickShapePreview(activeQuickShapePreviewToken)
+    }
+
+    private fun updateQuickShapeViewBounds(event: MotionEvent) {
+        val pointerIndex = event.findPointerIndex(currentPointer)
+        if (pointerIndex < 0) return
+        for (history in 0 until event.historySize) {
+            includeQuickShapeViewPoint(
+                event.getHistoricalX(pointerIndex, history),
+                event.getHistoricalY(pointerIndex, history),
+            )
+        }
+        includeQuickShapeViewPoint(event.getX(pointerIndex), event.getY(pointerIndex))
+    }
+
+    private fun includeQuickShapeViewPoint(x: Float, y: Float) {
+        quickShapeMinViewX = minOf(quickShapeMinViewX, x)
+        quickShapeMinViewY = minOf(quickShapeMinViewY, y)
+        quickShapeMaxViewX = maxOf(quickShapeMaxViewX, x)
+        quickShapeMaxViewY = maxOf(quickShapeMaxViewY, y)
+    }
+
+    private fun quickShapeCandidateAvailable(): Boolean {
+        if (currentPoints.size < QUICK_SHAPE_MINIMUM_POINT_COUNT) return false
+        val diagonal = kotlin.math.hypot(
+            quickShapeMaxViewX - quickShapeMinViewX,
+            quickShapeMaxViewY - quickShapeMinViewY,
+        )
+        return diagonal.isFinite() && diagonal >= dp(QUICK_SHAPE_MINIMUM_SIZE_DP)
+    }
+
+    private fun nextQuickShapePreviewToken(): Long {
+        nextQuickShapePreviewToken = if (nextQuickShapePreviewToken == Long.MAX_VALUE) {
+            1L
+        } else {
+            nextQuickShapePreviewToken + 1L
+        }
+        return nextQuickShapePreviewToken
+    }
+
     private fun cancel(event: MotionEvent) {
         cancelGradeLongPress()
         markHistoryGroupId?.let(onEndMarkHistoryDrag)
-        if (currentPointer >= 0 && (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER)) {
+        cancelQuickShapeGesture()
+        if (
+            currentPointer >= 0 &&
+            (activeTool == ReaderTool.PEN || activeTool == ReaderTool.HIGHLIGHTER) &&
+            !quickShapeWetInkDetached
+        ) {
             runCatching { wetInkView.cancelStroke(event, currentPointer) }
         }
         if (activeEraserGestureId != NO_ERASER_GESTURE) onEraserPreview(null)
@@ -410,6 +739,7 @@ class InkInputView(context: Context) : View(context) {
 
     private fun reset() {
         cancelGradeLongPress()
+        cancelQuickShapeHoldTimer()
         markHistoryGroupId = null
         draggingMarkHistory = false
         markedAttemptTarget = null
@@ -420,6 +750,15 @@ class InkInputView(context: Context) : View(context) {
         currentPage = -1
         activeEraserGestureId = NO_ERASER_GESTURE
         eraseGestureBlocked = false
+        quickShapeActive = false
+        quickShapeWetInkDetached = false
+        quickShapeRecognitionPointCount = 0
+        quickShapeMinimumDiagonalCanonical = 0f
+        quickShapeMinViewX = Float.POSITIVE_INFINITY
+        quickShapeMinViewY = Float.POSITIVE_INFINITY
+        quickShapeMaxViewX = Float.NEGATIVE_INFINITY
+        quickShapeMaxViewY = Float.NEGATIVE_INFINITY
+        activeQuickShapePreviewToken = NO_QUICK_SHAPE_PREVIEW
         currentPoints.clear()
         parent.requestDisallowInterceptTouchEvent(false)
     }
@@ -454,6 +793,13 @@ class InkInputView(context: Context) : View(context) {
     private companion object {
         const val LONG_PRESS_MILLIS = 550L
         const val NO_ERASER_GESTURE = 0L
+        const val NO_QUICK_SHAPE_PREVIEW = 0L
+        const val NO_QUICK_SHAPE_GENERATION = -1L
+        const val QUICK_SHAPE_HOLD_SLOP_DP = 8f
+        const val QUICK_SHAPE_RAW_RESUME_SLOP_DP = 12f
+        const val QUICK_SHAPE_MINIMUM_SIZE_DP = 24f
+        const val QUICK_SHAPE_MINIMUM_POINT_COUNT = 6
+        const val QUICK_SHAPE_COMMIT_HOLD_MILLIS = 80L
         const val WORK_ACTIVITY_THROTTLE_MILLIS = 500L
     }
 }
