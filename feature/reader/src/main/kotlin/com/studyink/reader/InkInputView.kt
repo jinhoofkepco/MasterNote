@@ -543,7 +543,7 @@ class InkInputView(context: Context) : View(context) {
         )
     }
 
-    /** Resolves the exact 2 s boundary even when ACTION_UP is dequeued before its due Runnable. */
+    /** Resolves the exact 700 ms boundary even when ACTION_UP is dequeued before its due Runnable. */
     private fun settleDueQuickShapeHold(eventTimeMs: Long) {
         val snapshot = quickShapeSession.snapshot
         val dueAt = snapshot.holdDueAtMs ?: return
@@ -562,6 +562,7 @@ class InkInputView(context: Context) : View(context) {
         return QuickShapeRecognizer.recognize(
             currentPoints.take(prefixSize),
             minimumDiagonal = quickShapeMinimumDiagonalCanonical,
+            outputEndpoint = currentPoints.lastOrNull(),
         )
     }
 

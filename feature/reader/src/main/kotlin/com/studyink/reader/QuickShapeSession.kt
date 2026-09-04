@@ -245,7 +245,7 @@ internal class QuickShapeSession<Candidate : Any>(
         hypot(x - other.x, y - other.y)
 
     internal companion object {
-        const val HOLD_DURATION_MS = 2_000L
+        const val HOLD_DURATION_MS = 700L
     }
 }
 

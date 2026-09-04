@@ -9,19 +9,19 @@ import org.junit.Test
 
 class QuickShapeSessionTest {
     @Test
-    fun `snap fires exactly two seconds after the last meaningful movement`() {
+    fun `snap fires exactly seven hundred milliseconds after the last meaningful movement`() {
         val session = session()
         assertHasNoCommit(session.onDown(0f, 0f, 100L))
         val schedule = session.onMove(20f, 0f, 250L, candidateAvailable = true).singleSchedule()
 
-        assertEquals(2_250L, schedule.dueAtMs)
+        assertEquals(950L, schedule.dueAtMs)
         assertEquals(
             schedule,
-            session.onHoldTimer(schedule.generation, 2_249L, "line").singleSchedule(),
+            session.onHoldTimer(schedule.generation, 949L, "line").singleSchedule(),
         )
         assertEquals(
             listOf(QuickShapeEffect.ShowSnappedPreview("line")),
-            session.onHoldTimer(schedule.generation, 2_250L, "line"),
+            session.onHoldTimer(schedule.generation, 950L, "line"),
         )
         assertEquals(QuickShapePhase.SNAPPED, session.snapshot.phase)
     }
@@ -38,7 +38,7 @@ class QuickShapeSessionTest {
         val boundaryEffects = session.onMove(28f, 0f, 600L, candidateAvailable = true)
         assertEquals(QuickShapeEffect.CancelHoldTimer, boundaryEffects.first())
         val replacement = boundaryEffects.singleSchedule()
-        assertEquals(2_600L, replacement.dueAtMs)
+        assertEquals(1_300L, replacement.dueAtMs)
         assertTrue(replacement.generation != first.generation)
     }
 
@@ -68,7 +68,7 @@ class QuickShapeSessionTest {
         val resumeEffects = session.onMove(32f, 0f, 2_300L, candidateAvailable = true)
         assertEquals(QuickShapeEffect.ResumeRawPreview, resumeEffects.first())
         val second = resumeEffects.singleSchedule()
-        assertEquals(4_300L, second.dueAtMs)
+        assertEquals(3_000L, second.dueAtMs)
         assertEquals(QuickShapePhase.HOLD_ARMED, session.snapshot.phase)
 
         assertEquals(
@@ -93,7 +93,7 @@ class QuickShapeSessionTest {
         assertEquals(QuickShapePhase.RAW, session.snapshot.phase)
 
         val later = session.onMove(40f, 0f, 2_500L, candidateAvailable = true).singleSchedule()
-        assertEquals(4_500L, later.dueAtMs)
+        assertEquals(3_200L, later.dueAtMs)
     }
 
     @Test
@@ -119,13 +119,13 @@ class QuickShapeSessionTest {
         assertTrue(session.onHoldTimer(rejected.generation, rejected.dueAtMs, null).isEmpty())
         assertEquals(QuickShapePhase.RAW, session.snapshot.phase)
 
-        val retry = session.onMove(21f, 0f, 2_200L, candidateAvailable = true).singleSchedule()
-        // The retry window starts at the rejected recognition deadline (2,100 ms), so the
-        // first subsequent jitter event only schedules the remainder of a fresh two-second hold.
-        assertEquals(4_100L, retry.dueAtMs)
+        val retry = session.onMove(21f, 0f, 900L, candidateAvailable = true).singleSchedule()
+        // The retry window starts at the rejected recognition deadline (800 ms), so the
+        // first subsequent jitter event only schedules the remainder of a fresh 700 ms hold.
+        assertEquals(1_500L, retry.dueAtMs)
         assertEquals(
             listOf(QuickShapeEffect.ShowSnappedPreview("circle")),
-            session.onHoldTimer(retry.generation, 4_100L, "circle"),
+            session.onHoldTimer(retry.generation, 1_500L, "circle"),
         )
     }
 
@@ -133,15 +133,16 @@ class QuickShapeSessionTest {
     fun `up is the only raw commit boundary`() {
         val session = session()
         assertHasNoCommit(session.onDown(0f, 0f, 0L))
-        val schedule = session.onMove(20f, 0f, 100L, candidateAvailable = true)
-        assertHasNoCommit(schedule)
+        val effects = session.onMove(20f, 0f, 100L, candidateAvailable = true)
+        assertHasNoCommit(effects)
+        val schedule = effects.singleSchedule()
         assertHasNoCommit(
-            session.onHoldTimer(schedule.singleSchedule().generation, 1_000L, "line"),
+            session.onHoldTimer(schedule.generation, schedule.dueAtMs - 1L, "line"),
         )
 
-        val effects = session.onUp(1_500L)
-        assertEquals(QuickShapeCommit.Raw, effects.singleCommit().stroke)
-        assertEquals(QuickShapeEffect.CleanupPreview, effects.last())
+        val commitEffects = session.onUp(schedule.dueAtMs - 1L)
+        assertEquals(QuickShapeCommit.Raw, commitEffects.singleCommit().stroke)
+        assertEquals(QuickShapeEffect.CleanupPreview, commitEffects.last())
         assertEquals(QuickShapePhase.IDLE, session.snapshot.phase)
     }
 
@@ -199,11 +200,11 @@ class QuickShapeSessionTest {
 
         // Eight pixels is below the normal 12 px post-snap escape threshold. Its event time proves
         // it physically happened before the hold deadline, however, so the timer won a queue race.
-        val recovery = session.onMove(28f, 0f, 2_000L, candidateAvailable = true)
+        val recovery = session.onMove(28f, 0f, 700L, candidateAvailable = true)
 
         assertEquals(QuickShapeEffect.ResumeRawPreview, recovery.first())
         val replacement = recovery.singleSchedule()
-        assertEquals(4_000L, replacement.dueAtMs)
+        assertEquals(1_400L, replacement.dueAtMs)
         assertEquals(QuickShapePhase.HOLD_ARMED, session.snapshot.phase)
         assertTrue(session.onHoldTimer(first.generation, replacement.dueAtMs, "stale").isEmpty())
         assertEquals(
@@ -235,7 +236,7 @@ class QuickShapeSessionTest {
         session.onDown(0f, 0f, 0L)
         val rejected = session.onMove(20f, 0f, 100L, candidateAvailable = true).singleSchedule()
         session.onHoldTimer(rejected.generation, rejected.dueAtMs, null)
-        val retry = session.onMove(21f, 0f, 2_200L, candidateAvailable = true).singleSchedule()
+        val retry = session.onMove(21f, 0f, 900L, candidateAvailable = true).singleSchedule()
 
         assertTrue(session.onHoldTimer(rejected.generation, retry.dueAtMs, "stale").isEmpty())
         assertEquals(QuickShapePhase.HOLD_ARMED, session.snapshot.phase)
@@ -303,7 +304,7 @@ class QuickShapeSessionTest {
         assertEquals(QuickShapePhase.RAW, session.snapshot.phase)
         assertTrue(session.onHoldTimer(old.generation, Long.MAX_VALUE, "stale").isEmpty())
         val fresh = session.onMove(25f, 6f, 3_100L, candidateAvailable = true).singleSchedule()
-        assertEquals(5_100L, fresh.dueAtMs)
+        assertEquals(3_800L, fresh.dueAtMs)
     }
 
     @Test
@@ -313,7 +314,7 @@ class QuickShapeSessionTest {
         val schedule = session.onMove(
             20f,
             0f,
-            Long.MAX_VALUE - 1_000L,
+            Long.MAX_VALUE - 500L,
             candidateAvailable = true,
         ).singleSchedule()
 

@@ -57,12 +57,18 @@ object QuickShapeRecognizer {
     /**
      * [minimumDiagonal] is expressed in canonical page units. The input owner should convert its
      * physical/dp minimum through the current viewport so recognition stays invariant under zoom.
+     * [outputEndpoint] is the current held pen position when it is newer than the immutable points
+     * used for recognition. It only anchors accepted output geometry; it never helps a shape win.
      */
     fun recognize(
         points: List<PagePoint>,
         minimumDiagonal: Float = DEFAULT_MINIMUM_DIAGONAL,
+        outputEndpoint: PagePoint? = null,
     ): QuickShapeRecognition? {
         if (!minimumDiagonal.isFinite() || minimumDiagonal <= 0f) return null
+        if (outputEndpoint != null && (!outputEndpoint.x.isFinite() || !outputEndpoint.y.isFinite())) {
+            return null
+        }
         if (points.size < MIN_POINT_COUNT || points.any { !it.x.isFinite() || !it.y.isFinite() }) {
             return null
         }
@@ -118,7 +124,128 @@ object QuickShapeRecognizer {
         val runnerUp = ranked.getOrNull(1)
         if (runnerUp != null && winner.score - runnerUp.score < MIN_RUNNER_UP_MARGIN) return null
 
-        return QuickShapeRecognition(winner.kind, winner.score.coerceIn(0f, 1f), winner.points)
+        val heldEndpoint = outputEndpoint ?: points.last()
+        val anchoredPoints = when (winner.kind) {
+            QuickShapeKind.LINE -> anchorLineEndpoints(
+                source = input,
+                start = points.first(),
+                end = heldEndpoint,
+                pressure = pressure,
+                minimumDiagonal = minimumDiagonal,
+            )
+            else -> anchorClosedGeometry(
+                canonical = winner.points,
+                source = resampleByArcLength(closeAtMidpoint(loopInput), 96),
+                sourceStart = points.first(),
+                sourceEnd = loopInput.last(),
+                heldEndpoint = heldEndpoint,
+                diagonal = diagonal,
+                pressure = pressure,
+            )
+        } ?: return null
+        return QuickShapeRecognition(winner.kind, winner.score.coerceIn(0f, 1f), anchoredPoints)
+    }
+
+    /** Keeps a corrected line attached to the exact pen-down and held points, not TLS projections. */
+    private fun anchorLineEndpoints(
+        source: List<PagePoint>,
+        start: PagePoint,
+        end: PagePoint,
+        pressure: Float,
+        minimumDiagonal: Float,
+    ): List<PagePoint>? {
+        val anchoredStart = PagePoint(start.x, start.y, pressure)
+        val anchoredEnd = PagePoint(end.x, end.y, pressure)
+        val chord = distance(anchoredStart, anchoredEnd)
+        if (!chord.isFinite() || chord < minimumDiagonal) return null
+
+        val deviations = source.map { segmentDistance(it, anchoredStart, anchoredEnd) }
+        val rms = sqrt(deviations.sumOf { (it * it).toDouble() } / deviations.size).toFloat() / chord
+        val maximum = deviations.maxOrNull()!! / chord
+        if (rms > 0.045f || maximum > 0.105f) return null
+        return listOf(anchoredStart, anchoredEnd)
+    }
+
+    /**
+     * Translates a fitted closed outline just enough to pass through the held pen position. The
+     * anchor becomes the stored seam, while all fitted angles, parallel edges, and aspect ratios
+     * remain unchanged. A translated fit outside the original acceptance envelope is rejected.
+     */
+    private fun anchorClosedGeometry(
+        canonical: List<PagePoint>,
+        source: List<PagePoint>,
+        sourceStart: PagePoint,
+        sourceEnd: PagePoint,
+        heldEndpoint: PagePoint,
+        diagonal: Float,
+        pressure: Float,
+    ): List<PagePoint>? {
+        if (canonical.size < 4 || source.size < MIN_CLOSED_POINT_COUNT || diagonal <= 0f) return null
+        val open = if (distance(canonical.first(), canonical.last()) <= 1e-4f) {
+            canonical.dropLast(1)
+        } else {
+            canonical
+        }
+        if (open.size < 3) return null
+
+        val held = PagePoint(heldEndpoint.x, heldEndpoint.y, pressure)
+        val projection = closestClosedSegmentProjection(open, held) ?: return null
+        val dx = held.x - projection.point.x
+        val dy = held.y - projection.point.y
+        val translated = open.map { point -> PagePoint(point.x + dx, point.y + dy, point.pressure) }
+        val translatedClosed = translated + translated.first()
+
+        val deviations = source.map { pointToClosedPolylineDistance(it, translatedClosed) / diagonal }
+        if (deviations.average().toFloat() > 0.045f || percentile(deviations, 0.90f) > 0.085f) {
+            return null
+        }
+        if (
+            pointToClosedPolylineDistance(sourceStart, translatedClosed) / diagonal > 0.045f ||
+            pointToClosedPolylineDistance(sourceEnd, translatedClosed) / diagonal > 0.045f
+        ) return null
+
+        val sameDirection = signedArea(source) == 0f || signedArea(open) == 0f ||
+            signedArea(source) * signedArea(open) > 0f
+        val step = if (sameDirection) 1 else -1
+        val traversalStart = if (step > 0) {
+            (projection.segmentIndex + 1) % translated.size
+        } else {
+            projection.segmentIndex
+        }
+        val duplicateTolerance = max(1e-4f, diagonal * 1e-6f)
+        return buildList(translated.size + 2) {
+            add(held)
+            repeat(translated.size) { offset ->
+                val index = (traversalStart + step * offset).mod(translated.size)
+                val point = translated[index]
+                if (distance(last(), point) > duplicateTolerance) add(point)
+            }
+            if (distance(last(), held) <= duplicateTolerance) {
+                set(lastIndex, held)
+            } else {
+                add(held)
+            }
+        }
+    }
+
+    private fun closestClosedSegmentProjection(
+        points: List<PagePoint>,
+        target: PagePoint,
+    ): ClosedSegmentProjection? {
+        var best: ClosedSegmentProjection? = null
+        var bestDistance = Float.POSITIVE_INFINITY
+        for (index in points.indices) {
+            val start = points[index]
+            val end = points[(index + 1) % points.size]
+            val fraction = segmentProjectionFraction(target, start, end)
+            val point = interpolate(start, end, fraction)
+            val candidateDistance = distance(target, point)
+            if (candidateDistance < bestDistance) {
+                bestDistance = candidateDistance
+                best = ClosedSegmentProjection(index, point)
+            }
+        }
+        return best
     }
 
     private fun lineCandidate(
@@ -886,6 +1013,11 @@ object QuickShapeRecognizer {
         val kind: QuickShapeKind,
         val score: Float,
         val points: List<PagePoint>,
+    )
+
+    private data class ClosedSegmentProjection(
+        val segmentIndex: Int,
+        val point: PagePoint,
     )
 
     private data class AxisFit(val center: PagePoint, val axis: Vector)

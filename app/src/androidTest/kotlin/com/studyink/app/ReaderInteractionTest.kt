@@ -85,13 +85,17 @@ class ReaderInteractionTest {
     }
 
     @Test
-    fun penLineHeldForTwoSecondsCommitsOneSnappedStroke() {
+    fun penLineHeldForSevenTenthsOfASecondCommitsOneSnappedStroke() {
         val committed = mutableListOf<StrokeAsset>()
         val previews = mutableListOf<QuickShapePreview?>()
+        var expectedStart: PagePoint? = null
+        var expectedHeldEnd: PagePoint? = null
         scenario.onActivity { activity ->
             activity.findInkInputView().apply {
                 tool = ReaderTool.PEN
                 quickShapeEnabled = true
+                expectedStart = requireNotNull(viewport.viewToCanonical(360f, 820f)).point
+                expectedHeldEnd = requireNotNull(viewport.viewToCanonical(624f, 872f)).point
                 onQuickShapePreview = previews::add
                 onStrokeAwaitingPersistence = { stroke, complete ->
                     committed += stroke
@@ -125,16 +129,16 @@ class ReaderInteractionTest {
                     )
                 )
             }
-            // Drawing ends at +400 ms, so this UP is at least 2,000 ms after the last meaningful
+            // Drawing ends at +400 ms, so this UP is at least 700 ms after the last meaningful
             // movement on every screen density. Synchronous dispatch exercises ACTION_UP settling.
             add(
                 motionEvent(
                     MotionEvent.ACTION_UP,
                     InputDevice.SOURCE_STYLUS,
                     MotionEvent.TOOL_TYPE_STYLUS,
-                    620f,
-                    870f,
-                    eventTime = downAt + 2_400L,
+                    624f,
+                    872f,
+                    eventTime = downAt + 1_100L,
                 )
             )
         }
@@ -144,6 +148,13 @@ class ReaderInteractionTest {
         assertEquals(1, committed.size)
         assertEquals(StrokeTool.PEN, committed.single().tool)
         assertEquals(2, committed.single().points.size)
+        val snappedPoints = committed.single().points
+        val start = requireNotNull(expectedStart)
+        val heldEnd = requireNotNull(expectedHeldEnd)
+        assertEquals(start.x, snappedPoints.first().x, 0.001f)
+        assertEquals(start.y, snappedPoints.first().y, 0.001f)
+        assertEquals(heldEnd.x, snappedPoints.last().x, 0.001f)
+        assertEquals(heldEnd.y, snappedPoints.last().y, 0.001f)
         assertTrue(previews.filterNotNull().any { it.path.size == 2 })
     }
 

@@ -16,7 +16,7 @@ import org.junit.Test
 
 class QuickShapeRecognizerTest {
     @Test
-    fun `recognizes a noisy diagonal line and emits two fitted endpoints`() {
+    fun `recognizes a noisy diagonal line and preserves its exact endpoints`() {
         val points = sampleOpenLine(
             PagePoint(40f, 75f),
             PagePoint(390f, 265f),
@@ -30,8 +30,31 @@ class QuickShapeRecognizerTest {
         assertEquals(QuickShapeKind.LINE, result!!.kind)
         assertEquals(2, result.points.size)
         assertTrue(result.score >= 0.72f)
-        assertTrue(distance(result.points.first(), points.first()) < 3f)
-        assertTrue(distance(result.points.last(), points.last()) < 3f)
+        assertPointNear(points.first(), result.points.first(), 0.0001f)
+        assertPointNear(points.last(), result.points.last(), 0.0001f)
+    }
+
+    @Test
+    fun `line output follows a newer held endpoint without letting that endpoint create a match`() {
+        val points = sampleOpenLine(
+            PagePoint(40f, 75f),
+            PagePoint(390f, 265f),
+            count = 56,
+            noise = 1.4f,
+        )
+        val held = PagePoint(394f, 267f, pressure = 0.15f)
+
+        val result = QuickShapeRecognizer.recognize(points, outputEndpoint = held)
+
+        assertNotNull(result)
+        assertEquals(QuickShapeKind.LINE, result!!.kind)
+        assertPointNear(points.first(), result.points.first(), 0.0001f)
+        assertEquals(held.x, result.points.last().x, 0f)
+        assertEquals(held.y, result.points.last().y, 0f)
+        assertEquals(result.points.first().pressure, result.points.last().pressure, 0f)
+
+        val disruptiveHeldPoint = PagePoint(390f, 345f)
+        assertNull(QuickShapeRecognizer.recognize(points, outputEndpoint = disruptiveHeldPoint))
     }
 
     @Test
@@ -50,7 +73,7 @@ class QuickShapeRecognizerTest {
 
         assertNotNull(result)
         assertEquals(QuickShapeKind.TRIANGLE, result!!.kind)
-        assertEquals(4, result.points.size)
+        assertTrue(result.points.size in 4..5)
         assertPointNear(result.points.first(), result.points.last(), 0.001f)
         assertTrue(result.score >= 0.72f)
     }
@@ -95,9 +118,9 @@ class QuickShapeRecognizerTest {
 
         assertNotNull(result)
         assertEquals(QuickShapeKind.RECTANGLE, result!!.kind)
-        assertEquals(5, result.points.size)
+        assertTrue(result.points.size in 5..6)
         assertPointNear(result.points.first(), result.points.last(), 0.001f)
-        assertRightAngles(result.points.dropLast(1))
+        assertRightAngles(closedPolylineCorners(result.points))
         assertTrue(result.score >= 0.72f)
     }
 
@@ -113,10 +136,95 @@ class QuickShapeRecognizerTest {
 
         assertNotNull(result)
         assertEquals(QuickShapeKind.SQUARE, result!!.kind)
-        assertEquals(5, result.points.size)
-        assertRightAngles(result.points.dropLast(1))
-        val canonicalEdges = result.points.zipWithNext { first, second -> distance(first, second) }
+        assertTrue(result.points.size in 5..6)
+        val corners = closedPolylineCorners(result.points)
+        assertRightAngles(corners)
+        val canonicalEdges = corners.indices.map { index ->
+            distance(corners[index], corners[(index + 1) % corners.size])
+        }
         assertTrue(canonicalEdges.max() - canonicalEdges.min() < 0.01f)
+    }
+
+    @Test
+    fun `closed shapes keep the live held point as their exact connected seam`() {
+        val triangle = rotateClosedStroke(
+            sampleClosedPolygon(
+                listOf(PagePoint(90f, 310f), PagePoint(245f, 65f), PagePoint(425f, 325f)),
+                samplesPerEdge = 24,
+                noise = 0.8f,
+            ),
+            offset = 12,
+        )
+        val rectangle = rotateClosedStroke(
+            sampleClosedPolygon(
+                rotatedBox(310f, 280f, width = 310f, height = 135f, angleDegrees = 31f),
+                samplesPerEdge = 24,
+                noise = 0.8f,
+            ),
+            offset = 12,
+        )
+        val square = rotateClosedStroke(
+            sampleClosedPolygon(
+                rotatedBox(250f, 220f, width = 190f, height = 185f, angleDegrees = -23f),
+                samplesPerEdge = 24,
+                noise = 0.6f,
+            ),
+            offset = 12,
+        )
+        val circle = rotateClosedStroke(
+            sampleEllipse(300f, 260f, 145f, 140f, angleDegrees = 0f, noise = 0.8f),
+            offset = 19,
+        )
+        val ellipse = rotateClosedStroke(
+            sampleEllipse(380f, 330f, 185f, 82f, angleDegrees = 34f, noise = 0.8f),
+            offset = 27,
+        )
+
+        listOf(
+            QuickShapeKind.TRIANGLE to triangle,
+            QuickShapeKind.RECTANGLE to rectangle,
+            QuickShapeKind.SQUARE to square,
+            QuickShapeKind.CIRCLE to circle,
+            QuickShapeKind.ELLIPSE to ellipse,
+        ).forEach { (expectedKind, stroke) ->
+            val held = stroke.last().copy(x = stroke.last().x + 1f, y = stroke.last().y - 0.75f)
+            val result = QuickShapeRecognizer.recognize(stroke, outputEndpoint = held)
+
+            assertNotNull("$expectedKind was rejected", result)
+            assertEquals(expectedKind, result!!.kind)
+            assertPointNear(held, result.points.first(), 0.001f)
+            assertPointNear(held, result.points.last(), 0.001f)
+            assertTrue(
+                "$expectedKind contains consecutive duplicate points",
+                result.points.zipWithNext().all { (first, second) -> distance(first, second) > 0.0001f },
+            )
+            when (expectedKind) {
+                QuickShapeKind.TRIANGLE -> assertEquals(3, closedPolylineCorners(result.points).size)
+                QuickShapeKind.RECTANGLE -> assertRightAngles(closedPolylineCorners(result.points))
+                QuickShapeKind.SQUARE -> {
+                    val corners = closedPolylineCorners(result.points)
+                    assertRightAngles(corners)
+                    val edges = corners.indices.map { index ->
+                        distance(corners[index], corners[(index + 1) % corners.size])
+                    }
+                    assertTrue(edges.max() - edges.min() < 0.01f)
+                }
+                QuickShapeKind.CIRCLE,
+                QuickShapeKind.ELLIPSE,
+                QuickShapeKind.LINE,
+                -> Unit
+            }
+        }
+
+        assertNull(
+            QuickShapeRecognizer.recognize(
+                triangle,
+                outputEndpoint = triangle.last().copy(
+                    x = triangle.last().x + 220f,
+                    y = triangle.last().y + 180f,
+                ),
+            )
+        )
     }
 
     @Test
@@ -134,8 +242,8 @@ class QuickShapeRecognizerTest {
 
         assertNotNull(result)
         assertEquals(QuickShapeKind.RECTANGLE, result!!.kind)
-        assertEquals(5, result.points.size)
-        assertRightAngles(result.points.dropLast(1))
+        assertTrue(result.points.size in 5..6)
+        assertRightAngles(closedPolylineCorners(result.points))
     }
 
     @Test
@@ -234,7 +342,7 @@ class QuickShapeRecognizerTest {
     }
 
     @Test
-    fun `recognizes a noisy circle and emits a 72 segment canonical loop`() {
+    fun `recognizes a noisy circle and emits an anchored canonical loop`() {
         val points = sampleEllipse(
             centerX = 300f,
             centerY = 260f,
@@ -248,7 +356,7 @@ class QuickShapeRecognizerTest {
 
         assertNotNull(result)
         assertEquals(QuickShapeKind.CIRCLE, result!!.kind)
-        assertEquals(73, result.points.size)
+        assertTrue(result.points.size in 73..74)
         assertPointNear(result.points.first(), result.points.last(), 0.001f)
         assertTrue(result.score >= 0.72f)
     }
@@ -268,7 +376,7 @@ class QuickShapeRecognizerTest {
 
         assertNotNull(result)
         assertEquals(QuickShapeKind.ELLIPSE, result!!.kind)
-        assertEquals(73, result.points.size)
+        assertTrue(result.points.size in 73..74)
         assertPointNear(result.points.first(), result.points.last(), 0.001f)
     }
 
@@ -853,6 +961,7 @@ class QuickShapeRecognizerTest {
     )
 
     private fun assertRightAngles(corners: List<PagePoint>) {
+        assertEquals(4, corners.size)
         corners.indices.forEach { index ->
             val previous = corners[(index - 1 + corners.size) % corners.size]
             val current = corners[index]
@@ -866,6 +975,24 @@ class QuickShapeRecognizerTest {
         }
     }
 
+    private fun closedPolylineCorners(points: List<PagePoint>): List<PagePoint> {
+        val open = if (points.size > 1 && distance(points.first(), points.last()) <= 0.001f) {
+            points.dropLast(1)
+        } else {
+            points
+        }
+        return open.filterIndexed { index, current ->
+            val previous = open[(index - 1 + open.size) % open.size]
+            val next = open[(index + 1) % open.size]
+            val incomingX = current.x - previous.x
+            val incomingY = current.y - previous.y
+            val outgoingX = next.x - current.x
+            val outgoingY = next.y - current.y
+            val denominator = hypot(incomingX, incomingY) * hypot(outgoingX, outgoingY)
+            denominator > 1e-6f && abs(incomingX * outgoingY - incomingY * outgoingX) / denominator > 0.05f
+        }
+    }
+
     private fun assertPointNear(expected: PagePoint, actual: PagePoint, tolerance: Float) {
         assertTrue("expected=$expected actual=$actual", distance(expected, actual) <= tolerance)
     }
@@ -874,6 +1001,13 @@ class QuickShapeRecognizerTest {
         val result = QuickShapeRecognizer.recognize(stroke)
         assertNotNull("$label was rejected", result)
         assertEquals(label, expected, result!!.kind)
+        if (expected == QuickShapeKind.LINE) {
+            assertPointNear(stroke.first(), result.points.first(), 0.001f)
+            assertPointNear(stroke.last(), result.points.last(), 0.001f)
+        } else {
+            assertPointNear(stroke.last(), result.points.first(), 0.001f)
+            assertPointNear(stroke.last(), result.points.last(), 0.001f)
+        }
     }
 
     private fun distance(a: PagePoint, b: PagePoint): Float = hypot(a.x - b.x, a.y - b.y)
