@@ -1,7 +1,6 @@
 package com.studyink.reader
 
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
@@ -19,6 +18,14 @@ internal data class ConstructionAnnotationHit(val id: String, val kind: Construc
 
 /** CAD-style annotations have their own hit targets and never become geometric lines. */
 internal class ConstructionAnnotationRenderer(private val density: Float) {
+    private companion object {
+        // Dimension guides and numbers are reference information, not drawable geometry.
+        // Keep both measured and driving dimensions in the same quiet blue family.
+        const val DIMENSION_GUIDE = 0xFF96B4D8.toInt()
+        const val DIMENSION_TEXT = 0xFF5F82AD.toInt()
+        const val DIMENSION_SELECTED = 0xFF4776C5.toInt()
+    }
+
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val hits = mutableListOf<ConstructionAnnotationHit>()
     private lateinit var sx: (Double) -> Float
@@ -82,7 +89,7 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
     private fun drawDimension(canvas: Canvas, layout: ConstructionMeasurementLayout, id: String,
                               kind: ConstructionAnnotationKind, selected: Boolean, reference: Boolean) {
         paint.reset(); paint.isAntiAlias = true; paint.strokeWidth = density * 1.15f
-        paint.color = if (reference) Color.rgb(88, 105, 125) else Color.rgb(46, 61, 77)
+        paint.color = if (selected) DIMENSION_SELECTED else DIMENSION_GUIDE
         paint.style = Paint.Style.STROKE
         when (layout.type) {
             MeasurementType.DISTANCE -> {
@@ -158,10 +165,10 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
         paint.color = if (selected) 0xFFE5EDFF.toInt() else 0xF7FFFEF9.toInt()
         canvas.drawRoundRect(bounds, 4 * density, 4 * density, paint)
         if (selected) {
-            paint.color = 0xFF4776C5.toInt(); paint.style = Paint.Style.STROKE; paint.strokeWidth = density
+            paint.color = DIMENSION_SELECTED; paint.style = Paint.Style.STROKE; paint.strokeWidth = density
             canvas.drawRoundRect(bounds, 4 * density, 4 * density, paint); paint.style = Paint.Style.FILL
         }
-        paint.color = if (kind == ConstructionAnnotationKind.CONSTRAINT) 0xFF293A4D.toInt() else 0xFF58697D.toInt()
+        paint.color = if (selected) DIMENSION_SELECTED else DIMENSION_TEXT
         canvas.drawText(text, x - half, y - (paint.ascent() + paint.descent()) / 2, paint)
         hits += ConstructionAnnotationHit(id, kind, RectF(bounds).apply { inset(-5 * density, -10 * density) })
     }

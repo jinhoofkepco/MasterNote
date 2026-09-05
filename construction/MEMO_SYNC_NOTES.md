@@ -3,9 +3,11 @@
 ## User-visible contract
 
 - One optional construction board belongs to each memo UUID. A board may contain many points, segments, circles, constraints and measurements.
-- The board and handwriting occupy separate clipped panes. A physical pointer gesture cannot transfer ownership to the other pane. Crossing the border ends the active stroke/drag at the border; the rest of that gesture is consumed.
-- Wide screens use left/right panes. Narrow portrait memo panels (under 560 dp) use top/bottom panes so neither editing surface is reduced to a narrow strip.
-- Handwriting retains its original normalized coordinates and 2.2 paper aspect. Construction retains mathematical world coordinates. Their erase, selection, undo and persistence paths are independent.
+- The expanded memo fills the usable screen. Construction and handwriting are transparent layers on the SAME paper, with one shared zoom/pan transform; writing on a circle stays on it during camera changes.
+- Select handwriting/eraser or a construction tool to choose the active editing layer. Editing, deletion and undo never fall through to the other layer. Fingers pan in handwriting mode; two fingers pan/pinch in either mode. A stylus-owned gesture ignores palm pointers. Paper/view boundary exits finish once and consume the remainder.
+- Handwriting retains its original normalized coordinates and 2.2 paper aspect. Canonical `(0,0)..(1000,2200)` maps uniformly to mathematical `(-3,24)..(27,-42)` cm, identically on every device. Neither ink nor geometry is rewritten on camera change. This is a finite paper, not an infinite-ink format migration. Older geometry outside the paper remains visible/editable on the surrounding gray space; handwriting stays bounded to its original paper.
+- Content fit uses both ink and geometry without moving document points. Remote changes and subsequent geometry reloads do not reset the camera. Measurement guides and values use subdued blue, separate from main entity colors.
+- Native wet ink is screen-coordinate data until handoff: pending render handoffs, persistence and pending UI dry-snapshot application fence zoom/resize/reparent. Mode switches cancel the active input; completed strokes are retired only after the durable dry snapshot is visible.
 - Students automatically send committed construction edits, not transient solver previews. Teachers edit a local draft and must press Publish to send geometry to the student.
 - Publish queries the student's latest version first. Divergence from the common base produces the two explicit choices: use the teacher drawing on the student, or use the student drawing on the teacher. Either choice performs a new comparison; stale choices never force an overwrite.
 - Student storage uses generation + revision + digest compare-and-swap. Publication is complete only after the matching durable application RESULT, not a socket write or Telegram receipt. Editing a new teacher draft during an outstanding publication remains possible.
@@ -26,6 +28,6 @@ The restore generation is stored outside the replaceable data root. Ordinary app
 
 ## Verification boundary
 
-Host tests cover replica conflict/restore/idempotence, embedded editor behavior, pane pointer boundaries, bounded packet assembly and peer-role checks. Android Ink's native rendering is not available to ordinary desktop JVM tests; full memo/native-ink instrumentation is kept separately for a device run. End-to-end two-device LAN/Telegram publication must additionally be exercised on both updated devices.
+Host tests cover replica conflict/restore/idempotence, embedded editor behavior, shared-canvas alignment and gesture isolation, bounded packet assembly and peer-role checks. Native graphics previews exercise the real geometry editor with a canonical ink fixture; Android Ink's native authoring runtime is not available to ordinary desktop JVM tests. Full memo/native-ink instrumentation is kept separately for an isolated device run, never run destructively on a user's tutoring device. End-to-end two-device LAN/Telegram publication must additionally be exercised on both updated devices.
 
 No dependency or solver was replaced: existing Apache Commons Math 3.6.1 construction code and its provenance remain unchanged. This update is integration/transport code, not a new mathematical solver.

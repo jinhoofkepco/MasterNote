@@ -8,16 +8,18 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PointF
+import android.graphics.RectF
 import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
 import android.view.Gravity
 import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import com.studyink.construction.core.ConstructionScene
+import com.studyink.construction.core.GeometryCircle
 import com.studyink.construction.core.GeometryPoint
+import com.studyink.construction.core.GeometrySegment
 import com.studyink.construction.core.GeometryMeasurement
 import com.studyink.construction.core.MeasurementType
 import com.studyink.construction.storage.ConstructionConflictChoice
@@ -28,6 +30,7 @@ import com.studyink.construction.storage.ConstructionSceneStore
 import com.studyink.construction.storage.ConstructionSyncUiState
 import com.studyink.construction.storage.ConstructionTarget
 import com.studyink.construction.storage.ConstructionUiBridge
+import com.studyink.core.model.PagePoint
 import java.io.File
 import java.util.UUID
 import org.junit.After
@@ -182,111 +185,178 @@ class ConstructionEmbeddedEditorTest {
         assertEquals(3, teacher.load(target, ConstructionReplicaRole.TEACHER).scene.points.size)
     }
 
-    /** Layout QA only: the geometry editor is real; the ink pane is an explicitly static fixture.
-     * AndroidX Ink's Android JNI is tested separately in src/androidTest on a device. */
+    @Test fun `shared circle and canonical ink stay aligned after zoom pan and editor reload`() {
+        access.save(access.load(target), circleExample())
+        var editor = open()
+        val host = SharedMemoCanvasHost(activity)
+        val ink = attachInkFixture(editor, host)
+        val root = editor.parent as FrameLayout
+        editor.layoutParams = FrameLayout.LayoutParams(900, 700)
+        layout(root, 900, 700)
+        assertAligned(editor, host)
+        val before = requireNotNull(canvas(editor).pointScreenPosition("A"))
+        val focus = host.viewport.worldToView(9.0, 12.0)
+        host.viewport.zoom(1.6f, focus.x, focus.y)
+        host.viewport.pan(-22f, 17f)
+        assertAligned(editor, host)
+        val transformed = requireNotNull(canvas(editor).pointScreenPosition("A"))
+        assertTrue(before != transformed)
+        assertEquals(host.width, ink.width)
+        assertEquals(host.height, ink.height)
+        assertEquals(circleExample(), access.load(target).scene)
+
+        editor.detachSharedCanvas()
+        editor.closeEditor()
+        root.removeView(editor)
+        editor = ConstructionEditorView(activity, target, "메모", embedded = true,
+            store = access, replicaRole = ConstructionReplicaRole.STUDENT).also(editors::add)
+        editor.attachSharedCanvas(host)
+        root.addView(editor, FrameLayout.LayoutParams(900, 700))
+        layout(root, 900, 700)
+        awaitReady(editor)
+        layout(root, 900, 700)
+        assertAligned(editor, host)
+        assertPoint(transformed, requireNotNull(canvas(editor).pointScreenPosition("A")))
+        assertEquals(circleExample(), canvas(editor).scene)
+    }
+
+    @Test fun `opening small condition and measurement panels never shifts shared ink or geometry`() {
+        access.save(access.load(target), circleExample())
+        val editor = open()
+        val host = SharedMemoCanvasHost(activity)
+        val ink = attachInkFixture(editor, host)
+        layout(editor, 900, 700)
+        val bounds = globalBounds(host)
+        val point = requireNotNull(canvas(editor).pointScreenPosition("A"))
+        for (label in listOf("작도 조건 추가", "작도 측정", "작도 조건 목록")) {
+            walk(editor).single { it.contentDescription == label }.performClick()
+            layout(editor, 900, 700)
+            assertEquals(bounds, globalBounds(host))
+            assertEquals(globalBounds(canvas(editor)), globalBounds(ink))
+            assertPoint(point, requireNotNull(canvas(editor).pointScreenPosition("A")))
+            assertAligned(editor, host)
+        }
+    }
+
+    /** Layout QA only: the geometry editor is real and ink is a transparent canonical fixture.
+     * AndroidX wet ink's Android JNI is tested separately in src/androidTest on an isolated device. */
     @Test
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
     @Config(sdk = [35], qualifiers = "w1200dp-h800dp-land-mdpi")
-    fun `native composed memo layout previews tablet and narrow phone panes`() {
-        val example = ConstructionEdits.trapezoid()
-        val perpendicular = example.segments.single { it.label == "ㅁㅂ" }
-        access.save(access.load(target), example.copy(measurements = listOf(
-            GeometryMeasurement("length-note", MeasurementType.DISTANCE,
-                listOf(perpendicular.startPointId, perpendicular.endPointId)),
-        )))
+    fun `native shared memo previews handwriting on a circle at two zoom levels`() {
+        access.save(access.load(target), circleExample())
         for ((label, width, height) in listOf(Triple("tablet", 1200, 800), Triple("phone", 420, 900))) {
             val editor = ConstructionEditorView(activity, target, "메모", embedded = true,
                 store = access, replicaRole = ConstructionReplicaRole.STUDENT)
             editors += editor
-            val host = MemoCompositionHost(activity)
-            val ink = LinearLayout(activity).apply {
-                orientation = LinearLayout.VERTICAL
-                addView(TextView(activity).apply {
-                    text = "손필기   펜   지우개   ↶   ↷"; textSize = 11f; gravity = Gravity.CENTER_VERTICAL
-                    setPadding(6, 0, 0, 0)
-                }, LinearLayout.LayoutParams(-1, 36))
-                addView(ScrollView(activity).apply {
-                    addView(StaticInkPreview(activity), FrameLayout.LayoutParams(-1, -2))
-                }, LinearLayout.LayoutParams(-1, 0, 1f))
-            }
-            host.addView(editor, LinearLayout.LayoutParams(0, -1, .56f))
-            host.addView(View(activity).apply { setBackgroundColor(0xffc3cabc.toInt()) }, LinearLayout.LayoutParams(1, -1))
-            host.addView(ink, LinearLayout.LayoutParams(0, -1, .44f))
-            val card = FrameLayout(activity).apply {
+            val host = SharedMemoCanvasHost(activity)
+            val ink = attachInkFixture(editor, host)
+            val root = FrameLayout(activity).apply {
                 setBackgroundColor(0xfffffdf5.toInt())
-                addView(host, FrameLayout.LayoutParams(-1, -1).apply { topMargin = 44 })
+                addView(editor, FrameLayout.LayoutParams(-1, -1).apply { topMargin = 36 })
                 addView(TextView(activity).apply {
-                    text = "메모 · 1회                         도형 포함    —"
+                    text = "메모 · 1회    손필기 / 도형    —"
                     textSize = 13f; gravity = Gravity.CENTER_VERTICAL; setPadding(14, 0, 0, 0)
                     setBackgroundColor(0xfff6f2e6.toInt())
-                }, FrameLayout.LayoutParams(-1, 44))
-            }
-            val root = FrameLayout(activity).apply {
-                setBackgroundColor(0xffdeded9.toInt())
-                addView(card, FrameLayout.LayoutParams((width * .8).toInt(), (height * .8).toInt(), Gravity.CENTER))
+                }, FrameLayout.LayoutParams(-1, 36))
             }
             activity.setContentView(root)
-            root.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-                View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY))
-            root.layout(0, 0, width, height)
+            layout(root, width, height)
             awaitReady(editor)
-            // The awaited ViewRoot traversal uses this test's 1200dp landscape qualifiers.
-            // Reapply the requested capture bounds afterwards, particularly for the second,
-            // narrow-phone fixture; otherwise its centered card can lie outside the bitmap.
-            root.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-                View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY))
-            root.layout(0, 0, width, height)
-            canvas(editor).fitScene()
+            // Reapply capture bounds after the qualified ViewRoot traversal (also for portrait).
+            layout(root, width, height)
             assertEquals(width, root.width)
             assertEquals(height, root.height)
-            assertTrue(card.left >= 0 && card.right <= width && card.top >= 0 && card.bottom <= height)
+            assertEquals(0, editor.left)
+            assertEquals(width, editor.width)
+            assertEquals(height - 36, editor.height)
             assertTrue(canvas(editor).width > 0 && canvas(editor).height > 0)
-            assertEquals(if (label == "phone") LinearLayout.VERTICAL else LinearLayout.HORIZONTAL, host.orientation)
-            if (label == "phone") {
-                assertEquals(host.width, editor.width)
-                assertEquals(host.width, ink.width)
-                assertTrue(ink.top > editor.bottom)
-            }
-            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            val output = File("build/outputs/memo-composition-$label-qa.png")
+            assertEquals(globalBounds(canvas(editor)), globalBounds(ink))
             try {
-                root.draw(Canvas(bitmap))
-                check(output.parentFile!!.mkdirs() || output.parentFile!!.isDirectory)
-                output.outputStream().use { assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)) }
-                assertTrue(output.length() > 5_000L)
-                println("Composed memo layout QA (static ink fixture): ${output.absolutePath}")
-            } finally { bitmap.recycle(); editor.closeEditor() }
+                // Center the same circle + ink anchor, never fitting either layer independently.
+                val center = host.viewport.worldToView(9.0, 12.0)
+                host.viewport.pan(host.width / 2f - center.x, host.height / 2f - center.y)
+                for ((zoomLabel, factor) in listOf("overview" to 1f, "zoomed" to 1.65f)) {
+                    val circleCenter = host.viewport.worldToView(9.0, 12.0)
+                    host.viewport.zoom(factor, circleCenter.x, circleCenter.y)
+                    assertAligned(editor, host)
+                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    val output = File("build/outputs/memo-shared-$label-$zoomLabel-qa.png")
+                    try {
+                        root.draw(Canvas(bitmap))
+                        check(output.parentFile!!.mkdirs() || output.parentFile!!.isDirectory)
+                        output.outputStream().use { assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)) }
+                        assertTrue(output.length() > 5_000L)
+                        println("Shared memo layout QA (canonical ink fixture): ${output.absolutePath}")
+                    } finally { bitmap.recycle() }
+                }
+            } finally { editor.detachSharedCanvas(); editor.closeEditor() }
         }
     }
 
-    private class StaticInkPreview(context: Context) : View(context) {
+    private fun attachInkFixture(editor: ConstructionEditorView, host: SharedMemoCanvasHost): View {
+        val ink = StaticInkPreview(activity, host.viewport)
+        val inkLayer = FrameLayout(activity).apply { addView(ink, FrameLayout.LayoutParams(-1, -1)) }
+        host.addView(inkLayer, FrameLayout.LayoutParams(-1, -1))
+        host.inkLayer = inkLayer
+        editor.attachSharedCanvas(host)
+        return ink
+    }
+
+    private fun assertAligned(editor: ConstructionEditorView, host: SharedMemoCanvasHost) {
+        // World A=(14,12) maps to the existing 1000x2200 canonical memo page, without migration.
+        val inkAnchor = requireNotNull(host.viewport.canonicalToView(0, PagePoint(17f / 30f * 1000f, 400f)))
+        assertPoint(inkAnchor, requireNotNull(canvas(editor).pointScreenPosition("A")))
+    }
+
+    private fun assertPoint(expected: PointF, actual: PointF) {
+        assertEquals(expected.x, actual.x, .002f)
+        assertEquals(expected.y, actual.y, .002f)
+    }
+
+    private fun globalBounds(view: View): RectF {
+        val location = IntArray(2)
+        view.getLocationOnScreen(location)
+        return RectF(location[0].toFloat(), location[1].toFloat(),
+            (location[0] + view.width).toFloat(), (location[1] + view.height).toFloat())
+    }
+
+    private fun layout(view: View, width: Int, height: Int) {
+        view.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY))
+        view.layout(0, 0, width, height)
+    }
+
+    private fun circleExample() = ConstructionScene(
+        points = listOf(GeometryPoint("O", 9.0, 12.0, "O"), GeometryPoint("A", 14.0, 12.0, "A")),
+        segments = listOf(GeometrySegment("OA", "O", "A", colorArgb = 0xff344454.toInt())),
+        circles = listOf(GeometryCircle("circle", "O", 5.0, colorArgb = 0xff344454.toInt())),
+        measurements = listOf(GeometryMeasurement("radius", MeasurementType.RADIUS, listOf("circle"))),
+    )
+
+    private class StaticInkPreview(context: Context, private val viewport: SharedMemoViewport) : View(context) {
         private val pen = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(39, 61, 80); style = Paint.Style.STROKE
+            color = Color.rgb(167, 67, 85); style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
         }
-        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-            val width = MeasureSpec.getSize(widthMeasureSpec)
-            setMeasuredDimension(width, (width * 2.2).toInt())
-        }
         override fun onDraw(canvas: Canvas) {
-            canvas.drawColor(0xfffffef9.toInt())
-            pen.strokeWidth = width * .004f
+            pen.strokeWidth = viewport.canonicalWidthToView(0, 3.5f)
             val marks = listOf(
-                listOf(.10f to .10f, .18f to .10f, .20f to .11f, .18f to .12f, .14f to .123f,
-                    .19f to .13f, .20f to .14f, .18f to .15f, .10f to .15f),
-                listOf(.24f to .148f, .241f to .149f),
-                listOf(.31f to .12f, .28f to .11f, .30f to .10f, .35f to .10f, .37f to .11f,
-                    .35f to .123f, .30f to .13f, .28f to .14f, .30f to .15f, .35f to .15f,
-                    .37f to .14f, .35f to .13f, .31f to .12f),
-                listOf(.10f to .18f, .50f to .181f),
-                listOf(.12f to .36f, .36f to .25f, .73f to .37f, .12f to .36f),
-                listOf(.36f to .25f, .38f to .365f),
+                // Check mark's middle point lies exactly on circle A, making drift visible.
+                listOf(530f to 440f, (17f / 30f * 1000f) to 400f, 640f to 320f),
+                // Handwritten r = 5 beside the radius and a free underline through the circle.
+                listOf(300f to 520f, 300f to 490f, 312f to 482f, 326f to 490f),
+                listOf(342f to 494f, 370f to 494f),
+                listOf(342f to 507f, 370f to 507f),
+                listOf(418f to 480f, 389f to 480f, 387f to 499f, 410f to 498f,
+                    420f to 510f, 411f to 523f, 387f to 521f),
+                listOf(290f to 539f, 430f to 543f),
             )
             for (mark in marks) {
                 val path = Path()
                 mark.forEachIndexed { index, point ->
-                    if (index == 0) path.moveTo(point.first * width, point.second * height)
-                    else path.lineTo(point.first * width, point.second * height)
+                    val mapped = requireNotNull(viewport.canonicalToView(0, PagePoint(point.first, point.second)))
+                    if (index == 0) path.moveTo(mapped.x, mapped.y) else path.lineTo(mapped.x, mapped.y)
                 }
                 canvas.drawPath(path, pen)
             }

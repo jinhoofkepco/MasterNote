@@ -2371,6 +2371,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         ViewCompat.setOnApplyWindowInsetsListener(root) { _, windowInsets ->
             val bars: Insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
             systemBarInsets = bars
+            memoOverlay.setEditorTopInset(bars.top)
             topChrome.updateFrameLayoutParams { topMargin = bars.top }
             stylusMenuOverlay.updateFrameLayoutParams {
                 topMargin = bars.top

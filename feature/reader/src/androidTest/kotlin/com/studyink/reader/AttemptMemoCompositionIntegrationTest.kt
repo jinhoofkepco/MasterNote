@@ -1,6 +1,8 @@
 package com.studyink.reader
 
 import android.app.Activity
+import android.graphics.PointF
+import android.graphics.RectF
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -13,6 +15,7 @@ import com.studyink.construction.storage.ConstructionReplicaRole
 import com.studyink.construction.storage.ConstructionReplicaStore
 import com.studyink.construction.storage.ConstructionSceneStore
 import com.studyink.construction.storage.ConstructionTarget
+import com.studyink.core.model.PagePoint
 import com.studyink.memo.core.MemoAnchor
 import com.studyink.memo.core.MemoPoint
 import com.studyink.memo.core.MemoStroke
@@ -77,7 +80,7 @@ class AttemptMemoCompositionIntegrationTest {
             dataRoot.name.startsWith("memo-composition-test-")) dataRoot.deleteRecursively()
     }
 
-    @Test fun existingDrawingOpensBesideReadOnlyTeacherInkWithoutChangingBytesOrAspect() {
+    @Test fun existingDrawingSharesReadOnlyTeacherInkPlaneWithoutChangingBytesOrPaperAspect() {
         val legacy = ConstructionSceneStore(dataRoot)
         legacy.save(legacy.load(constructionTarget), ConstructionScene(points = listOf(GeometryPoint("A", 3.0, 4.0))))
         val originalInk = memos.exportMemo(memoTarget, memo.id)
@@ -90,9 +93,26 @@ class AttemptMemoCompositionIntegrationTest {
         onMain {
             val ink = walk(memoView).filterIsInstance<InkInputView>().single()
             assertFalse(ink.isEnabled)
-            val sheet = ink.parent as View
-            assertTrue(sheet.width > 0)
-            assertEquals(2.2, sheet.height.toDouble() / sheet.width, .01)
+            val host = walk(memoView).filterIsInstance<SharedMemoCanvasHost>().single()
+            val sheet = requireNotNull(ink.viewport.activePageBounds())
+            assertTrue(sheet.width() > 0)
+            // The paper keeps its saved 2.2 ratio; the full-screen visible window need not.
+            assertEquals(2.2, sheet.height().toDouble() / sheet.width(), .01)
+            assertEquals(globalBounds(canvas()), globalBounds(ink))
+            assertEquals(host.width, ink.width)
+            assertEquals(host.height, ink.height)
+            val background = walk(memoView).single { it.contentDescription == "메모 편집 배경" } as ViewGroup
+            val card = background.getChildAt(0)
+            assertEquals(memoView.width, card.width)
+            assertEquals(memoView.height, card.height)
+            val canonical = PagePoint(200f, 20f / 30f * 1000f)
+            assertPoint(requireNotNull(ink.viewport.canonicalToView(0, canonical)),
+                requireNotNull(canvas().pointScreenPosition("A")))
+            val before = requireNotNull(canvas().pointScreenPosition("A"))
+            assertTrue(host.zoomBy(1.4f))
+            assertPoint(requireNotNull(ink.viewport.canonicalToView(0, canonical)),
+                requireNotNull(canvas().pointScreenPosition("A")))
+            assertTrue(before != canvas().pointScreenPosition("A"))
             canvas().onPoint(ConstructionAnchor(8.0, 9.0))
         }
         await { editor()?.hasPendingWork == false && canvas().scene.points.size == 2 }
@@ -135,6 +155,16 @@ class AttemptMemoCompositionIntegrationTest {
     )
     private fun editor() = walk(memoView).filterIsInstance<ConstructionEditorView>().singleOrNull()
     private fun canvas() = walk(memoView).filterIsInstance<ConstructionCanvasView>().single()
+    private fun globalBounds(view: View): RectF {
+        val location = IntArray(2)
+        view.getLocationOnScreen(location)
+        return RectF(location[0].toFloat(), location[1].toFloat(),
+            (location[0] + view.width).toFloat(), (location[1] + view.height).toFloat())
+    }
+    private fun assertPoint(expected: PointF, actual: PointF) {
+        assertEquals(expected.x, actual.x, .002f)
+        assertEquals(expected.y, actual.y, .002f)
+    }
     private fun layout() {
         val width = activity.resources.displayMetrics.widthPixels
         val height = activity.resources.displayMetrics.heightPixels

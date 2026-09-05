@@ -35,6 +35,8 @@ class InkInputView(context: Context) : View(context) {
     var quickShapeEnabled: Boolean = false
     var onQuickShapePreview: (QuickShapePreview?) -> Unit = {}
     var onStrokeStart: (Int) -> Unit = {}
+    /** Lets a shared viewport fence the asynchronous, screen-coordinate wet-ink handoff. */
+    var onWetStrokeFinishing: () -> Unit = {}
     var onStylusContact: () -> Unit = {}
     /**
      * Contact activity for the lightweight study-idle monitor. This is emitted only while a pen,
@@ -423,6 +425,7 @@ class InkInputView(context: Context) : View(context) {
     }
 
     private fun finishOrdinaryStroke(event: MotionEvent) {
+        onWetStrokeFinishing()
         wetInkView.finishStroke(event, currentPointer)
         if (currentPoints.isNotEmpty()) onStroke(newStroke(currentPoints.toList()))
     }
@@ -441,7 +444,10 @@ class InkInputView(context: Context) : View(context) {
             QuickShapeCommit.Raw -> currentPoints.toList()
             is QuickShapeCommit.Snapped -> commit.candidate.points
         }
-        if (!quickShapeWetInkDetached) wetInkView.finishStroke(event, currentPointer)
+        if (!quickShapeWetInkDetached) {
+            onWetStrokeFinishing()
+            wetInkView.finishStroke(event, currentPointer)
+        }
         if (points.isEmpty()) {
             clearQuickShapePreview(activeQuickShapePreviewToken)
             return

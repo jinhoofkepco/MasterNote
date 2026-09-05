@@ -63,6 +63,9 @@ internal class ConstructionEditorView(
     var onDurableChanged: () -> Unit = {}
     var onLoaded: (ConstructionSceneSnapshot) -> Unit = {}
     var onUndoStateChanged: () -> Unit = {}
+    var onEditingRequested: () -> Unit = {}
+    private var sharedMemoHost: SharedMemoCanvasHost? = null
+    private var memoGeometryActive = true
     val hasPendingWork: Boolean get() = (busy && !loadFailed) || dragSolving || dragBase != null || measurementBase != null
     val canUndo: Boolean get() = !hasPendingWork && !closed && undo.isNotEmpty()
     val canRedo: Boolean get() = !hasPendingWork && !closed && redo.isNotEmpty()
@@ -146,7 +149,7 @@ internal class ConstructionEditorView(
         closeButton = button("닫기", register = false, icon = ConstructionIcon.CLOSE, iconOnly = true) { requestClose() }
         if (embedded) closeButton?.visibility = View.GONE
         header.addView(closeButton)
-        root.addView(header)
+        if (!embedded) root.addView(header)
         root.addView(toolbar {
             listOf(Triple(ConstructionTool.SELECT,"선택",ConstructionIcon.SELECT), Triple(ConstructionTool.POINT,"점",ConstructionIcon.POINT),
                 Triple(ConstructionTool.SEGMENT,"선분",ConstructionIcon.SEGMENT), Triple(ConstructionTool.CIRCLE,"원",ConstructionIcon.CIRCLE)).forEach { (tool, label, icon) ->
@@ -175,6 +178,11 @@ internal class ConstructionEditorView(
             action(PanelKind.CONDITIONS, "조건 목록", ConstructionIcon.LIST)
             addView(button("맞춤", icon = ConstructionIcon.FIT, iconOnly = true) { canvas.fitScene() })
             addView(button("더보기", icon = ConstructionIcon.MORE, iconOnly = true) { togglePanel(PanelKind.MORE) })
+            if (embedded) {
+                addView(button("되돌리기", icon = ConstructionIcon.UNDO, iconOnly = true) { onEditingRequested(); history(true) })
+                addView(button("다시", icon = ConstructionIcon.REDO, iconOnly = true) { onEditingRequested(); history(false) })
+                publishButton?.let { header.removeView(it); addView(it) }
+            }
         })
         viewport.addView(canvas, FrameLayout.LayoutParams(-1, -1))
         selectionInfo.apply { textSize = 11f; setTextColor(Color.rgb(40, 88, 82)); setPadding(dp(8), dp(3), dp(8), dp(3)); maxLines = 2; ellipsize = TextUtils.TruncateAt.END; background = surface(0xf0fffef9.toInt()); elevation = dp(2).toFloat(); contentDescription = "현재 작도 동작" }
@@ -311,6 +319,7 @@ internal class ConstructionEditorView(
         })
     }
     private fun togglePanel(kind: PanelKind) {
+        onEditingRequested()
         if (panelKind == kind) return closePanel()
         if (canvas.tool != ConstructionTool.SELECT) canvas.tool = ConstructionTool.SELECT
         selectedCondition = null; canvas.selectedConstraintId = null; canvas.selectedMeasurementId = null
@@ -327,7 +336,7 @@ internal class ConstructionEditorView(
         }
     }
     private fun updateToolbar() {
-        toolButtons.forEach { (tool, b) -> b.isSelected = canvas.tool == tool }
+        toolButtons.forEach { (tool, b) -> b.isSelected = memoGeometryActive && canvas.tool == tool }
         panelButtons.forEach { (kind,b) -> b.isSelected = panelKind == kind }
         colorButtons.forEach { (color,b) -> b.isSelected = color == newColor; b.setTextColor(color); b.background = if (color == newColor) surface(Color.rgb(230,235,229)) else surface(Color.TRANSPARENT); b.isEnabled = !busy && dragBase == null && measurementBase == null }
         actionButtons.firstOrNull { it.tag == "snap-toggle" }?.isSelected = canvas.snapEnabled
@@ -365,6 +374,7 @@ internal class ConstructionEditorView(
         onUndoStateChanged()
     }
     private fun chooseTool(tool: ConstructionTool) {
+        onEditingRequested()
         canvas.tool = tool; canvas.clearSelection()
         closePanel(); updateToolbar(); updateHint()
     }
@@ -380,7 +390,7 @@ internal class ConstructionEditorView(
                 if (closed || generation != token) return@post
                 result.onSuccess { loaded ->
                     snapshot = loaded; scene = loaded.scene; canvas.scene = scene
-                    canvas.clearSelection(); if (fit) canvas.fitScene(); setBusy(false)
+                    canvas.clearSelection(); if (fit && sharedMemoHost == null) canvas.fitScene(); setBusy(false)
                     onLoaded(loaded)
                     status.text = "선분·원을 그린 뒤 대상을 선택해 조건을 추가하세요. 예제로 시작할 수도 있습니다."
                 }.onFailure {
@@ -458,7 +468,7 @@ internal class ConstructionEditorView(
                     while (undo.size > 80) undo.removeFirst()
                     snapshot = committed; scene = committed.scene; canvas.scene = scene
                     onDurableChanged()
-                    if (fitAfterCommit) { fitAfterCommit = false; canvas.fitScene() }
+                    if (fitAfterCommit) { fitAfterCommit = false; if (sharedMemoHost == null) canvas.fitScene() }
                     canvas.selectedIds = canvas.selectedIds.intersect(allIds())
                     setBusy(false); updateSelection()
                     status.text = if (solved != null) {
@@ -811,7 +821,43 @@ internal class ConstructionEditorView(
     fun handleBack() { if (panelKind != null) closePanel() else requestClose() }
     fun undoEdit(): Boolean = if (canUndo) { history(true); true } else false
     fun redoEdit(): Boolean = if (canRedo) { history(false); true } else false
-    fun cancelInteraction() { canvas.cancelDrag(); dismissChildren() }
+    fun cancelInteraction() { canvas.cancelDrag(); canvas.tool = canvas.tool; dismissChildren() }
+
+    /** Toolbars remain outside the shared content rectangle; both editable layers fill it exactly. */
+    fun attachSharedCanvas(host: SharedMemoCanvasHost) {
+        check(embedded && sharedMemoHost == null)
+        sharedMemoHost = host
+        (host.parent as? ViewGroup)?.removeView(host)
+        viewport.removeView(canvas)
+        canvas.sharedViewport = host.viewport
+        canvas.setBackgroundColor(Color.TRANSPARENT)
+        canvas.onSharedZoom = { host.zoomBy(it) }
+        canvas.onSharedFit = { host.fitContent() }
+        host.addView(canvas, 0, FrameLayout.LayoutParams(-1, -1))
+        host.geometryLayer = canvas
+        viewport.addView(host, 0, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    fun detachSharedCanvas() {
+        val host = sharedMemoHost ?: return
+        host.cancelOwnedGesture()
+        host.geometryLayer = null
+        host.removeView(canvas)
+        viewport.removeView(host)
+        canvas.sharedViewport = null
+        canvas.onSharedZoom = {}; canvas.onSharedFit = {}
+        sharedMemoHost = null
+    }
+
+    fun setMemoGeometryMode(enabled: Boolean) {
+        if (memoGeometryActive != enabled) cancelInteraction()
+        memoGeometryActive = enabled
+        selectionInfo.visibility = if (enabled) View.VISIBLE else View.GONE
+        status.visibility = if (enabled) View.VISIBLE else View.GONE
+        updateToolbar()
+    }
+
+    fun notifySharedViewportChanged() { canvas.notifyViewportChanged() }
     private fun reloadAfterRemoteChange() {
         generation++; dragRequest++; dragBase = null; measurementBase = null
         pendingDrag = null; dragSolving = false; undo.clear(); redo.clear(); canvas.cancelDrag()

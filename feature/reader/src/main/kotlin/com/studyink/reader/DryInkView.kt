@@ -58,6 +58,9 @@ data class StylusHoverPreview(
 )
 
 class DryInkView(context: Context) : View(context) {
+    /** Shared memo paper is painted below both layers; do not mask legacy geometry around it. */
+    var isolatePageBackground: Boolean = true
+        set(value) { field = value; invalidate() }
     private val readerTokens = readerCanvasTokens()
     var viewport: InkViewport? = null
         set(value) { field = value; invalidate() }
@@ -126,7 +129,7 @@ class DryInkView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val adapter = viewport ?: return
-        drawPageIsolationMask(canvas, adapter.activePageBounds())
+        if (isolatePageBackground) drawPageIsolationMask(canvas, adapter.activePageBounds())
         val visibleBounds = RectF(0f, 0f, width.toFloat(), height.toFloat())
         val active = visibleReaderStrokes(
             strokes = cachedPageStrokes[activePage].orEmpty(),

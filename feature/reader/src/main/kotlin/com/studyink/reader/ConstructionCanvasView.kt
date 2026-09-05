@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.PointF
+import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
@@ -33,8 +34,13 @@ internal data class ConstructionAnchor(
 
 /** The viewport is presentation only: one uniform cm-to-pixel scale preserves mathematical angles. */
 internal class ConstructionCanvasView(context: Context) : View(context) {
+    /** Memo geometry and handwriting use this exact transform; standalone drawings keep theirs. */
+    var sharedViewport: SharedMemoViewport? = null
+        set(value) { field = value; updateSharedContentBounds(); notifyViewportChanged() }
+    var onSharedZoom: (Float) -> Unit = {}
+    var onSharedFit: () -> Unit = {}
     var scene = ConstructionScene()
-        set(value) { field = value; annotationHits = emptyList(); invalidate(); updateDescription() }
+        set(value) { field = value; updateSharedContentBounds(); annotationHits = emptyList(); invalidate(); updateDescription() }
     var selectedIds: Set<String> = emptySet()
         set(value) { field = value; invalidate() }
     var tool = ConstructionTool.SELECT
@@ -61,9 +67,16 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
     private val pen = Paint(Paint.ANTI_ALIAS_FLAG)
     private val annotations = ConstructionAnnotationRenderer(density)
     private var annotationHits = emptyList<ConstructionAnnotationHit>()
-    private var scale = 28f * density
-    private var originX = 48f * density
-    private var originY = 400f * density
+    private var localScale = 28f * density
+    private val scale: Float get() = sharedViewport?.pixelsPerCm ?: localScale
+    private var localOriginX = 48f * density
+    private var localOriginY = 400f * density
+    private var originX: Float
+        get() = sharedViewport?.worldToView(0.0, 0.0)?.x ?: localOriginX
+        set(value) { localOriginX = value }
+    private var originY: Float
+        get() = sharedViewport?.worldToView(0.0, 0.0)?.y ?: localOriginY
+        set(value) { localOriginY = value }
     private var initialized = false
     private var firstAnchor: ConstructionAnchor? = null
     private var snapPreview: ConstructionAnchor? = null
@@ -111,25 +124,45 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
     }
 
     internal fun pointScreenPosition(id: String): PointF? = point(id)?.let { PointF(sx(it.x), sy(it.y)) }
+    fun notifyViewportChanged() { annotationHits = emptyList(); invalidate() }
+
+    private fun updateSharedContentBounds() {
+        val shared = sharedViewport ?: return
+        if (scene.points.isEmpty()) { shared.geometryWorldBounds = null; return }
+        var left = scene.points.minOf { it.x }; var right = scene.points.maxOf { it.x }
+        var bottom = scene.points.minOf { it.y }; var top = scene.points.maxOf { it.y }
+        scene.circles.forEach { circle -> point(circle.centerPointId)?.let { center ->
+            left = min(left, center.x - circle.radius); right = max(right, center.x + circle.radius)
+            bottom = min(bottom, center.y - circle.radius); top = max(top, center.y + circle.radius)
+        } }
+        scene.measurements.forEach { measurement ->
+            ConstructionMeasurementGeometry.layout(scene, measurement)?.label?.let {
+                left = min(left, it.x); right = max(right, it.x); bottom = min(bottom, it.y); top = max(top, it.y)
+            }
+        }
+        shared.geometryWorldBounds = RectF(left.toFloat(), bottom.toFloat(), right.toFloat(), top.toFloat())
+    }
     internal fun measurementScreenPosition(id: String): PointF? = scene.measurements.firstOrNull { it.id == id }
         ?.let { ConstructionMeasurementGeometry.layout(scene, it) }?.let { PointF(sx(it.label.x), sy(it.label.y)) }
 
     fun clearSelection() { selectedIds = emptySet(); selectedMeasurementId = null; selectedConstraintId = null; onSelectionChanged(selectedIds) }
     fun zoom(factor: Float) = zoomAt(factor, width / 2f, height / 2f)
     private fun zoomAt(factor: Float, x: Float, y: Float) {
+        if (sharedViewport != null) { onSharedZoom(factor); return }
         val next = (scale * factor).coerceIn(3f * density, 160f * density)
         val ratio = next / scale
         originX = x - (x - originX) * ratio
         originY = y - (y - originY) * ratio
-        scale = next
+        localScale = next
         annotationHits = emptyList()
         invalidate()
     }
 
     fun fitScene() {
+        if (sharedViewport != null) { onSharedFit(); return }
         if (width <= 0 || height <= 0) return
         if (scene.points.isEmpty()) {
-            scale = min(width / 23f, height / 18f).coerceAtLeast(3f * density)
+            localScale = min(width / 23f, height / 18f).coerceAtLeast(3f * density)
             originX = width * .12f
             originY = height * .86f
         } else {
@@ -146,7 +179,7 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
                 }
             }
             val padding = min(56f * density, min(width, height) * .18f)
-            scale = min((width - 2 * padding) / max(right - left, 5.0), (height - 2 * padding) / max(top - bottom, 5.0))
+            localScale = min((width - 2 * padding) / max(right - left, 5.0), (height - 2 * padding) / max(top - bottom, 5.0))
                 .toFloat().coerceIn(3f * density, 100f * density)
             originX = (width / 2.0 - (left + right) * .5 * scale).toFloat()
             originY = (height / 2.0 + (bottom + top) * .5 * scale).toFloat()
@@ -158,6 +191,7 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
+        if (sharedViewport != null) { annotationHits = emptyList(); return }
         if (!initialized) fitScene() else { originX += (w - oldw) / 2f; originY += (h - oldh) / 2f }
         annotationHits = emptyList()
     }
@@ -276,7 +310,7 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (!isEnabled) return false
-        scaleDetector.onTouchEvent(event)
+        if (sharedViewport == null) scaleDetector.onTouchEvent(event)
         if (event.pointerCount > 1) {
             cancelDrag(); hadMultiTouch = true
             val x = (event.getX(0) + event.getX(1)) / 2; val y = (event.getY(0) + event.getY(1)) / 2
@@ -325,7 +359,9 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
                         if (!dragging) { dragging = true; onDragPoint(movingPoint!!, p.x, p.y, ConstructionDragPhase.START) }
                         onDragPoint(movingPoint!!, p.x, p.y, ConstructionDragPhase.MOVE)
                     } else if (tool == ConstructionTool.SELECT && tappedAnnotation == null) {
-                        panning = true; originX += event.x - lastPan.x; originY += event.y - lastPan.y; invalidate()
+                        panning = true
+                        if (sharedViewport == null) { originX += event.x - lastPan.x; originY += event.y - lastPan.y }
+                        invalidate()
                         annotationHits = emptyList()
                     }
                 }
