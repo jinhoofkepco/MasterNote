@@ -1,6 +1,8 @@
 package com.studyink.reader
 
 import com.studyink.construction.core.ConstructionScene
+import com.studyink.construction.core.ConstraintType
+import com.studyink.construction.core.GeometryConstraint
 import com.studyink.construction.core.GeometryMeasurement
 import com.studyink.construction.core.MeasurementType
 import kotlin.math.abs
@@ -33,9 +35,90 @@ internal data class ConstructionMeasurementLayout(
     val angleStart: Double = 0.0,
     val angleSweep: Double = 0.0,
     val arcRadius: Double = 0.0,
+    /** Start->end direction markers distinguish solver angles from three-point interior angles. */
+    val directionSegments: List<Pair<ConstructionVector, ConstructionVector>> = emptyList(),
+    /** Collision avoidance may move the caption without moving its extension/dimension lines. */
+    val dimensionGuideAnchor: ConstructionVector? = null,
 )
 
 internal object ConstructionMeasurementGeometry {
+    /**
+     * Driving annotations keep their saved target even while disabled. Their guide geometry is
+     * always derived from the current scene, never used to move points or replace solver math.
+     */
+    fun constraintLayout(scene: ConstructionScene, constraint: GeometryConstraint): ConstructionMeasurementLayout? {
+        val refs = constraint.entityIds
+        val layout = when (constraint.type) {
+            ConstraintType.LENGTH -> {
+                val segment = refs.firstOrNull()?.let(scene::segment) ?: return null
+                val measurement = scene.measurements.firstOrNull { matchesConstraint(scene, it, constraint) }
+                    ?.copy(id = constraint.id)
+                    ?: GeometryMeasurement(constraint.id, MeasurementType.DISTANCE, listOf(segment.startPointId, segment.endPointId))
+                layout(scene, measurement)
+            }
+            ConstraintType.RADIUS -> {
+                val measurement = scene.measurements.firstOrNull { matchesConstraint(scene, it, constraint) }
+                    ?.copy(id = constraint.id)
+                    ?: GeometryMeasurement(constraint.id, MeasurementType.RADIUS, refs)
+                layout(scene, measurement)
+            }
+            ConstraintType.DISTANCE_POINT_LINE -> {
+                val p = refs.getOrNull(0)?.let(scene::point) ?: return null
+                val segment = refs.getOrNull(1)?.let(scene::segment) ?: return null
+                val a = scene.point(segment.startPointId) ?: return null
+                val b = scene.point(segment.endPointId) ?: return null
+                val delta = ConstructionVector(b.x - a.x, b.y - a.y)
+                val norm = delta.x * delta.x + delta.y * delta.y
+                if (norm < 1e-16) return null
+                val point = ConstructionVector(p.x, p.y)
+                val amount = ((p.x - a.x) * delta.x + (p.y - a.y) * delta.y) / norm
+                val foot = ConstructionVector(a.x, a.y) + delta * amount
+                val base = (point + foot) * .5 + delta.unit() * .9
+                ConstructionMeasurementLayout(constraint.id, MeasurementType.DISTANCE, base, base,
+                    (point - foot).length(), point, foot)
+            }
+            ConstraintType.ANGLE -> directedAngleLayout(scene, constraint)
+            else -> null
+        } ?: return null
+        return layout.copy(value = constraint.value ?: layout.value)
+    }
+
+    /** A saved reference label is retained in the model; its driving label takes over the hit. */
+    fun matchesConstraint(scene: ConstructionScene, measurement: GeometryMeasurement, constraint: GeometryConstraint): Boolean =
+        when (constraint.type) {
+            ConstraintType.LENGTH -> measurement.type == MeasurementType.DISTANCE &&
+                measurement.entityIds.toSet() == constraint.entityIds.firstOrNull()?.let(scene::segment)
+                    ?.let { setOf(it.startPointId, it.endPointId) }
+            ConstraintType.RADIUS -> measurement.type == MeasurementType.RADIUS && measurement.entityIds == constraint.entityIds
+            else -> false
+        }
+
+    private fun directedAngleLayout(scene: ConstructionScene, constraint: GeometryConstraint): ConstructionMeasurementLayout? {
+        val first = constraint.entityIds.getOrNull(0)?.let(scene::segment) ?: return null
+        val second = constraint.entityIds.getOrNull(1)?.let(scene::segment) ?: return null
+        fun point(id: String) = scene.point(id)?.let { ConstructionVector(it.x, it.y) }
+        val a = point(first.startPointId) ?: return null
+        val b = point(first.endPointId) ?: return null
+        val c = point(second.startPointId) ?: return null
+        val d = point(second.endPointId) ?: return null
+        val left = b - a; val right = d - c
+        if (left.length() < 1e-8 || right.length() < 1e-8) return null
+        // Incoming segments must NOT be reversed to form an interior angle: that would silently
+        // label its supplement. Translate both original directions to one comparison vertex.
+        // Avoid intersecting disconnected supporting lines; near parallels send that point to infinity.
+        val shared = listOf(first.startPointId, first.endPointId)
+            .firstOrNull { it == second.startPointId || it == second.endPointId }
+        val vertex = shared?.let(::point) ?: a
+        val start = atan2(left.y, left.x)
+        val sweep = atan2(left.x * right.y - left.y * right.x, left.x * right.x + left.y * right.y)
+        val radius = (min(left.length(), right.length()) * .28).coerceIn(.7, 1.8)
+        val base = vertex + ConstructionVector(cos(start + sweep / 2), sin(start + sweep / 2)) * (radius + .35)
+        return ConstructionMeasurementLayout(constraint.id, MeasurementType.ANGLE, base, base,
+            Math.toDegrees(abs(sweep)), vertex + left, vertex + right, vertex,
+            angleStart = start, angleSweep = sweep, arcRadius = radius,
+            directionSegments = listOf(a to b, c to d))
+    }
+
     fun layout(scene: ConstructionScene, measurement: GeometryMeasurement): ConstructionMeasurementLayout? {
         fun point(index: Int) = measurement.entityIds.getOrNull(index)?.let(scene::point)?.let { ConstructionVector(it.x, it.y) }
         val offset = ConstructionVector(measurement.offsetX, measurement.offsetY)

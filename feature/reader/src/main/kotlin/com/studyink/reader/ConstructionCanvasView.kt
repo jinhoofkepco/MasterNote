@@ -14,6 +14,7 @@ import android.view.ViewConfiguration
 import com.studyink.construction.core.ConstructionScene
 import com.studyink.construction.core.ConstraintType
 import com.studyink.construction.core.GeometryPoint
+import com.studyink.construction.core.GeometryLineStyle
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -60,6 +61,7 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
     var onMeasurementSelected: (String) -> Unit = {}
     var onMeasurementDrag: (String, Double, Double, ConstructionDragPhase) -> Unit = { _, _, _, _ -> }
     var onConstraintSelected: (String) -> Unit = {}
+    var onAnnotationLayoutChanged: () -> Unit = {}
     var onToolHintChanged: (String) -> Unit = {}
         set(value) { field = value; lastHint = ""; publishHint() }
 
@@ -124,6 +126,9 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
     }
 
     internal fun pointScreenPosition(id: String): PointF? = point(id)?.let { PointF(sx(it.x), sy(it.y)) }
+    internal fun constraintScreenBounds(id: String): RectF? = annotationHits.firstOrNull {
+        it.id == id && it.kind == ConstructionAnnotationKind.CONSTRAINT
+    }?.bounds?.let(::RectF)
     fun notifyViewportChanged() { annotationHits = emptyList(); invalidate() }
 
     private fun updateSharedContentBounds() {
@@ -135,15 +140,17 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
             left = min(left, center.x - circle.radius); right = max(right, center.x + circle.radius)
             bottom = min(bottom, center.y - circle.radius); top = max(top, center.y + circle.radius)
         } }
-        scene.measurements.forEach { measurement ->
-            ConstructionMeasurementGeometry.layout(scene, measurement)?.label?.let {
-                left = min(left, it.x); right = max(right, it.x); bottom = min(bottom, it.y); top = max(top, it.y)
-            }
+        annotationWorldLabels().forEach {
+            left = min(left, it.x); right = max(right, it.x); bottom = min(bottom, it.y); top = max(top, it.y)
         }
         shared.geometryWorldBounds = RectF(left.toFloat(), bottom.toFloat(), right.toFloat(), top.toFloat())
     }
     internal fun measurementScreenPosition(id: String): PointF? = scene.measurements.firstOrNull { it.id == id }
         ?.let { ConstructionMeasurementGeometry.layout(scene, it) }?.let { PointF(sx(it.label.x), sy(it.label.y)) }
+
+    private fun annotationWorldLabels(): List<ConstructionVector> =
+        scene.measurements.mapNotNull { ConstructionMeasurementGeometry.layout(scene, it)?.label } +
+            scene.constraints.mapNotNull { ConstructionMeasurementGeometry.constraintLayout(scene, it)?.label }
 
     fun clearSelection() { selectedIds = emptySet(); selectedMeasurementId = null; selectedConstraintId = null; onSelectionChanged(selectedIds) }
     fun zoom(factor: Float) = zoomAt(factor, width / 2f, height / 2f)
@@ -173,10 +180,8 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
                 left = min(left, center.x - circle.radius); right = max(right, center.x + circle.radius)
                 bottom = min(bottom, center.y - circle.radius); top = max(top, center.y + circle.radius)
             }
-            scene.measurements.forEach { measurement ->
-                ConstructionMeasurementGeometry.layout(scene, measurement)?.label?.let {
-                    left = min(left, it.x); right = max(right, it.x); bottom = min(bottom, it.y); top = max(top, it.y)
-                }
+            annotationWorldLabels().forEach {
+                left = min(left, it.x); right = max(right, it.x); bottom = min(bottom, it.y); top = max(top, it.y)
             }
             val padding = min(56f * density, min(width, height) * .18f)
             localScale = min((width - 2 * padding) / max(right - left, 5.0), (height - 2 * padding) / max(top - bottom, 5.0))
@@ -227,18 +232,21 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
         label(gridLabel, width - pen.measureText(gridLabel) - 8f * density, height - 9f * density)
         for (circle in scene.circles) {
             val center = point(circle.centerPointId) ?: continue
-            geometryStroke(circle.colorArgb ?: CIRCLE, circle.id in selectedIds, 1.6f) {
+            geometryStroke(circle.colorArgb ?: CIRCLE, circle.id in selectedIds, 1.6f, circle.lineStyle) {
                 canvas.drawCircle(sx(center.x), sy(center.y), (circle.radius * scale).toFloat(), pen)
             }
         }
         for (segment in scene.segments) {
             val a = point(segment.startPointId) ?: continue
             val b = point(segment.endPointId) ?: continue
-            geometryStroke(segment.colorArgb ?: INK, segment.id in selectedIds, 1.8f) {
+            geometryStroke(segment.colorArgb ?: INK, segment.id in selectedIds, 1.8f, segment.lineStyle) {
                 canvas.drawLine(sx(a.x), sy(a.y), sx(b.x), sy(b.y), pen)
             }
         }
-        annotationHits = annotations.draw(canvas, scene, selectedIds, selectedMeasurementId, selectedConstraintId, scale, ::sx, ::sy)
+        val nextHits = annotations.draw(canvas, scene, selectedIds, selectedMeasurementId, selectedConstraintId, scale, ::sx, ::sy)
+        val annotationsChanged = annotationHits != nextHits
+        annotationHits = nextHits
+        if (annotationsChanged) onAnnotationLayoutChanged()
         for (p in scene.points) {
             val fixed = scene.constraints.any { it.enabled && it.type == ConstraintType.FIXED_POINT && p.id in it.entityIds }
             pen.reset(); pen.isAntiAlias = true; pen.style = Paint.Style.FILL
@@ -272,10 +280,17 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
         drawingCanvas = null
     }
 
-    private inline fun geometryStroke(color: Int, selected: Boolean, width: Float, draw: () -> Unit) {
+    private inline fun geometryStroke(color: Int, selected: Boolean, width: Float, style: GeometryLineStyle, draw: () -> Unit) {
         pen.reset(); pen.isAntiAlias = true; pen.style = Paint.Style.STROKE
+        pen.strokeCap = if (style == GeometryLineStyle.DOTTED) Paint.Cap.ROUND else Paint.Cap.BUTT
+        pen.pathEffect = when (style) {
+            GeometryLineStyle.SOLID -> null
+            GeometryLineStyle.DASHED -> DashPathEffect(floatArrayOf(8 * density, 5 * density), 0f)
+            GeometryLineStyle.DOTTED -> DashPathEffect(floatArrayOf(.1f * density, 5 * density), 0f)
+        }
         if (selected) { pen.color = SELECTION_HALO; pen.strokeWidth = (width + 8) * density; draw() }
         pen.color = color; pen.strokeWidth = width * density; draw()
+        pen.pathEffect = null
     }
 
     private fun nearestPoint(x: Float, y: Float): GeometryPoint? = scene.points
@@ -314,7 +329,10 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
         if (event.pointerCount > 1) {
             cancelDrag(); hadMultiTouch = true
             val x = (event.getX(0) + event.getX(1)) / 2; val y = (event.getY(0) + event.getY(1)) / 2
-            if (event.actionMasked == MotionEvent.ACTION_MOVE && panning) { originX += x - lastPan.x; originY += y - lastPan.y; invalidate() }
+            if (event.actionMasked == MotionEvent.ACTION_MOVE && panning) {
+                originX += x - lastPan.x; originY += y - lastPan.y
+                annotationHits = emptyList(); invalidate()
+            }
             lastPan = PointF(x, y); panning = true
             return true
         }
@@ -329,9 +347,16 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
                         .minByOrNull { hypot(sx(it.x) - event.x, sy(it.y) - event.y) }
                         ?: nearestPoint(event.x, event.y)
                 } else null
-                tappedAnnotation = if (editable && tool == ConstructionTool.SELECT &&
-                    (chosenPoint == null || (chosenPoint.id !in selectedIds && hypot(sx(chosenPoint.x) - event.x, sy(chosenPoint.y) - event.y) > 10 * density))) {
-                    annotationHits.lastOrNull { it.bounds.contains(event.x, event.y) }
+                val visibleAnnotation = annotationHits.filter { it.visualBounds.contains(event.x, event.y) }
+                    .minByOrNull { hypot(it.visualBounds.centerX() - event.x, it.visualBounds.centerY() - event.y) }
+                tappedAnnotation = if (editable && tool == ConstructionTool.SELECT) {
+                    // A tap on visible text means the dimension, even beside a selected point.
+                    // Point priority is retained in the invisible touch-padding surrounding it.
+                    visibleAnnotation ?: if (chosenPoint == null ||
+                        (chosenPoint.id !in selectedIds && hypot(sx(chosenPoint.x) - event.x, sy(chosenPoint.y) - event.y) > 10 * density)) {
+                        annotationHits.filter { it.bounds.contains(event.x, event.y) }
+                            .minByOrNull { hypot(it.bounds.centerX() - event.x, it.bounds.centerY() - event.y) }
+                    } else null
                 } else null
                 movingPoint = if (tappedAnnotation == null) chosenPoint?.id else null
                 pointGrabOffset = chosenPoint?.let { ConstructionVector(it.x - downWorld.x, it.y - downWorld.y) } ?: ConstructionVector(0.0, 0.0)
@@ -452,5 +477,6 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
     }
 }
 
-internal fun formatGeometry(value: Double): String = String.format(Locale.US, "%.4f", value)
+internal fun formatGeometry(value: Double): String = String.format(Locale.US,
+    if (value != 0.0 && abs(value) < .0001) "%.6f" else "%.4f", value)
     .trimEnd('0').trimEnd('.').let { if (it == "-0") "0" else it }

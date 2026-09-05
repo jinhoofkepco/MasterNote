@@ -4,6 +4,7 @@ import com.studyink.construction.core.ConstraintType
 import com.studyink.construction.core.ConstructionScene
 import com.studyink.construction.core.GeometryCircle
 import com.studyink.construction.core.GeometryConstraint
+import com.studyink.construction.core.GeometryLineStyle
 import com.studyink.construction.core.GeometryMeasurement
 import com.studyink.construction.core.GeometryPoint
 import com.studyink.construction.core.GeometrySegment
@@ -110,11 +111,14 @@ internal object ConstructionJsonCodec {
             JSONObject().put("id", it.id).put("startPointId", it.startPointId)
                 .put("endPointId", it.endPointId).put("label", it.label)
                 .put("colorArgb", it.colorArgb ?: JSONObject.NULL)
+                // Omit the legacy default to retain existing replica digests and pending receipts.
+                .apply { if (it.lineStyle != GeometryLineStyle.SOLID) put("lineStyle", it.lineStyle.name) }
         }))
         .put("circles", JSONArray(scene.circles.map {
             JSONObject().put("id", it.id).put("centerPointId", it.centerPointId)
                 .put("radius", it.radius).put("label", it.label)
                 .put("colorArgb", it.colorArgb ?: JSONObject.NULL)
+                .apply { if (it.lineStyle != GeometryLineStyle.SOLID) put("lineStyle", it.lineStyle.name) }
         }))
         .put("constraints", JSONArray(scene.constraints.map {
             JSONObject().put("id", it.id).put("type", it.type.name)
@@ -134,10 +138,10 @@ internal object ConstructionJsonCodec {
             GeometryPoint(it.getString("id"), it.getDouble("x"), it.getDouble("y"), it.getString("label"), it.optionalColor())
         },
         segments = json.boundedArray("segments", SceneValidator.MAX_ENTITIES).objects().map {
-            GeometrySegment(it.getString("id"), it.getString("startPointId"), it.getString("endPointId"), it.getString("label"), it.optionalColor())
+            GeometrySegment(it.getString("id"), it.getString("startPointId"), it.getString("endPointId"), it.getString("label"), it.optionalColor(), it.optionalLineStyle())
         },
         circles = json.boundedArray("circles", SceneValidator.MAX_ENTITIES).objects().map {
-            GeometryCircle(it.getString("id"), it.getString("centerPointId"), it.getDouble("radius"), it.getString("label"), it.optionalColor())
+            GeometryCircle(it.getString("id"), it.getString("centerPointId"), it.getDouble("radius"), it.getString("label"), it.optionalColor(), it.optionalLineStyle())
         },
         constraints = json.boundedArray("constraints", SceneValidator.MAX_CONSTRAINTS).objects().map {
             val refs = it.boundedArray("entityIds", 2)
@@ -166,6 +170,10 @@ internal object ConstructionJsonCodec {
     private fun JSONArray.objects(): List<JSONObject> = (0 until length()).map(::getJSONObject)
     private fun JSONObject.nullableDouble(key: String): Double? = if (isNull(key)) null else getDouble(key)
     private fun JSONObject.optionalColor(): Int? = if (!has("colorArgb") || isNull("colorArgb")) null else exactInt("colorArgb")
+    // Old documents omit this display field. Unknown values fail visibly instead of silently
+    // discarding newer presentation data during the next save or publication.
+    private fun JSONObject.optionalLineStyle(): GeometryLineStyle =
+        if (!has("lineStyle")) GeometryLineStyle.SOLID else GeometryLineStyle.valueOf(getString("lineStyle"))
     private fun JSONObject.exactLong(key: String): Long {
         val value = get(key)
         require(value is Number) { "Invalid $key" }

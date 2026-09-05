@@ -4,6 +4,7 @@ import com.studyink.construction.core.ConstructionScene
 import com.studyink.construction.core.ConstraintType
 import com.studyink.construction.core.GeometryCircle
 import com.studyink.construction.core.GeometryConstraint
+import com.studyink.construction.core.GeometryLineStyle
 import com.studyink.construction.core.GeometryMeasurement
 import com.studyink.construction.core.GeometryPoint
 import com.studyink.construction.core.GeometrySegment
@@ -65,17 +66,19 @@ internal object ConstructionEdits {
         return scene.copy(points = scene.points + point, constraints = scene.constraints + relations) to point.id
     }
 
-    fun addSegment(scene: ConstructionScene, start: ConstructionAnchor, end: ConstructionAnchor, colorArgb: Int? = null): ConstructionScene {
+    fun addSegment(scene: ConstructionScene, start: ConstructionAnchor, end: ConstructionAnchor, colorArgb: Int? = null,
+                   lineStyle: GeometryLineStyle = GeometryLineStyle.SOLID): ConstructionScene {
         val (withStart, a) = anchor(scene, start, colorArgb)
         val (withBoth, b) = anchor(withStart, end, colorArgb)
         require(a != b) { "서로 다른 두 점을 선택하세요." }
-        return withBoth.copy(segments = withBoth.segments + GeometrySegment(id(), a, b, colorArgb = colorArgb))
+        return withBoth.copy(segments = withBoth.segments + GeometrySegment(id(), a, b, colorArgb = colorArgb, lineStyle = lineStyle))
     }
 
-    fun addCircle(scene: ConstructionScene, center: ConstructionAnchor, radius: Double, colorArgb: Int? = null): ConstructionScene {
+    fun addCircle(scene: ConstructionScene, center: ConstructionAnchor, radius: Double, colorArgb: Int? = null,
+                  lineStyle: GeometryLineStyle = GeometryLineStyle.SOLID): ConstructionScene {
         val (withCenter, p) = anchor(scene, center, colorArgb)
         require(radius.isFinite() && radius > 0) { "반지름은 0보다 커야 합니다." }
-        return withCenter.copy(circles = withCenter.circles + GeometryCircle(id(), p, radius, colorArgb = colorArgb))
+        return withCenter.copy(circles = withCenter.circles + GeometryCircle(id(), p, radius, colorArgb = colorArgb, lineStyle = lineStyle))
     }
 
     fun remove(scene: ConstructionScene, selected: Set<String>): ConstructionScene {
@@ -94,6 +97,12 @@ internal object ConstructionEdits {
         points = scene.points.map { if (it.id in selectedIds) it.copy(colorArgb = colorArgb) else it },
         segments = scene.segments.map { if (it.id in selectedIds) it.copy(colorArgb = colorArgb) else it },
         circles = scene.circles.map { if (it.id in selectedIds) it.copy(colorArgb = colorArgb) else it },
+    )
+
+    /** Only selected strokes change; choosing an endpoint never restyles its adjoining lines. */
+    fun setLineStyle(scene: ConstructionScene, selectedIds: Set<String>, lineStyle: GeometryLineStyle): ConstructionScene = scene.copy(
+        segments = scene.segments.map { if (it.id in selectedIds) it.copy(lineStyle = lineStyle) else it },
+        circles = scene.circles.map { if (it.id in selectedIds) it.copy(lineStyle = lineStyle) else it },
     )
 
     /** Repeated 'show measurement' keeps the existing label identity and the user's placement. */

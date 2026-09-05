@@ -17,6 +17,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
@@ -29,10 +30,12 @@ import com.studyink.construction.core.ConstraintSolver
 import com.studyink.construction.core.ConstraintType
 import com.studyink.construction.core.DragTarget
 import com.studyink.construction.core.GeometryConstraint
+import com.studyink.construction.core.GeometryLineStyle
 import com.studyink.construction.core.GeometryPoint
 import com.studyink.construction.core.GeometrySegment
 import com.studyink.construction.core.GeometryMeasurement
 import com.studyink.construction.core.MeasurementType
+import com.studyink.construction.core.SceneValidator
 import com.studyink.construction.core.SolveResult
 import com.studyink.construction.storage.ConstructionSceneSnapshot
 import com.studyink.construction.storage.ConstructionSceneStore
@@ -92,11 +95,16 @@ internal class ConstructionEditorView(
     private val toolButtons = mutableMapOf<ConstructionTool, Button>()
     private val panelButtons = mutableMapOf<PanelKind, Button>()
     private val colorButtons = mutableMapOf<Int, Button>()
+    private val lineStyleButtons = mutableMapOf<GeometryLineStyle, Button>()
     private var panelKind: PanelKind? = null
     private var detailSelection: Set<String> = emptySet()
     private var toolHint = "선택 · 대상을 눌러 주세요"
     private var newColor = Color.rgb(44, 59, 72)
+    private var newLineStyle = GeometryLineStyle.SOLID
     private var selectedCondition: String? = null
+    private var panelAnchorConstraint: String? = null
+    private var panelRevision = 0L
+    private val conditionSteps = mutableMapOf<String, Double>()
     private var measurementBase: ConstructionScene? = null
     private enum class PanelKind { RELATIONS, MEASURE, CONDITIONS, MORE, DETAIL }
     private val actionButtons = mutableListOf<Button>()
@@ -162,11 +170,15 @@ internal class ConstructionEditorView(
             }
             addView(TextView(context).apply { text = "│"; setTextColor(Color.LTGRAY); gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(15), dp(36)))
             for ((color, label) in palette()) {
-                val b = button(label, register = false) { newColor = color; updateToolbar(); notice("새 도형 색: $label") }.apply {
-                    text = "●"; textSize = 18f; setTextColor(color); contentDescription = "새 도형 색 $label"
+                val b = button(label, register = false) { applyColor(color) }.apply {
+                    text = "●"; textSize = 18f; setTextColor(color); contentDescription = "도형 색 $label"
                     layoutParams = LinearLayout.LayoutParams(dp(36), dp(36))
                 }
                 colorButtons[color] = b; addView(b)
+            }
+            GeometryLineStyle.entries.forEach { style ->
+                val b = button(style.koreanName(), icon = style.icon(), iconOnly = true) { applyLineStyle(style) }
+                lineStyleButtons[style] = b; addView(b)
             }
             addView(button("자동 연결", icon = ConstructionIcon.MAGNET, iconOnly = true) {
                 canvas.snapEnabled = !canvas.snapEnabled; updateToolbar()
@@ -210,12 +222,13 @@ internal class ConstructionEditorView(
         canvas.onSelectionChanged = { updateSelection() }
         canvas.onToolHintChanged = { toolHint = it; updateHint() }
         canvas.onPoint = { p -> runCatching { ConstructionEdits.addPoint(scene, p, newColor) }.onSuccess { edit(it) }.onFailure { notice(it.message.orEmpty()) } }
-        canvas.onSegment = { a, b -> runCatching { ConstructionEdits.addSegment(scene, a, b, newColor) }.onSuccess { edit(it) }.onFailure { notice(it.message.orEmpty()) } }
-        canvas.onCircle = { center, radius -> runCatching { ConstructionEdits.addCircle(scene, center, radius, newColor) }.onSuccess { edit(it) }.onFailure { notice(it.message.orEmpty()) } }
+        canvas.onSegment = { a, b -> runCatching { ConstructionEdits.addSegment(scene, a, b, newColor, newLineStyle) }.onSuccess { edit(it) }.onFailure { notice(it.message.orEmpty()) } }
+        canvas.onCircle = { center, radius -> runCatching { ConstructionEdits.addCircle(scene, center, radius, newColor, newLineStyle) }.onSuccess { edit(it) }.onFailure { notice(it.message.orEmpty()) } }
         canvas.onDragPoint =(::onDrag)
         canvas.onMeasurementSelected = { id -> canvas.selectedMeasurementId = id; showMeasurementDetails(id) }
         canvas.onMeasurementDrag = ::onMeasurementDrag
-        canvas.onConstraintSelected = { id -> selectedCondition = id; showConditionDetails(id) }
+        canvas.onConstraintSelected = { id -> panelAnchorConstraint = id; showConditionDetails(id) }
+        canvas.onAnnotationLayoutChanged = { positionConditionPanel() }
         restoreListener = store.addRestoreListener {
             uiHandler.post {
                 if (!closed) {
@@ -260,6 +273,20 @@ internal class ConstructionEditorView(
     }
     private fun palette() = listOf(Color.rgb(44,59,72) to "먹색", Color.rgb(53,113,176) to "파랑", Color.rgb(194,91,64) to "주황")
 
+    private fun applyColor(color: Int) {
+        onEditingRequested()
+        newColor = color
+        presentationEdit(ConstructionEdits.setColor(scene, canvas.selectedIds, color))
+        updateToolbar()
+    }
+
+    private fun applyLineStyle(style: GeometryLineStyle) {
+        onEditingRequested()
+        newLineStyle = style
+        presentationEdit(ConstructionEdits.setLineStyle(scene, canvas.selectedIds, style))
+        updateToolbar()
+    }
+
     /** This panel is a sibling of the full-size canvas, never a row above it. */
     private fun configurePanel() {
         panel.orientation = LinearLayout.VERTICAL; panel.visibility = View.GONE
@@ -279,7 +306,7 @@ internal class ConstructionEditorView(
         var startX = 0f; var startY = 0f; var initialX = 0f; var initialY = 0f
         panelTitle.setOnTouchListener { _, event ->
             when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { startX = event.rawX; startY = event.rawY; initialX = panel.translationX; initialY = panel.translationY; true }
+                MotionEvent.ACTION_DOWN -> { panelAnchorConstraint = null; startX = event.rawX; startY = event.rawY; initialX = panel.translationX; initialY = panel.translationY; true }
                 MotionEvent.ACTION_MOVE -> { panel.translationX = initialX + event.rawX - startX; panel.translationY = initialY + event.rawY - startY; clampPanel(); true }
                 MotionEvent.ACTION_UP -> { panelTitle.performClick(); true }
                 MotionEvent.ACTION_CANCEL -> true
@@ -288,12 +315,35 @@ internal class ConstructionEditorView(
         }
         viewport.addOnLayoutChangeListener { _, l,t,r,b, oldL,oldT,oldR,oldB ->
             if (r-l != oldR-oldL || b-t != oldB-oldT) {
-                val width = minOf(dp(310), (r-l-dp(16)).coerceAtLeast(dp(120)))
+                val width = minOf(dp(if (panelAnchorConstraint != null) 256 else 310), (r-l-dp(16)).coerceAtLeast(dp(120)))
                 panel.layoutParams = (panel.layoutParams as FrameLayout.LayoutParams).apply { this.width = width }
                 panelScroll.requestLayout(); panel.post { clampPanel() }
             }
         }
-        panel.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> clampPanel() }
+        panel.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            if (panelAnchorConstraint != null) positionConditionPanel() else clampPanel()
+        }
+    }
+    /** Place the existing overlay beside the dimension. Neither canvas layer is ever resized. */
+    private fun positionConditionPanel() {
+        if (panelKind != PanelKind.DETAIL || panel.visibility != View.VISIBLE || panel.width == 0) return
+        val id = panelAnchorConstraint ?: return
+        val bounds = canvas.constraintScreenBounds(id) ?: return
+        val gap = dp(8).toFloat()
+        val margin = dp(4).toFloat()
+        val right = bounds.right + gap
+        val left = bounds.left - gap - panel.width
+        val x: Float
+        val y: Float
+        when {
+            right + panel.width <= viewport.width - margin -> { x = right; y = bounds.centerY() - panel.height / 2f }
+            left >= margin -> { x = left; y = bounds.centerY() - panel.height / 2f }
+            bounds.bottom + gap + panel.height <= viewport.height - margin -> { x = bounds.centerX() - panel.width / 2f; y = bounds.bottom + gap }
+            else -> { x = bounds.centerX() - panel.width / 2f; y = bounds.top - gap - panel.height }
+        }
+        panel.translationX = x - panel.left
+        panel.translationY = y - panel.top
+        clampPanel()
     }
     private fun clampPanel() {
         panel.translationX = panel.translationX.coerceIn(-panel.left.toFloat() + dp(4), maxOf(-panel.left.toFloat() + dp(4), (viewport.width-panel.right-dp(4)).toFloat()))
@@ -305,13 +355,28 @@ internal class ConstructionEditorView(
     }
     private fun closePanel() {
         hideKeyboard(); panelKind = null; panel.visibility = View.GONE
+        panelRevision++
+        panelAnchorConstraint = null
         panelBody.removeAllViews(); selectedCondition = null; canvas.selectedConstraintId = null
         canvas.selectedMeasurementId = null; updateToolbar()
     }
     private fun showPanel(title: String, kind: PanelKind, build: LinearLayout.() -> Unit) {
+        val retainedScroll = if (kind == PanelKind.CONDITIONS && panelKind == kind) panelScroll.scrollY else 0
+        val revision = ++panelRevision
+        if (kind != PanelKind.DETAIL) panelAnchorConstraint = null
         hideKeyboard(); panelKind = kind; panelTitle.text = title
+        val desiredWidth = dp(if (panelAnchorConstraint != null) 256 else 310)
+        panel.layoutParams = (panel.layoutParams as FrameLayout.LayoutParams).apply {
+            width = minOf(desiredWidth, (viewport.width - dp(16)).coerceAtLeast(dp(120)))
+        }
         detailSelection = canvas.selectedIds.toSet(); panelBody.removeAllViews(); panelBody.build()
-        panelScroll.scrollTo(0, 0); panel.visibility = View.VISIBLE; panel.bringToFront(); updateToolbar()
+        panelScroll.scrollTo(0, retainedScroll); panel.visibility = View.VISIBLE; panel.bringToFront(); updateToolbar()
+        if (retainedScroll > 0) panelBody.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(v: View, l: Int, t: Int, r: Int, b: Int, oldL: Int, oldT: Int, oldR: Int, oldB: Int) {
+                v.removeOnLayoutChangeListener(this)
+                if (panelRevision == revision && panelKind == kind) panelScroll.scrollTo(0, retainedScroll)
+            }
+        })
     }
     private fun LinearLayout.info(text: String) {
         addView(TextView(context).apply { this.text = text; textSize = 11f; setTextColor(Color.rgb(80,91,83)); setPadding(dp(7), dp(4), dp(7), dp(5)) }, LinearLayout.LayoutParams(-1, -2))
@@ -342,7 +407,16 @@ internal class ConstructionEditorView(
     private fun updateToolbar() {
         toolButtons.forEach { (tool, b) -> b.isSelected = memoGeometryActive && canvas.tool == tool }
         panelButtons.forEach { (kind,b) -> b.isSelected = panelKind == kind }
-        colorButtons.forEach { (color,b) -> b.isSelected = color == newColor; b.setTextColor(color); b.background = if (color == newColor) surface(Color.rgb(230,235,229)) else surface(Color.TRANSPARENT); b.isEnabled = !busy && dragBase == null && measurementBase == null }
+        val colors = canvas.selectedIds.mapNotNull { id ->
+            scene.point(id)?.let { it.colorArgb ?: Color.rgb(44,59,72) }
+                ?: scene.segment(id)?.let { it.colorArgb ?: Color.rgb(44,59,72) }
+                ?: scene.circle(id)?.let { it.colorArgb ?: Color.rgb(57,123,112) }
+        }.distinct()
+        val shownColor = if (canvas.selectedIds.isEmpty()) newColor else colors.singleOrNull()
+        colorButtons.forEach { (color,b) -> b.isSelected = color == shownColor; b.setTextColor(color); b.background = if (color == shownColor) surface(Color.rgb(230,235,229)) else surface(Color.TRANSPARENT); b.isEnabled = !busy && dragBase == null && measurementBase == null }
+        val styles = (selectedSegments().map { it.lineStyle } + selectedCircles().map { it.lineStyle }).distinct()
+        val shownStyle = if (styles.isEmpty()) newLineStyle else styles.singleOrNull()
+        lineStyleButtons.forEach { (style,b) -> b.isSelected = style == shownStyle }
         actionButtons.firstOrNull { it.tag == "snap-toggle" }?.isSelected = canvas.snapEnabled
         actionButtons.firstOrNull { it.tag == "더보기" }?.isSelected = panelKind == PanelKind.MORE
     }
@@ -373,6 +447,11 @@ internal class ConstructionEditorView(
         actionButtons.forEach { it.isEnabled = !value && dragBase == null && measurementBase == null }
         closeButton?.isEnabled = !value
         canvas.editable = !value
+        fun enableControls(view: View) {
+            if (view is Button || view is EditText) view.isEnabled = !value && dragBase == null && measurementBase == null
+            if (view is ViewGroup) for (i in 0 until view.childCount) enableControls(view.getChildAt(i))
+        }
+        enableControls(panelBody)
         updateToolbar()
         refreshSyncState()
         onUndoStateChanged()
@@ -624,7 +703,7 @@ internal class ConstructionEditorView(
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
             setText(formatGeometry(initial)); selectAll(); setSingleLine(); contentDescription = "작도 치수 값"
         }
-        panel.translationX = 0f; panel.translationY = 0f
+        panelAnchorConstraint = null; panel.translationX = 0f; panel.translationY = 0f
         selectedCondition = null; canvas.selectedMeasurementId = null
         showPanel(title, PanelKind.DETAIL) {
             info(if (angle) "시작→끝 방향 사이 각도 · 0~180°" else "조건 값 · cm (화면 확대와 무관)")
@@ -643,35 +722,137 @@ internal class ConstructionEditorView(
         }
     }
 
-    private fun conditionLabel(c: GeometryConstraint): String = "${if (c.enabled) "●" else "○"} ${c.type.koreanName()} · ${c.entityIds.joinToString { name(it) }}${c.value?.let { " = ${formatGeometry(it)}${if (c.type == ConstraintType.ANGLE) "°" else " cm"}" } ?: ""}"
+    private fun conditionLabel(c: GeometryConstraint): String = "${c.type.koreanName()} · ${c.entityIds.joinToString { name(it) }}${c.value?.let { " = ${formatGeometry(it)}${if (c.type == ConstraintType.ANGLE) "°" else " cm"}" } ?: ""}"
     private fun showConditions() {
+        if (scene.constraints.none { it.id == selectedCondition }) selectedCondition = null
         showPanel("조건 목록 · ${scene.constraints.size}개", PanelKind.CONDITIONS) {
             if (scene.constraints.isEmpty()) info("조건이 없습니다. 대상을 선택한 뒤 조건 추가를 누르세요.")
             val selected = canvas.selectedIds
             scene.constraints.sortedByDescending { c -> c.entityIds.any { it in selected } }.forEach { c ->
-                action(conditionLabel(c)) { showConditionDetails(c.id) }
+                val expanded = c.id == selectedCondition
+                addView(LinearLayout(context).apply {
+                    orientation = LinearLayout.VERTICAL; tag = "condition-row-${c.id}"
+                    background = if (expanded) surface(0xEEF0F5FA.toInt()) else null
+                    addView(LinearLayout(context).apply {
+                        gravity = Gravity.CENTER_VERTICAL
+                        addView(conditionCheckBox(c), LinearLayout.LayoutParams(dp(36), dp(40)))
+                        addView(button("${if (expanded) "▾" else "▸"} ${conditionLabel(c)}", register = false) {
+                            selectedCondition = if (expanded) null else c.id
+                            canvas.selectedConstraintId = selectedCondition; canvas.selectedMeasurementId = null
+                            showConditions()
+                        }.apply {
+                            tag = "condition-expand-${c.id}"; maxLines = 2; gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                            contentDescription = "조건 세부 메뉴 ${conditionLabel(c)}"
+                        }, LinearLayout.LayoutParams(0, dp(44), 1f))
+                    })
+                    if (expanded) addConditionControls(c)
+                }, LinearLayout.LayoutParams(-1, -2))
             }
         }
     }
+
+    private fun conditionCheckBox(c: GeometryConstraint): CheckBox {
+        val token = generation
+        return CheckBox(context).apply {
+            tag = "condition-enabled-${c.id}"; isChecked = c.enabled
+            buttonTintList = android.content.res.ColorStateList.valueOf(Color.rgb(79,117,158))
+            setPadding(0, 0, 0, 0); minWidth = 0; minimumWidth = 0
+            contentDescription = "${conditionLabel(c)} 조건 ${if (c.enabled) "켜짐" else "꺼짐"} · 눌러 전환"
+            setOnClickListener {
+                if (isCurrent(token)) {
+                    edit(scene.copy(constraints = scene.constraints.map { if (it.id == c.id) it.copy(enabled = isChecked) else it }))
+                } else isChecked = scene.constraints.firstOrNull { it.id == c.id }?.enabled ?: false
+            }
+        }
+    }
+
+    /** The same controls are embedded in a list row or in the overlay next to a dimension. */
+    private fun LinearLayout.addConditionControls(c: GeometryConstraint) {
+        addView(LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL; tag = "condition-controls-${c.id}"
+            setPadding(dp(5), 0, dp(5), dp(3))
+            val numericValue = c.value
+            if (numericValue != null) {
+                val token = generation
+                val angle = c.type == ConstraintType.ANGLE
+                val unit = if (angle) "°" else "cm"
+                val step = conditionSteps[c.id] ?: if (angle) 1.0 else .1
+                val input = EditText(context).apply {
+                    tag = "condition-value-${c.id}"; contentDescription = "조건 값 ${c.type.koreanName()} $unit"
+                    inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                    textSize = 15f; gravity = Gravity.CENTER; setSingleLine(); setSelectAllOnFocus(true)
+                    setPadding(dp(2), 0, dp(2), 0); setText(formatGeometry(numericValue))
+                }
+                addView(LinearLayout(context).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    fun adjust(label: String, delta: Double, tagName: String) = button(label, register = false) {
+                        if (isCurrent(token)) {
+                            val current = scene.constraints.firstOrNull { it.id == c.id }?.value ?: return@button
+                            val minimum = if (angle || c.type == ConstraintType.DISTANCE_POINT_LINE) 0.0 else SceneValidator.MIN_LENGTH
+                            val maximum = if (angle) 180.0 else SceneValidator.MAX_MAGNITUDE
+                            val proposed = kotlin.math.round((current + delta) * 1e9) / 1e9
+                            if (minimum > 0 && proposed < minimum) return@button notice("길이는 0보다 커야 합니다. 더 작은 값은 직접 입력하세요.")
+                            val value = proposed.coerceIn(minimum, maximum)
+                            changeConditionValue(c.id, value)
+                        }
+                    }.apply { tag = tagName; contentDescription = "${c.type.koreanName()} $label $step $unit"; textSize = 20f }
+                    addView(adjust("−", -step, "condition-minus-${c.id}"), LinearLayout.LayoutParams(dp(40), dp(38)))
+                    addView(input, LinearLayout.LayoutParams(0, dp(38), 1f))
+                    addView(TextView(context).apply { text = unit; textSize = 11f; setPadding(dp(2), 0, dp(4), 0) })
+                    addView(adjust("+", step, "condition-plus-${c.id}"), LinearLayout.LayoutParams(dp(40), dp(38)))
+                })
+                addView(LinearLayout(context).apply {
+                    for (choice in if (angle) listOf(1.0, 5.0) else listOf(.1, 1.0)) {
+                        addView(button("${formatGeometry(choice)}$unit", register = false) {
+                            conditionSteps[c.id] = choice; refreshPanel()
+                        }.apply {
+                            isSelected = step == choice; tag = "condition-step-${c.id}-$choice"
+                            contentDescription = "조절 간격 ${formatGeometry(choice)} $unit"
+                        }, LinearLayout.LayoutParams(0, dp(32), 1f))
+                    }
+                    addView(button("입력 적용", register = false) {
+                        if (isCurrent(token)) {
+                            val value = input.text.toString().toDoubleOrNull()
+                            val minimum = if (angle || c.type == ConstraintType.DISTANCE_POINT_LINE) 0.0 else SceneValidator.MIN_LENGTH
+                            val maximum = if (angle) 180.0 else SceneValidator.MAX_MAGNITUDE
+                            if (value == null || !value.isFinite() || value !in minimum..maximum) {
+                                input.error = if (angle) "0~180°를 입력하세요" else "유효한 길이를 입력하세요"
+                            } else { hideKeyboard(); changeConditionValue(c.id, value) }
+                        }
+                    }.apply { tag = "condition-apply-${c.id}" }, LinearLayout.LayoutParams(0, dp(32), 1.3f))
+                })
+                if (c.type == ConstraintType.RADIUS) info("반지름 기준 · 둘레 ${formatGeometry(2 * Math.PI * numericValue)} cm")
+                if (angle) info("시작→끝 방향 사이 각도 · 0~180°")
+                if (!c.enabled) info("잠시 꺼짐 · 설정 값만 변경됩니다. 체크하면 다시 적용합니다.")
+            } else info(if (c.enabled) "체크를 해제하면 관계를 잠시 풉니다." else "잠시 꺼짐 · 체크하면 다시 적용합니다.")
+            action("조건 삭제", ConstructionIcon.DELETE) {
+                selectedCondition = null; canvas.selectedConstraintId = null
+                if (panelKind == PanelKind.DETAIL) closePanel()
+                edit(scene.copy(constraints = scene.constraints.filterNot { it.id == c.id }))
+            }
+        }, LinearLayout.LayoutParams(-1, -2))
+    }
+
+    private fun changeConditionValue(id: String, value: Double) {
+        // A disabled condition stays disabled; the checkbox alone controls activation.
+        edit(scene.copy(constraints = scene.constraints.map { if (it.id == id) it.copy(value = value) else it }))
+    }
+
     private fun showConditionDetails(id: String) {
         val c = scene.constraints.firstOrNull { it.id == id } ?: return closePanel()
         selectedCondition = id; canvas.selectedConstraintId = id; canvas.selectedMeasurementId = null
         showPanel("조건 · ${c.type.koreanName()}", PanelKind.DETAIL) {
-            info(conditionLabel(c))
-            info("조건은 모양을 유지합니다. 끄면 해당 관계가 풀립니다.")
-            if (c.value != null) action("값 바꾸기") {
-                numberInput(c.type.koreanName(), c.value!!, angle = c.type == ConstraintType.ANGLE, allowZero = c.type == ConstraintType.DISTANCE_POINT_LINE) { value ->
-                    edit(scene.copy(constraints = scene.constraints.map { if (it.id == id) it.copy(value = value, enabled = true) else it }))
-                }
-            }
-            action(if (c.enabled) "조건 잠시 끄기" else "조건 다시 켜기") {
-                edit(scene.copy(constraints = scene.constraints.map { if (it.id == id) it.copy(enabled = !c.enabled) else it }))
-            }
-            action("조건 삭제", ConstructionIcon.DELETE) {
-                closePanel(); edit(scene.copy(constraints = scene.constraints.filterNot { it.id == id }))
-            }
+            addView(LinearLayout(context).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(conditionCheckBox(c), LinearLayout.LayoutParams(dp(36), dp(36)))
+                addView(TextView(context).apply {
+                    text = conditionLabel(c); textSize = 11f; setTextColor(Color.rgb(80,91,83))
+                }, LinearLayout.LayoutParams(0, -2, 1f))
+            })
+            addConditionControls(c)
             action("조건 목록으로") { showConditions() }
         }
+        positionConditionPanel()
     }
 
     private fun length(line: GeometrySegment): Double {
@@ -742,6 +923,7 @@ internal class ConstructionEditorView(
     }
     private fun showMeasurementDetails(id: String) {
         val m = scene.measurements.firstOrNull { it.id == id } ?: return closePanel()
+        panelAnchorConstraint = null
         selectedCondition = null; canvas.selectedConstraintId = null; canvas.selectedMeasurementId = id
         showPanel("측정 표시", PanelKind.DETAIL) {
             info(measurementLabel(m)); info("글자를 끌어 위치를 바꾸세요. 측정은 조건이 아니므로 도형을 고정하지 않습니다.")
@@ -754,7 +936,7 @@ internal class ConstructionEditorView(
         val token = generation
         val p = selectedPoints().singleOrNull()?.takeIf { canvas.selectedIds.size == 1 } ?: return notice("이름을 바꿀 점 하나를 선택하세요.")
         val input = EditText(context).apply { setText(p.label); setSingleLine(); selectAll(); filters = arrayOf(android.text.InputFilter.LengthFilter(12)) }
-        panel.translationX = 0f; panel.translationY = 0f
+        panelAnchorConstraint = null; panel.translationX = 0f; panel.translationY = 0f
         selectedCondition = null; canvas.selectedMeasurementId = null
         showPanel("점 이름", PanelKind.DETAIL) {
             addView(input, LinearLayout.LayoutParams(-1, dp(42)))
@@ -791,7 +973,7 @@ internal class ConstructionEditorView(
         val t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy)
         if (distanceToLine(p, line) < .0001) return notice("점이 이미 직선 위에 있습니다. 길이 0인 수선은 만들지 않습니다.")
         val e = GeometryPoint(ConstructionEdits.id(), a.x + t * dx, a.y + t * dy, ConstructionEdits.nextPointLabel(scene), newColor)
-        val perpendicular = GeometrySegment(ConstructionEdits.id(), p.id, e.id, colorArgb = newColor)
+        val perpendicular = GeometrySegment(ConstructionEdits.id(), p.id, e.id, colorArgb = newColor, lineStyle = newLineStyle)
         edit(scene.copy(points = scene.points + e, segments = scene.segments + perpendicular, constraints = scene.constraints + listOf(
             GeometryConstraint(ConstructionEdits.id(), ConstraintType.POINT_ON_LINE, listOf(e.id, line.id)),
             GeometryConstraint(ConstructionEdits.id(), ConstraintType.PERPENDICULAR, listOf(perpendicular.id, line.id)),
@@ -815,7 +997,7 @@ internal class ConstructionEditorView(
     }
     private fun showHelp() {
         AlertDialog.Builder(context).setTitle("함께 작도하기")
-            .setMessage("1. 눌린 도구의 배경색과 왼쪽 위 안내가 다음 동작을 알려줍니다. 선분·원은 두 번 눌러 만듭니다.\n2. 색을 고른 뒤 그리세요. 이미 그린 도형은 선택 → 더보기에서 색을 바꿉니다.\n3. 자석이 켜져 있으면 기존 끝점·선 위·두 선의 교점에 연결됩니다. 원 둘레를 맞추는 두 번째 탭은 반지름 위치만 맞추며 연결 조건을 만들지는 않습니다.\n4. 선택 → 조건 추가로 모양을 유지할 관계를 지정합니다. 조건 목록에서 값 변경·켜기·끄기가 가능합니다.\n5. 선택 → 측정 → 그림에 표시. 측정은 모양을 고정하지 않습니다. 글자를 끌면 치수 표시만 이동합니다. 각도는 A → 꼭짓점 B → C 순서로 세 점을 선택합니다.\n6. 작은 메뉴의 제목을 끌면 옮길 수 있습니다. 열고 닫아도 도형은 움직이지 않습니다. 두 손가락으로 도형을 확대·이동합니다.\n\n빈 곳을 누르면 선택 해제. 겹친 점은 반복해서 누르면 따로 선택됩니다. 두 선의 각도 조건은 시작→끝 방향 기준입니다. 직선 위 조건·수선·교점은 연장선을 포함합니다. 원과 선·두 원의 교점 자동 연결은 아직 지원하지 않습니다.\n\n${if (embedded) "도형과 손필기는 별도 영역이며 지우개·되돌리기가 서로 영향을 주지 않습니다. 경계를 넘으면 획은 경계에서 끝납니다. 학생 도형은 손을 놓아 저장한 뒤 자동 전송됩니다. 선생 도형은 초안으로 저장되며 발행을 눌러야 학생에게 전송됩니다. 끊겨도 로컬 작업은 유지됩니다." else "이 전체화면 작도는 현재 기기에 자동 저장되고 앱 백업에 포함됩니다. 메모 안에 넣은 도형판만 원격 동기화 대상입니다."}")
+            .setMessage("1. 눌린 도구의 배경색과 왼쪽 위 안내가 다음 동작을 알려줍니다. 선분·원은 두 번 눌러 만듭니다.\n2. 도형을 선택하고 색·실선·점선·점점선 아이콘을 누르면 바로 바뀝니다. 선택이 없으면 다음 도형에 적용됩니다.\n3. 자석이 켜져 있으면 기존 끝점·선 위·두 선의 교점에 연결됩니다. 원 둘레를 맞추는 두 번째 탭은 반지름 위치만 맞추며 연결 조건을 만들지는 않습니다.\n4. 선택 → 조건 추가로 모양을 유지할 관계를 지정합니다. 길이·반지름·방향각은 그림에 표시됩니다. 표시를 누르면 옆 메뉴에서 ±로 바로 조절합니다. 조건 목록의 항목은 아래로 펼쳐지며 체크로 잠시 끄고 켭니다.\n5. 선택 → 측정 → 그림에 표시. 측정은 모양을 고정하지 않습니다. 글자를 끌면 치수 표시만 이동합니다. 각도는 A → 꼭짓점 B → C 순서로 세 점을 선택합니다.\n6. 작은 메뉴의 제목을 끌면 옮길 수 있습니다. 열고 닫아도 도형은 움직이지 않습니다. 두 손가락으로 도형을 확대·이동합니다.\n\n빈 곳을 누르면 선택 해제. 겹친 점은 반복해서 누르면 따로 선택됩니다. 두 선의 각도 조건은 시작→끝 방향 기준입니다. 직선 위 조건·수선·교점은 연장선을 포함합니다. 원과 선·두 원의 교점 자동 연결은 아직 지원하지 않습니다.\n\n${if (embedded) "도형과 손필기는 같은 평면에서 함께 확대·이동하지만 지우개·되돌리기는 서로 영향을 주지 않습니다. 필기/도형 모드를 선택해 조작하세요. 학생 도형은 손을 놓아 저장한 뒤 자동 전송됩니다. 선생 도형은 초안으로 저장되며 발행을 눌러야 학생에게 전송됩니다. 끊겨도 로컬 작업은 유지됩니다." else "이 전체화면 작도는 현재 기기에 자동 저장되고 앱 백업에 포함됩니다. 메모 안에 넣은 도형판만 원격 동기화 대상입니다."}")
             .setPositiveButton("확인", null).showChild()
     }
     private fun requestClose() {

@@ -138,12 +138,14 @@ class ConstructionEditorDialogTest {
         assertEquals(MeasurementType.DISTANCE, canvas.scene.measurements.single().type)
 
         click(dialog, "조건 목록")
-        clickPanelContaining(dialog, "13.3")
-        click(dialog, "값 바꾸기")
-        walk(overlay(dialog)).filterIsInstance<EditText>().single().setText("14")
+        val heightId = canvas.scene.constraints.single { it.type == ConstraintType.DISTANCE_POINT_LINE }.id
+        clickTag(dialog, "condition-expand-$heightId")
+        conditionInput(dialog, heightId).setText("14")
         assertNoVisibleAlert()
-        click(dialog, "적용")
+        clickTag(dialog, "condition-apply-$heightId")
         awaitReady(dialog) { it.constraints.any { c -> c.value == 14.0 } }
+        assertTrue("The condition list stays open after its inline value is applied", button(dialog, "조건 목록").isSelected)
+        assertEquals(View.VISIBLE, overlay(dialog).visibility)
         assertEquals(4.0, perpendicularLength(), 1e-5)
         assertEquals(canvas.scene, store.load(target).scene)
     }
@@ -253,6 +255,44 @@ class ConstructionEditorDialogTest {
         assertEquals(canvas.scene, store.load(target).scene)
     }
 
+    @Test fun `backup restoration invalidates a captured inline numeric apply without overwriting restored bytes`() {
+        val original = measuredSegmentScene()
+        store.save(store.load(target), original)
+        val dialog = open()
+        val canvas = canvas(dialog)
+        val dataRoot = File(activity.applicationContext.filesDir, "masternote")
+        val sceneFile = File(dataRoot, ConstructionSceneStore.FEATURE_DIRECTORY).walkTopDown().single {
+            it.isFile && it.extension == "json" && it.readText().contains(target.memoId)
+        }
+        val backupBytes = sceneFile.readBytes()
+        canvas.onPoint(ConstructionAnchor(12.0, 3.0))
+        awaitReady(dialog) { it.points.size == 3 }
+        click(dialog, "조건 목록")
+        clickTag(dialog, "condition-expand-length")
+        conditionInput(dialog, "length").setText("12")
+        val staleApply = taggedButton(dialog, "condition-apply-length")
+
+        MasterNoteOptionalDataRootGuard.withStableDataRoot(dataRoot) {
+            sceneFile.writeBytes(backupBytes)
+            MasterNoteDataRootBus.dataRootReplaced()
+        }
+        awaitReady(dialog) { it == original }
+        staleApply.performClick()
+        shadowOf(Looper.getMainLooper()).idle()
+        awaitReady(dialog)
+        assertEquals(original, canvas.scene)
+        assertArrayEquals("A queued stale numeric click cannot replace restored data", backupBytes, sceneFile.readBytes())
+
+        // Current controls must still work; rejecting a stale callback must not freeze editing.
+        click(dialog, "조건 목록")
+        clickTag(dialog, "condition-expand-length")
+        conditionInput(dialog, "length").setText("11")
+        clickTag(dialog, "condition-apply-length")
+        awaitReady(dialog) { it.constraints.single().value == 11.0 }
+        assertEquals(11.0, distance(canvas.scene, "a", "b"), 1e-4)
+        assertEquals(canvas.scene, store.load(target).scene)
+    }
+
     @Test fun `condition measurement and numeric overlays never resize or move the drawing viewport`() {
         val original = measuredSegmentScene()
         store.save(store.load(target), original)
@@ -290,9 +330,8 @@ class ConstructionEditorDialogTest {
             assertViewportUnchanged()
         }
         click(dialog, "조건 목록")
-        clickPanelContaining(dialog, "10 cm")
-        click(dialog, "값 바꾸기")
-        walk(overlay(dialog)).filterIsInstance<EditText>().single().requestFocus()
+        clickTag(dialog, "condition-expand-length")
+        conditionInput(dialog, "length").requestFocus()
         assertViewportUnchanged()
         click(dialog, "메뉴 닫기")
         assertViewportUnchanged()
@@ -320,7 +359,7 @@ class ConstructionEditorDialogTest {
     @Test fun `new drawing color survives durable save and reopening`() {
         val dialog = open()
         val canvas = canvas(dialog)
-        clickDescription(dialog, "새 도형 색 파랑")
+        clickDescription(dialog, "도형 색 파랑")
         canvas.onSegment(ConstructionAnchor(1.0, 1.0), ConstructionAnchor(7.0, 1.0))
         awaitReady(dialog) { it.segments.size == 1 }
         val blue = Color.rgb(53, 113, 176)
@@ -336,7 +375,12 @@ class ConstructionEditorDialogTest {
     }
 
     @Test fun `dragging a dimension saves once and undo delete undo preserve geometry and hard conditions`() {
-        val original = measuredSegmentScene()
+        // A dimension that duplicates a driving condition now opens that condition's editor.
+        // Keep this reference-label drag test independent while retaining AB's hard length rule.
+        val original = measuredSegmentScene().copy(
+            points = measuredSegmentScene().points + GeometryPoint("c", 10.0, 5.0, "C"),
+            measurements = listOf(GeometryMeasurement("distance", MeasurementType.DISTANCE, listOf("a", "c"))),
+        )
         store.save(store.load(target), original)
         val dialog = open()
         val canvas = canvas(dialog)
@@ -471,6 +515,19 @@ class ConstructionEditorDialogTest {
         target.performClick()
         shadowOf(Looper.getMainLooper()).idle()
     }
+
+    private fun taggedButton(dialog: ConstructionEditorDialog, tag: String): Button =
+        walk(overlay(dialog)).filterIsInstance<Button>().single { it.tag == tag }
+
+    private fun clickTag(dialog: ConstructionEditorDialog, tag: String) {
+        val target = taggedButton(dialog, tag)
+        assertTrue("Button $tag must be enabled", target.isEnabled)
+        target.performClick()
+        shadowOf(Looper.getMainLooper()).idle()
+    }
+
+    private fun conditionInput(dialog: ConstructionEditorDialog, id: String): EditText =
+        walk(overlay(dialog)).filterIsInstance<EditText>().single { it.tag == "condition-value-$id" }
 
     private fun clickMore(dialog: ConstructionEditorDialog, label: String) {
         click(dialog, "더보기")

@@ -28,6 +28,7 @@ data class GeometrySegment(
     val endPointId: String,
     val label: String = "",
     val colorArgb: Int? = null,
+    val lineStyle: GeometryLineStyle = GeometryLineStyle.SOLID,
 )
 data class GeometryCircle(
     val id: String,
@@ -35,7 +36,11 @@ data class GeometryCircle(
     val radius: Double,
     val label: String = "",
     val colorArgb: Int? = null,
+    val lineStyle: GeometryLineStyle = GeometryLineStyle.SOLID,
 )
+
+/** Presentation only. Gaps never change the supporting line/circle or its solver equations. */
+enum class GeometryLineStyle { SOLID, DASHED, DOTTED }
 
 enum class MeasurementType { DISTANCE, ANGLE, RADIUS, AREA }
 

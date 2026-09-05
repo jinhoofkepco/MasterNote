@@ -18,9 +18,22 @@ import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
+import com.studyink.construction.core.GeometryLineStyle
 import kotlin.math.roundToInt
 
-internal enum class ConstructionIcon { SELECT, POINT, SEGMENT, CIRCLE, CONSTRAINT, MEASURE, LIST, UNDO, REDO, FIT, CLOSE, MORE, MAGNET, DELETE }
+internal enum class ConstructionIcon { SELECT, POINT, SEGMENT, CIRCLE, CONSTRAINT, MEASURE, LIST, UNDO, REDO, FIT, CLOSE, MORE, MAGNET, DELETE, LINE_SOLID, LINE_DASHED, LINE_DOTTED }
+
+internal fun GeometryLineStyle.koreanName(): String = when (this) {
+    GeometryLineStyle.SOLID -> "실선"
+    GeometryLineStyle.DASHED -> "점선"
+    GeometryLineStyle.DOTTED -> "점점선"
+}
+
+internal fun GeometryLineStyle.icon(): ConstructionIcon = when (this) {
+    GeometryLineStyle.SOLID -> ConstructionIcon.LINE_SOLID
+    GeometryLineStyle.DASHED -> ConstructionIcon.LINE_DASHED
+    GeometryLineStyle.DOTTED -> ConstructionIcon.LINE_DOTTED
+}
 
 internal fun constructionButton(context: Context, label: String, icon: ConstructionIcon? = null, iconOnly: Boolean = false, onClick: () -> Unit): Button {
     fun dp(value: Int) = (value * context.resources.displayMetrics.density).roundToInt()
@@ -80,6 +93,9 @@ private class ConstructionGlyph(private val icon: ConstructionIcon, private val 
             ConstructionIcon.POINT -> { canvas.drawCircle(12f,12f,2.8f,paint); dot(12f,12f,.8f) }
             ConstructionIcon.SEGMENT -> { line(5f,19f,19f,5f); canvas.drawCircle(5f,19f,2f,paint); canvas.drawCircle(19f,5f,2f,paint) }
             ConstructionIcon.CIRCLE -> { canvas.drawCircle(12f,12f,8f,paint); dot(12f,12f,.9f) }
+            ConstructionIcon.LINE_SOLID -> line(3f,12f,21f,12f)
+            ConstructionIcon.LINE_DASHED -> { line(3f,12f,6f,12f); line(10.5f,12f,13.5f,12f); line(18f,12f,21f,12f) }
+            ConstructionIcon.LINE_DOTTED -> for (x in floatArrayOf(3f,7.5f,12f,16.5f,21f)) dot(x,12f,1f)
             ConstructionIcon.CONSTRAINT -> { canvas.drawCircle(8f,9f,4f,paint); canvas.drawCircle(16f,15f,4f,paint); line(10f,11f,14f,13f) }
             ConstructionIcon.MEASURE -> { canvas.rotate(-35f,12f,12f); canvas.drawRoundRect(RectF(3f,8f,21f,16f),1.3f,1.3f,paint); for(x in floatArrayOf(7f,11f,15f,19f)) line(x,8f,x,if(x==7f||x==15f)12f else 10.5f) }
             ConstructionIcon.LIST -> for(y in floatArrayOf(6f,12f,18f)) { dot(4f,y,1f); line(9f,y,21f,y) }
