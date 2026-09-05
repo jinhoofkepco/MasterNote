@@ -160,6 +160,33 @@ class ConstructionEmbeddedEditorTest {
         assertFalse(teacher.load(target, ConstructionReplicaRole.TEACHER).draftDirty)
     }
 
+    @Test fun `repository load and student receipt complete before the editor is attached`() {
+        val student = ConstructionReplicaStore(File(temporary.root, "detached-student"))
+        val teacher = ConstructionReplicaStore(File(temporary.root, "detached-teacher"))
+        student.saveLocal(student.load(target, ConstructionReplicaRole.STUDENT),
+            ConstructionScene(points = listOf(GeometryPoint("A", 1.0, 2.0))))
+        teacher.receiveStudentSnapshot(target, student.studentSnapshot(target))
+        val teacherAccess = teacher.sceneAccess(ConstructionReplicaRole.TEACHER)
+        val editor = ConstructionEditorView(activity, target, "아직 연결하지 않은 메모", embedded = true,
+            store = teacherAccess, replicaRole = ConstructionReplicaRole.TEACHER,
+            syncBridge = TestBridge(teacherAccess)).also(editors::add)
+        assertFalse(editor.isAttachedToWindow)
+        // A View.post callback would remain in the detached canvas's run queue indefinitely.
+        // Repository completion belongs to the controller's main looper, not surface attachment.
+        awaitReady(editor) { it.points.single().x == 1.0 }
+        student.saveLocal(student.load(target, ConstructionReplicaRole.STUDENT),
+            ConstructionScene(points = listOf(GeometryPoint("A", 7.5, -4.25))))
+        teacher.receiveStudentSnapshot(target, student.studentSnapshot(target))
+        awaitReady(editor) { it.points.single().x == 7.5 }
+        assertFalse(editor.isAttachedToWindow)
+        assertEquals(-4.25, canvas(editor).scene.points.single().y, 0.0)
+        assertFalse(teacher.load(target, ConstructionReplicaRole.TEACHER).draftDirty)
+        activity.setContentView(FrameLayout(activity).apply { addView(editor, FrameLayout.LayoutParams(-1, -1)) })
+        awaitReady(editor) { it.points.single().x == 7.5 }
+        assertTrue(editor.isAttachedToWindow)
+        assertEquals(teacher.load(target, ConstructionReplicaRole.TEACHER).scene, canvas(editor).scene)
+    }
+
     @Test fun `incoming student commit does not overwrite the teachers edited draft`() {
         val student = ConstructionReplicaStore(File(temporary.root, "student"))
         val teacher = ConstructionReplicaStore(File(temporary.root, "teacher"))
@@ -387,7 +414,9 @@ class ConstructionEmbeddedEditorTest {
             if (!editor.hasPendingWork && canvas(editor).editable && predicate(canvas(editor).scene)) return
             Thread.sleep(10)
         }
-        fail("Embedded editor did not finish its bounded worker")
+        val canvas = canvas(editor)
+        fail("Embedded editor did not finish its bounded worker: pending=${editor.hasPendingWork}, " +
+            "editable=${canvas.editable}, attached=${editor.isAttachedToWindow}, scene=${canvas.scene}")
     }
 
     private fun canvas(editor: ConstructionEditorView) = walk(editor).filterIsInstance<ConstructionCanvasView>().single()

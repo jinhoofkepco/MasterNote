@@ -6,6 +6,8 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
@@ -70,6 +72,8 @@ internal class ConstructionEditorView(
     val canUndo: Boolean get() = !hasPendingWork && !closed && undo.isNotEmpty()
     val canRedo: Boolean get() = !hasPendingWork && !closed && redo.isNotEmpty()
     private val solver = ConstraintSolver()
+    // Storage/replica results belong to the controller, even while its canvas is being reparented.
+    private val uiHandler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "construction-editor").apply { isDaemon = true } }
     private val density = context.resources.displayMetrics.density
     private val canvas = ConstructionCanvasView(context)
@@ -213,7 +217,7 @@ internal class ConstructionEditorView(
         canvas.onMeasurementDrag = ::onMeasurementDrag
         canvas.onConstraintSelected = { id -> selectedCondition = id; showConditionDetails(id) }
         restoreListener = store.addRestoreListener {
-            canvas.post {
+            uiHandler.post {
                 if (!closed) {
                     generation++; dragBase = null; measurementBase = null; pendingDrag = null; dragSolving = false
                     undo.clear(); redo.clear(); canvas.cancelDrag(); load()
@@ -226,14 +230,14 @@ internal class ConstructionEditorView(
                     change.kind in setOf(ConstructionReplicaChangeKind.REMOTE_STUDENT,
                         ConstructionReplicaChangeKind.REMOTE_PUBLISH, ConstructionReplicaChangeKind.ADOPTED_STUDENT,
                         ConstructionReplicaChangeKind.PUBLISH_RESULT,
-                        ConstructionReplicaChangeKind.DELETED)) canvas.post {
+                        ConstructionReplicaChangeKind.DELETED)) uiHandler.post {
                     // Shadow/ACK metadata can advance while the teacher is drawing a new draft.
                     // The access adapter safely rebases identical scene bytes without discarding
                     // that in-progress gesture or its undo history.
                     if (!closed && (change.snapshot.deleted || change.snapshot.scene != snapshot?.scene)) reloadAfterRemoteChange()
                 }
             }
-            syncListener = syncBridge?.addListener(target) { canvas.post { if (!closed) refreshSyncState() } }
+            syncListener = syncBridge?.addListener(target) { uiHandler.post { if (!closed) refreshSyncState() } }
         }
         updateToolbar(); updateHint()
         refreshSyncState()
@@ -386,7 +390,7 @@ internal class ConstructionEditorView(
         setBusy(true); status.text = "작도 메모 불러오는 중…"
         worker.execute {
             val result = runCatching { store.load(target) }
-            canvas.post {
+            uiHandler.post {
                 if (closed || generation != token) return@post
                 result.onSuccess { loaded ->
                     snapshot = loaded; scene = loaded.scene; canvas.scene = scene
@@ -408,7 +412,7 @@ internal class ConstructionEditorView(
         val token = ++generation; setBusy(true); status.text = "조건 확인 중…"
         worker.execute {
             val result = runCatching { solver.solve(candidate) }
-            canvas.post {
+            uiHandler.post {
                 if (closed || generation != token) return@post
                 result.onSuccess { solved ->
                     if (solved.success) persist(solved.scene, solved = solved)
@@ -457,7 +461,7 @@ internal class ConstructionEditorView(
         setBusy(true); status.text = "저장 중…"
         worker.execute {
             val result = runCatching { store.save(expected, next) }
-            canvas.post {
+            uiHandler.post {
                 if (closed || generation != token) return@post
                 result.onSuccess { committed ->
                     when (historyDirection) {
@@ -524,7 +528,7 @@ internal class ConstructionEditorView(
         val gesture = dragRequest; val token = generation; val base = scene
         worker.execute {
             val result = runCatching { solver.solve(base, request.first) }
-            canvas.post {
+            uiHandler.post {
                 if (closed || generation != token || gesture != dragRequest || dragBase == null) return@post
                 dragSolving = false
                 result.onSuccess { solved ->

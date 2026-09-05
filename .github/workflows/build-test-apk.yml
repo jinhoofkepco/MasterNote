@@ -78,7 +78,10 @@ jobs:
       - name: Build and test
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleRelease testDebugUnitTest
+          # Keep native UI tests and R8 from competing for the small runner's CPU/memory.
+          # Both checks remain required; do not release an APK if either invocation fails.
+          ./gradlew testDebugUnitTest
+          ./gradlew :app:assembleRelease
 
       - name: Verify signing certificate
         env:
