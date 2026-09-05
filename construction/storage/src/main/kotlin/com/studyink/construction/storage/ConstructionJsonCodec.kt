@@ -4,8 +4,10 @@ import com.studyink.construction.core.ConstraintType
 import com.studyink.construction.core.ConstructionScene
 import com.studyink.construction.core.GeometryCircle
 import com.studyink.construction.core.GeometryConstraint
+import com.studyink.construction.core.GeometryMeasurement
 import com.studyink.construction.core.GeometryPoint
 import com.studyink.construction.core.GeometrySegment
+import com.studyink.construction.core.MeasurementType
 import com.studyink.construction.core.SceneValidator
 import org.json.JSONArray
 import org.json.JSONObject
@@ -23,7 +25,7 @@ internal data class StoredConstructionDocument(
 /** A separate, explicitly versioned envelope; no existing annotation or memo bytes are rewritten. */
 internal object ConstructionJsonCodec {
     const val MAX_BYTES = 4 * 1024 * 1024
-    private const val SCHEMA_VERSION = 1
+    private const val SCHEMA_VERSION = 2
     private const val MAX_LABEL_LENGTH = 256
 
     fun encode(document: StoredConstructionDocument): ByteArray {
@@ -46,7 +48,7 @@ internal object ConstructionJsonCodec {
     fun decode(bytes: ByteArray): StoredConstructionDocument {
         require(bytes.size <= MAX_BYTES) { "Construction document is too large" }
         val root = JSONObject(bytes.toString(Charsets.UTF_8))
-        require(root.exactLong("schemaVersion") == SCHEMA_VERSION.toLong()) {
+        require(root.exactLong("schemaVersion") in 1L..SCHEMA_VERSION.toLong()) {
             "Unsupported construction document version"
         }
         val revision = root.exactLong("revision")
@@ -76,6 +78,9 @@ internal object ConstructionJsonCodec {
             constraints = Collections.unmodifiableList(scene.constraints.map {
                 it.copy(entityIds = Collections.unmodifiableList(it.entityIds.toList()))
             }),
+            measurements = Collections.unmodifiableList(scene.measurements.map {
+                it.copy(entityIds = Collections.unmodifiableList(it.entityIds.toList()))
+            }),
         )
         val issues = SceneValidator.validate(result)
         require(issues.isEmpty()) { issues.joinToString(" ") }
@@ -99,14 +104,17 @@ internal object ConstructionJsonCodec {
     private fun encodeScene(scene: ConstructionScene) = JSONObject()
         .put("points", JSONArray(scene.points.map {
             JSONObject().put("id", it.id).put("x", it.x).put("y", it.y).put("label", it.label)
+                .put("colorArgb", it.colorArgb ?: JSONObject.NULL)
         }))
         .put("segments", JSONArray(scene.segments.map {
             JSONObject().put("id", it.id).put("startPointId", it.startPointId)
                 .put("endPointId", it.endPointId).put("label", it.label)
+                .put("colorArgb", it.colorArgb ?: JSONObject.NULL)
         }))
         .put("circles", JSONArray(scene.circles.map {
             JSONObject().put("id", it.id).put("centerPointId", it.centerPointId)
                 .put("radius", it.radius).put("label", it.label)
+                .put("colorArgb", it.colorArgb ?: JSONObject.NULL)
         }))
         .put("constraints", JSONArray(scene.constraints.map {
             JSONObject().put("id", it.id).put("type", it.type.name)
@@ -115,16 +123,21 @@ internal object ConstructionJsonCodec {
                 .put("targetX", it.targetX ?: JSONObject.NULL)
                 .put("targetY", it.targetY ?: JSONObject.NULL)
         }))
+        .put("measurements", JSONArray(scene.measurements.map {
+            JSONObject().put("id", it.id).put("type", it.type.name)
+                .put("entityIds", JSONArray(it.entityIds))
+                .put("offsetX", it.offsetX).put("offsetY", it.offsetY)
+        }))
 
     private fun decodeScene(json: JSONObject): ConstructionScene = immutableScene(ConstructionScene(
         points = json.boundedArray("points", SceneValidator.MAX_POINTS).objects().map {
-            GeometryPoint(it.getString("id"), it.getDouble("x"), it.getDouble("y"), it.getString("label"))
+            GeometryPoint(it.getString("id"), it.getDouble("x"), it.getDouble("y"), it.getString("label"), it.optionalColor())
         },
         segments = json.boundedArray("segments", SceneValidator.MAX_ENTITIES).objects().map {
-            GeometrySegment(it.getString("id"), it.getString("startPointId"), it.getString("endPointId"), it.getString("label"))
+            GeometrySegment(it.getString("id"), it.getString("startPointId"), it.getString("endPointId"), it.getString("label"), it.optionalColor())
         },
         circles = json.boundedArray("circles", SceneValidator.MAX_ENTITIES).objects().map {
-            GeometryCircle(it.getString("id"), it.getString("centerPointId"), it.getDouble("radius"), it.getString("label"))
+            GeometryCircle(it.getString("id"), it.getString("centerPointId"), it.getDouble("radius"), it.getString("label"), it.optionalColor())
         },
         constraints = json.boundedArray("constraints", SceneValidator.MAX_CONSTRAINTS).objects().map {
             val refs = it.boundedArray("entityIds", 2)
@@ -135,6 +148,16 @@ internal object ConstructionJsonCodec {
                 it.getBoolean("enabled"),
             )
         },
+        measurements = (if (json.has("measurements")) json.boundedArray("measurements", SceneValidator.MAX_MEASUREMENTS)
+            else JSONArray()).objects().map {
+            val refs = it.boundedArray("entityIds", 3)
+            GeometryMeasurement(
+                it.getString("id"), MeasurementType.valueOf(it.getString("type")),
+                (0 until refs.length()).map(refs::getString),
+                if (it.has("offsetX")) it.getDouble("offsetX") else 0.0,
+                if (it.has("offsetY")) it.getDouble("offsetY") else 0.0,
+            )
+        },
     ))
 
     private fun JSONObject.boundedArray(key: String, maximum: Int): JSONArray =
@@ -142,6 +165,7 @@ internal object ConstructionJsonCodec {
 
     private fun JSONArray.objects(): List<JSONObject> = (0 until length()).map(::getJSONObject)
     private fun JSONObject.nullableDouble(key: String): Double? = if (isNull(key)) null else getDouble(key)
+    private fun JSONObject.optionalColor(): Int? = if (!has("colorArgb") || isNull("colorArgb")) null else exactInt("colorArgb")
     private fun JSONObject.exactLong(key: String): Long {
         val value = get(key)
         require(value is Number) { "Invalid $key" }
