@@ -21,7 +21,22 @@ import android.widget.LinearLayout
 import com.studyink.construction.core.GeometryLineStyle
 import kotlin.math.roundToInt
 
-internal enum class ConstructionIcon { SELECT, POINT, SEGMENT, CIRCLE, CONSTRAINT, MEASURE, LIST, UNDO, REDO, FIT, CLOSE, MORE, MAGNET, DELETE, LINE_SOLID, LINE_DASHED, LINE_DOTTED }
+internal enum class ConstructionIcon { SELECT, POINT, SEGMENT, CIRCLE, CONSTRAINT, MEASURE, LIST, UNDO, REDO, FIT, CLOSE, MORE, MAGNET, DELETE, LINE_SOLID, LINE_DASHED, LINE_DOTTED, SQUARE, RECTANGLE, TRIANGLE, TRAPEZOID, DIVIDE, EQUAL, ANGLE }
+
+internal fun ConstructionPreset.koreanName(): String = when (this) {
+    ConstructionPreset.SQUARE -> "정사각형"
+    ConstructionPreset.RECTANGLE -> "직사각형"
+    ConstructionPreset.ISOSCELES_TRIANGLE -> "이등변삼각형"
+    ConstructionPreset.EQUILATERAL_TRIANGLE -> "정삼각형"
+    ConstructionPreset.TRAPEZOID -> "사다리꼴"
+}
+
+internal fun ConstructionPreset.icon(): ConstructionIcon = when (this) {
+    ConstructionPreset.SQUARE -> ConstructionIcon.SQUARE
+    ConstructionPreset.RECTANGLE -> ConstructionIcon.RECTANGLE
+    ConstructionPreset.ISOSCELES_TRIANGLE, ConstructionPreset.EQUILATERAL_TRIANGLE -> ConstructionIcon.TRIANGLE
+    ConstructionPreset.TRAPEZOID -> ConstructionIcon.TRAPEZOID
+}
 
 internal fun GeometryLineStyle.koreanName(): String = when (this) {
     GeometryLineStyle.SOLID -> "실선"
@@ -93,6 +108,13 @@ private class ConstructionGlyph(private val icon: ConstructionIcon, private val 
             ConstructionIcon.POINT -> { canvas.drawCircle(12f,12f,2.8f,paint); dot(12f,12f,.8f) }
             ConstructionIcon.SEGMENT -> { line(5f,19f,19f,5f); canvas.drawCircle(5f,19f,2f,paint); canvas.drawCircle(19f,5f,2f,paint) }
             ConstructionIcon.CIRCLE -> { canvas.drawCircle(12f,12f,8f,paint); dot(12f,12f,.9f) }
+            ConstructionIcon.SQUARE -> canvas.drawRect(5f,5f,19f,19f,paint)
+            ConstructionIcon.RECTANGLE -> canvas.drawRect(3f,7f,21f,17f,paint)
+            ConstructionIcon.TRIANGLE -> path { moveTo(12f,4f); lineTo(21f,20f); lineTo(3f,20f); close() }
+            ConstructionIcon.TRAPEZOID -> path { moveTo(7f,6f); lineTo(17f,6f); lineTo(22f,19f); lineTo(2f,19f); close() }
+            ConstructionIcon.DIVIDE -> { line(3f,12f,21f,12f); for (x in floatArrayOf(3f,9f,15f,21f)) line(x,8f,x,16f) }
+            ConstructionIcon.EQUAL -> { line(5f,9f,19f,9f); line(5f,15f,19f,15f) }
+            ConstructionIcon.ANGLE -> { path { moveTo(18f,5f); lineTo(4f,19f); lineTo(21f,19f) }; canvas.drawArc(RectF(-3f,12f,11f,26f),-45f,45f,false,paint) }
             ConstructionIcon.LINE_SOLID -> line(3f,12f,21f,12f)
             ConstructionIcon.LINE_DASHED -> { line(3f,12f,6f,12f); line(10.5f,12f,13.5f,12f); line(18f,12f,21f,12f) }
             ConstructionIcon.LINE_DOTTED -> for (x in floatArrayOf(3f,7.5f,12f,16.5f,21f)) dot(x,12f,1f)

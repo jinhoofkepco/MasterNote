@@ -1,7 +1,13 @@
 package com.studyink.app
 
 import com.studyink.memo.core.MemoTarget
+import com.studyink.memo.core.MemoAnchor
+import com.studyink.memo.core.MemoPoint
+import com.studyink.memo.core.MemoStroke
+import com.studyink.memo.core.MemoTool
+import com.studyink.memo.core.StudentMemo
 import com.studyink.monitor.core.StudentMemoEnvelope
+import com.studyink.monitor.core.RemoteReviewDocumentCodec
 import com.studyink.monitor.core.RemoteReviewExchangeStateMachine
 import com.studyink.monitor.core.studentMemoPayloadSha256Hex
 import org.junit.Assert.assertEquals
@@ -12,6 +18,25 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class StudentMemoTelegramRoutingTest {
+    @Test fun extendedMemoFrameMatchesOnlyItsVersionedPayloadAndFutureVersionIsRetainedWithoutAck() {
+        val stroke = MemoStroke(id = "10000000-0000-0000-0000-000000000001", tool = MemoTool.PEN,
+            colorArgb = 0xff000000.toInt(), widthFraction = .003f,
+            points = listOf(MemoPoint(.5f, .5f)), createdAtEpochMillis = 1L)
+        val legacy = StudentMemo(id = "00000000-0000-0000-0000-000000000001", target = MemoTarget("book", 0, 1),
+            anchor = MemoAnchor(.5f, .5f), revision = 1L, digestSha256 = "a".repeat(64),
+            strokes = listOf(stroke), createdAtEpochMillis = 1L, updatedAtEpochMillis = 1L)
+        val extended = legacy.copy(strokes = listOf(stroke.copy(points = listOf(MemoPoint(-.5f, 1.5f)))))
+        assertTrue(studentMemoCanvasFrameMatches(envelope(), legacy))
+        assertFalse(studentMemoCanvasFrameMatches(envelope(), extended))
+        assertFalse(studentMemoCanvasFrameMatches(envelope(copyExtendedCanvas = true), legacy))
+        assertTrue(studentMemoCanvasFrameMatches(envelope(copyExtendedCanvas = true), extended))
+        val bytes = RemoteReviewDocumentCodec.encode(envelope(copyExtendedCanvas = true)).copyBytes()
+        assertEquals(2, bytes[4].toInt() and 0xff)
+        assertTrue(decodeRemoteReviewInboxDocument(bytes) is RemoteReviewInboxDecodeResult.Decoded)
+        bytes[4] = 3
+        assertEquals(RemoteReviewInboxDecodeResult.RetainWithoutAcknowledgement, decodeRemoteReviewInboxDocument(bytes))
+    }
+
     @Test
     fun studentPublicationRequiresExactGenerationPageWorkbookContentAndAttempt() {
         val page = studentPage()
@@ -124,6 +149,7 @@ class StudentMemoTelegramRoutingTest {
         copyAttemptNo: Int = 4,
         copyPageNumber: Int = 94,
         copyContentSha: String = CONTENT_SHA,
+        copyExtendedCanvas: Boolean = false,
     ): StudentMemoEnvelope {
         val payload = byteArrayOf(1, 2, 3)
         return StudentMemoEnvelope(
@@ -140,6 +166,7 @@ class StudentMemoTelegramRoutingTest {
             memoDigestSha256 = "d".repeat(64),
             payloadSha256 = studentMemoPayloadSha256Hex(payload),
             payloadBytes = payload,
+            extendedCanvas = copyExtendedCanvas,
         )
     }
 

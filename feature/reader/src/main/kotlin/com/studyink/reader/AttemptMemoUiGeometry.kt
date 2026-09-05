@@ -115,7 +115,7 @@ internal fun MemoPoint.toCanonicalMemoPoint(): PagePoint = PagePoint(
 )
 
 internal fun PagePoint.toMemoPoint(): MemoPoint = MemoPoint(
-    normalizedX = (x / CANONICAL_PAGE_WIDTH).coerceIn(0f, 1f),
-    normalizedY = (y / MEMO_CANONICAL_HEIGHT).coerceIn(0f, 1f),
+    normalizedX = x / CANONICAL_PAGE_WIDTH,
+    normalizedY = y / MEMO_CANONICAL_HEIGHT,
     pressure = pressure.coerceAtLeast(0f),
 )

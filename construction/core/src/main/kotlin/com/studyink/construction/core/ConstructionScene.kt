@@ -74,6 +74,12 @@ enum class ConstraintType {
     PERPENDICULAR,
     EQUAL_LENGTH,
     ANGLE,
+    POINT_ON_SEGMENT,
+    POINT_FRACTION,
+    POINT_DISTANCE,
+    LENGTH_RATIO,
+    INTERIOR_ANGLE,
+    EQUAL_ANGLE,
 }
 
 /**
@@ -85,6 +91,13 @@ enum class ConstraintType {
  * HORIZONTAL / VERTICAL [segment];
  * PARALLEL / PERPENDICULAR / EQUAL_LENGTH / ANGLE [segment, segment].
  * ANGLE is the unsigned angle in [0, 180] degrees between directed start->end segments.
+ * POINT_ON_SEGMENT [point, segment] includes its endpoints, but not the extensions.
+ * POINT_FRACTION [point, segment] stores the exact fraction numerator/denominator from start.
+ * POINT_DISTANCE [point, segment] is value cm from start (or end when fromEnd), toward the other
+ * endpoint. It stays inside the segment unless allowExtension explicitly permits going beyond it.
+ * LENGTH_RATIO [segmentA, segmentB] means length A = value * length B.
+ * INTERIOR_ANGLE [A, B, C] has vertex B and value degrees in [0, 180]. EQUAL_ANGLE compares
+ * [A, B, C] and [D, E, F] interiors. The two triples may share vertices or rays.
  * A displayed measurement is not a constraint unless explicitly added here.
  */
 data class GeometryConstraint(
@@ -95,6 +108,10 @@ data class GeometryConstraint(
     val targetX: Double? = null,
     val targetY: Double? = null,
     val enabled: Boolean = true,
+    val numerator: Int? = null,
+    val denominator: Int? = null,
+    val fromEnd: Boolean = false,
+    val allowExtension: Boolean = false,
 )
 
 data class DragTarget(val pointId: String, val x: Double, val y: Double)
@@ -119,6 +136,7 @@ object SceneValidator {
     const val MAX_MEASUREMENTS = 120
     const val MIN_LENGTH = 1e-6
     const val MAX_MAGNITUDE = 1e6
+    const val MAX_DIVISIONS = 1_000_000
 
     fun validate(scene: ConstructionScene): List<String> = buildList {
         if (scene.points.size > MAX_POINTS) add("점은 ${MAX_POINTS}개까지 사용할 수 있습니다.")
@@ -151,10 +169,19 @@ object SceneValidator {
             fun point(index: Int) = refs.getOrNull(index) in points
             fun segment(index: Int) = refs.getOrNull(index) in segments
             fun circle(index: Int) = refs.getOrNull(index) in circles
+            fun angleTriple(start: Int): Boolean = refs.size >= start + 3 &&
+                refs.subList(start, start + 3).let { it.all(points::containsKey) && it.distinct().size == 3 }
             val valid = when (c.type) {
                 ConstraintType.FIXED_POINT -> refs.size == 1 && point(0) && validNumber(c.targetX) && validNumber(c.targetY)
                 ConstraintType.COINCIDENT -> refs.size == 2 && point(0) && point(1) && refs[0] != refs[1]
                 ConstraintType.POINT_ON_LINE -> refs.size == 2 && point(0) && segment(1)
+                ConstraintType.POINT_ON_SEGMENT -> refs.size == 2 && point(0) && segment(1)
+                ConstraintType.POINT_FRACTION -> refs.size == 2 && point(0) && segment(1) &&
+                    c.denominator != null && c.denominator in 2..MAX_DIVISIONS &&
+                    c.numerator != null && c.numerator in 1 until c.denominator &&
+                    segments[refs[1]]!!.let { refs[0] != it.startPointId && refs[0] != it.endPointId }
+                ConstraintType.POINT_DISTANCE -> refs.size == 2 && point(0) && segment(1) &&
+                    validNumber(c.value) && c.value!! >= 0.0
                 ConstraintType.POINT_ON_CIRCLE -> refs.size == 2 && point(0) && circle(1)
                 ConstraintType.DISTANCE_POINT_LINE -> refs.size == 2 && point(0) && segment(1) &&
                     validNumber(c.value) && c.value!! >= 0.0
@@ -165,8 +192,16 @@ object SceneValidator {
                     refs.size == 2 && segment(0) && segment(1) && refs[0] != refs[1]
                 ConstraintType.ANGLE -> refs.size == 2 && segment(0) && segment(1) && refs[0] != refs[1] &&
                     c.value != null && c.value.isFinite() && c.value in 0.0..180.0
+                ConstraintType.LENGTH_RATIO -> refs.size == 2 && segment(0) && segment(1) && refs[0] != refs[1] && validLength(c.value)
+                ConstraintType.INTERIOR_ANGLE -> refs.size == 3 && angleTriple(0) &&
+                    c.value != null && c.value.isFinite() && c.value in 0.0..180.0
+                ConstraintType.EQUAL_ANGLE -> refs.size == 6 && angleTriple(0) && angleTriple(3) &&
+                    // The same angle, including reversed arms, is not a new relation.
+                    !(refs[1] == refs[4] && setOf(refs[0], refs[2]) == setOf(refs[3], refs[5]))
             }
-            if (!valid) add("조건 ${c.id}의 대상 또는 값이 올바르지 않습니다.")
+            val validOptions = (c.type == ConstraintType.POINT_FRACTION || c.numerator == null && c.denominator == null) &&
+                (c.type == ConstraintType.POINT_DISTANCE || !c.fromEnd && !c.allowExtension)
+            if (!valid || !validOptions) add("조건 ${c.id}의 대상 또는 값이 올바르지 않습니다.")
         }
         scene.measurements.forEach { measurement ->
             val refs = measurement.entityIds

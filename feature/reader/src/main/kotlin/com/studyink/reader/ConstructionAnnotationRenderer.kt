@@ -59,6 +59,18 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
                 constraint.id == selectedConstraint, reference = false, enabled = constraint.enabled)
         }
         val dimensionIds = dimensions.mapTo(mutableSetOf()) { it.first.id }
+        scene.constraints.filter { it.type == ConstraintType.EQUAL_ANGLE }.forEachIndexed { index, constraint ->
+            if (!constraint.enabled && constraint.id != selectedConstraint && constraint.entityIds.none { it in selected }) return@forEachIndexed
+            val layouts = ConstructionMeasurementGeometry.equalAngleLayouts(scene, constraint)
+            layouts.forEach { layout ->
+                // Matching captions on both arcs identify an equality, not a fixed degree value.
+                val relation = layout.copy(captionOverride = "같은 각 ${index + 1}")
+                val placed = placeDrivingCaption(canvas, relation, constraint.enabled)
+                drawDimension(canvas, placed, constraint.id, ConstructionAnnotationKind.CONSTRAINT,
+                    constraint.id == selectedConstraint, reference = false, enabled = constraint.enabled)
+            }
+            if (layouts.isNotEmpty()) dimensionIds += constraint.id
+        }
         val related = scene.constraints.filter { c ->
             c.id !in dimensionIds && (c.enabled || c.id == selectedConstraint || c.entityIds.any { id ->
                 id in selected || scene.segment(id)?.let { it.startPointId in selected || it.endPointId in selected } == true ||
@@ -177,13 +189,13 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
     }
 
     private fun dimensionText(layout: ConstructionMeasurementLayout, reference: Boolean, enabled: Boolean): String {
-        val text = when (layout.type) {
+        val text = layout.captionOverride ?: (layout.captionPrefix + when (layout.type) {
             MeasurementType.DISTANCE -> "${formatGeometry(layout.value)} cm"
             MeasurementType.RADIUS -> "r ${formatGeometry(layout.value)} cm"
             MeasurementType.ANGLE -> if (layout.value.isFinite())
                 (if (layout.directionSegments.isNotEmpty()) "방향각 " else "") + "${formatGeometry(layout.value)}°" else "각도 미정"
             MeasurementType.AREA -> "${formatGeometry(layout.value)} cm²"
-        }
+        })
         val prefix = when { !enabled -> "꺼짐 · 설정 "; reference -> "≈ "; else -> "" }
         return prefix + text
     }
@@ -231,12 +243,24 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
         // Persistent badges belong to visible geometry, not a stack of offscreen constraints
         // clamped against the edge while the user pans around the shared sheet.
         if (sx(anchor.x) < 0f || sx(anchor.x) > canvas.width || sy(anchor.y) < 0f || sy(anchor.y) > canvas.height) return
+        val relationText = when (constraint.type) {
+            ConstraintType.POINT_FRACTION -> {
+                val segment = constraint.entityIds.getOrNull(1)?.let(scene::segment)
+                val start = segment?.startPointId?.let(scene::point)?.label.orEmpty()
+                val end = segment?.endPointId?.let(scene::point)?.label.orEmpty()
+                "$start→$end · ${constraint.numerator}/${constraint.denominator}"
+            }
+            ConstraintType.LENGTH_RATIO -> "비 ${formatGeometry(constraint.value ?: 1.0)}:1"
+            else -> null
+        }
+        paint.reset(); paint.isAntiAlias = true; paint.textSize = 11f * density
         val half = 12f * density
+        val halfWidth = if (relationText == null) half else max(half, paint.measureText(relationText) / 2 + 6f * density)
         var bounds = RectF()
         for (attempt in 0..40) {
-            val x = (sx(anchor.x) + (attempt % 5 - 2) * 29 * density).coerceIn(half + 3 * density, max(half + 3 * density, canvas.width - half - 3 * density))
+            val x = (sx(anchor.x) + (attempt % 5 - 2) * (halfWidth * 2 + 5 * density)).coerceIn(halfWidth + 3 * density, max(halfWidth + 3 * density, canvas.width - halfWidth - 3 * density))
             val y = (sy(anchor.y) + 27 * density + (attempt / 5) * 29 * density).coerceIn(half + 3 * density, max(half + 3 * density, canvas.height - half - 3 * density))
-            bounds = RectF(x - half, y - half, x + half, y + half)
+            bounds = RectF(x - halfWidth, y - half, x + halfWidth, y + half)
             if (hits.none { RectF.intersects(it.bounds, bounds) }) break
         }
         paint.reset(); paint.isAntiAlias = true; paint.color = if (selected) 0xFFDFEAFE.toInt() else 0xF7F3F6FB.toInt()
@@ -246,7 +270,11 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
         canvas.drawRoundRect(bounds, 6 * density, 6 * density, paint)
         canvas.save(); canvas.translate(bounds.centerX(), bounds.centerY()); canvas.scale(density, density)
         paint.strokeWidth = 1.4f
-        symbol(canvas, constraint.type)
+        if (relationText == null) symbol(canvas, constraint.type) else {
+            paint.style = Paint.Style.FILL; paint.textSize = 11f
+            canvas.drawText(relationText, -paint.measureText(relationText) / 2, -(paint.ascent() + paint.descent()) / 2, paint)
+            paint.style = Paint.Style.STROKE
+        }
         if (!constraint.enabled) canvas.drawLine(-8f, 8f, 8f, -8f, paint)
         canvas.restore()
         hits += ConstructionAnnotationHit(constraint.id, ConstructionAnnotationKind.CONSTRAINT,
@@ -258,13 +286,18 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
         when (type) {
             ConstraintType.COINCIDENT -> { c.drawCircle(-2f, 0f, 4f, paint); c.drawCircle(2f, 0f, 4f, paint) }
             ConstraintType.POINT_ON_LINE -> { line(-7f, 0f, 7f, 0f); c.drawCircle(0f, 0f, 3f, paint) }
+            ConstraintType.POINT_ON_SEGMENT -> { line(-7f, 0f, 7f, 0f); line(-7f, -3f, -7f, 3f); line(7f, -3f, 7f, 3f); c.drawCircle(0f, 0f, 2f, paint) }
+            ConstraintType.POINT_FRACTION -> { line(-7f, 0f, 7f, 0f); for (x in floatArrayOf(-7f, 0f, 7f)) line(x, -3f, x, 3f) }
+            ConstraintType.POINT_DISTANCE -> { line(-7f, 0f, 7f, 0f); c.drawCircle(-7f, 0f, 2f, paint); line(7f, -3f, 7f, 3f) }
             ConstraintType.POINT_ON_CIRCLE -> { c.drawCircle(0f, 0f, 6f, paint); c.drawCircle(4f, -4f, 2f, paint) }
             ConstraintType.PARALLEL -> { line(-6f, 6f, 0f, -6f); line(0f, 6f, 6f, -6f) }
             ConstraintType.PERPENDICULAR -> { line(-6f, 5f, 6f, 5f); line(0f, -6f, 0f, 5f) }
             ConstraintType.HORIZONTAL -> line(-7f, 0f, 7f, 0f)
             ConstraintType.VERTICAL -> line(0f, -7f, 0f, 7f)
             ConstraintType.EQUAL_LENGTH -> { line(-6f, -3f, 6f, -3f); line(-6f, 3f, 6f, 3f) }
-            ConstraintType.ANGLE -> { line(-6f, 5f, 7f, 5f); line(-6f, 5f, 3f, -6f); c.drawArc(RectF(-12f, -1f, 0f, 11f), -50f, 50f, false, paint) }
+            ConstraintType.LENGTH_RATIO -> { line(-7f, -3f, 7f, -3f); line(-7f, 3f, 0f, 3f) }
+            ConstraintType.ANGLE, ConstraintType.INTERIOR_ANGLE -> { line(-6f, 5f, 7f, 5f); line(-6f, 5f, 3f, -6f); c.drawArc(RectF(-12f, -1f, 0f, 11f), -50f, 50f, false, paint) }
+            ConstraintType.EQUAL_ANGLE -> { line(-7f, 5f, 7f, 5f); line(-7f, 5f, 0f, -5f); line(2f, -3f, 7f, -3f); line(2f, 0f, 7f, 0f) }
             ConstraintType.FIXED_POINT -> { c.drawRect(-5f, -1f, 5f, 7f, paint); c.drawArc(RectF(-3f, -7f, 3f, 3f), 180f, 180f, false, paint) }
             ConstraintType.LENGTH -> { line(-7f, 0f, 7f, 0f); line(-7f, 0f, -3f, -3f); line(-7f, 0f, -3f, 3f); line(7f, 0f, 3f, -3f); line(7f, 0f, 3f, 3f) }
             ConstraintType.DISTANCE_POINT_LINE -> { line(-7f, 6f, 7f, 6f); line(0f, -7f, 0f, 6f); c.drawCircle(0f, -7f, 2f, paint) }

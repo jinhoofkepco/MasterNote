@@ -39,6 +39,9 @@ internal data class ConstructionMeasurementLayout(
     val directionSegments: List<Pair<ConstructionVector, ConstructionVector>> = emptyList(),
     /** Collision avoidance may move the caption without moving its extension/dimension lines. */
     val dimensionGuideAnchor: ConstructionVector? = null,
+    /** A relation caption can identify the endpoint or equality pair without claiming a value. */
+    val captionPrefix: String = "",
+    val captionOverride: String? = null,
 )
 
 internal object ConstructionMeasurementGeometry {
@@ -78,6 +81,19 @@ internal object ConstructionMeasurementGeometry {
                     (point - foot).length(), point, foot)
             }
             ConstraintType.ANGLE -> directedAngleLayout(scene, constraint)
+            ConstraintType.INTERIOR_ANGLE -> {
+                val measurement = scene.measurements.firstOrNull { matchesConstraint(scene, it, constraint) }
+                    ?.copy(id = constraint.id) ?: GeometryMeasurement(constraint.id, MeasurementType.ANGLE, refs)
+                layout(scene, measurement)
+            }
+            ConstraintType.POINT_DISTANCE -> {
+                val segment = refs.getOrNull(1)?.let(scene::segment) ?: return null
+                val endpoint = if (constraint.fromEnd) segment.endPointId else segment.startPointId
+                val point = refs.firstOrNull() ?: return null
+                val measurement = scene.measurements.firstOrNull { matchesConstraint(scene, it, constraint) }
+                    ?.copy(id = constraint.id) ?: GeometryMeasurement(constraint.id, MeasurementType.DISTANCE, listOf(endpoint, point))
+                layout(scene, measurement)?.copy(captionPrefix = "${scene.point(endpoint)?.label.orEmpty()}→${scene.point(point)?.label.orEmpty()} ")
+            }
             else -> null
         } ?: return null
         return layout.copy(value = constraint.value ?: layout.value)
@@ -90,8 +106,25 @@ internal object ConstructionMeasurementGeometry {
                 measurement.entityIds.toSet() == constraint.entityIds.firstOrNull()?.let(scene::segment)
                     ?.let { setOf(it.startPointId, it.endPointId) }
             ConstraintType.RADIUS -> measurement.type == MeasurementType.RADIUS && measurement.entityIds == constraint.entityIds
+            ConstraintType.INTERIOR_ANGLE -> measurement.type == MeasurementType.ANGLE &&
+                measurement.entityIds.size == 3 && constraint.entityIds.size == 3 &&
+                measurement.entityIds[1] == constraint.entityIds[1] &&
+                setOf(measurement.entityIds[0], measurement.entityIds[2]) == setOf(constraint.entityIds[0], constraint.entityIds[2])
+            ConstraintType.POINT_DISTANCE -> measurement.type == MeasurementType.DISTANCE &&
+                constraint.entityIds.getOrNull(1)?.let(scene::segment)?.let { segment ->
+                    val endpoint = if (constraint.fromEnd) segment.endPointId else segment.startPointId
+                    measurement.entityIds.toSet() == setOf(endpoint, constraint.entityIds.first())
+                } == true
             else -> false
         }
+
+    /** Both interiors share one editable relation ID, including an ordinary angle-bisector setup. */
+    fun equalAngleLayouts(scene: ConstructionScene, constraint: GeometryConstraint): List<ConstructionMeasurementLayout> {
+        if (constraint.type != ConstraintType.EQUAL_ANGLE || constraint.entityIds.size != 6) return emptyList()
+        return constraint.entityIds.chunked(3).mapNotNull { refs ->
+            layout(scene, GeometryMeasurement(constraint.id, MeasurementType.ANGLE, refs))
+        }
+    }
 
     private fun directedAngleLayout(scene: ConstructionScene, constraint: GeometryConstraint): ConstructionMeasurementLayout? {
         val first = constraint.entityIds.getOrNull(0)?.let(scene::segment) ?: return null

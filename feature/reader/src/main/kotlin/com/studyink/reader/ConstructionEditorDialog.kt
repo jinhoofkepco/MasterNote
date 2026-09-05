@@ -102,6 +102,7 @@ internal class ConstructionEditorView(
     private var newColor = Color.rgb(44, 59, 72)
     private var newLineStyle = GeometryLineStyle.SOLID
     private var selectedCondition: String? = null
+    private var pendingEqualAngle: List<String>? = null
     private var panelAnchorConstraint: String? = null
     private var panelRevision = 0L
     private val conditionSteps = mutableMapOf<String, Double>()
@@ -192,6 +193,7 @@ internal class ConstructionEditorView(
             action(PanelKind.RELATIONS, "조건 추가", ConstructionIcon.CONSTRAINT)
             action(PanelKind.MEASURE, "측정", ConstructionIcon.MEASURE)
             action(PanelKind.CONDITIONS, "조건 목록", ConstructionIcon.LIST)
+            addView(button("기본 도형", icon = ConstructionIcon.SQUARE, iconOnly = true) { onEditingRequested(); showPresets() })
             addView(button("맞춤", icon = ConstructionIcon.FIT, iconOnly = true) { canvas.fitScene() })
             addView(button("더보기", icon = ConstructionIcon.MORE, iconOnly = true) { togglePanel(PanelKind.MORE) })
             if (embedded) {
@@ -421,7 +423,9 @@ internal class ConstructionEditorView(
         actionButtons.firstOrNull { it.tag == "더보기" }?.isSelected = panelKind == PanelKind.MORE
     }
     private fun updateHint() {
-        selectionInfo.text = if (canvas.tool == ConstructionTool.SELECT) {
+        selectionInfo.text = if (pendingEqualAngle != null) {
+            "∠${pendingEqualAngle!!.joinToString("") { name(it) }}와 같게 · 다른 각의 세 점(끝→꼭짓점→끝) 선택 후 조건 추가"
+        } else if (canvas.tool == ConstructionTool.SELECT) {
             if (canvas.selectedIds.isEmpty()) "선택 · 대상을 눌러 주세요" else "선택 · ${canvas.selectedIds.joinToString { name(it) }}"
         } else toolHint
     }
@@ -458,10 +462,12 @@ internal class ConstructionEditorView(
     }
     private fun chooseTool(tool: ConstructionTool) {
         onEditingRequested()
+        pendingEqualAngle = null
         canvas.tool = tool; canvas.clearSelection()
         closePanel(); updateToolbar(); updateHint()
     }
     private fun load(fit: Boolean = true) {
+        pendingEqualAngle = null
         dismissChildren()
         loadFailed = false
         canvas.tool = canvas.tool // Discard an unfinished two-tap construction from the old scene.
@@ -629,6 +635,7 @@ internal class ConstructionEditorView(
     private fun history(backward: Boolean) {
         val next = if (backward) undo.lastOrNull() else redo.lastOrNull()
         if (next == null) return notice(if (backward) "되돌릴 작업이 없습니다." else "다시 실행할 작업이 없습니다.")
+        pendingEqualAngle = null
         generation++; dismissChildren()
         persist(next, historyDirection = if (backward) -1 else 1)
     }
@@ -640,7 +647,10 @@ internal class ConstructionEditorView(
         ?: scene.circles.firstOrNull { it.id == id }?.let { "원(${name(it.centerPointId)})" } ?: "대상"
     private fun updateSelection() {
         updateHint(); updateToolbar()
-        if (panelKind == PanelKind.DETAIL && detailSelection != canvas.selectedIds) closePanel()
+        // Transient input menus capture a generation. A completed unrelated edit must dismiss
+        // them rather than leave visible buttons that silently reject every subsequent click.
+        if (panelKind == PanelKind.DETAIL && (detailSelection != canvas.selectedIds ||
+                selectedCondition == null && canvas.selectedMeasurementId == null)) closePanel()
         if (dragBase == null && measurementBase == null) refreshPanel()
     }
 
@@ -652,7 +662,8 @@ internal class ConstructionEditorView(
         val actions = mutableListOf<RelationAction>()
         fun relation(label: String, type: ConstraintType, ids: List<String>, numeric: Double? = null) {
             actions += RelationAction(label) {
-                if (numeric != null) numberInput(label, numeric, angle = type == ConstraintType.ANGLE, allowZero = type == ConstraintType.DISTANCE_POINT_LINE) { value ->
+                if (numeric != null) numberInput(label, numeric, angle = type in setOf(ConstraintType.ANGLE, ConstraintType.INTERIOR_ANGLE), allowZero = type == ConstraintType.DISTANCE_POINT_LINE,
+                    description = if (type == ConstraintType.LENGTH_RATIO) "${name(ids[0])} 길이 = 입력 배수 × ${name(ids[1])} 길이" else null) { value ->
                     edit(ConstructionEdits.addConstraint(scene, GeometryConstraint(ConstructionEdits.id(), type, ids, value = value)))
                 } else edit(ConstructionEdits.addConstraint(scene, GeometryConstraint(ConstructionEdits.id(), type, ids)))
             }
@@ -665,6 +676,7 @@ internal class ConstructionEditorView(
         }
         if (count == 2 && points.size == 2) relation("두 점 일치", ConstraintType.COINCIDENT, points.map { it.id })
         if (count == 2 && points.size == 1 && lines.size == 1) {
+            actions += RelationAction("선분 위 위치 · 등분 / 끝점부터 cm") { showPointLocation(points[0].id, lines[0].id) }
             relation("점이 직선 위에 있음 (연장선 포함)", ConstraintType.POINT_ON_LINE, listOf(points[0].id, lines[0].id))
             relation("점에서 직선까지 수선 거리", ConstraintType.DISTANCE_POINT_LINE, listOf(points[0].id, lines[0].id), distanceToLine(points[0], lines[0]))
         }
@@ -673,12 +685,14 @@ internal class ConstructionEditorView(
             relation("선분 길이 (cm)", ConstraintType.LENGTH, listOf(lines[0].id), length(lines[0]))
             relation("수평으로 유지", ConstraintType.HORIZONTAL, listOf(lines[0].id))
             relation("수직 방향으로 유지", ConstraintType.VERTICAL, listOf(lines[0].id))
+            actions += RelationAction("등분점 만들기 · 원래 선분 유지") { showDivideSegment(lines[0].id) }
         }
         if (count == 1 && circles.size == 1) relation("반지름 (cm)", ConstraintType.RADIUS, listOf(circles[0].id), circles[0].radius)
         if (count == 2 && lines.size == 2) {
             relation("두 선 평행", ConstraintType.PARALLEL, lines.map { it.id })
             relation("두 선 수직 (90°)", ConstraintType.PERPENDICULAR, lines.map { it.id })
             relation("두 선분 같은 길이 유지", ConstraintType.EQUAL_LENGTH, lines.map { it.id })
+            relation("두 선분 길이 비율", ConstraintType.LENGTH_RATIO, lines.map { it.id }, length(lines[0]) / length(lines[1]))
             relation("두 선의 각도 (시작→끝 방향 기준)", ConstraintType.ANGLE, lines.map { it.id }, angle(lines[0], lines[1]))
             actions += RelationAction("평행하게 만들고 높이 지정 (cm)") {
                 val p = scene.points.first { it.id == lines[1].startPointId }
@@ -689,15 +703,170 @@ internal class ConstructionEditorView(
             }
             actions += RelationAction("두 직선의 교점 만들기") { createIntersection(lines[0], lines[1]) }
         }
+        if (count >= 3 && lines.size == count) actions += RelationAction("선분 ${count}개 모두 같은 길이") {
+            runCatching { ConstructionEdits.multiEqualLength(scene, lines.map { it.id }) }
+                .onSuccess { edit(it) }.onFailure { notice(it.message.orEmpty()) }
+        }
+        val angleIds = selectedAngleIds()
+        if (angleIds != null) {
+            val value = ConstructionMeasurementGeometry.layout(scene, GeometryMeasurement("preview", MeasurementType.ANGLE, angleIds))?.value
+            if (value != null) relation("∠${angleIds.joinToString("") { name(it) }} 크기 지정", ConstraintType.INTERIOR_ANGLE, angleIds, value)
+            actions += RelationAction(if (pendingEqualAngle == null) "이 각과 다른 각을 같게…" else "기준 각과 이 각을 같게") { chooseEqualAngle(angleIds) }
+        }
         if (count == 2 && points.size == 1 && lines.size == 1) actions += RelationAction("수선과 수선의 발 만들기") { createFoot(points[0], lines[0]) }
         showPanel("조건 추가", PanelKind.RELATIONS) {
             info(if (count == 0) "그림에서 대상을 선택하세요.\n점 2개 → 일치 · 선분 1개 → 길이" else canvas.selectedIds.joinToString { name(it) })
-            if (actions.isEmpty() && count > 0) info("이 조합에 추가할 조건이 없습니다. 점·선·원을 1~2개 선택하세요.")
+            if (pendingEqualAngle != null) action("같은 각 선택 취소") { pendingEqualAngle = null; updateHint(); showRelationMenu() }
+            if (actions.isEmpty() && count > 0) info("점·선·원을 선택하세요. 각도는 세 점(끝→꼭짓점→끝), 같은 길이는 여러 선분입니다.")
             actions.forEach { option -> action(option.label) { if (isCurrent(token)) option.run() } }
         }
     }
 
-    private fun numberInput(title: String, initial: Double, angle: Boolean = false, allowZero: Boolean = false, apply: (Double) -> Unit) {
+    private fun selectedAngleIds(): List<String>? {
+        val points = selectedPoints()
+        if (points.size == 3 && canvas.selectedIds.size == 3) return points.map { it.id }
+        val lines = selectedSegments()
+        if (lines.size != 2 || canvas.selectedIds.size != 2) return null
+        val a = listOf(lines[0].startPointId, lines[0].endPointId)
+        val b = listOf(lines[1].startPointId, lines[1].endPointId)
+        val vertex = a.intersect(b.toSet()).singleOrNull() ?: return null
+        return listOf(a.first { it != vertex }, vertex, b.first { it != vertex }).takeIf { it.distinct().size == 3 }
+    }
+
+    /** Select each angle separately so a shared vertex can participate in both triples. */
+    private fun chooseEqualAngle(ids: List<String>) {
+        val first = pendingEqualAngle
+        if (first == null) {
+            pendingEqualAngle = ids.toList()
+            closePanel(); canvas.tool = ConstructionTool.SELECT; canvas.clearSelection(); updateHint()
+        } else {
+            val condition = GeometryConstraint(ConstructionEdits.id(), ConstraintType.EQUAL_ANGLE, first + ids)
+            val next = ConstructionEdits.addConstraint(scene, condition)
+            val errors = SceneValidator.validate(next)
+            if (errors.isNotEmpty()) return notice("서로 다른 두 각을 선택하세요. 각의 가운데 점이 꼭짓점입니다.")
+            pendingEqualAngle = null; closePanel(); updateHint(); edit(next)
+        }
+    }
+
+    private fun showPresets() {
+        pendingEqualAngle = null
+        canvas.tool = ConstructionTool.SELECT; updateHint()
+        panelAnchorConstraint = null; selectedCondition = null; canvas.selectedMeasurementId = null
+        showPanel("기본 도형", PanelKind.DETAIL) {
+            info("현재 화면 가운데에 추가합니다. 점·선분과 관계로 만들어져 길이를 바꾸거나 움직일 수 있습니다.")
+            ConstructionPreset.entries.forEach { preset -> action(preset.koreanName(), preset.icon()) {
+                val center = canvas.viewportCenterWorld()
+                runCatching { ConstructionEdits.createPreset(scene, preset, center.x, center.y, colorArgb = newColor, lineStyle = newLineStyle) }
+                    .onSuccess { closePanel(); edit(it) }.onFailure { notice(it.message.orEmpty()) }
+            } }
+        }
+    }
+
+    private fun integerInput(initial: Int, description: String) = EditText(context).apply {
+        inputType = InputType.TYPE_CLASS_NUMBER; setSingleLine(); textSize = 14f; gravity = Gravity.CENTER
+        setText(initial.toString()); setSelectAllOnFocus(true); contentDescription = description; tag = description
+    }
+
+    private fun showDivideSegment(segmentId: String) {
+        panelAnchorConstraint = null; selectedCondition = null; canvas.selectedMeasurementId = null
+        val input = integerInput(3, "전체 등분 수")
+        showPanel("${name(segmentId)} 등분점 만들기", PanelKind.DETAIL) {
+            info("원래 선분은 나누어 삭제하지 않습니다. 새 점들이 선분의 길이 변화에 따라 함께 움직입니다.")
+            addView(input, LinearLayout.LayoutParams(-1, dp(40)))
+            fun divide(n: Int) {
+                runCatching { ConstructionEdits.divideSegment(scene, segmentId, n, newColor) }
+                    .onSuccess { closePanel(); edit(it) }.onFailure { input.error = it.message }
+            }
+            action("중점 하나 만들기", ConstructionIcon.DIVIDE) { divide(2) }
+            action("3등분점 두 개 만들기", ConstructionIcon.DIVIDE) { divide(3) }
+            action("입력한 수로 등분점 만들기", ConstructionIcon.DIVIDE) {
+                val n = input.text.toString().toIntOrNull()
+                if (n == null || n !in 2..SceneValidator.MAX_POINTS) input.error = "2~${SceneValidator.MAX_POINTS} 사이 정수" else divide(n)
+            }
+        }
+    }
+
+    /** Position rules replace only another rule for this same point and segment, not other relations. */
+    private fun setPointLocation(condition: GeometryConstraint) {
+        val types = setOf(ConstraintType.POINT_FRACTION, ConstraintType.POINT_DISTANCE, ConstraintType.POINT_ON_SEGMENT, ConstraintType.POINT_ON_LINE)
+        val previous = scene.constraints.firstOrNull { it.id == condition.id }
+            ?: scene.constraints.filter { it.entityIds == condition.entityIds && it.type in types }
+                .maxByOrNull { if (it.type in setOf(ConstraintType.POINT_FRACTION, ConstraintType.POINT_DISTANCE)) 1 else 0 }
+        val base = scene.copy(constraints = scene.constraints.filterNot { it.entityIds == condition.entityIds && it.type in types })
+        val updated = condition.copy(id = previous?.id ?: condition.id, enabled = previous?.enabled ?: condition.enabled)
+        if (selectedCondition == condition.id) { selectedCondition = updated.id; canvas.selectedConstraintId = updated.id }
+        edit(base.copy(constraints = base.constraints + updated))
+    }
+
+    private fun LinearLayout.addFractionControls(pointId: String, segmentId: String, existing: GeometryConstraint? = null) {
+        val k = integerInput(existing?.numerator ?: 1, "등분 위치 k")
+        val n = integerInput(existing?.denominator ?: 2, "등분 수 n")
+        val line = scene.segment(segmentId) ?: return
+        info("${name(line.startPointId)} → ${name(line.endPointId)} 방향 · n등분 중 k번째")
+        addView(LinearLayout(context).apply {
+            addView(k, LinearLayout.LayoutParams(0, dp(38), 1f))
+            addView(TextView(context).apply { text = " / "; gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(25), dp(38)))
+            addView(n, LinearLayout.LayoutParams(0, dp(38), 1f))
+        })
+        action("등분 위치 적용", ConstructionIcon.DIVIDE) {
+            val numerator = k.text.toString().toIntOrNull(); val denominator = n.text.toString().toIntOrNull()
+            if (numerator == null || denominator == null || denominator !in 2..SceneValidator.MAX_DIVISIONS || numerator !in 1 until denominator) {
+                n.error = "n은 2 이상, k는 1~(n−1) 정수"
+            } else {
+                hideKeyboard()
+                val id = existing?.id ?: ConstructionEdits.id()
+                if (panelKind != PanelKind.CONDITIONS) { selectedCondition = id; canvas.selectedConstraintId = id }
+                setPointLocation(GeometryConstraint(id, ConstraintType.POINT_FRACTION,
+                    listOf(pointId, segmentId), enabled = existing?.enabled ?: true, numerator = numerator, denominator = denominator))
+            }
+        }
+    }
+
+    private fun showPointLocation(pointId: String, segmentId: String, existing: GeometryConstraint? = null) {
+        val line = scene.segment(segmentId) ?: return
+        panelAnchorConstraint = null; selectedCondition = null; canvas.selectedMeasurementId = null
+        val fromEnd = CheckBox(context).apply { text = "${name(line.endPointId)}부터 재기 (기본: ${name(line.startPointId)})"; isChecked = existing?.fromEnd ?: false; textSize = 11f }
+        val extension = CheckBox(context).apply { text = "반대 끝점을 넘어 연장 허용"; isChecked = existing?.allowExtension ?: false; textSize = 11f }
+        val saved = existing ?: scene.constraints.firstOrNull { it.entityIds == listOf(pointId, segmentId) && it.type == ConstraintType.POINT_FRACTION }
+        showPanel("${name(pointId)} · ${name(segmentId)} 위 위치", PanelKind.DETAIL) {
+            info("등분 비율과 끝점부터 cm는 하나만 사용합니다. 적용하면 이 선분에 대한 이전 위치 조건을 바꿉니다.")
+            action("선분 위에서 자유롭게 이동") {
+                closePanel(); setPointLocation(GeometryConstraint(existing?.id ?: ConstructionEdits.id(), ConstraintType.POINT_ON_SEGMENT, listOf(pointId, segmentId), enabled = existing?.enabled ?: true))
+            }
+            for ((k, n) in listOf(1 to 2, 1 to 3, 2 to 3)) action(if (n == 2) "중점 · 1/2" else "3등분 · $k/3", ConstructionIcon.DIVIDE) {
+                closePanel(); setPointLocation(GeometryConstraint(existing?.id ?: ConstructionEdits.id(), ConstraintType.POINT_FRACTION,
+                    listOf(pointId, segmentId), enabled = existing?.enabled ?: true, numerator = k, denominator = n))
+            }
+            addFractionControls(pointId, segmentId, saved)
+            action("내분비 m:n으로 지정") { showPointRatio(pointId, segmentId, existing) }
+            addView(fromEnd); addView(extension)
+            action("선택한 끝점부터 거리 (cm)", ConstructionIcon.MEASURE) {
+                val reverse = fromEnd.isChecked; val extend = extension.isChecked
+                numberInput("끝점부터 거리", existing?.value ?: 1.0, allowZero = true,
+                    description = "${name(if (reverse) line.endPointId else line.startPointId)}부터 반대 끝점 방향 · ${if (extend) "연장 허용" else "선분 안쪽"}") { value ->
+                    setPointLocation(GeometryConstraint(existing?.id ?: ConstructionEdits.id(), ConstraintType.POINT_DISTANCE,
+                        listOf(pointId, segmentId), value = value, enabled = existing?.enabled ?: true, fromEnd = reverse, allowExtension = extend))
+                }
+            }
+        }
+    }
+
+    private fun showPointRatio(pointId: String, segmentId: String, existing: GeometryConstraint?) {
+        val line = scene.segment(segmentId) ?: return
+        val m = integerInput(1, "내분비 m"); val n = integerInput(2, "내분비 n")
+        showPanel("내분비 m:n", PanelKind.DETAIL) {
+            info("${name(line.startPointId)}${name(pointId)} : ${name(pointId)}${name(line.endPointId)} = m:n\n1:2이면 시작점에서 1/3 위치입니다.")
+            addView(m); addView(n)
+            action("내분비 적용") {
+                val a = m.text.toString().toIntOrNull(); val b = n.text.toString().toIntOrNull()
+                if (a == null || b == null || a <= 0 || b <= 0 || a.toLong() + b > SceneValidator.MAX_DIVISIONS) n.error = "양의 정수, 합계 ${SceneValidator.MAX_DIVISIONS} 이하"
+                else { closePanel(); setPointLocation(GeometryConstraint(existing?.id ?: ConstructionEdits.id(), ConstraintType.POINT_FRACTION,
+                    listOf(pointId, segmentId), enabled = existing?.enabled ?: true, numerator = a, denominator = a + b)) }
+            }
+        }
+    }
+
+    private fun numberInput(title: String, initial: Double, angle: Boolean = false, allowZero: Boolean = false, description: String? = null, apply: (Double) -> Unit) {
         val token = generation
         val input = EditText(context).apply {
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
@@ -706,7 +875,7 @@ internal class ConstructionEditorView(
         panelAnchorConstraint = null; panel.translationX = 0f; panel.translationY = 0f
         selectedCondition = null; canvas.selectedMeasurementId = null
         showPanel(title, PanelKind.DETAIL) {
-            info(if (angle) "시작→끝 방향 사이 각도 · 0~180°" else "조건 값 · cm (화면 확대와 무관)")
+            info(description ?: if (angle) "각도 · 0~180° (꼭짓점을 확인하세요)" else "조건 값 · cm (화면 확대와 무관)")
             addView(input, LinearLayout.LayoutParams(-1, dp(42)))
             addView(LinearLayout(context).apply {
                 for (step in listOf(-1.0, -.1, .1, 1.0)) addView(button(if (step > 0) "+${formatGeometry(step)}" else formatGeometry(step), register = false) {
@@ -722,7 +891,13 @@ internal class ConstructionEditorView(
         }
     }
 
-    private fun conditionLabel(c: GeometryConstraint): String = "${c.type.koreanName()} · ${c.entityIds.joinToString { name(it) }}${c.value?.let { " = ${formatGeometry(it)}${if (c.type == ConstraintType.ANGLE) "°" else " cm"}" } ?: ""}"
+    private fun conditionUnit(c: GeometryConstraint) = when (c.type) {
+        ConstraintType.ANGLE, ConstraintType.INTERIOR_ANGLE -> "°"
+        ConstraintType.LENGTH_RATIO -> "배"
+        else -> "cm"
+    }
+    private fun conditionLabel(c: GeometryConstraint): String = "${c.type.koreanName()} · ${c.entityIds.joinToString { name(it) }}${c.value?.let { " = ${formatGeometry(it)} ${conditionUnit(c)}" } ?: ""}" +
+        if (c.type == ConstraintType.POINT_FRACTION) " · ${c.numerator}/${c.denominator}" else ""
     private fun showConditions() {
         if (scene.constraints.none { it.id == selectedCondition }) selectedCondition = null
         showPanel("조건 목록 · ${scene.constraints.size}개", PanelKind.CONDITIONS) {
@@ -774,8 +949,8 @@ internal class ConstructionEditorView(
             val numericValue = c.value
             if (numericValue != null) {
                 val token = generation
-                val angle = c.type == ConstraintType.ANGLE
-                val unit = if (angle) "°" else "cm"
+                val angle = c.type in setOf(ConstraintType.ANGLE, ConstraintType.INTERIOR_ANGLE)
+                val unit = conditionUnit(c)
                 val step = conditionSteps[c.id] ?: if (angle) 1.0 else .1
                 val input = EditText(context).apply {
                     tag = "condition-value-${c.id}"; contentDescription = "조건 값 ${c.type.koreanName()} $unit"
@@ -788,7 +963,7 @@ internal class ConstructionEditorView(
                     fun adjust(label: String, delta: Double, tagName: String) = button(label, register = false) {
                         if (isCurrent(token)) {
                             val current = scene.constraints.firstOrNull { it.id == c.id }?.value ?: return@button
-                            val minimum = if (angle || c.type == ConstraintType.DISTANCE_POINT_LINE) 0.0 else SceneValidator.MIN_LENGTH
+                            val minimum = if (angle || c.type in setOf(ConstraintType.DISTANCE_POINT_LINE, ConstraintType.POINT_DISTANCE)) 0.0 else SceneValidator.MIN_LENGTH
                             val maximum = if (angle) 180.0 else SceneValidator.MAX_MAGNITUDE
                             val proposed = kotlin.math.round((current + delta) * 1e9) / 1e9
                             if (minimum > 0 && proposed < minimum) return@button notice("길이는 0보다 커야 합니다. 더 작은 값은 직접 입력하세요.")
@@ -813,7 +988,7 @@ internal class ConstructionEditorView(
                     addView(button("입력 적용", register = false) {
                         if (isCurrent(token)) {
                             val value = input.text.toString().toDoubleOrNull()
-                            val minimum = if (angle || c.type == ConstraintType.DISTANCE_POINT_LINE) 0.0 else SceneValidator.MIN_LENGTH
+                            val minimum = if (angle || c.type in setOf(ConstraintType.DISTANCE_POINT_LINE, ConstraintType.POINT_DISTANCE)) 0.0 else SceneValidator.MIN_LENGTH
                             val maximum = if (angle) 180.0 else SceneValidator.MAX_MAGNITUDE
                             if (value == null || !value.isFinite() || value !in minimum..maximum) {
                                 input.error = if (angle) "0~180°를 입력하세요" else "유효한 길이를 입력하세요"
@@ -822,9 +997,31 @@ internal class ConstructionEditorView(
                     }.apply { tag = "condition-apply-${c.id}" }, LinearLayout.LayoutParams(0, dp(32), 1.3f))
                 })
                 if (c.type == ConstraintType.RADIUS) info("반지름 기준 · 둘레 ${formatGeometry(2 * Math.PI * numericValue)} cm")
-                if (angle) info("시작→끝 방향 사이 각도 · 0~180°")
+                if (angle) info(if (c.type == ConstraintType.INTERIOR_ANGLE) "꼭짓점 ${name(c.entityIds[1])} · 0~180°" else "시작→끝 방향 사이 각도 · 0~180°")
+                if (c.type == ConstraintType.LENGTH_RATIO) info("${name(c.entityIds[0])} = ${formatGeometry(numericValue)} × ${name(c.entityIds[1])}")
+                if (c.type == ConstraintType.POINT_DISTANCE) {
+                    val line = scene.segment(c.entityIds[1])!!
+                    info("${name(if (c.fromEnd) line.endPointId else line.startPointId)}부터 반대 끝점 방향 · ${if (c.allowExtension) "연장 허용" else "선분 안쪽"}")
+                    addView(CheckBox(context).apply {
+                        tag = "condition-from-end-${c.id}"; text = "${name(line.endPointId)}부터 재기 (기본: ${name(line.startPointId)})"
+                        textSize = 11f; isChecked = c.fromEnd
+                        setOnClickListener {
+                            if (isCurrent(token)) edit(scene.copy(constraints = scene.constraints.map { if (it.id == c.id) it.copy(fromEnd = isChecked) else it }))
+                            else isChecked = scene.constraints.firstOrNull { it.id == c.id }?.fromEnd ?: false
+                        }
+                    })
+                    addView(CheckBox(context).apply {
+                        tag = "condition-extension-${c.id}"; text = "반대 끝점을 넘어 연장 허용"; textSize = 11f; isChecked = c.allowExtension
+                        setOnClickListener {
+                            if (isCurrent(token)) edit(scene.copy(constraints = scene.constraints.map { if (it.id == c.id) it.copy(allowExtension = isChecked) else it }))
+                            else isChecked = scene.constraints.firstOrNull { it.id == c.id }?.allowExtension ?: false
+                        }
+                    })
+                }
                 if (!c.enabled) info("잠시 꺼짐 · 설정 값만 변경됩니다. 체크하면 다시 적용합니다.")
             } else info(if (c.enabled) "체크를 해제하면 관계를 잠시 풉니다." else "잠시 꺼짐 · 체크하면 다시 적용합니다.")
+            if (c.type == ConstraintType.POINT_FRACTION) addFractionControls(c.entityIds[0], c.entityIds[1], c)
+            if (c.type == ConstraintType.INTERIOR_ANGLE) action("이 각과 다른 각을 같게…", ConstructionIcon.ANGLE) { chooseEqualAngle(c.entityIds) }
             action("조건 삭제", ConstructionIcon.DELETE) {
                 selectedCondition = null; canvas.selectedConstraintId = null
                 if (panelKind == PanelKind.DETAIL) closePanel()
@@ -927,6 +1124,7 @@ internal class ConstructionEditorView(
         selectedCondition = null; canvas.selectedConstraintId = null; canvas.selectedMeasurementId = id
         showPanel("측정 표시", PanelKind.DETAIL) {
             info(measurementLabel(m)); info("글자를 끌어 위치를 바꾸세요. 측정은 조건이 아니므로 도형을 고정하지 않습니다.")
+            if (m.type == MeasurementType.ANGLE) action(if (pendingEqualAngle == null) "이 각과 다른 각을 같게…" else "기준 각과 이 각을 같게", ConstructionIcon.EQUAL) { chooseEqualAngle(m.entityIds) }
             action("표시 위치 초기화") { presentationEdit(scene.copy(measurements = scene.measurements.map { if (it.id == id) it.copy(offsetX = 0.0, offsetY = 0.0) else it })) }
             action("표시 지우기", ConstructionIcon.DELETE) { closePanel(); presentationEdit(scene.copy(measurements = scene.measurements.filterNot { it.id == id })) }
             action("측정으로") { showMeasurement() }
@@ -997,17 +1195,17 @@ internal class ConstructionEditorView(
     }
     private fun showHelp() {
         AlertDialog.Builder(context).setTitle("함께 작도하기")
-            .setMessage("1. 눌린 도구의 배경색과 왼쪽 위 안내가 다음 동작을 알려줍니다. 선분·원은 두 번 눌러 만듭니다.\n2. 도형을 선택하고 색·실선·점선·점점선 아이콘을 누르면 바로 바뀝니다. 선택이 없으면 다음 도형에 적용됩니다.\n3. 자석이 켜져 있으면 기존 끝점·선 위·두 선의 교점에 연결됩니다. 원 둘레를 맞추는 두 번째 탭은 반지름 위치만 맞추며 연결 조건을 만들지는 않습니다.\n4. 선택 → 조건 추가로 모양을 유지할 관계를 지정합니다. 길이·반지름·방향각은 그림에 표시됩니다. 표시를 누르면 옆 메뉴에서 ±로 바로 조절합니다. 조건 목록의 항목은 아래로 펼쳐지며 체크로 잠시 끄고 켭니다.\n5. 선택 → 측정 → 그림에 표시. 측정은 모양을 고정하지 않습니다. 글자를 끌면 치수 표시만 이동합니다. 각도는 A → 꼭짓점 B → C 순서로 세 점을 선택합니다.\n6. 작은 메뉴의 제목을 끌면 옮길 수 있습니다. 열고 닫아도 도형은 움직이지 않습니다. 두 손가락으로 도형을 확대·이동합니다.\n\n빈 곳을 누르면 선택 해제. 겹친 점은 반복해서 누르면 따로 선택됩니다. 두 선의 각도 조건은 시작→끝 방향 기준입니다. 직선 위 조건·수선·교점은 연장선을 포함합니다. 원과 선·두 원의 교점 자동 연결은 아직 지원하지 않습니다.\n\n${if (embedded) "도형과 손필기는 같은 평면에서 함께 확대·이동하지만 지우개·되돌리기는 서로 영향을 주지 않습니다. 필기/도형 모드를 선택해 조작하세요. 학생 도형은 손을 놓아 저장한 뒤 자동 전송됩니다. 선생 도형은 초안으로 저장되며 발행을 눌러야 학생에게 전송됩니다. 끊겨도 로컬 작업은 유지됩니다." else "이 전체화면 작도는 현재 기기에 자동 저장되고 앱 백업에 포함됩니다. 메모 안에 넣은 도형판만 원격 동기화 대상입니다."}")
+            .setMessage("1. 눌린 도구와 왼쪽 위 안내가 다음 동작입니다. 선분·원은 두 번 눌러 만듭니다. 선택한 도형은 색·선종류 버튼으로 바뀝니다.\n2. □ 기본 도형은 점·선분과 관계로 추가됩니다. 길이는 고정되지 않으므로 필요할 때 치수를 넣으세요.\n3. 점과 선분 선택 → 조건 추가 → 선분 위 위치. 중점·k/n·내분비·끝점부터 cm를 지정합니다. 같은 점/선분의 이전 위치 조건을 바꾸며, 꺼진 조건은 체크해야 적용됩니다.\n4. 선분 하나 → 등분점 만들기. 원래 선분은 그대로입니다. 선분 여러 개 → 같은 길이, 두 선분 → 길이 비율을 지정합니다.\n5. 각도는 세 점(끝→꼭짓점→끝) 또는 꼭짓점을 공유하는 두 선분을 선택하세요. ‘이 각과 다른 각을 같게’ → 다른 각 선택 → 조건 추가로 묶습니다. 측정된 각 표시를 눌러서도 연결할 수 있습니다. 각 이등분은 두 작은 각을 같게 구성하세요.\n6. 길이·반지름·각도 표시를 누르면 옆 메뉴에서 ±로 바꿉니다. 조건 목록은 항목 아래로 펼쳐지며 체크로 잠시 끄고 켭니다. 측정은 모양을 고정하지 않으며 글자를 끌어 옮길 수 있습니다.\n7. 작은 메뉴 제목을 끌면 옮겨집니다. 열고 닫아도 도형은 밀리지 않습니다. 두 손가락으로 도형과 필기를 함께 확대·이동합니다.\n\n자석은 끝점·선분 안쪽·두 선분의 교점에 자동 연결합니다. 명시적으로 만드는 직선 위 조건·수선·직선 교점은 연장선을 포함합니다. 원과 선·두 원의 교점 자동 연결은 아직 지원하지 않습니다.\n\n${if (embedded) "필기와 도형은 같은 평면이지만 지우기·되돌리기는 서로 영향을 주지 않습니다. 학생 도형은 저장 후 자동 전송되고 선생 도형은 발행해야 전송됩니다. 새 관계와 종이 바깥 확장 필기를 동기화하려면 두 기기를 모두 업데이트하세요. 기존 필기 좌표는 바뀌지 않습니다." else "현재 기기에 자동 저장되고 앱 백업에 포함됩니다. 메모 안의 도형만 원격 동기화 대상입니다."}")
             .setPositiveButton("확인", null).showChild()
     }
     private fun requestClose() {
         if (busy || dragSolving) return notice("저장을 마친 뒤 닫을 수 있습니다.")
         canvas.cancelDrag(); onRequestClose()
     }
-    fun handleBack() { if (panelKind != null) closePanel() else requestClose() }
+    fun handleBack() { if (panelKind != null) closePanel() else if (pendingEqualAngle != null) { pendingEqualAngle = null; updateHint() } else requestClose() }
     fun undoEdit(): Boolean = if (canUndo) { history(true); true } else false
     fun redoEdit(): Boolean = if (canRedo) { history(false); true } else false
-    fun cancelInteraction() { canvas.cancelDrag(); canvas.tool = canvas.tool; dismissChildren() }
+    fun cancelInteraction() { pendingEqualAngle = null; canvas.cancelDrag(); canvas.tool = canvas.tool; dismissChildren(); updateHint() }
 
     /** Toolbars remain outside the shared content rectangle; both editable layers fill it exactly. */
     fun attachSharedCanvas(host: SharedMemoCanvasHost) {

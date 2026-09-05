@@ -8,7 +8,7 @@ internal object MemoJsonCodec {
     fun encodeMemo(memo: StudentMemo): ByteArray {
         val normalized = validateAndCopy(memo.target, listOf(memo)).single()
         return JSONObject()
-            .put("formatVersion", FORMAT_VERSION)
+            .put("formatVersion", formatVersion(listOf(normalized)))
             .put("target", memo.target.toJson())
             .put("memo", normalized.toJson())
             .toString()
@@ -17,9 +17,13 @@ internal object MemoJsonCodec {
 
     fun decodeMemo(bytes: ByteArray): StudentMemo {
         val root = JSONObject(bytes.toString(Charsets.UTF_8))
-        require(root.getInt("formatVersion") == FORMAT_VERSION) { "Unsupported memo format" }
+        val formatVersion = readFormatVersion(root)
         val target = root.getJSONObject("target").toTarget()
-        return validateAndCopy(target, listOf(root.getJSONObject("memo").toMemo(target))).single()
+        return validateAndCopy(target, listOf(root.getJSONObject("memo").toMemo(target))).single().also {
+            require(formatVersion >= EXTENDED_FORMAT_VERSION || !it.usesExtendedCanvas) {
+                "Extended memo coordinates require format v2"
+            }
+        }
     }
 
     fun encode(snapshot: StudentMemoTargetSnapshot): ByteArray {
@@ -27,7 +31,7 @@ internal object MemoJsonCodec {
         val digest = StudentMemoDigest.targetSha256(snapshot.target, normalized)
         require(snapshot.digestSha256 == digest) { "Memo target digest mismatch" }
         return JSONObject()
-            .put("formatVersion", FORMAT_VERSION)
+            .put("formatVersion", formatVersion(normalized))
             .put("target", snapshot.target.toJson())
             .put("revision", snapshot.revision)
             .put("digestSha256", digest)
@@ -45,7 +49,7 @@ internal object MemoJsonCodec {
         decodeRoot(JSONObject(bytes.toString(Charsets.UTF_8)), expectedTarget)
 
     private fun decodeRoot(root: JSONObject, expectedTarget: MemoTarget): StudentMemoTargetSnapshot {
-        require(root.getInt("formatVersion") == FORMAT_VERSION) { "Unsupported memo format" }
+        val formatVersion = readFormatVersion(root)
         require(root.getJSONObject("target").toTarget() == expectedTarget) { "Memo target identity mismatch" }
         val values = root.getJSONArray("memos")
         require(values.length() <= MAX_MEMOS_PER_TARGET) { "Too many memos in one attempt" }
@@ -53,6 +57,9 @@ internal object MemoJsonCodec {
             for (index in 0 until values.length()) add(values.getJSONObject(index).toMemo(expectedTarget))
         }
         val normalized = validateAndCopy(expectedTarget, memos)
+        require(formatVersion >= EXTENDED_FORMAT_VERSION || normalized.none(StudentMemo::usesExtendedCanvas)) {
+            "Extended memo coordinates require format v2"
+        }
         val digest = StudentMemoDigest.targetSha256(expectedTarget, normalized)
         require(root.getString("digestSha256") == digest) { "Memo target digest mismatch" }
         return StudentMemoTargetSnapshot(
@@ -172,7 +179,19 @@ internal object MemoJsonCodec {
     private fun <T> immutableCopy(values: Collection<T>): List<T> =
         Collections.unmodifiableList(ArrayList(values))
 
-    private const val FORMAT_VERSION = 1
+    private fun formatVersion(memos: List<StudentMemo>): Int =
+        if (memos.any(StudentMemo::usesExtendedCanvas)) EXTENDED_FORMAT_VERSION else LEGACY_FORMAT_VERSION
+
+    private fun readFormatVersion(root: JSONObject): Int {
+        val value = root.get("formatVersion")
+        require(value is Number && value.toDouble().isFinite() &&
+            value.toDouble() == value.toInt().toDouble() &&
+            value.toInt() in LEGACY_FORMAT_VERSION..EXTENDED_FORMAT_VERSION) { "Unsupported memo format" }
+        return value.toInt()
+    }
+
+    private const val LEGACY_FORMAT_VERSION = 1
+    private const val EXTENDED_FORMAT_VERSION = 2
     private const val MAX_MEMOS_PER_TARGET = 128
     private const val MAX_STROKES_PER_MEMO = 4_096
     private const val MAX_POINTS_PER_STROKE = 100_000

@@ -1623,6 +1623,7 @@ private class RemoteReviewRuntime(
                 memoDigestSha256 = memo.digestSha256,
                 payloadSha256 = com.studyink.monitor.core.studentMemoPayloadSha256Hex(payload),
                 payloadBytes = payload,
+                extendedCanvas = memo.usesExtendedCanvas,
             )
         }.getOrNull() ?: return StudentMemoSendResult.SKIP
         return when (enqueuePageSyncEnvelope(envelope)) {
@@ -1665,6 +1666,9 @@ private class RemoteReviewRuntime(
         ) ?: return RemotePageSyncIncomingResult.RETAIN
         val decoded = runCatching { memoRepository.decodeMemo(envelope.copyPayloadBytes()) }
             .getOrElse { return RemotePageSyncIncomingResult.DROP }
+        // Never apply a v2 coordinate payload carried in the legacy frame: pre-update readers
+        // would DROP it and return a transport ACK without persisting the extended ink.
+        if (!studentMemoCanvasFrameMatches(envelope, decoded)) return RemotePageSyncIncomingResult.RETAIN
         if (decoded.id != envelope.memoId || decoded.revision != envelope.memoRevision ||
             decoded.digestSha256 != envelope.memoDigestSha256 ||
             decoded.target.pageNumber + 1 != envelope.pageNumber ||
@@ -2887,6 +2891,9 @@ internal fun decodeRemoteReviewInboxDocument(bytes: ByteArray): RemoteReviewInbo
     } catch (_: Exception) {
         RemoteReviewInboxDecodeResult.RetainWithoutAcknowledgement
     }
+
+internal fun studentMemoCanvasFrameMatches(envelope: StudentMemoEnvelope, memo: StudentMemo): Boolean =
+    envelope.extendedCanvas == memo.usesExtendedCanvas
 
 internal fun selectRemoteReviewInboxUpdateIds(
     pendingUpdateIds: List<Long>,

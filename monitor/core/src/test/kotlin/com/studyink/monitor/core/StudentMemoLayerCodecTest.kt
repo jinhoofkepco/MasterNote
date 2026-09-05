@@ -20,6 +20,8 @@ class StudentMemoLayerCodecTest {
             .envelope as StudentMemoEnvelope
 
         assertEquals(11, first.copyBytes()[5].toInt() and 0xff)
+        assertEquals(1, first.copyBytes()[4].toInt() and 0xff)
+        assertEquals(false, decoded.extendedCanvas)
         assertArrayEquals(first.copyBytes(), second.copyBytes())
         assertEquals(RemoteReviewEnvelopeType.STUDENT_MEMO, decoded.type)
         assertEquals("memo_transfer_0001", decoded.transferId)
@@ -39,6 +41,34 @@ class StudentMemoLayerCodecTest {
         val leakedCopy = decoded.copyPayloadBytes()
         leakedCopy.fill(1)
         assertArrayEquals(originalPayload, decoded.copyPayloadBytes())
+    }
+
+    @Test fun extendedCanvasUsesOuterVersionFenceAndLegacyReaderCannotAcknowledgeDecodedMemo() {
+        val payload = "extended-memo-format-v2".toByteArray()
+        val envelope = memoEnvelope(payload, extendedCanvas = true)
+        val bytes = RemoteReviewDocumentCodec.encode(envelope).copyBytes()
+        assertEquals(2, bytes[4].toInt() and 0xff)
+        val failure = assertThrows(RemoteReviewCodecException::class.java) {
+            RemoteReviewDocumentCodec.decodeWithVersionCeiling(bytes, maximumSupportedVersion = 1)
+        }
+        assertEquals(RemoteReviewCodecError.UNSUPPORTED_VERSION, failure.error)
+        val decoded = RemoteReviewDocumentCodec.decode(bytes).envelope as StudentMemoEnvelope
+        assertTrue(decoded.extendedCanvas)
+        assertArrayEquals(payload, decoded.copyPayloadBytes())
+        assertArrayEquals(bytes, RemoteReviewDocumentCodec.encode(decoded).copyBytes())
+        assertEquals(envelope.memoDigestSha256, decoded.memoDigestSha256)
+    }
+
+    @Test fun versionTwoIsReservedForExtendedMemosAndFutureVersionsStillFailClosed() {
+        val bytes = RemoteReviewDocumentCodec.encode(memoEnvelope("memo".toByteArray(), extendedCanvas = true)).copyBytes()
+        val otherType = bytes.copyOf().also { it[5] = 1 }
+        val unknownVersion = bytes.copyOf().also { it[4] = 3 }
+        listOf(otherType, unknownVersion).forEach { unsupported ->
+            val failure = assertThrows(RemoteReviewCodecException::class.java) {
+                RemoteReviewDocumentCodec.decode(unsupported)
+            }
+            assertEquals(RemoteReviewCodecError.UNSUPPORTED_VERSION, failure.error)
+        }
     }
 
     @Test
@@ -81,6 +111,7 @@ class StudentMemoLayerCodecTest {
         payloadSha256: String = studentMemoPayloadSha256Hex(payload),
         contentSha256: String = "11".repeat(32),
         pageNumber: Int = 94,
+        extendedCanvas: Boolean = false,
     ) = StudentMemoEnvelope(
         transferId = "memo_transfer_0001",
         createdAtEpochMs = 1_700_000_000_000L,
@@ -95,5 +126,6 @@ class StudentMemoLayerCodecTest {
         memoDigestSha256 = "22".repeat(32),
         payloadSha256 = payloadSha256,
         payloadBytes = payload,
+        extendedCanvas = extendedCanvas,
     )
 }

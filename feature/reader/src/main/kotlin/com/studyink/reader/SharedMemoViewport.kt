@@ -5,11 +5,13 @@ import android.graphics.RectF
 import com.studyink.core.model.PagePoint
 import com.studyink.document.pdf.CanonicalPdfPoint
 import com.studyink.document.pdf.InkViewport
+import com.studyink.memo.core.MEMO_MAX_COORDINATE
+import com.studyink.memo.core.MEMO_MIN_COORDINATE
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * One camera for mathematical construction and the existing normalized memo sheet.
+ * One camera for mathematical construction and the continuous memo working plane.
  *
  * This mapping is a document invariant, not a device-dependent fit to the current geometry:
  * canonical (0, 0) is (-3, 24) cm, and canonical (1000, 2200) is (27, -42) cm.
@@ -34,6 +36,7 @@ internal class SharedMemoViewport : InkViewport {
         get() = inkBounds?.let(::RectF)
         set(value) { inkBounds = safeWorldBounds(value) }
 
+    /** The original sheet remains a reference rectangle, never the writable clipping boundary. */
     val paperBounds: RectF
         get() = RectF(offsetX, offsetY, offsetX + WIDTH.toFloat() * pixelsPerCm,
             offsetY + HEIGHT.toFloat() * pixelsPerCm)
@@ -91,8 +94,7 @@ internal class SharedMemoViewport : InkViewport {
             .coerceIn(minScale(), maxScale())
         offsetX = viewWidth / 2f - (content.centerX() - LEFT.toFloat()) * pixelsPerCm
         offsetY = viewHeight / 2f - (TOP.toFloat() - content.centerY()) * pixelsPerCm
-        // A fitted point at the very edge may intentionally show a small surround margin.
-        constrainPan(FIT_PADDING_PX / pixelsPerCm)
+        constrainPan()
         onChanged()
     }
 
@@ -119,11 +121,15 @@ internal class SharedMemoViewport : InkViewport {
             x < 0f || y < 0f || x > viewWidth || y > viewHeight) return null
         val px = (x - offsetX) / (pixelsPerCm * CM_PER_CANONICAL)
         val py = (y - offsetY) / (pixelsPerCm * CM_PER_CANONICAL)
-        // Tiny float roundoff at a synthetic boundary UP must not discard the stroke endpoint.
-        if (px < -EDGE_EPSILON || px > CANONICAL_WIDTH + EDGE_EPSILON ||
-            py < -EDGE_EPSILON || py > CANONICAL_HEIGHT + EDGE_EPSILON) return null
-        return CanonicalPdfPoint(PAGE, PagePoint(px.coerceIn(0f, CANONICAL_WIDTH),
-            py.coerceIn(0f, CANONICAL_HEIGHT)))
+        // The old canonical origin/unit never change. Negative and beyond-sheet positions are
+        // stored as memo-format v2 instead of being clamped back to the legacy paper edge.
+        val minX = MEMO_MIN_COORDINATE * CANONICAL_WIDTH
+        val maxX = MEMO_MAX_COORDINATE * CANONICAL_WIDTH
+        val minY = MEMO_MIN_COORDINATE * CANONICAL_HEIGHT
+        val maxY = MEMO_MAX_COORDINATE * CANONICAL_HEIGHT
+        if (!px.isFinite() || !py.isFinite() || px < minX - EDGE_EPSILON || px > maxX + EDGE_EPSILON ||
+            py < minY - EDGE_EPSILON || py > maxY + EDGE_EPSILON) return null
+        return CanonicalPdfPoint(PAGE, PagePoint(px.coerceIn(minX, maxX), py.coerceIn(minY, maxY)))
     }
 
     override fun canonicalToView(pageNumber: Int, point: PagePoint): PointF? =
@@ -139,42 +145,33 @@ internal class SharedMemoViewport : InkViewport {
         if (pageNumber == PAGE && isSized()) widthPixels / (CM_PER_CANONICAL * pixelsPerCm) else widthPixels
 
     override fun activePage(): Int = PAGE
-    override fun activePageBounds(): RectF? = if (isSized()) paperBounds else null
+    override fun activePageBounds(): RectF? =
+        if (isSized()) RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat()) else null
 
     private fun isSized() = viewWidth > 0 && viewHeight > 0
     private fun widthScale() = viewWidth / WIDTH.toFloat()
     private fun minScale(): Float {
         val paperFit = min(widthScale(), viewHeight / HEIGHT.toFloat())
-        if (geometryBounds == null && inkBounds == null) return paperFit
-        val navigable = navigableWorldBounds()
-        return min(paperFit,
-            min(max(viewWidth - FIT_PADDING_PX * 2f, 1f) / navigable.width(),
-                max(viewHeight - FIT_PADDING_PX * 2f, 1f) / navigable.height()))
+        val content = combinedContentBounds()
+        val contentFit = if (content == null) paperFit else
+            min(max(viewWidth - FIT_PADDING_PX * 2f, 1f) / max(content.width(), 1f),
+                max(viewHeight - FIT_PADDING_PX * 2f, 1f) / max(content.height(), 1f))
+        val coordinateSpan = MEMO_MAX_COORDINATE - MEMO_MIN_COORDINATE
+        val safeFloor = max(viewWidth / (coordinateSpan * WIDTH.toFloat()),
+            viewHeight / (coordinateSpan * HEIGHT.toFloat()))
+        return max(safeFloor, min(paperFit / 16f, contentFit))
     }
     private fun maxScale() = widthScale() * 8f
 
-    private fun constrainPan(extraMarginCm: Float = 0f) {
-        val bounds = navigableWorldBounds()
-        if (extraMarginCm > 0f) bounds.inset(-extraMarginCm, -extraMarginCm)
-        val left = (bounds.left - LEFT.toFloat()) * pixelsPerCm
-        val right = (bounds.right - LEFT.toFloat()) * pixelsPerCm
-        val top = (TOP.toFloat() - bounds.bottom) * pixelsPerCm
-        val bottom = (TOP.toFloat() - bounds.top) * pixelsPerCm
-        offsetX = if (right - left <= viewWidth) (viewWidth - left - right) / 2f
-            else offsetX.coerceIn(viewWidth - right, -left)
-        // Short paper stays top-aligned. Legacy geometry can extend the navigable world beyond it.
-        offsetY = if (bottom - top <= viewHeight) -top
-            else offsetY.coerceIn(viewHeight - bottom, -top)
-    }
-
-    private fun navigableWorldBounds(): RectF = RectF(LEFT.toFloat(), (TOP - HEIGHT).toFloat(),
-        (LEFT + WIDTH).toFloat(), TOP.toFloat()).apply {
-        geometryBounds?.let {
-            left = min(left, it.left - LEGACY_MARGIN_CM)
-            top = min(top, it.top - LEGACY_MARGIN_CM)
-            right = max(right, it.right + LEGACY_MARGIN_CM)
-            bottom = max(bottom, it.bottom + LEGACY_MARGIN_CM)
-        }
+    private fun constrainPan() {
+        // Keep the whole visible viewport writable, including near the generous numeric safety
+        // boundary. Pan is no longer tied to existing content or the old paper rectangle.
+        val left = MEMO_MIN_COORDINATE * WIDTH.toFloat() * pixelsPerCm
+        val right = MEMO_MAX_COORDINATE * WIDTH.toFloat() * pixelsPerCm
+        val top = MEMO_MIN_COORDINATE * HEIGHT.toFloat() * pixelsPerCm
+        val bottom = MEMO_MAX_COORDINATE * HEIGHT.toFloat() * pixelsPerCm
+        offsetX = offsetX.coerceIn(viewWidth - right, -left)
+        offsetY = offsetY.coerceIn(viewHeight - bottom, -top)
     }
 
     private fun combinedContentBounds(): RectF? {
@@ -203,9 +200,8 @@ internal class SharedMemoViewport : InkViewport {
         const val CANONICAL_WIDTH = 1000f
         const val CANONICAL_HEIGHT = 2200f
         private const val CM_PER_CANONICAL = .03f
-        private const val EDGE_EPSILON = .001f
+        private const val EDGE_EPSILON = 1f
         private const val FIT_PADDING_PX = 24f
-        private const val LEGACY_MARGIN_CM = 1f
         private const val PAGE = 0
     }
 }

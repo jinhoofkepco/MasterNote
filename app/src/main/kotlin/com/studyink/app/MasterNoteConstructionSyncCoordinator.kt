@@ -44,6 +44,20 @@ internal fun constructionCoalesceKey(scope: String, request: String, chunkIndex:
 internal fun constructionMayStartNewDelivery(pendingChunkCount: Int, allAcknowledged: Boolean, terminalFailure: Boolean): Boolean =
     pendingChunkCount == 0 && (allAcknowledged || terminalFailure)
 
+/** Unknown future relations and failed durable applications retain the inbox document. This
+ * transport acknowledgement is never the publication RESULT required by ConstructionReplicaStore.
+ * Decode/apply failures deliberately propagate to the inbox's deferred/retry boundary. */
+internal fun constructionApplyBeforeAcknowledging(
+    bytes: ByteArray,
+    apply: (ConstructionSyncPacket) -> Boolean,
+    acknowledge: () -> Unit,
+): Boolean {
+    val packet = ConstructionSyncCodec.decode(bytes)
+    if (!apply(packet)) return false
+    acknowledge()
+    return true
+}
+
 internal class ConstructionSyncRuntime(private val app: Application) : ConstructionUiBridge {
     private val root = File(app.filesDir, "masternote")
     private val store = ConstructionReplicaStore(root)
@@ -321,11 +335,12 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
             val bytes = ConstructionTelegramWire.assemble(group.map { it.second }) ?: return@runCatching
             val route = MasterNoteRemoteReviewCoordinator.withConstructionIncoming(first.first.senderBotId, first.second.address) { it }
                 ?: return@runCatching
-            val packet = ConstructionSyncCodec.decode(bytes)
             val source = pin(route)
-            if (accept(route.target, packet, route.peerIsStudent, source) {
+            constructionApplyBeforeAcknowledging(bytes, apply = { packet ->
+                accept(route.target, packet, route.peerIsStudent, source) {
                     MasterNoteRemoteReviewCoordinator.withConstructionIncoming(first.first.senderBotId, first.second.address) { it == route } == true
-                }) group.forEach { gateway.acknowledgePeerDocument(it.first.updateId) }
+                }
+            }, acknowledge = { group.forEach { gateway.acknowledgePeerDocument(it.first.updateId) } })
         }.onFailure { Log.w(TAG, "Construction document deferred", it) } }
     }
 

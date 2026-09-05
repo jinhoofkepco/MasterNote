@@ -23,6 +23,8 @@ class StudentMemoEnvelope(
     val memoDigestSha256: String,
     val payloadSha256: String,
     payloadBytes: ByteArray,
+    /** Requires the v2 outer frame so an older peer retains the document without a false ACK. */
+    val extendedCanvas: Boolean = false,
 ) : RemoteReviewEnvelope {
     override val type: RemoteReviewEnvelopeType = RemoteReviewEnvelopeType.STUDENT_MEMO
 

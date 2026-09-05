@@ -22,7 +22,7 @@ class ConstructionSnapEditsTest {
         assertEquals(original.segments, result.segments)
         assertEquals(original.measurements, result.measurements)
         val p = result.points.last()
-        val snap = result.constraints.single { it.type == ConstraintType.POINT_ON_LINE }
+        val snap = result.constraints.single { it.type == ConstraintType.POINT_ON_SEGMENT }
         assertEquals(listOf(p.id, "ab"), snap.entityIds)
         assertEquals(BLUE, p.colorArgb)
         assertEquals(original.constraints, result.constraints.filterNot { it.id == snap.id })
@@ -50,7 +50,7 @@ class ConstructionSnapEditsTest {
         assertEquals(base.segments, result.segments.take(2))
         val line = result.segments.last()
         val start = result.point(line.startPointId)!!
-        val relations = result.constraints.filter { it.type == ConstraintType.POINT_ON_LINE }
+        val relations = result.constraints.filter { it.type == ConstraintType.POINT_ON_SEGMENT }
         assertEquals(setOf(listOf(start.id, "ab"), listOf(start.id, "cd")), relations.map { it.entityIds }.toSet())
         assertEquals(BLUE, line.colorArgb)
         assertEquals(BLUE, start.colorArgb)
@@ -64,8 +64,27 @@ class ConstructionSnapEditsTest {
 
     @Test fun `duplicate line snap candidates produce only one condition`() {
         val result = ConstructionEdits.addPoint(baseline(), ConstructionAnchor(3.0, 0.0, lineIds = listOf("ab", "ab")))
-        assertEquals(1, result.constraints.count { it.type == ConstraintType.POINT_ON_LINE })
+        assertEquals(1, result.constraints.count { it.type == ConstraintType.POINT_ON_SEGMENT })
         assertTrue(SceneValidator.validate(result).isEmpty())
+    }
+
+    @Test fun `new segment snap cannot escape the endpoints but an old supporting line still can`() {
+        val added = ConstructionEdits.addPoint(baseline(), ConstructionAnchor(4.0, 0.0, lineIds = listOf("ab")))
+        val point = added.points.last()
+        val result = ConstraintSolver().solve(added, DragTarget(point.id, 14.0, 0.0))
+        assertTrue(result.message, result.success)
+        assertTrue(result.dragLimited)
+        assertTrue(result.scene.point(point.id)!!.x <= 10.0001)
+        val legacy = added.copy(constraints = added.constraints.map {
+            if (it.type == ConstraintType.POINT_ON_SEGMENT) it.copy(type = ConstraintType.POINT_ON_LINE) else it
+        })
+        val legacyMoved = ConstraintSolver().solve(legacy, DragTarget(point.id, 14.0, 0.0))
+        assertTrue(legacyMoved.message, legacyMoved.success)
+        assertFalse(legacyMoved.dragLimited)
+        assertEquals(14.0, legacyMoved.scene.point(point.id)!!.x, 1e-4)
+        assertThrows(IllegalArgumentException::class.java) {
+            ConstructionEdits.addPoint(baseline(), ConstructionAnchor(14.0, 0.0, lineIds = listOf("ab")))
+        }
     }
 
     @Test fun `stale line or point references reject the entire edit instead of silently detaching`() {

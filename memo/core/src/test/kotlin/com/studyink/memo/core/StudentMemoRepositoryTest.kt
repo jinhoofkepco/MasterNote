@@ -28,6 +28,57 @@ class StudentMemoRepositoryTest {
 
     @get:Rule val temporary = TemporaryFolder()
 
+    @Test fun `legacy memo encoding stays v1 while extended ink requires v2 without digest migration`() {
+        val directory = temporary.newFolder("extended")
+        val repository = repository(directory) { MEMO_ONE }
+        val created = repository.create(TARGET_ONE, MemoAnchor(.2f, .3f))
+        val first = repository.replaceStrokes(TARGET_ONE, created.id, created.revision, listOf(stroke(STROKE_ONE)))
+        val legacyBytes = repository.exportMemo(TARGET_ONE, created.id)
+        assertEquals(1, JSONObject(legacyBytes.toString(Charsets.UTF_8)).getInt("formatVersion"))
+        assertFalse(first.usesExtendedCanvas)
+        val extended = stroke(STROKE_TWO).copy(points = listOf(MemoPoint(-.5f, -1f, .7f), MemoPoint(1.5f, 2.25f, .8f)))
+        val next = repository.replaceStrokes(TARGET_ONE, created.id, first.revision, first.strokes + extended)
+        val encoded = repository.exportMemo(TARGET_ONE, created.id)
+        assertEquals(2, JSONObject(encoded.toString(Charsets.UTF_8)).getInt("formatVersion"))
+        assertEquals(2, JSONObject(repository.exportSnapshot(TARGET_ONE).toString(Charsets.UTF_8)).getInt("formatVersion"))
+        assertEquals(first.strokes.single(), next.strokes.first())
+        assertEquals(next, repository(directory) { error("No create expected") }.memo(TARGET_ONE, created.id))
+        assertEquals(next, repository.decodeMemo(encoded))
+        assertEquals(first, repository.decodeMemo(legacyBytes))
+        val localTarget = MemoTarget("teacher", 0, 1)
+        val received = repository.decodeMemo(encoded).remapTo(localTarget)
+        val receiver = repository(temporary.newFolder("receiver")) { error("No create expected") }
+        assertEquals(MemoAuthoritativeApplyStatus.APPLIED, receiver.applyAuthenticatedStudentMemo(received).status)
+        assertEquals(next.strokes, receiver.memo(localTarget, created.id)!!.strokes)
+    }
+
+    @Test fun `extended coordinates cannot be disguised as legacy format and unknown formats fail closed`() {
+        val repository = repository(temporary.newFolder("formats")) { MEMO_ONE }
+        val created = repository.create(TARGET_ONE, MemoAnchor(.2f, .3f))
+        repository.replaceStrokes(TARGET_ONE, created.id, created.revision,
+            listOf(stroke(STROKE_ONE).copy(points = listOf(MemoPoint(-.5f, 2f)))))
+        val memo = JSONObject(repository.exportMemo(TARGET_ONE, created.id).toString(Charsets.UTF_8))
+        val target = JSONObject(repository.exportSnapshot(TARGET_ONE).toString(Charsets.UTF_8))
+        listOf(1, 0, 3, 2.5, "2").forEach { version ->
+            assertThrows(IllegalArgumentException::class.java) {
+                repository.decodeMemo(memo.put("formatVersion", version).toString().toByteArray())
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                repository.decodeSnapshot(target.put("formatVersion", version).toString().toByteArray())
+            }
+        }
+    }
+
+    @Test fun `only memo ink extends while PDF icon anchors and finite numeric safety stay bounded`() {
+        assertThrows(IllegalArgumentException::class.java) { MemoAnchor(-.01f, .5f) }
+        assertThrows(IllegalArgumentException::class.java) { MemoAnchor(.5f, 1.01f) }
+        assertEquals(-.5f, MemoPoint(-.5f, 2f).normalizedX, 0f)
+        listOf(Float.NaN, Float.POSITIVE_INFINITY, MEMO_MAX_COORDINATE + 1f, MEMO_MIN_COORDINATE - 1f).forEach { invalid ->
+            assertThrows(IllegalArgumentException::class.java) { MemoPoint(invalid, .5f) }
+            assertThrows(IllegalArgumentException::class.java) { MemoPoint(.5f, invalid) }
+        }
+    }
+
     @Test
     fun `multiple memos persist independently by exact attempt`() {
         val ids = ArrayDeque(listOf(MEMO_ONE, MEMO_TWO, MEMO_THREE))
@@ -302,5 +353,6 @@ class StudentMemoRepositoryTest {
         const val MEMO_TWO = "00000000-0000-0000-0000-000000000002"
         const val MEMO_THREE = "00000000-0000-0000-0000-000000000003"
         const val STROKE_ONE = "10000000-0000-0000-0000-000000000001"
+        const val STROKE_TWO = "10000000-0000-0000-0000-000000000002"
     }
 }

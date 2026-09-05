@@ -64,8 +64,9 @@ class AttemptMemoUiGeometryTest {
         val source = MemoPoint(0.25f, 0.8f, 0.7f)
         assertEquals(source, source.toCanonicalMemoPoint().toMemoPoint())
 
-        val clamped = PagePoint(-20f, MEMO_CANONICAL_HEIGHT + 20f, 1f).toMemoPoint()
-        assertEquals(0f, clamped.normalizedX, 0f)
-        assertEquals(1f, clamped.normalizedY, 0f)
+        val extended = PagePoint(-250f, MEMO_CANONICAL_HEIGHT * 1.5f, 1f).toMemoPoint()
+        assertEquals(-.25f, extended.normalizedX, 0f)
+        assertEquals(1.5f, extended.normalizedY, 0f)
+        assertEquals(extended, extended.toCanonicalMemoPoint().toMemoPoint())
     }
 }

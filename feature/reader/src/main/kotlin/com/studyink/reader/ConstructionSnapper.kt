@@ -6,8 +6,8 @@ import kotlin.math.abs
 import kotlin.math.hypot
 
 /** Snap proposals carry exact mathematical incidence rules, not just rounded screen coordinates.
- * Candidates are picked on the visible finite segments; a committed POINT_ON_LINE condition
- * subsequently applies to the supporting line, including extensions. No source line is split. */
+ * Candidates and new POINT_ON_SEGMENT relations both stay inside visible finite segments.
+ * Legacy POINT_ON_LINE constraints retain their supporting-line semantics. No source line is split. */
 internal object ConstructionSnapper {
     fun resolve(scene: ConstructionScene, x: Double, y: Double, tolerance: Double, enabled: Boolean): ConstructionAnchor {
         val free = ConstructionAnchor(x, y)
@@ -30,7 +30,7 @@ internal object ConstructionSnapper {
         }
         if (closestIntersection != null) return closestIntersection
         return candidates.mapNotNull { projection(x, y, it) }
-            .minByOrNull { hypot(it.x - x, it.y - y) }?.copy(snapLabel = "직선 위") ?: free
+            .minByOrNull { hypot(it.x - x, it.y - y) }?.copy(snapLabel = "선분 위") ?: free
     }
 
     private data class Line(val id: String, val ax: Double, val ay: Double, val bx: Double, val by: Double)

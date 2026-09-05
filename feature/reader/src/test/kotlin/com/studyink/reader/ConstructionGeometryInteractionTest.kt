@@ -51,7 +51,7 @@ class ConstructionGeometryInteractionTest {
             segments = listOf(GeometrySegment("AB", "A", "B"), GeometrySegment("CD", "C", "D")))
         val snap = ConstructionSnapper.resolve(scene, 0.0, .02, .2, true)
         assertEquals(1, snap.lineIds.size)
-        assertEquals("직선 위", snap.snapLabel)
+        assertEquals("선분 위", snap.snapLabel)
     }
 
     @Test fun `snapping off preserves the raw point without silently attaching it`() {

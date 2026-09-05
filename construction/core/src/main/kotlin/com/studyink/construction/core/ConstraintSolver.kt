@@ -167,7 +167,7 @@ class ConstraintSolver {
         val scale = max(1.0, max(
             source.points.maxOf { max(abs(it.x - originX), abs(it.y - originY)) },
             max(source.circles.maxOfOrNull { it.radius } ?: 0.0,
-                active.filter { it.type == ConstraintType.LENGTH || it.type == ConstraintType.RADIUS || it.type == ConstraintType.DISTANCE_POINT_LINE }.maxOfOrNull { it.value ?: 0.0 } ?: 0.0),
+                active.filter { it.type == ConstraintType.LENGTH || it.type == ConstraintType.RADIUS || it.type == ConstraintType.DISTANCE_POINT_LINE || it.type == ConstraintType.POINT_DISTANCE }.maxOfOrNull { it.value ?: 0.0 } ?: 0.0),
         ))
         val initial = DoubleArray(source.points.size * 2 + source.circles.size).also { x ->
             source.points.forEach { p -> val i = pointIndex.getValue(p.id); x[i] = (p.x - originX) / scale; x[i + 1] = (p.y - originY) / scale }
@@ -180,8 +180,21 @@ class ConstraintSolver {
         private val distanceSigns = active.filter { it.type == ConstraintType.DISTANCE_POINT_LINE }.associate { c ->
             c.id to if (lineDistance(initial, c.entityIds[0], c.entityIds[1]) < -1e-12) -1.0 else 1.0
         }
-        private val rowOwners = active.flatMap { c -> List(if (c.type == ConstraintType.FIXED_POINT || c.type == ConstraintType.COINCIDENT) 2 else 1) { c.id } }
-        private val angularRows = rowOwners.mapIndexedNotNull { index, id -> if (active.any { it.id == id && it.type == ConstraintType.ANGLE }) index else null }.toSet()
+        private val interiorSigns = active.filter { it.type == ConstraintType.INTERIOR_ANGLE || it.type == ConstraintType.EQUAL_ANGLE }.associate { c ->
+            c.id to List(if (c.type == ConstraintType.EQUAL_ANGLE) 2 else 1) { part ->
+                val rays = angleRays(initial, c.entityIds, part * 3)
+                if (cross(rays.first, rays.second) < -1e-12) -1.0 else 1.0
+            }
+        }
+        private val rowOwners = active.flatMap { c -> List(when (c.type) {
+            ConstraintType.FIXED_POINT, ConstraintType.COINCIDENT, ConstraintType.POINT_ON_SEGMENT,
+            ConstraintType.POINT_FRACTION -> 2
+            ConstraintType.POINT_DISTANCE -> 3
+            else -> 1
+        }) { c.id } }
+        private val angularRows = rowOwners.mapIndexedNotNull { index, id -> if (active.any {
+            it.id == id && it.type in setOf(ConstraintType.ANGLE, ConstraintType.INTERIOR_ANGLE, ConstraintType.EQUAL_ANGLE)
+        }) index else null }.toSet()
 
         fun residuals(x: DoubleArray): DoubleArray {
             val output = ArrayList<Double>(rowOwners.size)
@@ -195,6 +208,26 @@ class ConstraintSolver {
                         val a = point(x, ids[0]); val b = point(x, ids[1]); output += a[0] - b[0]; output += a[1] - b[1]
                     }
                     ConstraintType.POINT_ON_LINE -> output += lineDistance(x, ids[0], ids[1])
+                    ConstraintType.POINT_ON_SEGMENT -> {
+                        output += lineDistance(x, ids[0], ids[1])
+                        output += segmentOvershoot(x, ids[0], ids[1])
+                    }
+                    ConstraintType.POINT_FRACTION -> {
+                        val segment = segments.getValue(ids[1]); val a = point(x, segment.startPointId)
+                        val d = direction(x, ids[1]); val p = point(x, ids[0])
+                        val fraction = c.numerator!!.toDouble() / c.denominator!!
+                        output += p[0] - a[0] - fraction * d[0]
+                        output += p[1] - a[1] - fraction * d[1]
+                    }
+                    ConstraintType.POINT_DISTANCE -> {
+                        val segment = segments.getValue(ids[1])
+                        val a = point(x, if (c.fromEnd) segment.endPointId else segment.startPointId)
+                        val d = direction(x, ids[1]); val p = point(x, ids[0])
+                        val amount = c.value!! / scale / max(norm(d), 1e-12) * if (c.fromEnd) -1.0 else 1.0
+                        output += p[0] - a[0] - amount * d[0]
+                        output += p[1] - a[1] - amount * d[1]
+                        output += if (c.allowExtension) 0.0 else segmentOvershoot(x, ids[0], ids[1])
+                    }
                     ConstraintType.DISTANCE_POINT_LINE -> output += lineDistance(x, ids[0], ids[1]) - c.value!! / scale * distanceSigns.getValue(c.id)
                     ConstraintType.POINT_ON_CIRCLE -> {
                         val p = point(x, ids[0]); val center = point(x, circles.getValue(ids[1]).centerPointId)
@@ -203,6 +236,15 @@ class ConstraintSolver {
                     ConstraintType.LENGTH -> output += norm(direction(x, ids[0])) - c.value!! / scale
                     ConstraintType.RADIUS -> output += x[circleIndex.getValue(ids[0])] - c.value!! / scale
                     ConstraintType.EQUAL_LENGTH -> output += norm(direction(x, ids[0])) - norm(direction(x, ids[1]))
+                    ConstraintType.LENGTH_RATIO -> output +=
+                        (norm(direction(x, ids[0])) - c.value!! * norm(direction(x, ids[1]))) / max(1.0, c.value)
+                    ConstraintType.INTERIOR_ANGLE -> output += wrapAngle(
+                        signedInterior(x, ids, 0) - Math.toRadians(c.value!!) * interiorSigns.getValue(c.id)[0],
+                    )
+                    ConstraintType.EQUAL_ANGLE -> {
+                        val signs = interiorSigns.getValue(c.id)
+                        output += wrapAngle(signedInterior(x, ids, 0) * signs[0] - signedInterior(x, ids, 3) * signs[1])
+                    }
                     ConstraintType.HORIZONTAL, ConstraintType.VERTICAL -> {
                         val d = direction(x, ids[0])
                         output += d[if (c.type == ConstraintType.HORIZONTAL) 1 else 0] / max(norm(d), 1e-12)
@@ -269,12 +311,20 @@ class ConstraintSolver {
             }
             active.forEach { c ->
                 val directions = when (c.type) {
-                    ConstraintType.POINT_ON_LINE, ConstraintType.DISTANCE_POINT_LINE -> listOf(c.entityIds[1])
+                    ConstraintType.POINT_ON_LINE, ConstraintType.DISTANCE_POINT_LINE,
+                    ConstraintType.POINT_ON_SEGMENT, ConstraintType.POINT_FRACTION, ConstraintType.POINT_DISTANCE -> listOf(c.entityIds[1])
                     ConstraintType.HORIZONTAL, ConstraintType.VERTICAL -> c.entityIds
-                    ConstraintType.PARALLEL, ConstraintType.PERPENDICULAR, ConstraintType.ANGLE -> c.entityIds
+                    ConstraintType.PARALLEL, ConstraintType.PERPENDICULAR, ConstraintType.ANGLE,
+                    ConstraintType.EQUAL_LENGTH, ConstraintType.LENGTH_RATIO -> c.entityIds
                     else -> emptyList()
                 }
                 if (directions.any { norm(direction(x, it)) * scale < SceneValidator.MIN_LENGTH }) errors[c.id] = Double.POSITIVE_INFINITY
+                if (c.type == ConstraintType.INTERIOR_ANGLE || c.type == ConstraintType.EQUAL_ANGLE) {
+                    val offsets = if (c.type == ConstraintType.EQUAL_ANGLE) listOf(0, 3) else listOf(0)
+                    if (offsets.any { offset -> angleRays(x, c.entityIds, offset).let {
+                        norm(it.first) * scale < SceneValidator.MIN_LENGTH || norm(it.second) * scale < SceneValidator.MIN_LENGTH
+                    } }) errors[c.id] = Double.POSITIVE_INFINITY
+                }
             }
             return errors
         }
@@ -330,6 +380,16 @@ class ConstraintSolver {
                         if (abs(value) > 1e-7) add(BranchGuard(ids[a], joint, ids[b], if (value > 0) 1.0 else -1.0))
                     }
                 }
+                // Interior angles keep their own arm ordering, including each half of an
+                // equal-angle bisector. Otherwise equal magnitudes admit a reflected solution.
+                active.filter { it.type == ConstraintType.INTERIOR_ANGLE || it.type == ConstraintType.EQUAL_ANGLE }.forEach { c ->
+                    val offsets = if (c.type == ConstraintType.EQUAL_ANGLE) listOf(0, 3) else listOf(0)
+                    offsets.forEach { offset ->
+                        val a = c.entityIds[offset]; val joint = c.entityIds[offset + 1]; val b = c.entityIds[offset + 2]
+                        val value = triangleSign(x, a, joint, b)
+                        if (abs(value) > 1e-7) add(BranchGuard(a, joint, b, if (value > 0) 1.0 else -1.0))
+                    }
+                }
             }
         }
 
@@ -342,6 +402,21 @@ class ConstraintSolver {
         private fun lineDistance(x: DoubleArray, pointId: String, lineId: String): Double {
             val line = segments.getValue(lineId); val p = point(x, pointId); val a = point(x, line.startPointId); val d = direction(x, line.id)
             return ((p[0] - a[0]) * d[1] - (p[1] - a[1]) * d[0]) / max(norm(d), 1e-12)
+        }
+        /** Signed distance along the supporting line outside its closed interval; zero inside. */
+        private fun segmentOvershoot(x: DoubleArray, pointId: String, lineId: String): Double {
+            val segment = segments.getValue(lineId); val a = point(x, segment.startPointId)
+            val p = point(x, pointId); val d = direction(x, lineId); val length = norm(d)
+            val along = ((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1]) / max(length, 1e-12)
+            return when { along < 0.0 -> along; along > length -> along - length; else -> 0.0 }
+        }
+        private fun angleRays(x: DoubleArray, ids: List<String>, offset: Int): Pair<DoubleArray, DoubleArray> {
+            val a = point(x, ids[offset]); val b = point(x, ids[offset + 1]); val c = point(x, ids[offset + 2])
+            return doubleArrayOf(a[0] - b[0], a[1] - b[1]) to doubleArrayOf(c[0] - b[0], c[1] - b[1])
+        }
+        private fun signedInterior(x: DoubleArray, ids: List<String>, offset: Int): Double {
+            val (a, b) = angleRays(x, ids, offset)
+            return atan2(cross(a, b), a[0] * b[0] + a[1] * b[1])
         }
         private fun direction(x: DoubleArray, id: String): DoubleArray {
             val s = segments.getValue(id); val a = pointIndex.getValue(s.startPointId); val b = pointIndex.getValue(s.endPointId)

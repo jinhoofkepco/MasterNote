@@ -164,6 +164,38 @@ class ConstructionAnnotationRendererTest {
         render(scene) { _, hits -> assertTrue(hits.isEmpty()) }
     }
 
+    @Test fun `new interior and endpoint dimensions retain persistent blue editable hit targets`() {
+        val constraints = listOf(
+            GeometryConstraint("interior", ConstraintType.INTERIOR_ANGLE, listOf("B", "A", "C"), value = 90.0),
+            GeometryConstraint("position", ConstraintType.POINT_DISTANCE, listOf("C", "AB"), value = 6.0),
+        )
+        for (constraint in constraints) render(scene().copy(constraints = listOf(constraint))) { bitmap, hits ->
+            assertTrue(bitmap.hasOpaqueColor(0xFF5F82AD.toInt()))
+            assertEquals(listOf(constraint.id), hits.map { it.id })
+            assertEquals(ConstructionAnnotationKind.CONSTRAINT, hits.single().kind)
+        }
+    }
+
+    @Test fun `equal angle relation displays two nonoverlapping matching arc hits with the same identity`() {
+        val relation = GeometryConstraint("equal", ConstraintType.EQUAL_ANGLE, listOf("B", "A", "C", "A", "B", "C"))
+        render(scene().copy(constraints = listOf(relation))) { bitmap, hits ->
+            assertTrue(bitmap.hasOpaqueColor(0xFF5F82AD.toInt()))
+            assertEquals(listOf("equal", "equal"), hits.map { it.id })
+            assertTrue(!RectF.intersects(hits[0].bounds, hits[1].bounds))
+        }
+    }
+
+    @Test fun `fraction and ratio badges are persistent and wide enough for readable condition text`() {
+        val constraints = listOf(
+            GeometryConstraint("fraction", ConstraintType.POINT_FRACTION, listOf("C", "AB"), numerator = 1, denominator = 3),
+            GeometryConstraint("ratio", ConstraintType.LENGTH_RATIO, listOf("AB", "AC"), value = 2.0),
+        )
+        for (constraint in constraints) render(scene().copy(constraints = listOf(constraint))) { _, hits ->
+            assertEquals(constraint.id, hits.single().id)
+            assertTrue(hits.single().visualBounds.width() > 48f)
+        }
+    }
+
     private fun scene() = ConstructionScene(
         points = listOf(GeometryPoint("A", 0.0, 0.0), GeometryPoint("B", 10.0, 0.0), GeometryPoint("C", 0.0, 6.0)),
         segments = listOf(GeometrySegment("AB", "A", "B"), GeometrySegment("AC", "A", "C")),

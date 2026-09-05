@@ -22,6 +22,8 @@ import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.log10
+import kotlin.math.pow
 
 internal enum class ConstructionTool { SELECT, POINT, SEGMENT, CIRCLE }
 internal enum class ConstructionDragPhase { START, MOVE, END, CANCEL }
@@ -87,6 +89,8 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
     private var movingPoint: String? = null
     private var movingMeasurement: String? = null
     private var tappedAnnotation: ConstructionAnnotationHit? = null
+    private var anchorConstraintId: String? = null
+    private var anchorConstraintIndex = 0
     private var measurementStartOffset = ConstructionVector(0.0, 0.0)
     private var pointerStartWorld = ConstructionVector(0.0, 0.0)
     private var pointGrabOffset = ConstructionVector(0.0, 0.0)
@@ -126,9 +130,10 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
     }
 
     internal fun pointScreenPosition(id: String): PointF? = point(id)?.let { PointF(sx(it.x), sy(it.y)) }
-    internal fun constraintScreenBounds(id: String): RectF? = annotationHits.firstOrNull {
+    internal fun viewportCenterWorld(): ConstructionAnchor = world(width / 2f, height / 2f)
+    internal fun constraintScreenBounds(id: String): RectF? = annotationHits.filter {
         it.id == id && it.kind == ConstructionAnnotationKind.CONSTRAINT
-    }?.bounds?.let(::RectF)
+    }.let { hits -> hits.getOrNull(if (id == anchorConstraintId) anchorConstraintIndex else 0) ?: hits.firstOrNull() }?.bounds?.let(::RectF)
     fun notifyViewportChanged() { annotationHits = emptyList(); invalidate() }
 
     private fun updateSharedContentBounds() {
@@ -220,13 +225,15 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
         super.onDraw(canvas)
         drawingCanvas = canvas
         pen.reset(); pen.isAntiAlias = true; pen.strokeWidth = density * .55f; pen.color = Color.rgb(231, 234, 233)
-        val gridStep = when { scale < 8f * density -> 5.0; scale < 18f * density -> 2.0; else -> 1.0 }
+        val desiredStep = max(1.0, 18.0 * density / scale)
+        val magnitude = 10.0.pow(floor(log10(desiredStep)))
+        val gridStep = listOf(1.0, 2.0, 5.0, 10.0).first { it * magnitude >= desiredStep } * magnitude
         val x0 = floor((-originX / scale) / gridStep).toInt()
         val x1 = ceil(((width - originX) / scale) / gridStep).toInt()
-        for (i in x0..min(x1, x0 + 300)) canvas.drawLine(sx(i * gridStep), 0f, sx(i * gridStep), height.toFloat(), pen)
+        for (i in x0..x1) canvas.drawLine(sx(i * gridStep), 0f, sx(i * gridStep), height.toFloat(), pen)
         val y0 = floor(((originY - height) / scale) / gridStep).toInt()
         val y1 = ceil((originY / scale) / gridStep).toInt()
-        for (i in y0..min(y1, y0 + 300)) canvas.drawLine(0f, sy(i * gridStep), width.toFloat(), sy(i * gridStep), pen)
+        for (i in y0..y1) canvas.drawLine(0f, sy(i * gridStep), width.toFloat(), sy(i * gridStep), pen)
         val gridLabel = "격자 ${formatGeometry(gridStep)} cm"
         pen.textSize = 12f * density
         label(gridLabel, width - pen.measureText(gridLabel) - 8f * density, height - 9f * density)
@@ -410,6 +417,8 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
                                 if (annotation.kind == ConstructionAnnotationKind.MEASUREMENT) {
                                     selectedMeasurementId = annotation.id; onMeasurementSelected(annotation.id)
                                 } else {
+                                    anchorConstraintId = annotation.id
+                                    anchorConstraintIndex = annotationHits.filter { it.id == annotation.id && it.kind == ConstructionAnnotationKind.CONSTRAINT }.indexOf(annotation).coerceAtLeast(0)
                                     selectedConstraintId = annotation.id; onConstraintSelected(annotation.id)
                                 }
                             } else {

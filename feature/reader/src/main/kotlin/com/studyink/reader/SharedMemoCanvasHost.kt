@@ -40,8 +40,7 @@ internal class SharedMemoCanvasHost(context: Context) : FrameLayout(context) {
     private var pendingSize = false
     private var pendingReset = false
     private var pendingFit = false
-    private val paperPaint = Paint().apply { color = Color.rgb(255, 254, 247) }
-    private val surroundPaint = Paint().apply { color = Color.rgb(229, 234, 239) }
+    private val paperPaint = Paint().apply { color = Color.WHITE }
     private val retrySize = object : Runnable {
         override fun run() {
             if ((pendingSize || pendingReset || pendingFit) && isAttachedToWindow && hasViewportSize() &&
@@ -63,8 +62,7 @@ internal class SharedMemoCanvasHost(context: Context) : FrameLayout(context) {
     }
 
     override fun onDraw(canvas: Canvas) {
-        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), surroundPaint)
-        canvas.drawRect(viewport.paperBounds, paperPaint)
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paperPaint)
         super.onDraw(canvas)
     }
 
@@ -302,11 +300,8 @@ internal class SharedMemoCanvasHost(context: Context) : FrameLayout(context) {
         transformed.recycle()
     }
 
-    private fun editingBounds(): RectF = if (geometryMode) {
+    private fun editingBounds(): RectF =
         RectF(0f, 0f, width.toFloat(), height.toFloat())
-    } else viewport.paperBounds.apply {
-        if (!intersect(0f, 0f, width.toFloat(), height.toFloat())) setEmpty()
-    }
 
     private fun fingerCount(event: MotionEvent): Int = (0 until event.pointerCount).count {
         event.getToolType(it) == MotionEvent.TOOL_TYPE_FINGER &&

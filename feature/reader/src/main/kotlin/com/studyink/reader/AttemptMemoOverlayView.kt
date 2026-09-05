@@ -1367,7 +1367,7 @@ private class MemoIconLayer(context: Context) : View(context) {
     }
 }
 
-private fun StudentMemo.toAnnotationSnapshot(): AnnotationSnapshot {
+internal fun StudentMemo.toAnnotationSnapshot(): AnnotationSnapshot {
     val assets = strokes.mapIndexed { index, stroke ->
         stroke.toStrokeAsset(this, logicalClock = index + 1L)
     }.associateBy(StrokeAsset::id)
@@ -1398,7 +1398,7 @@ private fun MemoStroke.toStrokeAsset(owner: StudentMemo, logicalClock: Long) = S
     createdAtEpochMillis = createdAtEpochMillis,
 )
 
-private fun AnnotationSnapshot.toMemoStrokes(): List<MemoStroke> = activeStrokes.map { stroke ->
+internal fun AnnotationSnapshot.toMemoStrokes(): List<MemoStroke> = activeStrokes.map { stroke ->
     MemoStroke(
         id = stroke.id.value,
         tool = when (stroke.tool) {

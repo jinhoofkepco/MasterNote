@@ -91,10 +91,11 @@ class SharedMemoCanvasHostTest {
     }
 
     @Test fun `ink fingers pan and never edit either layer`() {
+        val initialTop = host.viewport.paperBounds.top
         touch(MotionEvent.ACTION_DOWN, finger(200f, 300f))
         touch(MotionEvent.ACTION_MOVE, finger(200f, 200f))
         touch(MotionEvent.ACTION_UP, finger(200f, 200f))
-        assertEquals(-100f, host.viewport.paperBounds.top, .001f)
+        assertEquals(initialTop - 100f, host.viewport.paperBounds.top, .001f)
         assertTrue(ink.events.isEmpty())
         assertTrue(geometry.events.isEmpty())
     }
@@ -121,6 +122,7 @@ class SharedMemoCanvasHostTest {
     }
 
     @Test fun `palm contact never interrupts stylus and remaining palm never navigates`() {
+        val initialBounds = host.viewport.paperBounds
         touch(MotionEvent.ACTION_DOWN, pen(80f, 100f))
         touch(pointerDown(1), pen(80f, 100f), finger(300f, 400f, 1))
         touch(MotionEvent.ACTION_MOVE, pen(90f, 110f), finger(280f, 420f, 1))
@@ -129,7 +131,7 @@ class SharedMemoCanvasHostTest {
         touch(MotionEvent.ACTION_UP, finger(200f, 200f, 1))
         assertEquals(listOf(MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP), ink.actions())
         assertTrue(ink.events.all { it.pointerCount == 1 && it.tool == MotionEvent.TOOL_TYPE_STYLUS })
-        assertEquals(0f, host.viewport.paperBounds.top, .001f)
+        assertEquals(initialBounds, host.viewport.paperBounds)
         assertTrue(geometry.events.isEmpty())
     }
 
@@ -223,7 +225,7 @@ class SharedMemoCanvasHostTest {
         assertEquals(300f, center.y, .001f)
     }
 
-    @Test fun `paper and screen edges finish at boundary then swallow reentry`() {
+    @Test fun `screen edge finishes at boundary but legacy paper edge no longer blocks ink`() {
         touch(MotionEvent.ACTION_DOWN, pen(350f, 100f))
         touch(MotionEvent.ACTION_MOVE, pen(450f, 200f))
         touch(MotionEvent.ACTION_MOVE, pen(300f, 200f))
@@ -235,7 +237,7 @@ class SharedMemoCanvasHostTest {
         val margin = host.viewport.paperBounds.left / 2f
         touch(MotionEvent.ACTION_DOWN, pen(margin, 100f))
         touch(MotionEvent.ACTION_UP, pen(margin, 100f))
-        assertEquals(2, ink.events.size)
+        assertEquals(4, ink.events.size)
     }
 
     @Test fun `hover is delivered only to chosen layer and detach cancels once`() {
@@ -252,7 +254,7 @@ class SharedMemoCanvasHostTest {
         assertFalse(host.hasOwnedGesture)
     }
 
-    @Test fun `legacy geometry is editable beyond paper but ink remains bounded there`() {
+    @Test fun `legacy geometry and ink are independently editable beyond the original paper`() {
         host.viewport.geometryWorldBounds = RectF(39f, 4f, 41f, 6f)
         var ready = false
         host.canChangeViewport = { ready }
@@ -262,12 +264,12 @@ class SharedMemoCanvasHostTest {
         val legacy = host.viewport.worldToView(40.0, 5.0)
         touch(MotionEvent.ACTION_DOWN, pen(legacy.x, legacy.y))
         touch(MotionEvent.ACTION_UP, pen(legacy.x, legacy.y))
-        assertTrue(ink.events.isEmpty())
+        assertEquals(listOf(MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP), ink.actions())
         host.geometryMode = true
         touch(MotionEvent.ACTION_DOWN, pen(legacy.x, legacy.y))
         touch(MotionEvent.ACTION_UP, pen(legacy.x, legacy.y))
         assertEquals(listOf(MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP), geometry.actions())
-        assertTrue(ink.events.isEmpty())
+        assertEquals(listOf(MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP), ink.actions())
     }
 
     private fun resize(w: Int, h: Int) {

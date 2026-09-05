@@ -15,6 +15,9 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.sqrt
 
+/** Convenience recipes, never new rigid entities: every generated relation remains editable. */
+internal enum class ConstructionPreset { SQUARE, RECTANGLE, ISOSCELES_TRIANGLE, EQUILATERAL_TRIANGLE, TRAPEZOID }
+
 /** Pure editing commands shared by the canvas and the numerical editor. No ink format is changed. */
 internal object ConstructionEdits {
     fun id() = UUID.randomUUID().toString()
@@ -48,6 +51,8 @@ internal object ConstructionEdits {
             require(abs(dx * (anchor.y - a.y) - dy * (anchor.x - a.x)) / length <= 1e-5) {
                 "붙일 위치가 변경되었습니다. 선 위의 위치를 다시 선택하세요."
             }
+            val amount = ((anchor.x - a.x) * dx + (anchor.y - a.y) * dy) / (length * length)
+            require(amount in -1e-8..1.00000001) { "붙일 위치가 선분 밖입니다. 선분 안의 위치를 다시 선택하세요." }
             line
         }
         if (lines.size == 2) {
@@ -60,7 +65,7 @@ internal object ConstructionEdits {
         }
         val point = GeometryPoint(id(), anchor.x, anchor.y, nextPointLabel(scene), colorArgb)
         val relations = lines.map { line ->
-            GeometryConstraint(id(), ConstraintType.POINT_ON_LINE, listOf(point.id, line.id))
+            GeometryConstraint(id(), ConstraintType.POINT_ON_SEGMENT, listOf(point.id, line.id))
         }
         // The original segment stays intact, including its length condition and endpoint IDs.
         return scene.copy(points = scene.points + point, constraints = scene.constraints + relations) to point.id
@@ -105,6 +110,116 @@ internal object ConstructionEdits {
         circles = scene.circles.map { if (it.id in selectedIds) it.copy(lineStyle = lineStyle) else it },
     )
 
+    /** An equality group needs only N-1 independent links; existing chains count too. */
+    fun multiEqualLength(scene: ConstructionScene, segmentIds: Collection<String>): ConstructionScene {
+        val ids = segmentIds.distinct()
+        require(ids.size >= 2 && ids.all { scene.segment(it) != null }) { "길이를 같게 할 선분을 두 개 이상 선택하세요." }
+        val parent = scene.segments.associate { it.id to it.id }.toMutableMap()
+        fun root(id: String): String {
+            var current = id
+            while (parent.getValue(current) != current) current = parent.getValue(current)
+            return current
+        }
+        fun join(a: String, b: String) { parent[root(b)] = root(a) }
+        scene.constraints.filter { it.enabled && it.type == ConstraintType.EQUAL_LENGTH }.forEach {
+            if (it.entityIds.size == 2 && it.entityIds.all(parent::containsKey)) join(it.entityIds[0], it.entityIds[1])
+        }
+        var result = scene
+        for (other in ids.drop(1)) {
+            if (root(ids.first()) == root(other)) continue
+            result = addConstraint(result, GeometryConstraint(id(), ConstraintType.EQUAL_LENGTH, listOf(ids.first(), other)))
+            join(ids.first(), other)
+        }
+        return validated(result)
+    }
+
+    /** All interior division points arrive in one undo step, without splitting the original AB. */
+    fun divideSegment(scene: ConstructionScene, segmentId: String, divisions: Int, colorArgb: Int? = null): ConstructionScene {
+        require(divisions in 2..SceneValidator.MAX_POINTS) { "등분 수는 2~${SceneValidator.MAX_POINTS} 사이로 입력하세요." }
+        val segment = requireNotNull(scene.segment(segmentId)) { "등분할 선분을 다시 선택하세요." }
+        val a = requireNotNull(scene.point(segment.startPointId))
+        val b = requireNotNull(scene.point(segment.endPointId))
+        require(hypot(b.x - a.x, b.y - a.y) >= SceneValidator.MIN_LENGTH) { "길이가 0인 선분은 등분할 수 없습니다." }
+        var result = scene
+        for (numerator in 1 until divisions) {
+            val existing = result.constraints.firstOrNull { c ->
+                val savedNumerator = c.numerator
+                val savedDenominator = c.denominator
+                c.type == ConstraintType.POINT_FRACTION && c.entityIds.getOrNull(1) == segmentId &&
+                    savedNumerator != null && savedDenominator != null &&
+                    savedNumerator.toLong() * divisions == numerator.toLong() * savedDenominator &&
+                    result.point(c.entityIds.firstOrNull().orEmpty()) != null
+            }
+            if (existing != null) {
+                if (!existing.enabled) result = result.copy(constraints = result.constraints.map {
+                    if (it.id == existing.id) it.copy(enabled = true) else it
+                })
+                continue
+            }
+            val amount = numerator.toDouble() / divisions
+            val point = GeometryPoint(id(), a.x + (b.x - a.x) * amount, a.y + (b.y - a.y) * amount,
+                nextPointLabel(result), colorArgb)
+            result = result.copy(points = result.points + point,
+                constraints = result.constraints + GeometryConstraint(id(), ConstraintType.POINT_FRACTION,
+                    listOf(point.id, segmentId), numerator = numerator, denominator = divisions))
+        }
+        return validated(result)
+    }
+
+    /** Shape dimensions here are initial placement only. Dragging may change size or orientation. */
+    fun createPreset(scene: ConstructionScene, preset: ConstructionPreset, centerX: Double, centerY: Double,
+                     size: Double = 6.0, colorArgb: Int? = null,
+                     lineStyle: GeometryLineStyle = GeometryLineStyle.SOLID): ConstructionScene {
+        require(centerX.isFinite() && centerY.isFinite() && size.isFinite() && size >= SceneValidator.MIN_LENGTH) {
+            "도형의 위치 또는 크기가 올바르지 않습니다."
+        }
+        val half = size / 2
+        val coordinates = when (preset) {
+            ConstructionPreset.SQUARE -> listOf(-half to -half, half to -half, half to half, -half to half)
+            ConstructionPreset.RECTANGLE -> listOf(-half to -half * .65, half to -half * .65, half to half * .65, -half to half * .65)
+            ConstructionPreset.ISOSCELES_TRIANGLE -> listOf(-half to -half * .6, half to -half * .6, 0.0 to half)
+            ConstructionPreset.EQUILATERAL_TRIANGLE -> {
+                val height = size * sqrt(3.0) / 2
+                listOf(-half to -height / 3, half to -height / 3, 0.0 to height * 2 / 3)
+            }
+            ConstructionPreset.TRAPEZOID -> listOf(-half to -half * .65, half to -half * .65, half * .7 to half * .65, -half * .4 to half * .65)
+        }
+        var result = scene
+        val points = coordinates.map { (x, y) ->
+            GeometryPoint(id(), centerX + x, centerY + y, nextPointLabel(result), colorArgb).also {
+                result = result.copy(points = result.points + it)
+            }
+        }
+        val segments = points.indices.map { i ->
+            GeometrySegment(id(), points[i].id, points[(i + 1) % points.size].id, colorArgb = colorArgb, lineStyle = lineStyle)
+        }
+        result = result.copy(segments = result.segments + segments)
+        fun relation(type: ConstraintType, first: Int, second: Int) {
+            result = result.copy(constraints = result.constraints + GeometryConstraint(id(), type, listOf(segments[first].id, segments[second].id)))
+        }
+        when (preset) {
+            ConstructionPreset.SQUARE, ConstructionPreset.RECTANGLE -> {
+                relation(ConstraintType.PARALLEL, 0, 2)
+                relation(ConstraintType.PARALLEL, 1, 3)
+                relation(ConstraintType.PERPENDICULAR, 0, 1)
+                if (preset == ConstructionPreset.SQUARE) relation(ConstraintType.EQUAL_LENGTH, 0, 1)
+            }
+            ConstructionPreset.ISOSCELES_TRIANGLE -> relation(ConstraintType.EQUAL_LENGTH, 1, 2)
+            ConstructionPreset.EQUILATERAL_TRIANGLE -> {
+                relation(ConstraintType.EQUAL_LENGTH, 0, 1)
+                relation(ConstraintType.EQUAL_LENGTH, 0, 2)
+            }
+            ConstructionPreset.TRAPEZOID -> relation(ConstraintType.PARALLEL, 0, 2)
+        }
+        return validated(result)
+    }
+
+    private fun validated(scene: ConstructionScene): ConstructionScene {
+        val issues = SceneValidator.validate(scene)
+        require(issues.isEmpty()) { issues.joinToString(" ") }
+        return scene
+    }
+
     /** Repeated 'show measurement' keeps the existing label identity and the user's placement. */
     fun upsertMeasurement(scene: ConstructionScene, measurement: GeometryMeasurement): ConstructionScene {
         val existing = matchingMeasurement(scene, measurement)
@@ -130,9 +245,21 @@ internal object ConstructionEdits {
 
     fun addConstraint(scene: ConstructionScene, constraint: GeometryConstraint): ConstructionScene {
         // Re-edit an existing driving dimension instead of accumulating contradictory duplicates.
-        val dimensionTypes = setOf(ConstraintType.LENGTH, ConstraintType.RADIUS, ConstraintType.ANGLE, ConstraintType.DISTANCE_POINT_LINE)
+        val dimensionTypes = setOf(ConstraintType.LENGTH, ConstraintType.RADIUS, ConstraintType.ANGLE, ConstraintType.DISTANCE_POINT_LINE,
+            ConstraintType.POINT_FRACTION, ConstraintType.POINT_DISTANCE, ConstraintType.LENGTH_RATIO, ConstraintType.INTERIOR_ANGLE)
+        fun sameInterior(a: List<String>, b: List<String>) = a.size == 3 && b.size == 3 &&
+            a[1] == b[1] && setOf(a[0], a[2]) == setOf(b[0], b[2])
+        fun samePairOfInteriors(a: List<String>, b: List<String>): Boolean {
+            if (a.size != 6 || b.size != 6) return false
+            val first = a.take(3); val second = a.drop(3)
+            return (sameInterior(first, b.take(3)) && sameInterior(second, b.drop(3))) ||
+                (sameInterior(first, b.drop(3)) && sameInterior(second, b.take(3)))
+        }
         val existing = scene.constraints.firstOrNull {
-            it.type == constraint.type && it.entityIds == constraint.entityIds
+            it.type == constraint.type && (it.entityIds == constraint.entityIds ||
+                (constraint.type in setOf(ConstraintType.EQUAL_LENGTH, ConstraintType.LENGTH_RATIO) && it.entityIds.toSet() == constraint.entityIds.toSet()) ||
+                (constraint.type == ConstraintType.INTERIOR_ANGLE && sameInterior(it.entityIds, constraint.entityIds)) ||
+                (constraint.type == ConstraintType.EQUAL_ANGLE && samePairOfInteriors(it.entityIds, constraint.entityIds)))
         }
         if (existing != null) {
             val updated = if (constraint.type in dimensionTypes || constraint.type == ConstraintType.FIXED_POINT) constraint.copy(id = existing.id) else existing.copy(enabled = true)
@@ -194,12 +321,18 @@ internal fun ConstraintType.koreanName(): String = when (this) {
     ConstraintType.FIXED_POINT -> "점 고정"
     ConstraintType.COINCIDENT -> "점 일치"
     ConstraintType.POINT_ON_LINE -> "선 위의 점"
+    ConstraintType.POINT_ON_SEGMENT -> "선분 안의 점"
+    ConstraintType.POINT_FRACTION -> "등분 / 비율 위치"
+    ConstraintType.POINT_DISTANCE -> "끝점에서 거리"
     ConstraintType.POINT_ON_CIRCLE -> "원 위의 점"
     ConstraintType.LENGTH -> "길이"
     ConstraintType.RADIUS -> "반지름"
     ConstraintType.PARALLEL -> "평행"
     ConstraintType.PERPENDICULAR -> "수직"
     ConstraintType.EQUAL_LENGTH -> "같은 길이"
+    ConstraintType.LENGTH_RATIO -> "길이 비율"
+    ConstraintType.INTERIOR_ANGLE -> "세 점 각도"
+    ConstraintType.EQUAL_ANGLE -> "같은 각도"
     ConstraintType.ANGLE -> "각도"
     ConstraintType.HORIZONTAL -> "수평"
     ConstraintType.VERTICAL -> "수직 방향"

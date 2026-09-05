@@ -29,15 +29,19 @@ data class MemoAnchor(
     }
 }
 
-/** Position inside the fixed, non-zoomable memo canvas. */
+/**
+ * Position relative to the original 30 × 66 cm memo sheet, not the current camera or its bounds.
+ * The same origin and unit are retained when the working plane extends beyond that sheet.
+ * Only memo-local ink accepts this range; collapsed PDF anchors remain normalized to 0..1.
+ */
 data class MemoPoint(
     val normalizedX: Float,
     val normalizedY: Float,
     val pressure: Float = 1f,
 ) {
     init {
-        require(normalizedX.isFinite() && normalizedX in 0f..1f)
-        require(normalizedY.isFinite() && normalizedY in 0f..1f)
+        require(normalizedX.isFinite() && normalizedX in MEMO_MIN_COORDINATE..MEMO_MAX_COORDINATE)
+        require(normalizedY.isFinite() && normalizedY in MEMO_MIN_COORDINATE..MEMO_MAX_COORDINATE)
         require(pressure.isFinite() && pressure >= 0f)
     }
 }
@@ -77,6 +81,10 @@ data class StudentMemo(
     val deletedAtEpochMillis: Long? = null,
 ) {
     val deleted: Boolean get() = deletedAtEpochMillis != null
+    /** Format v2 is required only when the memo actually contains ink outside its legacy sheet. */
+    val usesExtendedCanvas: Boolean get() = strokes.any { stroke ->
+        stroke.points.any { it.normalizedX !in 0f..1f || it.normalizedY !in 0f..1f }
+    }
 
     init {
         requireValidMemoUuid(id, "memo id")
@@ -192,6 +200,10 @@ fun StudentMemo.remapTo(localTarget: MemoTarget): StudentMemo {
     )
     return copy(target = localTarget, digestSha256 = digest)
 }
+
+/** A bounded working plane avoids unbounded float precision loss without changing the old unit. */
+const val MEMO_MIN_COORDINATE = -1024f
+const val MEMO_MAX_COORDINATE = 1024f
 
 internal const val MAX_MEMO_BOOK_ID_BYTES = 512
 internal const val MAX_MEMO_PAGE_NUMBER = 100_000

@@ -126,6 +126,14 @@ internal object ConstructionJsonCodec {
                 .put("value", it.value ?: JSONObject.NULL)
                 .put("targetX", it.targetX ?: JSONObject.NULL)
                 .put("targetY", it.targetY ?: JSONObject.NULL)
+                // Keep old canonical bytes/digests unchanged. The new relation type is always
+                // explicit, so older readers reject it rather than accepting weaker equations.
+                .apply {
+                    if (it.numerator != null) put("numerator", it.numerator)
+                    if (it.denominator != null) put("denominator", it.denominator)
+                    if (it.fromEnd) put("fromEnd", true)
+                    if (it.allowExtension) put("allowExtension", true)
+                }
         }))
         .put("measurements", JSONArray(scene.measurements.map {
             JSONObject().put("id", it.id).put("type", it.type.name)
@@ -144,12 +152,16 @@ internal object ConstructionJsonCodec {
             GeometryCircle(it.getString("id"), it.getString("centerPointId"), it.getDouble("radius"), it.getString("label"), it.optionalColor(), it.optionalLineStyle())
         },
         constraints = json.boundedArray("constraints", SceneValidator.MAX_CONSTRAINTS).objects().map {
-            val refs = it.boundedArray("entityIds", 2)
+            val refs = it.boundedArray("entityIds", 6)
             GeometryConstraint(
                 it.getString("id"), ConstraintType.valueOf(it.getString("type")),
                 (0 until refs.length()).map(refs::getString),
                 it.nullableDouble("value"), it.nullableDouble("targetX"), it.nullableDouble("targetY"),
                 it.getBoolean("enabled"),
+                if (it.has("numerator")) it.exactInt("numerator") else null,
+                if (it.has("denominator")) it.exactInt("denominator") else null,
+                if (it.has("fromEnd")) it.exactBoolean("fromEnd") else false,
+                if (it.has("allowExtension")) it.exactBoolean("allowExtension") else false,
             )
         },
         measurements = (if (json.has("measurements")) json.boundedArray("measurements", SceneValidator.MAX_MEASUREMENTS)
@@ -182,6 +194,9 @@ internal object ConstructionJsonCodec {
     private fun JSONObject.exactInt(key: String): Int = exactLong(key).also {
         require(it in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong())
     }.toInt()
+    private fun JSONObject.exactBoolean(key: String): Boolean = get(key).also {
+        require(it is Boolean) { "Invalid $key" }
+    } as Boolean
 
     private fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
         .digest(bytes).joinToString("") { "%02x".format(it.toInt() and 0xff) }

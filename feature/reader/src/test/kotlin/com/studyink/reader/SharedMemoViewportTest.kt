@@ -50,30 +50,35 @@ class SharedMemoViewportTest {
         assertEquals(420f, reopened.paperBounds.width(), .001f)
     }
 
-    @Test fun `zoom out reveals full memo while pan cannot lose the paper`() {
+    @Test fun `zoom out leaves a continuous writable plane and reset still finds the original origin`() {
         val viewport = SharedMemoViewport().apply { updateSize(900, 1200); zoom(.001f, 450f, 600f) }
-        assertEquals(1200f, viewport.paperBounds.height(), .001f)
+        assertTrue(viewport.paperBounds.height() < 1200f)
         assertEquals((900f - viewport.paperBounds.width()) / 2f, viewport.paperBounds.left, .001f)
+        assertEquals(RectF(0f, 0f, 900f, 1200f), viewport.activePageBounds())
+        assertNotNull(viewport.viewToCanonical(0f, 0f))
+        assertNotNull(viewport.viewToCanonical(900f, 1200f))
         viewport.pan(10000f, -10000f)
-        assertEquals(0f, viewport.paperBounds.top, .001f)
+        assertTrue(viewport.paperBounds.top < -1000f)
         viewport.zoom(10000f, 450f, 600f)
         assertEquals(240f, viewport.pixelsPerCm, .001f)
         viewport.pan(10000f, 10000f)
-        assertEquals(0f, viewport.paperBounds.left, .001f)
-        assertEquals(0f, viewport.paperBounds.top, .001f)
+        assertNotNull(viewport.viewToCanonical(0f, 0f))
+        assertNotNull(viewport.viewToCanonical(900f, 1200f))
         viewport.reset()
         assertEquals(900f, viewport.paperBounds.width(), .001f)
         assertEquals(0f, viewport.paperBounds.top, .001f)
     }
 
-    @Test fun `margins reject new ink and invalid numeric camera input is ignored`() {
+    @Test fun `legacy margins accept ink but screen exterior and invalid camera input are rejected`() {
         val viewport = SharedMemoViewport()
         assertNull(viewport.activePageBounds())
         assertNull(viewport.viewToCanonical(0f, 0f))
         viewport.updateSize(900, 1200)
         assertNull(viewport.canonicalToView(1, PagePoint(0f, 0f)))
         viewport.zoom(.001f, 450f, 600f)
-        assertNull(viewport.viewToCanonical(0f, 500f))
+        assertNotNull(viewport.viewToCanonical(0f, 500f))
+        assertNull(viewport.viewToCanonical(-1f, 500f))
+        assertNull(viewport.viewToCanonical(500f, 1201f))
         assertNull(viewport.viewToCanonical(Float.NaN, 500f))
         val before = viewport.paperBounds
         viewport.zoom(Float.NaN, 450f, 600f)
@@ -84,20 +89,33 @@ class SharedMemoViewportTest {
         assertEquals(2200f, bottom.point.y, .001f)
     }
 
-    @Test fun `legacy geometry outside the finite memo remains reachable without remapping`() {
+    @Test fun `legacy geometry outside the original memo becomes writable without remapping`() {
         val viewport = SharedMemoViewport().apply { updateSize(900, 600) }
         val original = viewport.paperBounds
         viewport.geometryWorldBounds = RectF(39f, 4f, 41f, 6f)
         assertEquals("Content updates never move the camera", original, viewport.paperBounds)
-        viewport.pan(-10000f, 0f)
+        viewport.pan(-900f, 0f)
         val legacyPoint = viewport.worldToView(40.0, 5.0)
         assertTrue(legacyPoint.x in 0f..900f)
         viewport.fitContent()
         val fitted = viewport.worldToView(40.0, 5.0)
         assertTrue(fitted.x in 24f..876f)
         assertTrue(fitted.y in 24f..576f)
-        assertNull("Ink cannot be created outside its existing normalized paper", viewport.viewToCanonical(fitted.x, fitted.y))
+        val ink = viewport.viewToCanonical(fitted.x, fitted.y)!!
+        assertTrue(ink.point.x > 1000f)
+        same(fitted, viewport.canonicalToView(0, ink.point)!!)
         assertAligned(viewport)
+    }
+
+    @Test fun `numeric safety boundary keeps all visible corners writable`() {
+        val viewport = SharedMemoViewport().apply { updateSize(900, 1200); zoom(.001f, 450f, 600f) }
+        listOf(1e12f to 1e12f, -1e12f to -1e12f, 1e12f to -1e12f).forEach { (dx, dy) ->
+            viewport.pan(dx, dy)
+            listOf(0f to 0f, 900f to 0f, 0f to 1200f, 900f to 1200f).forEach { (x, y) ->
+                assertNotNull("All visible paper must remain writable", viewport.viewToCanonical(x, y))
+                viewport.viewToCanonical(x, y)!!.point.toMemoPoint()
+            }
+        }
     }
 
     @Test fun `fit includes both actual ink and geometry with one camera and defensive bounds copies`() {
