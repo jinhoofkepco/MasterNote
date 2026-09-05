@@ -18,6 +18,8 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import android.widget.Button
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.ScrollView
@@ -34,6 +36,9 @@ import com.studyink.core.model.PagePoint
 import com.studyink.core.model.StrokeAsset
 import com.studyink.core.model.StrokeId
 import com.studyink.core.model.StrokeTool
+import com.studyink.core.model.MasterNoteDataRootBus
+import com.studyink.construction.storage.ConstructionReplicaRole
+import com.studyink.construction.storage.ConstructionReplicaChangeBus
 import com.studyink.document.pdf.CanonicalPdfPoint
 import com.studyink.document.pdf.InkViewport
 import com.studyink.memo.core.MemoAnchor
@@ -90,6 +95,10 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     var onWorkActivity: () -> Unit = {}
     var onPersistenceError: (Throwable) -> Unit = {}
     var onOpenConstruction: (StudentMemo) -> Unit = {}
+    /** These repository callbacks run on the memo persistence worker, never on the UI thread. */
+    var hasConstructionAttachment: ((StudentMemo, ConstructionReplicaRole) -> Boolean)? = null
+    var ensureConstructionAttachment: ((StudentMemo, ConstructionReplicaRole) -> Unit)? = null
+    var createConstructionEditor: ((StudentMemo, ConstructionReplicaRole) -> ConstructionEditorView)? = null
 
     private val density = resources.displayMetrics.density
     private val iconLayer = MemoIconLayer(context).apply {
@@ -134,24 +143,24 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         setOnClickListener { minimizeEditor() }
     }
     private val constructionButton = TextView(context).apply {
-        text = "작도"
+        text = "도형 넣기"
         textSize = 13f
         gravity = Gravity.CENTER
         setTextColor(Color.rgb(50, 77, 127))
         isClickable = true
         isFocusable = true
-        contentDescription = "메모 작도 모드 열기"
+        contentDescription = "메모에 도형 작도판 넣기"
         setOnClickListener {
             if (!persistenceInProgress) activeMemo?.let { memo ->
                 cancelActiveGesture()
-                onOpenConstruction(memo)
+                if (createConstructionEditor != null) enableConstruction(memo) else onOpenConstruction(memo)
             }
         }
     }
     private val header = FrameLayout(context).apply {
         setBackgroundColor(Color.rgb(246, 242, 230))
-        addView(headerTitle, LayoutParams(MATCH, MATCH).apply { marginEnd = dpInt(104f) })
-        addView(constructionButton, LayoutParams(dpInt(56f), MATCH, Gravity.END).apply { marginEnd = dpInt(48f) })
+        addView(headerTitle, LayoutParams(MATCH, MATCH).apply { marginEnd = dpInt(132f) })
+        addView(constructionButton, LayoutParams(dpInt(84f), MATCH, Gravity.END).apply { marginEnd = dpInt(48f) })
         addView(minimizeButton, LayoutParams(dpInt(48f), MATCH, Gravity.END))
     }
     private val scroll = ScrollView(context).apply {
@@ -159,6 +168,45 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         overScrollMode = OVER_SCROLL_NEVER
         isVerticalScrollBarEnabled = true
         contentDescription = "메모 필기 영역"
+    }
+    private val composition = MemoCompositionHost(context).apply { contentDescription = "도형과 손필기 독립 영역" }
+    private val constructionHost = FrameLayout(context).apply {
+        visibility = GONE; clipChildren = true; clipToPadding = true
+        contentDescription = "메모 도형 작도판"
+    }
+    private val compositionDivider = View(context).apply {
+        visibility = GONE
+        setBackgroundColor(Color.rgb(195, 202, 188))
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
+    private val inkPanel = LinearLayout(context).apply {
+        orientation = LinearLayout.VERTICAL; clipChildren = true; clipToPadding = true
+        contentDescription = "메모 손필기판"
+    }
+    private var constructionEditor: ConstructionEditorView? = null
+    private var constructionMemo: Pair<MemoTarget, String>? = null
+    private var constructionLoadGeneration = 0L
+    private var constructionLoading = false
+    private var constructionRole = ConstructionReplicaRole.STUDENT
+    private var constructionRestoreListener: AutoCloseable? = null
+    private var constructionChangeListener: AutoCloseable? = null
+    private var geometryOwnsActions = false
+    private var inkUndoButton: Button? = null
+    private var inkRedoButton: Button? = null
+    private val inkToolbar = HorizontalScrollView(context).apply {
+        visibility = GONE
+        isHorizontalScrollBarEnabled = false
+        addView(LinearLayout(context).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(TextView(context).apply {
+                text = "손필기"; textSize = 11f; setPadding(dpInt(6f), 0, dpInt(4f), 0)
+            })
+            addView(constructionButton(context, "펜") { setTool(ReaderTool.PEN) }.apply { contentDescription = "손필기 펜" })
+            addView(constructionButton(context, "지우개") { setTool(ReaderTool.PARTIAL_ERASER) }.apply { contentDescription = "손필기 지우개" })
+            inkUndoButton = constructionButton(context, "되돌리기", ConstructionIcon.UNDO, true) { undoInk() }.apply { contentDescription = "손필기 되돌리기" }
+            inkRedoButton = constructionButton(context, "다시", ConstructionIcon.REDO, true) { redoInk() }.apply { contentDescription = "손필기 다시" }
+            addView(inkUndoButton); addView(inkRedoButton)
+        })
     }
     private val canvasHost = MemoCanvasHost(context)
     private val memoViewport = FixedMemoInkViewport(canvasHost)
@@ -222,7 +270,16 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         canvasHost.addView(wetInk, LayoutParams(MATCH, MATCH))
         canvasHost.addView(inkInput, LayoutParams(MATCH, MATCH))
         scroll.addView(canvasHost, FrameLayout.LayoutParams(MATCH, WRAP))
-        card.addView(scroll, LayoutParams(MATCH, MATCH).apply { topMargin = dpInt(HEADER_HEIGHT_DP) })
+        inkPanel.addView(inkToolbar, LinearLayout.LayoutParams(MATCH, WRAP))
+        inkPanel.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        composition.addView(constructionHost, LinearLayout.LayoutParams(0, MATCH, 0.56f))
+        composition.addView(compositionDivider, LinearLayout.LayoutParams(dpInt(1f).coerceAtLeast(1), MATCH))
+        composition.addView(inkPanel, LinearLayout.LayoutParams(0, MATCH, 0.44f))
+        composition.onOwnerChanged = { owner ->
+            geometryOwnsActions = owner === constructionHost
+            publishUndoState()
+        }
+        card.addView(composition, LayoutParams(MATCH, MATCH).apply { topMargin = dpInt(HEADER_HEIGHT_DP) })
         card.addView(header, LayoutParams(MATCH, dpInt(HEADER_HEIGHT_DP), Gravity.TOP))
         modalHost.addView(card, LayoutParams(1, 1, Gravity.CENTER))
         addView(modalHost, LayoutParams(MATCH, MATCH))
@@ -252,7 +309,9 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         if (inkSaveBinding?.queue?.isBusy == true) return updateInputEnabled()
         val refreshed = this.memos.firstOrNull { it.id == opened.id }
         if (refreshed == null) {
-            minimizeEditor()
+            // Authoritative deletion is not a user's optional close request. Invalidate every
+            // pending gesture/callback even if the geometry solver was still working.
+            closeForTargetChange()
         } else if (refreshed.digestSha256 != opened.digestSha256 &&
             !inkInput.hasActiveGesture && !blockingCommitInProgress
         ) {
@@ -275,6 +334,14 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         )
         updateInputEnabled()
         publishUndoState()
+    }
+
+    fun updateConstructionRole(role: ConstructionReplicaRole) {
+        if (constructionRole == role) return
+        constructionRole = role
+        detachConstruction()
+        activeMemo?.let(::bindConstruction)
+        updateInputEnabled()
     }
 
     fun clearMemos() {
@@ -312,8 +379,9 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     }
 
     fun minimizeEditor(): Boolean {
-        if (modalHost.visibility != VISIBLE || persistenceInProgress) return false
+        if (modalHost.visibility != VISIBLE || persistenceInProgress || constructionEditor?.hasPendingWork == true) return false
         cancelActiveGesture()
+        detachConstruction()
         activeMemo = null
         document = null
         detachInkSaveBinding()
@@ -329,8 +397,10 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     val editorVisible: Boolean get() = modalHost.visibility == VISIBLE
     val activeMemoId: String? get() = activeMemo?.id
     val hasActiveGesture: Boolean get() = inkInput.hasActiveGesture
-    val canUndo: Boolean get() = canEditActiveMemo() && document?.canUndo == true
-    val canRedo: Boolean get() = canEditActiveMemo() && document?.canRedo == true
+    val canUndo: Boolean get() = if (geometryOwnsActions) constructionEditor?.canUndo == true else canUndoInk
+    val canRedo: Boolean get() = if (geometryOwnsActions) constructionEditor?.canRedo == true else canRedoInk
+    private val canUndoInk: Boolean get() = canEditActiveMemo() && document?.canUndo == true
+    private val canRedoInk: Boolean get() = canEditActiveMemo() && document?.canRedo == true
 
     fun setTool(tool: ReaderTool) {
         inkInput.tool = when (tool) {
@@ -352,6 +422,11 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     }
 
     fun undo(): Boolean {
+        if (geometryOwnsActions) return constructionEditor?.undoEdit() == true
+        return undoInk()
+    }
+
+    private fun undoInk(): Boolean {
         val current = activeMemo ?: return false
         if (!canEditActiveMemo()) return false
         val currentDocument = document ?: return false
@@ -360,6 +435,11 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     }
 
     fun redo(): Boolean {
+        if (geometryOwnsActions) return constructionEditor?.redoEdit() == true
+        return redoInk()
+    }
+
+    private fun redoInk(): Boolean {
         val current = activeMemo ?: return false
         if (!canEditActiveMemo()) return false
         val currentDocument = document ?: return false
@@ -368,6 +448,8 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     }
 
     fun cancelActiveGesture(): Boolean {
+        composition.cancelOwnedGesture()
+        constructionEditor?.cancelInteraction()
         val cancelled = inkInput.cancelActiveGesture()
         dryInk.eraserPreview = null
         dryInk.hoverPreview = null
@@ -393,9 +475,37 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         if (persistenceExecutor.isShutdown) persistenceExecutor = newPersistenceExecutor()
+        constructionRestoreListener = MasterNoteDataRootBus.addListener {
+            post {
+                if (!isAttachedToWindow) return@post
+                cancelActiveGesture(); detachConstruction()
+                activeMemo?.let(::bindConstruction)
+                updateInputEnabled()
+            }
+        }
+        constructionChangeListener = ConstructionReplicaChangeBus.addListener { change ->
+            post {
+                if (!isAttachedToWindow) return@post
+                val memo = activeMemo
+                if (memo != null && change.role == constructionRole && change.target.bookId == memo.target.bookId &&
+                    change.target.pageNumber == memo.target.pageNumber && change.target.attemptNo == memo.target.attemptNo &&
+                    change.target.memoId == memo.id) {
+                    if (change.snapshot.deleted) {
+                        closeForTargetChange()
+                    } else if (constructionEditor == null && !constructionLoading) {
+                        constructionMemo = null
+                        bindConstruction(memo); updateInputEnabled()
+                    }
+                }
+            }
+        }
+        activeMemo?.let(::bindConstruction)
     }
 
     override fun onDetachedFromWindow() {
+        detachConstruction()
+        constructionRestoreListener?.close(); constructionRestoreListener = null
+        constructionChangeListener?.close(); constructionChangeListener = null
         operationGeneration += 1L
         blockingCommitInProgress = false
         detachInkSaveBinding()
@@ -439,11 +549,13 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
             scroll.scrollTo(0, 0)
         }
         headerTitle.text = "메모 · ${memo.target.attemptNo}회"
+        bindConstruction(memo)
         updateInputEnabled()
         publishUndoState()
     }
 
     private fun closeForTargetChange() {
+        detachConstruction()
         operationGeneration += 1L
         blockingCommitInProgress = false
         detachInkSaveBinding()
@@ -461,11 +573,12 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     private fun updateInputEnabled() {
         inkInput.isEnabled = canEditActiveMemo()
         minimizeButton.isEnabled = !persistenceInProgress
-        constructionButton.isEnabled = activeMemo != null && !persistenceInProgress
+        constructionButton.isEnabled = activeMemo != null && !persistenceInProgress && !constructionLoading && constructionEditor == null
+        inkToolbar.alpha = if (studentWritable) 1f else .5f
     }
 
     private fun canEditActiveMemo(): Boolean =
-        studentWritable && activeMemo != null && onReplaceStrokes != null && !blockingCommitInProgress
+        studentWritable && activeMemo != null && onReplaceStrokes != null && !blockingCommitInProgress && !constructionLoading
 
     private fun addStroke(stroke: StrokeAsset) {
         val memo = activeMemo ?: return
@@ -688,7 +801,81 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     }
 
     private fun publishUndoState() {
+        inkUndoButton?.isEnabled = canUndoInk
+        inkRedoButton?.isEnabled = canRedoInk
         onUndoStateChanged(canUndo, canRedo)
+    }
+
+    private fun bindConstruction(memo: StudentMemo) {
+        val key = memo.target to memo.id
+        if (constructionMemo == key) return
+        detachConstruction()
+        constructionMemo = key
+        val query = hasConstructionAttachment ?: return
+        val role = constructionRole
+        constructionLoading = true
+        val token = ++constructionLoadGeneration
+        if (persistenceExecutor.isShutdown) persistenceExecutor = newPersistenceExecutor()
+        persistenceExecutor.execute {
+            val result = runCatching { query(memo, role) }
+            post {
+                if (constructionLoadGeneration != token || activeMemo?.id != memo.id || activeMemo?.target != memo.target) return@post
+                constructionLoading = false
+                result.onSuccess { attached -> if (attached) attachConstruction(memo) }
+                    .onFailure { onPersistenceError(it) }
+                updateInputEnabled(); publishUndoState()
+            }
+        }
+    }
+
+    private fun enableConstruction(memo: StudentMemo) {
+        if (constructionLoading || constructionEditor != null || inkInput.hasActiveGesture) return
+        val ensure = ensureConstructionAttachment ?: return
+        val role = constructionRole
+        constructionLoading = true
+        updateInputEnabled()
+        val token = ++constructionLoadGeneration
+        if (persistenceExecutor.isShutdown) persistenceExecutor = newPersistenceExecutor()
+        persistenceExecutor.execute {
+            val result = runCatching { ensure(memo, role) }
+            post {
+                if (constructionLoadGeneration != token || activeMemo?.id != memo.id || activeMemo?.target != memo.target) return@post
+                constructionLoading = false
+                result.onSuccess { attachConstruction(memo) }.onFailure { onPersistenceError(it) }
+                updateInputEnabled(); publishUndoState()
+            }
+        }
+    }
+
+    private fun attachConstruction(memo: StudentMemo) {
+        if (constructionEditor != null) return
+        val editor = createConstructionEditor?.invoke(memo, constructionRole) ?: return
+        constructionEditor = editor
+        editor.onDurableChanged = { updateInputEnabled() }
+        editor.onUndoStateChanged = { publishUndoState() }
+        constructionHost.addView(editor, LayoutParams(MATCH, MATCH))
+        constructionHost.visibility = VISIBLE
+        compositionDivider.visibility = VISIBLE
+        inkToolbar.visibility = VISIBLE
+        constructionButton.text = "도형 포함"
+        constructionButton.contentDescription = "메모에 도형 작도판이 있습니다"
+        updateInputEnabled(); publishUndoState()
+    }
+
+    private fun detachConstruction() {
+        constructionLoadGeneration++
+        constructionLoading = false
+        composition.cancelOwnedGesture()
+        constructionEditor?.closeEditor()
+        constructionEditor = null
+        geometryOwnsActions = false
+        constructionHost.removeAllViews()
+        constructionHost.visibility = GONE
+        compositionDivider.visibility = GONE
+        inkToolbar.visibility = GONE
+        constructionMemo = null
+        constructionButton.text = "도형 넣기"
+        constructionButton.contentDescription = "메모에 도형 작도판 넣기"
     }
 
     private fun beginBlockingCommit(): Long? {

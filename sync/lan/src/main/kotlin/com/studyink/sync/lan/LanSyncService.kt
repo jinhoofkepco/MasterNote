@@ -119,6 +119,10 @@ class LanSyncService : Service(),
     @Volatile private var peerSupportsGptExplanation = false
     @Volatile private var peerSupportsTeacherReviewState = false
     @Volatile private var peerSupportsStudentMemo = false
+    @Volatile private var peerSupportsConstruction = false
+    @Volatile private var constructionSessionId = 0L
+    private val constructionAssembly = ConstructionLanAssembly()
+    private var constructionRegistration: AutoCloseable? = null
     @Volatile private var negotiatedAnnotationPointEncoding =
         AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS
     /** True only for a session that is visibly offering/consuming a QR pairing payload. */
@@ -183,6 +187,10 @@ class LanSyncService : Service(),
         LanSyncBus.addListener(this)
         LibraryAttemptBus.addListener(this)
         LibraryMarkGroupBus.addListener(this)
+        constructionRegistration = ConstructionLanBridge.registerTransport(object : ConstructionLanBridge.Transport {
+            override fun peer(bookId: String) = constructionPeer(bookId)
+            override fun send(bookId: String, payload: ByteArray, expectedPeer: ConstructionLanPeer) = sendConstruction(bookId, payload, expectedPeer)
+        })
         memoChangeSubscription = StudentMemoChangeBus.addListener { change ->
             if (role != LanPeerRole.STUDENT_SERVER || change.target.bookId != bookId ||
                 change.target.pageNumber != subscribedPage || !peerSupportsStudentMemo ||
@@ -406,6 +414,7 @@ class LanSyncService : Service(),
         socket = connected.apply { tcpNoDelay = true; keepAlive = true }
         writer = BufferedWriter(OutputStreamWriter(connected.getOutputStream(), Charsets.UTF_8))
         connectionEpoch.advance()
+        constructionSessionId = ConstructionLanBridge.nextSessionId()
         localAuthNonce = newLanSecretHex()
         lastSubscriptionGeneration = -1L
         lastSubscriptionPage = -1
@@ -561,6 +570,7 @@ class LanSyncService : Service(),
             }
         }
         when (type) {
+            ConstructionLanWire.TYPE -> receiveConstruction(message, attachedGeneration)
             "PING" -> send(LanWire.message("PONG") { put("nonce", message.optLong("nonce")) })
             "PONG" -> Unit
             "HELLO" -> {
@@ -586,6 +596,10 @@ class LanSyncService : Service(),
                 }
                 val announcedRole = LanPeerRole.valueOf(message.getString("role"))
                 val announcedCapabilities = message.optJSONArray("capabilities")
+                peerSupportsConstruction = announcedCapabilities != null &&
+                    (0 until announcedCapabilities.length()).any {
+                        announcedCapabilities.optString(it) == LAN_CAPABILITY_MEMO_CONSTRUCTION_V1
+                    }
                 peerSupportsGptExplanation = announcedCapabilities != null &&
                     (0 until announcedCapabilities.length()).any { index ->
                         announcedCapabilities.optString(index) == LAN_CAPABILITY_GPT_EXPLANATION_V2
@@ -2325,7 +2339,7 @@ class LanSyncService : Service(),
     }
 
     @Synchronized
-    private fun send(line: String, allowBeforeAuthentication: Boolean = false): Boolean {
+    private fun send(line: String, allowBeforeAuthentication: Boolean = false, expectedGeneration: Long? = null): Boolean {
         if (line.length > LanWire.MAX_LINE_CHARS) return false
         // Socket writes on the looper throw NetworkOnMainThreadException, which this method used to
         // swallow as an ordinary write failure - twice, once per direction. Refuse loudly instead of
@@ -2338,6 +2352,7 @@ class LanSyncService : Service(),
         val target = writer ?: return false
         val targetSocket = socket ?: return false
         val targetGeneration = connectionGeneration
+        if (expectedGeneration != null && targetGeneration != expectedGeneration) return false
         if (!allowBeforeAuthentication && authenticatedConnectionGeneration != targetGeneration) {
             return false
         }
@@ -2436,6 +2451,9 @@ class LanSyncService : Service(),
     }
 
     private fun closeSession() {
+        peerSupportsConstruction = false
+        constructionSessionId = 0L
+        constructionAssembly.clear()
         LanSyncBus.clearConnectionState(bookId)
         stopping.set(true)
         handler.removeCallbacksAndMessages(null)
@@ -2489,6 +2507,9 @@ class LanSyncService : Service(),
     }
 
     private fun clearPeerConnectionIdentity() {
+        peerSupportsConstruction = false
+        constructionSessionId = 0L
+        constructionAssembly.clear()
         authenticatedConnectionGeneration = 0L
         peerBookId = ""
         peerRole = null
@@ -2522,11 +2543,50 @@ class LanSyncService : Service(),
         LibraryMarkGroupBus.removeListener(this)
         memoChangeSubscription?.close()
         memoChangeSubscription = null
+        constructionRegistration?.close()
+        constructionRegistration = null
         closeSession()
         io.shutdownNow()
         metadataIo.shutdownNow()
         teacherReviewIo.shutdownNow()
         super.onDestroy()
+    }
+
+    @Synchronized
+    private fun constructionPeer(requestedBook: String): ConstructionLanPeer? {
+        if (requestedBook.isBlank() || requestedBook != bookId || writer == null || socket == null ||
+            !peerSupportsConstruction || authenticatedConnectionGeneration != connectionGeneration ||
+            authenticatedConnectionGeneration <= 0L || constructionSessionId <= 0L ||
+            peerDeviceId.isBlank() || !isValidLanSha256(documentHash)
+        ) return null
+        val other = peerRole ?: return null
+        return ConstructionLanPeer(bookId, documentHash, peerDeviceId, other == LanPeerRole.STUDENT_SERVER, constructionSessionId)
+    }
+
+    private fun sendConstruction(requestedBook: String, payload: ByteArray, peer: ConstructionLanPeer): Boolean {
+        if (Looper.myLooper() == Looper.getMainLooper()) return false
+        val generation = synchronized(this) {
+            if (constructionPeer(requestedBook) != peer) return false
+            connectionGeneration
+        }
+        return runCatching {
+            for (frame in ConstructionLanWire.frames(requestedBook, payload)) {
+                val sent = synchronized(this) {
+                    constructionPeer(requestedBook) == peer && send(frame, expectedGeneration = generation)
+                }
+                if (!sent) return@runCatching false
+            }
+            constructionPeer(requestedBook) == peer
+        }.getOrDefault(false)
+    }
+
+    private fun receiveConstruction(message: JSONObject, attachedGeneration: Long) {
+        val peer = constructionPeer(bookId) ?: error("Construction session unavailable")
+        require(attachedGeneration == connectionGeneration && peerBookId.isNotBlank())
+        val bytes = constructionAssembly.accept(message, peerBookId, peer.sessionId, SystemClock.elapsedRealtime()) ?: return
+        if (attachedGeneration == connectionGeneration && constructionPeer(peer.localBookId) == peer) {
+            ConstructionLanBridge.deliver(peer, bytes)
+        }
     }
 
     private fun createNotificationChannel() {

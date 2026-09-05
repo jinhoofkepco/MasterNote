@@ -23,6 +23,7 @@ import android.view.MotionEvent
 import android.view.PixelCopy
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Toast
@@ -60,6 +61,9 @@ import com.studyink.core.model.PageBounds
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
 import com.studyink.construction.storage.ConstructionTarget
+import com.studyink.construction.storage.ConstructionReplicaRole
+import com.studyink.construction.storage.ConstructionReplicaStore
+import com.studyink.construction.storage.ConstructionUiBridgeProvider
 import com.studyink.document.pdf.PdfViewportAdapter
 import com.studyink.document.pdf.ReaderPdfFragment
 import com.studyink.library.data.LibraryRepository
@@ -104,6 +108,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private val viewport = PdfViewportAdapter()
     private val assistantRepository by lazy { AssistantRepositoryProvider.get(this) }
     private val memoRepository by lazy { StudentMemoRepository.get(this) }
+    private val constructionReplicas by lazy { ConstructionReplicaStore(File(applicationContext.filesDir, "masternote")) }
+    @Volatile private var memoConstructionRole = ConstructionReplicaRole.STUDENT
+    private var memoPreviousSoftInputMode: Int? = null
     private var constructionEditor: ConstructionEditorDialog? = null
     private lateinit var rootHost: FrameLayout
     private lateinit var pdfContainer: FragmentContainerView
@@ -447,16 +454,27 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 memoStore.move(target, memoId, revision, anchor)
             }
             overlay.onDeleteMemo = { target, memoId, revision ->
-                memoStore.delete(target, memoId, revision)
+                memoStore.delete(target, memoId, revision).also {
+                    runCatching {
+                        constructionReplicas.markMemoDeleted(
+                            ConstructionTarget(target.bookId, target.pageNumber, target.attemptNo, memoId),
+                            ConstructionReplicaRole.STUDENT,
+                        )
+                    }.onFailure { error -> Log.w(MEMO_LOG_TAG, "Memo deleted; geometry tombstone needs retry", error) }
+                }
             }
             overlay.onEditorVisibilityChanged = { visible ->
                 memoEditorVisible = visible
                 if (visible) {
+                    if (memoPreviousSoftInputMode == null) memoPreviousSoftInputMode = window.attributes.softInputMode
+                    window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
                     overlay.bringToFront()
                     // Parent/teacher text remains readable above the memo sheet, while the sheet
                     // still owns all otherwise-empty space and cannot be dismissed accidentally.
                     if (::messageOverlayHost.isInitialized) messageOverlayHost.bringToFront()
                     if (::stylusMenuOverlay.isInitialized) stylusMenuOverlay.bringToFront()
+                } else memoPreviousSoftInputMode?.let { previous ->
+                    window.setSoftInputMode(previous); memoPreviousSoftInputMode = null
                 }
                 updateReaderInputEnabled()
             }
@@ -477,6 +495,27 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 openConstruction(
                     ConstructionTarget(memo.target.bookId, memo.target.pageNumber, memo.target.attemptNo, memo.id),
                     "${memo.target.pageNumber + 1}쪽 · 메모",
+                )
+            }
+            overlay.hasConstructionAttachment = { memo, role ->
+                constructionReplicas.hasAttachment(
+                    ConstructionTarget(memo.target.bookId, memo.target.pageNumber, memo.target.attemptNo, memo.id),
+                    role,
+                )
+            }
+            overlay.ensureConstructionAttachment = { memo, role ->
+                constructionReplicas.ensureAttachment(
+                    ConstructionTarget(memo.target.bookId, memo.target.pageNumber, memo.target.attemptNo, memo.id),
+                    role,
+                )
+            }
+            overlay.createConstructionEditor = { memo, role ->
+                val target = ConstructionTarget(memo.target.bookId, memo.target.pageNumber, memo.target.attemptNo, memo.id)
+                val bridge = ConstructionUiBridgeProvider.bridge
+                bridge?.registerTarget(target, role)
+                ConstructionEditorView(
+                    this, target, "${memo.target.pageNumber + 1}쪽 · 메모", embedded = true,
+                    store = constructionReplicas.sceneAccess(role), replicaRole = role, syncBridge = bridge,
                 )
             }
             root.addView(overlay, FrameLayout.LayoutParams(MATCH, MATCH))
@@ -924,6 +963,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun refreshAttemptMemos(force: Boolean = false) {
         if (!::memoOverlay.isInitialized) return
+        memoConstructionRole = if (latestState.role != ReaderRole.STUDENT) ConstructionReplicaRole.TEACHER else ConstructionReplicaRole.STUDENT
+        memoOverlay.updateConstructionRole(memoConstructionRole)
         val target = currentMemoTarget(latestState)
         if (target == null) {
             memoLoadGeneration += 1L

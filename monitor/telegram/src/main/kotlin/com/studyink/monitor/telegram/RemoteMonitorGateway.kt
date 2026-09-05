@@ -407,10 +407,15 @@ class RemoteMonitorGateway private constructor(context: Context) : AutoCloseable
         payloadType: String,
         plaintext: File,
         coalesceKey: String? = null,
+        expectedPairId: String? = null,
+        expectedPeerBotId: Long? = null,
     ): TelegramEnqueueResult = synchronized(lifecycleLock) {
         val active = credentials.load() ?: return TelegramEnqueueResult.NOT_CONFIGURED
         val peer = active.peerBinding ?: return TelegramEnqueueResult.NOT_CONFIGURED
         val pairId = active.peerPairId ?: return TelegramEnqueueResult.NOT_CONFIGURED
+        if (expectedPairId != null && pairId != expectedPairId ||
+            expectedPeerBotId != null && peer.botId != expectedPeerBotId
+        ) return TelegramEnqueueResult.NOT_CONFIGURED
         val key = active.peerSharedKey() ?: return TelegramEnqueueResult.NOT_CONFIGURED
         val caption = TelegramPeerProtocol.documentCaption(pairId, transferId, payloadType)
         require(plaintext.isFile && plaintext.canRead())

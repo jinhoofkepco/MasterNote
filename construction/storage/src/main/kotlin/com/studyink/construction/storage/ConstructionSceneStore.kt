@@ -16,18 +16,18 @@ import java.util.concurrent.atomic.AtomicLong
  * Pass File(context.filesDir, "masternote") as dataRoot. No stroke or memo metadata is changed.
  * Each save is one atomic full-scene transaction; stale editors must reload explicitly.
  */
-class ConstructionSceneStore(private val dataRoot: File) {
+class ConstructionSceneStore(private val dataRoot: File) : ConstructionSceneAccess {
     private val rootIdentity = dataRoot.toPath().toAbsolutePath().normalize().toString()
     private val featureRoot = File(dataRoot, FEATURE_DIRECTORY)
 
     init { RestoreEpoch.current() }
 
-    fun load(target: ConstructionTarget): ConstructionSceneSnapshot = locked {
+    override fun load(target: ConstructionTarget): ConstructionSceneSnapshot = locked {
         snapshot(target, read(target))
     }
 
     /** The expected snapshot carries revision, commit identity and restore epoch for CAS. */
-    fun save(expected: ConstructionSceneSnapshot, scene: ConstructionScene): ConstructionSceneSnapshot {
+    override fun save(expected: ConstructionSceneSnapshot, scene: ConstructionScene): ConstructionSceneSnapshot {
         val frozen = ConstructionJsonCodec.immutableScene(scene)
         val result = locked {
             if (expected.rootIdentity != rootIdentity || expected.rootEpoch != RestoreEpoch.current()) {
@@ -49,7 +49,7 @@ class ConstructionSceneStore(private val dataRoot: File) {
     }
 
     /** Invoked synchronously on the restore caller's thread; UI listeners must dispatch to main. */
-    fun addRestoreListener(listener: () -> Unit): AutoCloseable = MasterNoteDataRootBus.addListener(listener)
+    override fun addRestoreListener(listener: () -> Unit): AutoCloseable = MasterNoteDataRootBus.addListener(listener)
 
     private fun read(target: ConstructionTarget): StoredConstructionDocument? = try {
         file(target).readOrNull()?.let(ConstructionJsonCodec::decode)?.also {

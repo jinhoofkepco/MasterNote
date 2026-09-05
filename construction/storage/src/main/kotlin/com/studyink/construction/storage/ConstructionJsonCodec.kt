@@ -96,12 +96,12 @@ internal object ConstructionJsonCodec {
         return result
     }
 
-    private fun encodeTarget(target: ConstructionTarget) = JSONObject()
+    internal fun encodeTarget(target: ConstructionTarget) = JSONObject()
         .put("bookId", target.bookId).put("pageNumber", target.pageNumber)
         .put("attemptNo", target.attemptNo).put("memoId", target.memoId)
         .put("ownerScope", target.ownerScope)
 
-    private fun encodeScene(scene: ConstructionScene) = JSONObject()
+    internal fun encodeScene(scene: ConstructionScene) = JSONObject()
         .put("points", JSONArray(scene.points.map {
             JSONObject().put("id", it.id).put("x", it.x).put("y", it.y).put("label", it.label)
                 .put("colorArgb", it.colorArgb ?: JSONObject.NULL)
@@ -129,7 +129,7 @@ internal object ConstructionJsonCodec {
                 .put("offsetX", it.offsetX).put("offsetY", it.offsetY)
         }))
 
-    private fun decodeScene(json: JSONObject): ConstructionScene = immutableScene(ConstructionScene(
+    internal fun decodeScene(json: JSONObject): ConstructionScene = immutableScene(ConstructionScene(
         points = json.boundedArray("points", SceneValidator.MAX_POINTS).objects().map {
             GeometryPoint(it.getString("id"), it.getDouble("x"), it.getDouble("y"), it.getString("label"), it.optionalColor())
         },

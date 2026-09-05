@@ -1,5 +1,7 @@
 package com.studyink.app
 
+import com.studyink.construction.storage.ConstructionTarget
+
 import android.app.Application
 import android.os.SystemClock
 import com.studyink.assistant.core.AssistantRepositoryProvider
@@ -133,6 +135,12 @@ internal const val LAN_CATCH_UP_GRACE_MS = 4_000L
  * and page-bound binary grades. It never mutates attempts, student ink, or LAN session state.
  */
 object MasterNoteRemoteReviewCoordinator {
+    /** The callback only copies metadata. Encoding and I/O must run outside this lock. */
+    internal fun <T> withConstructionOutbound(target: ConstructionTarget, block: (ConstructionTelegramRoute) -> T): T? =
+        runtime?.withConstructionOutbound(target, block)
+
+    internal fun <T> withConstructionIncoming(senderBotId: Long, address: ConstructionTelegramAddress, block: (ConstructionTelegramRoute) -> T): T? =
+        runtime?.withConstructionIncoming(senderBotId, address, block)
     private val lifecycleLock = Any()
     private val inboxListeners = CopyOnWriteArraySet<() -> Unit>()
 
@@ -836,7 +844,7 @@ private class RemoteReviewRuntime(
             hybridBookId?.let(::updateHybridLink)
         }
         refreshPageSyncTransportState()
-        val pending = gateway.pendingPeerDocuments()
+        val pending = gateway.pendingPeerDocuments().filterNot { it.payloadType == CONSTRUCTION_TELEGRAM_PAYLOAD }
         val pendingIds = pending.mapTo(linkedSetOf(), PendingTelegramPeerDocument::updateId)
         retainedUndecodableUpdateIds.retainAll(pendingIds)
         val pendingById = pending.associateBy(PendingTelegramPeerDocument::updateId)
@@ -1707,6 +1715,7 @@ private class RemoteReviewRuntime(
     }
 
     private fun processIncoming(pending: PendingTelegramPeerDocument) {
+        if (pending.payloadType == CONSTRUCTION_TELEGRAM_PAYLOAD) return
         val session = refreshSession() ?: return
         if (pending.senderBotId != session.peerBotId) {
             dropIncoming(pending)
@@ -2093,6 +2102,60 @@ private class RemoteReviewRuntime(
         RemotePeerChatStateBus.publish(recorded.state)
         // The message and duplicate guard are fsynced before Telegram may delete its ciphertext.
         gateway.acknowledgePeerDocument(pending.updateId)
+    }
+
+    fun <T> withConstructionOutbound(target: ConstructionTarget, block: (ConstructionTelegramRoute) -> T): T? = synchronized(operationLock) {
+        if (closed || pausedForMaintenance) return@synchronized null
+        val session = refreshSession() ?: return@synchronized null
+        if (session != observedSession || pageSyncStore.currentPairId() != session.pairId) return@synchronized null
+        val route = constructionRouteLocked(target, session) ?: return@synchronized null
+        if (closed || pausedForMaintenance || connectedSession() != session) return@synchronized null
+        block(route)
+    }
+
+    fun <T> withConstructionIncoming(senderBotId: Long, address: ConstructionTelegramAddress, block: (ConstructionTelegramRoute) -> T): T? = synchronized(operationLock) {
+        if (closed || pausedForMaintenance) return@synchronized null
+        val session = refreshSession() ?: return@synchronized null
+        if (session != observedSession || senderBotId != session.peerBotId || address.pairId != session.pairId ||
+            pageSyncStore.currentPairId() != session.pairId) return@synchronized null
+        val localBookId = when (session.role) {
+            RemoteReviewRole.STUDENT -> pageSyncStore.studentPage(address.pageToken)?.bookId
+            RemoteReviewRole.TEACHER -> pageSyncStore.teacherPage(address.pageToken)?.localBookId
+        } ?: return@synchronized null
+        val target = runCatching { ConstructionTarget(localBookId, address.pageNumber, address.attemptNo, address.memoId) }.getOrNull()
+            ?: return@synchronized null
+        val route = constructionRouteLocked(target, session) ?: return@synchronized null
+        if (route.address != address || closed || pausedForMaintenance || connectedSession() != session) return@synchronized null
+        block(route)
+    }
+
+    private fun constructionRouteLocked(target: ConstructionTarget, session: ConnectedRemoteReviewSession): ConstructionTelegramRoute? {
+        if (target.ownerScope != "local" || target.attemptNo <= 0 || pageSyncStore.currentPairId() != session.pairId) return null
+        val book = runCatching { library.book(target.bookId) }.getOrNull() ?: return null
+        val hash = book.contentSha256.lowercase()
+        if (target.pageNumber !in 0 until book.pageCount || !Regex("[0-9a-f]{64}").matches(hash)) return null
+        if (!runCatching { library.attempts(target.bookId, target.pageNumber).any { it.attemptNo == target.attemptNo } }.getOrDefault(false)) return null
+        val address = when (session.role) {
+            RemoteReviewRole.STUDENT -> {
+                val generation = pageSyncStore.studentGeneration()
+                if (generation <= 0) return null
+                val pageToken = tokenFactory.pageSyncPageToken(session.pairId, target.bookId, target.pageNumber, generation)
+                val workbookToken = tokenFactory.pageSyncWorkbookToken(session.pairId, target.bookId)
+                val page = pageSyncStore.studentPage(pageToken) ?: return null
+                if (page.syncGeneration != generation || page.pageToken != pageToken || page.workbookToken != workbookToken ||
+                    page.bookId != target.bookId || page.pageNumber != target.pageNumber || page.contentSha256 != hash || target.attemptNo !in page.attemptNos) return null
+                ConstructionTelegramAddress(session.pairId, generation, pageToken, workbookToken, hash, target.pageNumber, target.attemptNo, target.memoId)
+            }
+            RemoteReviewRole.TEACHER -> {
+                val generation = pageSyncStore.teacherManifestGeneration()
+                if (generation <= 0) return null
+                val page = pageSyncStore.teacherPageForLocalTarget(target.bookId, target.pageNumber) ?: return null
+                if (page.syncGeneration != generation || page.localBookId != target.bookId || page.pageNumber != target.pageNumber ||
+                    page.contentSha256 != hash || target.attemptNo !in page.attemptNos) return null
+                ConstructionTelegramAddress(session.pairId, generation, page.pageToken, page.workbookToken, hash, target.pageNumber, target.attemptNo, target.memoId)
+            }
+        }
+        return ConstructionTelegramRoute(target, session.role, session.peerBotId, address)
     }
 
     private fun connectedSession(): ConnectedRemoteReviewSession? =

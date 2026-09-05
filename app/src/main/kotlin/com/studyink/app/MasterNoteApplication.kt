@@ -20,6 +20,7 @@ class MasterNoteApplication : Application(), Application.ActivityLifecycleCallba
         MasterNoteBackupCoordinator.initialize(this)
         MasterNoteRemoteMonitorCoordinator.initialize(this)
         MasterNoteRemoteReviewCoordinator.initialize(this)
+        MasterNoteConstructionSyncCoordinator.initialize(this)
         registerActivityLifecycleCallbacks(this)
     }
 

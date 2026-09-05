@@ -34,6 +34,12 @@ import com.studyink.construction.core.MeasurementType
 import com.studyink.construction.core.SolveResult
 import com.studyink.construction.storage.ConstructionSceneSnapshot
 import com.studyink.construction.storage.ConstructionSceneStore
+import com.studyink.construction.storage.ConstructionSceneAccess
+import com.studyink.construction.storage.ConstructionConflictChoice
+import com.studyink.construction.storage.ConstructionReplicaChangeBus
+import com.studyink.construction.storage.ConstructionReplicaChangeKind
+import com.studyink.construction.storage.ConstructionReplicaRole
+import com.studyink.construction.storage.ConstructionUiBridge
 import com.studyink.construction.storage.ConstructionTarget
 import java.io.File
 import java.util.concurrent.Executors
@@ -44,12 +50,22 @@ import kotlin.math.hypot
  * Local mathematical memo editor. All hard solving and durable writes run on one worker.
  * A complete drag is one persisted/undoable command; stale preview results cannot cross targets.
  */
-internal class ConstructionEditorDialog(
+internal class ConstructionEditorView(
     context: Context,
     private val target: ConstructionTarget,
     private val titleText: String,
-) : Dialog(context, android.R.style.Theme_Material_Light_NoActionBar) {
-    private val store = ConstructionSceneStore(File(context.applicationContext.filesDir, "masternote"))
+    private val embedded: Boolean = false,
+    private val store: ConstructionSceneAccess = ConstructionSceneStore(File(context.applicationContext.filesDir, "masternote")),
+    private val replicaRole: ConstructionReplicaRole? = null,
+    private val syncBridge: ConstructionUiBridge? = null,
+) : FrameLayout(context) {
+    var onRequestClose: () -> Unit = {}
+    var onDurableChanged: () -> Unit = {}
+    var onLoaded: (ConstructionSceneSnapshot) -> Unit = {}
+    var onUndoStateChanged: () -> Unit = {}
+    val hasPendingWork: Boolean get() = (busy && !loadFailed) || dragSolving || dragBase != null || measurementBase != null
+    val canUndo: Boolean get() = !hasPendingWork && !closed && undo.isNotEmpty()
+    val canRedo: Boolean get() = !hasPendingWork && !closed && redo.isNotEmpty()
     private val solver = ConstraintSolver()
     private val worker = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "construction-editor").apply { isDaemon = true } }
     private val density = context.resources.displayMetrics.density
@@ -83,7 +99,12 @@ internal class ConstructionEditorDialog(
     private val undo = ArrayDeque<ConstructionScene>()
     private val redo = ArrayDeque<ConstructionScene>()
     private var restoreListener: AutoCloseable? = null
+    private var replicaListener: AutoCloseable? = null
+    private var syncListener: AutoCloseable? = null
+    private var publishButton: Button? = null
+    private val syncStatus = TextView(context)
     private var busy = true
+    private var loadFailed = false
     private var generation = 0L
     private var closed = false
     private var dragBase: ConstructionScene? = null
@@ -103,22 +124,27 @@ internal class ConstructionEditorDialog(
     private fun AlertDialog.Builder.showChild() = showChild(create())
     private fun dismissChildren() { childDialogs.toList().forEach { it.dismiss() }; childDialogs.clear(); closePanel() }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setCanceledOnTouchOutside(false)
+    init {
+        clipChildren = true
+        clipToPadding = true
         val root = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            fitsSystemWindows = true
+            fitsSystemWindows = !embedded
             setBackgroundColor(Color.rgb(255, 254, 249))
         }
         val header = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(10), 0, dp(4), 0) }
         header.addView(TextView(context).apply {
-            text = "작도 메모 · $titleText"
+            text = if (embedded) "도형 작도판" else "작도 메모 · $titleText"
             textSize = 13f; setTextColor(Color.rgb(33, 47, 66)); setSingleLine(); ellipsize = TextUtils.TruncateAt.END; gravity = Gravity.CENTER_VERTICAL
         }, LinearLayout.LayoutParams(0, dp(36), 1f))
         header.addView(button("되돌리기", icon = ConstructionIcon.UNDO, iconOnly = true) { history(true) })
         header.addView(button("다시", icon = ConstructionIcon.REDO, iconOnly = true) { history(false) })
+        if (embedded && replicaRole == ConstructionReplicaRole.TEACHER) {
+            publishButton = button("발행", register = false) { requestPublication() }
+            header.addView(publishButton)
+        }
         closeButton = button("닫기", register = false, icon = ConstructionIcon.CLOSE, iconOnly = true) { requestClose() }
+        if (embedded) closeButton?.visibility = View.GONE
         header.addView(closeButton)
         root.addView(header)
         root.addView(toolbar {
@@ -155,12 +181,20 @@ internal class ConstructionEditorDialog(
         viewport.addView(selectionInfo, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply { leftMargin = dp(8); rightMargin = dp(8); topMargin = dp(6) })
         status.apply { textSize = 10f; setTextColor(Color.rgb(64, 77, 70)); setPadding(dp(7), dp(3), dp(7), dp(3)); maxLines = 2; ellipsize = TextUtils.TruncateAt.END; background = surface(0xeafffef9.toInt()); accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
         viewport.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply { leftMargin = dp(8); rightMargin = dp(8); bottomMargin = dp(5) })
+        if (embedded) {
+            syncStatus.apply {
+                textSize = 10f; setTextColor(Color.rgb(66, 85, 106)); maxLines = 2
+                setPadding(dp(7), dp(3), dp(7), dp(3)); background = surface(0xeafffef9.toInt())
+                contentDescription = "도형 동기화 상태"
+                setOnClickListener { showConflictChoices() }
+            }
+            viewport.addView(syncStatus, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
+                topMargin = dp(42); rightMargin = dp(8); leftMargin = dp(8)
+            })
+        }
         configurePanel()
         root.addView(viewport, LinearLayout.LayoutParams(-1, 0, 1f))
-        setContentView(root)
-        window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-        // Menus and the keyboard overlay this fixed viewport. Neither triggers fit/recentering.
-        window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING or WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
+        addView(root, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         canvas.onSelectionChanged = { updateSelection() }
         canvas.onToolHintChanged = { toolHint = it; updateHint() }
         canvas.onPoint = { p -> runCatching { ConstructionEdits.addPoint(scene, p, newColor) }.onSuccess { edit(it) }.onFailure { notice(it.message.orEmpty()) } }
@@ -178,7 +212,24 @@ internal class ConstructionEditorDialog(
                 }
             }
         }
+        if (embedded) {
+            replicaListener = ConstructionReplicaChangeBus.addListener { change ->
+                if (change.target == target && change.role == replicaRole &&
+                    change.kind in setOf(ConstructionReplicaChangeKind.REMOTE_STUDENT,
+                        ConstructionReplicaChangeKind.REMOTE_PUBLISH, ConstructionReplicaChangeKind.ADOPTED_STUDENT,
+                        ConstructionReplicaChangeKind.PUBLISH_RESULT,
+                        ConstructionReplicaChangeKind.DELETED)) canvas.post {
+                    // Shadow/ACK metadata can advance while the teacher is drawing a new draft.
+                    // The access adapter safely rebases identical scene bytes without discarding
+                    // that in-progress gesture or its undo history.
+                    if (!closed && (change.snapshot.deleted || change.snapshot.scene != snapshot?.scene)) reloadAfterRemoteChange()
+                }
+            }
+            syncListener = syncBridge?.addListener(target) { canvas.post { if (!closed) refreshSyncState() } }
+        }
         updateToolbar(); updateHint()
+        refreshSyncState()
+        onUndoStateChanged()
         load()
     }
 
@@ -310,13 +361,16 @@ internal class ConstructionEditorDialog(
         closeButton?.isEnabled = !value
         canvas.editable = !value
         updateToolbar()
+        refreshSyncState()
+        onUndoStateChanged()
     }
     private fun chooseTool(tool: ConstructionTool) {
         canvas.tool = tool; canvas.clearSelection()
         closePanel(); updateToolbar(); updateHint()
     }
-    private fun load() {
+    private fun load(fit: Boolean = true) {
         dismissChildren()
+        loadFailed = false
         canvas.tool = canvas.tool // Discard an unfinished two-tap construction from the old scene.
         val token = ++generation
         setBusy(true); status.text = "작도 메모 불러오는 중…"
@@ -326,12 +380,14 @@ internal class ConstructionEditorDialog(
                 if (closed || generation != token) return@post
                 result.onSuccess { loaded ->
                     snapshot = loaded; scene = loaded.scene; canvas.scene = scene
-                    canvas.clearSelection(); canvas.fitScene(); setBusy(false)
+                    canvas.clearSelection(); if (fit) canvas.fitScene(); setBusy(false)
+                    onLoaded(loaded)
                     status.text = "선분·원을 그린 뒤 대상을 선택해 조건을 추가하세요. 예제로 시작할 수도 있습니다."
                 }.onFailure {
+                    loadFailed = true
                     status.text = "저장된 작도를 읽지 못했습니다. 기존 파일은 보존됩니다: ${it.message}"
                     closeButton?.isEnabled = true
-                    closeButton?.setOnClickListener { dismiss() }
+                    closeButton?.setOnClickListener { onRequestClose() }
                 }
             }
         }
@@ -401,6 +457,7 @@ internal class ConstructionEditorDialog(
                     }
                     while (undo.size > 80) undo.removeFirst()
                     snapshot = committed; scene = committed.scene; canvas.scene = scene
+                    onDurableChanged()
                     if (fitAfterCommit) { fitAfterCommit = false; canvas.fitScene() }
                     canvas.selectedIds = canvas.selectedIds.intersect(allIds())
                     setBusy(false); updateSelection()
@@ -744,21 +801,99 @@ internal class ConstructionEditorDialog(
     }
     private fun showHelp() {
         AlertDialog.Builder(context).setTitle("함께 작도하기")
-            .setMessage("1. 눌린 도구의 배경색과 왼쪽 위 안내가 다음 동작을 알려줍니다. 선분·원은 두 번 눌러 만듭니다.\n2. 색을 고른 뒤 그리세요. 이미 그린 도형은 선택 → 더보기에서 색을 바꿉니다.\n3. 자석이 켜져 있으면 기존 끝점·선 위·두 선의 교점에 연결됩니다. 원 둘레를 맞추는 두 번째 탭은 반지름 위치만 맞추며 연결 조건을 만들지는 않습니다.\n4. 선택 → 조건 추가로 모양을 유지할 관계를 지정합니다. 조건 목록에서 값 변경·켜기·끄기가 가능합니다.\n5. 선택 → 측정 → 그림에 표시. 측정은 모양을 고정하지 않습니다. 글자를 끌면 치수 표시만 이동합니다. 각도는 A → 꼭짓점 B → C 순서로 세 점을 선택합니다.\n6. 작은 메뉴의 제목을 끌면 옮길 수 있습니다. 열고 닫아도 도형은 움직이지 않습니다. 두 손가락으로 도형을 확대·이동합니다.\n\n빈 곳을 누르면 선택 해제. 겹친 점은 반복해서 누르면 따로 선택됩니다. 두 선의 각도 조건은 시작→끝 방향 기준입니다. 직선 위 조건·수선·교점은 연장선을 포함합니다. 원과 선·두 원의 교점 자동 연결은 아직 지원하지 않습니다.\n\n작도는 현재 기기에 자동 저장되고 앱 백업에 포함됩니다. 기존 필기·메모와 원격 전송 데이터는 변경하지 않습니다.")
+            .setMessage("1. 눌린 도구의 배경색과 왼쪽 위 안내가 다음 동작을 알려줍니다. 선분·원은 두 번 눌러 만듭니다.\n2. 색을 고른 뒤 그리세요. 이미 그린 도형은 선택 → 더보기에서 색을 바꿉니다.\n3. 자석이 켜져 있으면 기존 끝점·선 위·두 선의 교점에 연결됩니다. 원 둘레를 맞추는 두 번째 탭은 반지름 위치만 맞추며 연결 조건을 만들지는 않습니다.\n4. 선택 → 조건 추가로 모양을 유지할 관계를 지정합니다. 조건 목록에서 값 변경·켜기·끄기가 가능합니다.\n5. 선택 → 측정 → 그림에 표시. 측정은 모양을 고정하지 않습니다. 글자를 끌면 치수 표시만 이동합니다. 각도는 A → 꼭짓점 B → C 순서로 세 점을 선택합니다.\n6. 작은 메뉴의 제목을 끌면 옮길 수 있습니다. 열고 닫아도 도형은 움직이지 않습니다. 두 손가락으로 도형을 확대·이동합니다.\n\n빈 곳을 누르면 선택 해제. 겹친 점은 반복해서 누르면 따로 선택됩니다. 두 선의 각도 조건은 시작→끝 방향 기준입니다. 직선 위 조건·수선·교점은 연장선을 포함합니다. 원과 선·두 원의 교점 자동 연결은 아직 지원하지 않습니다.\n\n${if (embedded) "도형과 손필기는 별도 영역이며 지우개·되돌리기가 서로 영향을 주지 않습니다. 경계를 넘으면 획은 경계에서 끝납니다. 학생 도형은 손을 놓아 저장한 뒤 자동 전송됩니다. 선생 도형은 초안으로 저장되며 발행을 눌러야 학생에게 전송됩니다. 끊겨도 로컬 작업은 유지됩니다." else "이 전체화면 작도는 현재 기기에 자동 저장되고 앱 백업에 포함됩니다. 메모 안에 넣은 도형판만 원격 동기화 대상입니다."}")
             .setPositiveButton("확인", null).showChild()
     }
     private fun requestClose() {
         if (busy || dragSolving) return notice("저장을 마친 뒤 닫을 수 있습니다.")
-        canvas.cancelDrag(); dismiss()
+        canvas.cancelDrag(); onRequestClose()
     }
-    @Deprecated("Android dialog back navigation")
-    override fun onBackPressed() { if (panelKind != null) closePanel() else requestClose() }
-    override fun dismiss() {
+    fun handleBack() { if (panelKind != null) closePanel() else requestClose() }
+    fun undoEdit(): Boolean = if (canUndo) { history(true); true } else false
+    fun redoEdit(): Boolean = if (canRedo) { history(false); true } else false
+    fun cancelInteraction() { canvas.cancelDrag(); dismissChildren() }
+    private fun reloadAfterRemoteChange() {
+        generation++; dragRequest++; dragBase = null; measurementBase = null
+        pendingDrag = null; dragSolving = false; undo.clear(); redo.clear(); canvas.cancelDrag()
+        load(fit = false)
+    }
+    private fun refreshSyncState() {
+        if (!embedded || closed) return
+        val state = runCatching { syncBridge?.state(target) }.getOrNull()
+        syncStatus.text = state?.message?.takeIf(String::isNotBlank)
+            ?: if (replicaRole == ConstructionReplicaRole.TEACHER) "선생 도형 초안 · 발행해야 학생에게 전송됩니다"
+            else "도형 자동 저장 · 연결 시 자동 전송"
+        syncStatus.isClickable = state?.conflictToken != null
+        publishButton?.isEnabled = !hasPendingWork && state?.canPublish == true && !state.busy
+    }
+    private fun requestPublication() {
+        if (hasPendingWork || closed) return
+        val state = syncBridge?.state(target) ?: return notice("원격 연결 상태를 확인해 주세요.")
+        if (state.conflictToken != null) { showConflictChoices(); return }
+        if (!state.canPublish || state.busy) return notice(state.message)
+        syncBridge.requestPublish(target)
+        refreshSyncState()
+    }
+    private fun showConflictChoices() {
+        if (hasPendingWork || closed) return
+        val bridge = syncBridge ?: return
+        val expectedToken = bridge.state(target).conflictToken ?: return
+        val token = generation
+        val labels = arrayOf("선생 도형으로 학생 맞추기", "학생 도형으로 선생 맞추기")
+        AlertDialog.Builder(context).setTitle("서로 다른 도형이 있습니다")
+            .setMessage("두 기기의 도형이 달라졌습니다. 어느 도형을 사용할지 선택하세요. 손필기는 변경되지 않습니다.")
+            .setPositiveButton(labels[0]) { _, _ -> confirmConflict(bridge, expectedToken, token, ConstructionConflictChoice.USE_TEACHER, labels[0]) }
+            .setNeutralButton(labels[1]) { _, _ -> confirmConflict(bridge, expectedToken, token, ConstructionConflictChoice.USE_STUDENT, labels[1]) }
+            .setNegativeButton("취소", null).showChild()
+    }
+    private fun confirmConflict(bridge: ConstructionUiBridge, expectedToken: String, token: Long, choice: ConstructionConflictChoice, label: String) {
+        if (!isCurrent(token) || bridge.state(target).conflictToken != expectedToken) {
+            notice("비교하는 동안 도형이 바뀌었습니다. 최신 도형을 다시 확인해 주세요."); return
+        }
+        AlertDialog.Builder(context).setTitle(label).setMessage("선택한 도형으로 맞출까요? 상대 도형이 다시 바뀌면 재확인합니다.")
+            .setPositiveButton("확인") { _, _ ->
+                if (isCurrent(token) && bridge.state(target).conflictToken == expectedToken) {
+                    bridge.resolveConflict(target, choice, expectedToken); refreshSyncState()
+                } else notice("비교하는 동안 도형이 바뀌었습니다. 다시 선택해 주세요.")
+            }.setNegativeButton("취소", null).showChild()
+    }
+    fun closeEditor() {
         if (!closed) {
+            canvas.cancelDrag()
             closed = true; generation++; dragRequest++
             dismissChildren()
             restoreListener?.close(); restoreListener = null; worker.shutdown()
+            replicaListener?.close(); replicaListener = null
+            syncListener?.close(); syncListener = null
         }
+    }
+}
+
+/** The existing full-screen entry point shares exactly the same controller as the memo pane. */
+internal class ConstructionEditorDialog(
+    context: Context,
+    private val target: ConstructionTarget,
+    private val titleText: String,
+) : Dialog(context, android.R.style.Theme_Material_Light_NoActionBar) {
+    private var editor: ConstructionEditorView? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setCanceledOnTouchOutside(false)
+        editor = ConstructionEditorView(context, target, titleText).also {
+            it.onRequestClose = { dismiss() }
+            setContentView(it)
+        }
+        window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING or WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
+    }
+
+    @Deprecated("Android dialog back navigation")
+    override fun onBackPressed() { editor?.handleBack() ?: super.onBackPressed() }
+
+    override fun dismiss() {
+        editor?.closeEditor()
+        editor = null
         super.dismiss()
     }
 }
