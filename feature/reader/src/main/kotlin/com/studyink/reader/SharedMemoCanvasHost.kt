@@ -44,7 +44,8 @@ internal class SharedMemoCanvasHost(context: Context) : FrameLayout(context) {
     private val surroundPaint = Paint().apply { color = Color.rgb(229, 234, 239) }
     private val retrySize = object : Runnable {
         override fun run() {
-            if ((pendingSize || pendingReset || pendingFit) && isAttachedToWindow && !applyViewportSize()) postDelayed(this, 32L)
+            if ((pendingSize || pendingReset || pendingFit) && isAttachedToWindow && hasViewportSize() &&
+                !applyViewportSize()) postDelayed(this, 32L)
         }
     }
 
@@ -76,7 +77,7 @@ internal class SharedMemoCanvasHost(context: Context) : FrameLayout(context) {
     }
 
     private fun applyViewportSize(): Boolean {
-        if (!canChangeViewport()) return false
+        if (!hasViewportSize() || !canChangeViewport()) return false
         onBeforeViewportChange()
         applyPendingViewport()
         return true
@@ -96,7 +97,7 @@ internal class SharedMemoCanvasHost(context: Context) : FrameLayout(context) {
     fun resetViewport(): Boolean {
         cancelOwnedGesture()
         pendingFit = false
-        if (!canChangeViewport()) {
+        if (!hasViewportSize() || !canChangeViewport()) {
             pendingReset = true
             removeCallbacks(retrySize)
             postDelayed(retrySize, 32L)
@@ -109,7 +110,7 @@ internal class SharedMemoCanvasHost(context: Context) : FrameLayout(context) {
     fun fitContent(): Boolean {
         cancelOwnedGesture()
         pendingReset = false
-        if (!canChangeViewport()) {
+        if (!hasViewportSize() || !canChangeViewport()) {
             pendingFit = true
             removeCallbacks(retrySize)
             postDelayed(retrySize, 32L)
@@ -120,12 +121,14 @@ internal class SharedMemoCanvasHost(context: Context) : FrameLayout(context) {
     }
 
     private inline fun changeViewport(change: () -> Unit): Boolean {
-        if (!canChangeViewport()) return false
+        if (!hasViewportSize() || !canChangeViewport()) return false
         onBeforeViewportChange()
         applyPendingViewport()
         change()
         return true
     }
+
+    private fun hasViewportSize(): Boolean = width > 0 && height > 0
 
     private fun applyPendingViewport() {
         if (pendingSize) {

@@ -179,6 +179,50 @@ class SharedMemoCanvasHostTest {
         assertEquals(0f, host.viewport.paperBounds.top, .001f)
     }
 
+    @Test fun `content fit requested before first measure is applied after first layout`() {
+        val fresh = SharedMemoCanvasHost(controller.get())
+        fresh.viewport.geometryWorldBounds = RectF(39f, 4f, 41f, 6f)
+        assertFalse(fresh.fitContent())
+        fresh.resumePendingResize()
+        assertNull(fresh.viewport.activePageBounds())
+        fresh.measure(exact(400), exact(600))
+        fresh.layout(0, 0, 400, 600)
+        val center = fresh.viewport.worldToView(40.0, 5.0)
+        assertEquals(200f, center.x, .001f)
+        assertEquals(300f, center.y, .001f)
+    }
+
+    @Test fun `reset before first layout supersedes an earlier deferred fit`() {
+        val fresh = SharedMemoCanvasHost(controller.get())
+        fresh.viewport.geometryWorldBounds = RectF(39f, 4f, 41f, 6f)
+        assertFalse(fresh.fitContent())
+        assertFalse(fresh.resetViewport())
+        fresh.resumePendingResize()
+        assertNull(fresh.viewport.activePageBounds())
+        fresh.measure(exact(400), exact(600))
+        fresh.layout(0, 0, 400, 600)
+        assertEquals(400f, fresh.viewport.paperBounds.width(), .001f)
+        assertEquals(0f, fresh.viewport.paperBounds.top, .001f)
+        assertEquals(0f, fresh.viewport.paperBounds.left, .001f)
+    }
+
+    @Test fun `first layout fit also waits for the durable ink gate`() {
+        val fresh = SharedMemoCanvasHost(controller.get())
+        var ready = false
+        fresh.canChangeViewport = { ready }
+        fresh.viewport.geometryWorldBounds = RectF(39f, 4f, 41f, 6f)
+        assertFalse(fresh.fitContent())
+        fresh.measure(exact(400), exact(600))
+        fresh.layout(0, 0, 400, 600)
+        fresh.resumePendingResize()
+        assertNull(fresh.viewport.activePageBounds())
+        ready = true
+        fresh.resumePendingResize()
+        val center = fresh.viewport.worldToView(40.0, 5.0)
+        assertEquals(200f, center.x, .001f)
+        assertEquals(300f, center.y, .001f)
+    }
+
     @Test fun `paper and screen edges finish at boundary then swallow reentry`() {
         touch(MotionEvent.ACTION_DOWN, pen(350f, 100f))
         touch(MotionEvent.ACTION_MOVE, pen(450f, 200f))

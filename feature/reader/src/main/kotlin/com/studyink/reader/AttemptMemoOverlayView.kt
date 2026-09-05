@@ -169,6 +169,17 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     private var constructionLoadGeneration = 0L
     private var constructionLoading = false
     private var pendingConstructionMemo: StudentMemo? = null
+    private val retryConstructionAttachment = object : Runnable {
+        override fun run() {
+            val pending = pendingConstructionMemo ?: return
+            if (!isAttachedToWindow || activeMemo?.id != pending.id || activeMemo?.target != pending.target) {
+                pendingConstructionMemo = null
+                return
+            }
+            if (sharedCanvas.canChangeViewport()) attachConstruction(pending)
+            else postDelayed(this, 32L)
+        }
+    }
     private var constructionRole = ConstructionReplicaRole.STUDENT
     private var constructionRestoreListener: AutoCloseable? = null
     private var constructionChangeListener: AutoCloseable? = null
@@ -375,7 +386,7 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
 
     fun minimizeEditor(): Boolean {
         if (modalHost.visibility != VISIBLE || persistenceInProgress || constructionEditor?.hasPendingWork == true) return false
-        if (awaitingWetHandoffs > 0 || finishedWetStrokeIds.isNotEmpty()) { wetInk.requestHandoff(); return false }
+        if (awaitingWetHandoffs > 0 || finishedWetStrokeIds.isNotEmpty()) return false
         cancelActiveGesture()
         detachConstruction()
         activeMemo = null
@@ -880,8 +891,11 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         if (constructionEditor != null) return
         if (!sharedCanvas.canChangeViewport()) {
             pendingConstructionMemo = memo
+            removeCallbacks(retryConstructionAttachment)
+            postDelayed(retryConstructionAttachment, 32L)
             return
         }
+        removeCallbacks(retryConstructionAttachment)
         pendingConstructionMemo = null
         val editor = createConstructionEditor?.invoke(memo, constructionRole) ?: return
         constructionEditor = editor
@@ -900,6 +914,7 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     }
 
     private fun detachConstruction() {
+        removeCallbacks(retryConstructionAttachment)
         pendingConstructionMemo = null
         constructionLoadGeneration++
         constructionLoading = false
