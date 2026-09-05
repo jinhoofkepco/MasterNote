@@ -89,6 +89,7 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     var onStylusContact: () -> Unit = {}
     var onWorkActivity: () -> Unit = {}
     var onPersistenceError: (Throwable) -> Unit = {}
+    var onOpenConstruction: (StudentMemo) -> Unit = {}
 
     private val density = resources.displayMetrics.density
     private val iconLayer = MemoIconLayer(context).apply {
@@ -132,9 +133,25 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         contentDescription = "메모 줄이기"
         setOnClickListener { minimizeEditor() }
     }
+    private val constructionButton = TextView(context).apply {
+        text = "작도"
+        textSize = 13f
+        gravity = Gravity.CENTER
+        setTextColor(Color.rgb(50, 77, 127))
+        isClickable = true
+        isFocusable = true
+        contentDescription = "메모 작도 모드 열기"
+        setOnClickListener {
+            if (!persistenceInProgress) activeMemo?.let { memo ->
+                cancelActiveGesture()
+                onOpenConstruction(memo)
+            }
+        }
+    }
     private val header = FrameLayout(context).apply {
         setBackgroundColor(Color.rgb(246, 242, 230))
-        addView(headerTitle, LayoutParams(MATCH, MATCH).apply { marginEnd = dpInt(48f) })
+        addView(headerTitle, LayoutParams(MATCH, MATCH).apply { marginEnd = dpInt(104f) })
+        addView(constructionButton, LayoutParams(dpInt(56f), MATCH, Gravity.END).apply { marginEnd = dpInt(48f) })
         addView(minimizeButton, LayoutParams(dpInt(48f), MATCH, Gravity.END))
     }
     private val scroll = ScrollView(context).apply {
@@ -444,6 +461,7 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     private fun updateInputEnabled() {
         inkInput.isEnabled = canEditActiveMemo()
         minimizeButton.isEnabled = !persistenceInProgress
+        constructionButton.isEnabled = activeMemo != null && !persistenceInProgress
     }
 
     private fun canEditActiveMemo(): Boolean =

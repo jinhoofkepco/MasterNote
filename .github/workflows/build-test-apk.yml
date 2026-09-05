@@ -2,14 +2,14 @@ name: Build latest APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, codex/construction-mode]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: master-note-latest-apk
+  group: master-note-apk-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -95,7 +95,16 @@ jobs:
           test "$ACTUAL_VERSION_CODE" = "$MASTERNOTE_VERSION_CODE"
           cp "$APK_PATH" "$RUNNER_TEMP/MasterNote.apk"
 
+      - name: Keep the verified update APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MasterNote-update-${{ env.MASTERNOTE_VERSION_NAME }}
+          path: ${{ runner.temp }}/MasterNote.apk
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Publish the stable APK download
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

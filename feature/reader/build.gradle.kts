@@ -10,6 +10,7 @@ android {
     compileSdkExtension = 19
     defaultConfig { minSdk = 31 }
     buildFeatures { compose = true }
+    testOptions { unitTests.isIncludeAndroidResources = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -28,6 +29,8 @@ dependencies {
     implementation(project(":monitor:core"))
     implementation(project(":monitor:telegram"))
     implementation(project(":memo:core"))
+    implementation(project(":construction:core"))
+    implementation(project(":construction:storage"))
 
     val composeBom = platform("androidx.compose:compose-bom:2026.06.00")
     implementation(composeBom)
@@ -43,5 +46,6 @@ dependencies {
     implementation("androidx.ink:ink-brush:1.0.0")
     implementation("androidx.ink:ink-strokes:1.0.0")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.16.1")
     testImplementation("org.json:json:20260814")
 }

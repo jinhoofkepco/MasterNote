@@ -59,6 +59,7 @@ import com.studyink.core.model.MarkColor
 import com.studyink.core.model.PageBounds
 import com.studyink.core.model.PagePoint
 import com.studyink.core.model.TEACHER_PAGE_REVIEW_ATTEMPT_NO
+import com.studyink.construction.storage.ConstructionTarget
 import com.studyink.document.pdf.PdfViewportAdapter
 import com.studyink.document.pdf.ReaderPdfFragment
 import com.studyink.library.data.LibraryRepository
@@ -103,6 +104,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private val viewport = PdfViewportAdapter()
     private val assistantRepository by lazy { AssistantRepositoryProvider.get(this) }
     private val memoRepository by lazy { StudentMemoRepository.get(this) }
+    private var constructionEditor: ConstructionEditorDialog? = null
     private lateinit var rootHost: FrameLayout
     private lateinit var pdfContainer: FragmentContainerView
     private lateinit var dryInkView: DryInkView
@@ -471,6 +473,12 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             overlay.onPersistenceError = {
                 Toast.makeText(this, "메모를 저장하지 못했습니다.", Toast.LENGTH_SHORT).show()
             }
+            overlay.onOpenConstruction = { memo ->
+                openConstruction(
+                    ConstructionTarget(memo.target.bookId, memo.target.pageNumber, memo.target.attemptNo, memo.id),
+                    "${memo.target.pageNumber + 1}쪽 · 메모",
+                )
+            }
             root.addView(overlay, FrameLayout.LayoutParams(MATCH, MATCH))
         }
 
@@ -777,6 +785,28 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         selectedMarkGroupId = dryInkView.markGroupAt(viewX, viewY)
         selectedMarkTarget = selectedMarkGroupId?.let { latestState.annotationTarget() }
         dryInkView.pressedMarkGroupId = selectedMarkGroupId
+    }
+
+    private fun openPageConstruction() {
+        val state = latestState
+        if (!state.documentReady || state.bookId.isBlank()) return
+        openConstruction(
+            ConstructionTarget(
+                state.bookId, state.pageNumber, state.attemptNo.coerceAtLeast(0),
+                UUID.nameUUIDFromBytes("MasterNote-page-construction-v1".toByteArray(Charsets.UTF_8)).toString(),
+            ),
+            "${state.pageNumber + 1}쪽 · ${state.attemptNo}회",
+        )
+    }
+
+    private fun openConstruction(target: ConstructionTarget, title: String) {
+        if (constructionEditor?.isShowing == true) return
+        cancelActiveInkInput()
+        closeStylusMenu()
+        constructionEditor = ConstructionEditorDialog(this, target, title).also { editor ->
+            editor.setOnDismissListener { if (constructionEditor === editor) constructionEditor = null }
+            editor.show()
+        }
     }
 
     private fun selectTool(tool: ReaderTool) {
@@ -1588,6 +1618,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
                 onOpenRemoteMonitor =(::openRemoteMonitorSetup),
                 onOpenGptAssistant =(::openTeacherGptResources),
                 onOpenAnswerPdf =(::openAnswerPdf),
+                onOpenConstruction =(::openPageConstruction),
             )
             if (studentActivityVisible && latestState.capabilities.showsStudentLocation) {
                 StudentActivityDialog(
@@ -2155,6 +2186,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     override fun onDestroy() {
+        constructionEditor?.dismiss()
+        constructionEditor = null
         explanationLoadGeneration += 1L
         memoLoadGeneration += 1L
         dismissAnswerCropPopup()

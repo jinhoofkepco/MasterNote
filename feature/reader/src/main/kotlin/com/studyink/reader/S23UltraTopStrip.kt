@@ -80,7 +80,7 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 internal const val S23_ULTRA_MODEL_PREFIX = "SM-S918"
-internal const val S23_STRIP_CELL_COUNT = 11
+internal const val S23_STRIP_CELL_COUNT = 12
 internal const val S23_STRIP_HISTORY_CELL_COUNT = 3
 
 // The visible paper is deliberately much thinner than the interaction lane. Keeping the latter
@@ -287,6 +287,7 @@ internal fun S23UltraTopStrip(
     onResumeStudentFollow: () -> Unit,
     onOpenGptAssistant: () -> Unit = {},
     onOpenAnswerPdf: () -> Unit = {},
+    onOpenConstruction: () -> Unit = {},
     transportCellModel: S23TransportCellModel =
         s23TransportCellModelForLan(state.liveConnection),
     onTransportClick: (S23TransportMode) -> Unit = { mode ->
@@ -372,6 +373,16 @@ internal fun S23UltraTopStrip(
                         forceHovered = previewHoveredDescription == "학생 필기량 보기" ||
                             previewHoveredDescription?.startsWith("학생 현재 페이지") == true,
                     )
+                    S23StripButton(
+                        description = "페이지 작도 메모 열기",
+                        onAction = onOpenConstruction,
+                        enabled = state.documentReady,
+                        role = state.role,
+                        cellWidth = cellWidth,
+                        forceHovered = previewHoveredDescription == "페이지 작도 메모 열기",
+                    ) {
+                        Text(text = "작도", color = tokens.paletteBlue, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    }
                     S23StripButton(
                         description = "GPT 페이지 설명",
                         onAction = onOpenGptAssistant,

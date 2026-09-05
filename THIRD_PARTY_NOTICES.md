@@ -1,5 +1,17 @@
 # Third-party notices
 
+## Apache Commons Math 3.6.1 — construction numeric solver
+
+- Source: https://github.com/apache/commons-math/tree/MATH_3_6_1
+- Published dependency: `org.apache.commons:commons-math3:3.6.1`
+- License: Apache License 2.0, with upstream third-party notices including MINPACK.
+- Upstream LICENSE and NOTICE are included in the APK assets under `construction_licenses/`.
+
+MasterNote reuses the published numerical optimizer and matrix decomposition implementation.
+The geometric constraint definitions, Android interaction, persistence, and acceptance tests
+are new MasterNote code. This is not a port of SolveSpace or FreeCAD source.
+See `construction/core/PROVENANCE.md` for the reviewed upstream source and scope.
+
 ## Jetpack Compose Animations — Radial FAB Menu
 
 - Copyright 2026 Jaewoong Eum (skydoves)

@@ -729,6 +729,7 @@ fun ReaderTopChrome(
     onOpenRemoteMonitor: () -> Unit = {},
     onOpenGptAssistant: () -> Unit = {},
     onOpenAnswerPdf: () -> Unit = {},
+    onOpenConstruction: () -> Unit = {},
     previewHoveredDescription: String? = null,
     /**
      * Optional compact, one-line page/attempt history. The caller owns its data and gestures so
@@ -752,6 +753,7 @@ fun ReaderTopChrome(
             onResumeStudentFollow = onResumeStudentFollow,
             onOpenGptAssistant = onOpenGptAssistant,
             onOpenAnswerPdf = onOpenAnswerPdf,
+            onOpenConstruction = onOpenConstruction,
             transportCellModel = s23TransportCellModelForHybrid(
                 decision = state.hybridLink,
                 legacyLanConnection = state.liveConnection,
@@ -903,6 +905,13 @@ fun ReaderTopChrome(
                             horizontalArrangement = Arrangement.spacedBy(tokens.itemGap),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
+                            TopChromeTextButton(
+                                text = "작도",
+                                description = "페이지 작도 메모 열기",
+                                onAction = onOpenConstruction,
+                                role = state.role,
+                                enabled = state.documentReady,
+                            )
                             if (state.capabilities.canSubmit) {
                                 TopChromeTextButton(
                                     text = "제출",

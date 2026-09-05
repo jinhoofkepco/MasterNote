@@ -28,6 +28,8 @@ include(
     ":monitor:telegram",
     ":monitor:render",
     ":memo:core",
+    ":construction:core",
+    ":construction:storage",
     ":sync:lan",
     ":document:pdf-androidx",
     ":feature:reader",
