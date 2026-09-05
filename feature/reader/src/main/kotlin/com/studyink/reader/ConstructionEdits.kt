@@ -233,6 +233,98 @@ internal object ConstructionEdits {
     fun matchingMeasurement(scene: ConstructionScene, measurement: GeometryMeasurement): GeometryMeasurement? =
         scene.measurements.firstOrNull { sameMeasurement(it, measurement) }
 
+    /** Turn the exact live measurement into a driving value. Display precision and label offsets
+     * never enter its value, and a distance between otherwise unjoined points creates no line. */
+    fun constrainMeasurement(scene: ConstructionScene, measurementId: String, value: Double? = null): ConstructionScene {
+        val measurement = requireNotNull(scene.measurements.firstOrNull { it.id == measurementId }) { "측정 표시를 다시 선택하세요." }
+        require(measurement.type != MeasurementType.AREA) { "넓이는 측정만 지원합니다." }
+        val measured = ConstructionMeasurementGeometry.layout(scene, measurement)?.value
+        require(measured != null && measured.isFinite()) { "현재 정의되지 않은 측정값은 고정할 수 없습니다." }
+        val target = value ?: measured
+        val minimum = if (measurement.type == MeasurementType.ANGLE) 0.0 else SceneValidator.MIN_LENGTH
+        val maximum = if (measurement.type == MeasurementType.ANGLE) 180.0 else SceneValidator.MAX_MAGNITUDE
+        require(target.isFinite() && target in minimum..maximum) { "고정할 값이 허용 범위를 벗어났습니다." }
+        val existing = scene.constraints.firstOrNull { condition ->
+            condition.value != null && (condition.type == ConstraintType.DISTANCE_POINTS && measurement.type == MeasurementType.DISTANCE &&
+                condition.entityIds.toSet() == measurement.entityIds.toSet() ||
+                ConstructionMeasurementGeometry.matchesConstraint(scene, measurement, condition))
+        }
+        if (existing != null) return validated(scene.copy(constraints = scene.constraints.map {
+            if (it.id == existing.id) it.copy(value = target) else it
+        }))
+        val segment = if (measurement.type == MeasurementType.DISTANCE) measuredSegment(scene, measurement) else null
+        val type = when (measurement.type) {
+            MeasurementType.DISTANCE -> if (segment != null) ConstraintType.LENGTH else ConstraintType.DISTANCE_POINTS
+            MeasurementType.RADIUS -> ConstraintType.RADIUS
+            MeasurementType.ANGLE -> ConstraintType.INTERIOR_ANGLE
+            MeasurementType.AREA -> error("Area constraints are not supported")
+        }
+        val refs = segment?.let { listOf(it.id) } ?: measurement.entityIds
+        return validated(scene.copy(constraints = scene.constraints + GeometryConstraint(id(), type, refs, value = target)))
+    }
+
+    /** Compare live distance/angle measurements without pinning their current numeric values.
+     * Existing paused relations stay paused; the explicit condition checkbox controls activation. */
+    fun equalMeasurements(scene: ConstructionScene, firstId: String, secondId: String): ConstructionScene {
+        val first = requireNotNull(scene.measurements.firstOrNull { it.id == firstId }) { "첫 번째 측정 표시를 다시 선택하세요." }
+        val second = requireNotNull(scene.measurements.firstOrNull { it.id == secondId }) { "두 번째 측정 표시를 다시 선택하세요." }
+        require(first.type == second.type && first.type in setOf(MeasurementType.DISTANCE, MeasurementType.ANGLE)) {
+            "거리끼리 또는 각도끼리 선택하세요. 반지름·넓이의 같음은 지원하지 않습니다."
+        }
+        require(!sameMeasurement(first, second)) { "서로 다른 두 측정값을 선택하세요." }
+        listOf(first, second).forEach { measurement ->
+            val value = ConstructionMeasurementGeometry.layout(scene, measurement)?.value
+            require(value != null && value.isFinite() && (measurement.type != MeasurementType.DISTANCE || value >= SceneValidator.MIN_LENGTH)) {
+                "정의되지 않거나 길이가 0인 측정은 같은 조건으로 묶을 수 없습니다."
+            }
+        }
+        val candidate: GeometryConstraint
+        if (first.type == MeasurementType.ANGLE) {
+            candidate = GeometryConstraint(id(), ConstraintType.EQUAL_ANGLE, first.entityIds + second.entityIds)
+        } else {
+            val a = measuredSegment(scene, first); val b = measuredSegment(scene, second)
+            candidate = if (a != null && b != null) GeometryConstraint(id(), ConstraintType.EQUAL_LENGTH, listOf(a.id, b.id))
+                else GeometryConstraint(id(), ConstraintType.EQUAL_DISTANCE_POINTS, first.entityIds + second.entityIds)
+        }
+        return if (matchingEqualityConstraint(scene, firstId, secondId) != null) scene
+            else validated(scene.copy(constraints = scene.constraints + candidate))
+    }
+
+    /** Returns the existing relation, including paused ones, so the UI can show its actual state. */
+    fun matchingEqualityConstraint(scene: ConstructionScene, firstId: String, secondId: String): GeometryConstraint? {
+        val first = scene.measurements.firstOrNull { it.id == firstId } ?: return null
+        val second = scene.measurements.firstOrNull { it.id == secondId } ?: return null
+        if (first.type != second.type || sameMeasurement(first, second)) return null
+        return when (first.type) {
+            MeasurementType.ANGLE -> scene.constraints.firstOrNull {
+                it.type == ConstraintType.EQUAL_ANGLE && sameAnglePairs(it.entityIds, first.entityIds + second.entityIds)
+            }
+            MeasurementType.DISTANCE -> {
+                val requestedPairs = setOf(first.entityIds.toSet(), second.entityIds.toSet())
+                scene.constraints.firstOrNull { condition ->
+                    when (condition.type) {
+                        ConstraintType.EQUAL_DISTANCE_POINTS -> condition.entityIds.size == 4 &&
+                            setOf(condition.entityIds.take(2).toSet(), condition.entityIds.drop(2).toSet()) == requestedPairs
+                        ConstraintType.EQUAL_LENGTH -> condition.entityIds.size == 2 && condition.entityIds.mapNotNull(scene::segment)
+                            .map { setOf(it.startPointId, it.endPointId) }.toSet() == requestedPairs
+                        else -> false
+                    }
+                }
+            }
+            else -> null
+        }
+    }
+
+    private fun measuredSegment(scene: ConstructionScene, measurement: GeometryMeasurement): GeometrySegment? =
+        scene.segments.firstOrNull { setOf(it.startPointId, it.endPointId) == measurement.entityIds.toSet() }
+
+    private fun sameInterior(a: List<String>, b: List<String>) = a.size == 3 && b.size == 3 &&
+        a[1] == b[1] && setOf(a[0], a[2]) == setOf(b[0], b[2])
+
+    private fun sameAnglePairs(a: List<String>, b: List<String>): Boolean = a.size == 6 && b.size == 6 &&
+        (sameInterior(a.take(3), b.take(3)) && sameInterior(a.drop(3), b.drop(3)) ||
+            sameInterior(a.take(3), b.drop(3)) && sameInterior(a.drop(3), b.take(3)))
+
     private fun sameMeasurement(a: GeometryMeasurement, b: GeometryMeasurement): Boolean {
         if (a.type != b.type) return false
         return when (a.type) {
@@ -246,7 +338,8 @@ internal object ConstructionEdits {
     fun addConstraint(scene: ConstructionScene, constraint: GeometryConstraint): ConstructionScene {
         // Re-edit an existing driving dimension instead of accumulating contradictory duplicates.
         val dimensionTypes = setOf(ConstraintType.LENGTH, ConstraintType.RADIUS, ConstraintType.ANGLE, ConstraintType.DISTANCE_POINT_LINE,
-            ConstraintType.POINT_FRACTION, ConstraintType.POINT_DISTANCE, ConstraintType.LENGTH_RATIO, ConstraintType.INTERIOR_ANGLE)
+            ConstraintType.POINT_FRACTION, ConstraintType.POINT_DISTANCE, ConstraintType.LENGTH_RATIO, ConstraintType.INTERIOR_ANGLE,
+            ConstraintType.DISTANCE_POINTS)
         fun sameInterior(a: List<String>, b: List<String>) = a.size == 3 && b.size == 3 &&
             a[1] == b[1] && setOf(a[0], a[2]) == setOf(b[0], b[2])
         fun samePairOfInteriors(a: List<String>, b: List<String>): Boolean {
@@ -258,6 +351,10 @@ internal object ConstructionEdits {
         val existing = scene.constraints.firstOrNull {
             it.type == constraint.type && (it.entityIds == constraint.entityIds ||
                 (constraint.type in setOf(ConstraintType.EQUAL_LENGTH, ConstraintType.LENGTH_RATIO) && it.entityIds.toSet() == constraint.entityIds.toSet()) ||
+                (constraint.type == ConstraintType.DISTANCE_POINTS && it.entityIds.toSet() == constraint.entityIds.toSet()) ||
+                (constraint.type == ConstraintType.EQUAL_DISTANCE_POINTS && it.entityIds.size == 4 && constraint.entityIds.size == 4 &&
+                    setOf(it.entityIds.take(2).toSet(), it.entityIds.drop(2).toSet()) ==
+                    setOf(constraint.entityIds.take(2).toSet(), constraint.entityIds.drop(2).toSet())) ||
                 (constraint.type == ConstraintType.INTERIOR_ANGLE && sameInterior(it.entityIds, constraint.entityIds)) ||
                 (constraint.type == ConstraintType.EQUAL_ANGLE && samePairOfInteriors(it.entityIds, constraint.entityIds)))
         }
@@ -326,10 +423,12 @@ internal fun ConstraintType.koreanName(): String = when (this) {
     ConstraintType.POINT_DISTANCE -> "끝점에서 거리"
     ConstraintType.POINT_ON_CIRCLE -> "원 위의 점"
     ConstraintType.LENGTH -> "길이"
+    ConstraintType.DISTANCE_POINTS -> "두 점 거리"
     ConstraintType.RADIUS -> "반지름"
     ConstraintType.PARALLEL -> "평행"
     ConstraintType.PERPENDICULAR -> "수직"
     ConstraintType.EQUAL_LENGTH -> "같은 길이"
+    ConstraintType.EQUAL_DISTANCE_POINTS -> "같은 거리"
     ConstraintType.LENGTH_RATIO -> "길이 비율"
     ConstraintType.INTERIOR_ANGLE -> "세 점 각도"
     ConstraintType.EQUAL_ANGLE -> "같은 각도"

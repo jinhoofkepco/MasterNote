@@ -80,6 +80,8 @@ enum class ConstraintType {
     LENGTH_RATIO,
     INTERIOR_ANGLE,
     EQUAL_ANGLE,
+    DISTANCE_POINTS,
+    EQUAL_DISTANCE_POINTS,
 }
 
 /**
@@ -98,6 +100,8 @@ enum class ConstraintType {
  * LENGTH_RATIO [segmentA, segmentB] means length A = value * length B.
  * INTERIOR_ANGLE [A, B, C] has vertex B and value degrees in [0, 180]. EQUAL_ANGLE compares
  * [A, B, C] and [D, E, F] interiors. The two triples may share vertices or rays.
+ * DISTANCE_POINTS [pointA, pointB] fixes their distance without adding a visible segment.
+ * EQUAL_DISTANCE_POINTS [A, B, C, D] means distance AB = distance CD; pairs may share a point.
  * A displayed measurement is not a constraint unless explicitly added here.
  */
 data class GeometryConstraint(
@@ -186,6 +190,9 @@ object SceneValidator {
                 ConstraintType.DISTANCE_POINT_LINE -> refs.size == 2 && point(0) && segment(1) &&
                     validNumber(c.value) && c.value!! >= 0.0
                 ConstraintType.LENGTH -> refs.size == 1 && segment(0) && validLength(c.value)
+                ConstraintType.DISTANCE_POINTS -> refs.size == 2 && point(0) && point(1) && refs[0] != refs[1] && validLength(c.value)
+                ConstraintType.EQUAL_DISTANCE_POINTS -> refs.size == 4 && refs.all(points::containsKey) &&
+                    refs[0] != refs[1] && refs[2] != refs[3] && refs.take(2).toSet() != refs.drop(2).toSet()
                 ConstraintType.RADIUS -> refs.size == 1 && circle(0) && validLength(c.value)
                 ConstraintType.HORIZONTAL, ConstraintType.VERTICAL -> refs.size == 1 && segment(0)
                 ConstraintType.PARALLEL, ConstraintType.PERPENDICULAR, ConstraintType.EQUAL_LENGTH ->

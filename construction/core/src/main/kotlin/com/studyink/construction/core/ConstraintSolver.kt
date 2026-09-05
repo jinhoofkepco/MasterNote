@@ -167,7 +167,7 @@ class ConstraintSolver {
         val scale = max(1.0, max(
             source.points.maxOf { max(abs(it.x - originX), abs(it.y - originY)) },
             max(source.circles.maxOfOrNull { it.radius } ?: 0.0,
-                active.filter { it.type == ConstraintType.LENGTH || it.type == ConstraintType.RADIUS || it.type == ConstraintType.DISTANCE_POINT_LINE || it.type == ConstraintType.POINT_DISTANCE }.maxOfOrNull { it.value ?: 0.0 } ?: 0.0),
+                active.filter { it.type == ConstraintType.LENGTH || it.type == ConstraintType.RADIUS || it.type == ConstraintType.DISTANCE_POINT_LINE || it.type == ConstraintType.POINT_DISTANCE || it.type == ConstraintType.DISTANCE_POINTS }.maxOfOrNull { it.value ?: 0.0 } ?: 0.0),
         ))
         val initial = DoubleArray(source.points.size * 2 + source.circles.size).also { x ->
             source.points.forEach { p -> val i = pointIndex.getValue(p.id); x[i] = (p.x - originX) / scale; x[i + 1] = (p.y - originY) / scale }
@@ -234,6 +234,11 @@ class ConstraintSolver {
                         output += hypot(p[0] - center[0], p[1] - center[1]) - x[circleIndex.getValue(ids[1])]
                     }
                     ConstraintType.LENGTH -> output += norm(direction(x, ids[0])) - c.value!! / scale
+                    ConstraintType.DISTANCE_POINTS -> {
+                        val a = point(x, ids[0]); val b = point(x, ids[1])
+                        output += hypot(b[0] - a[0], b[1] - a[1]) - c.value!! / scale
+                    }
+                    ConstraintType.EQUAL_DISTANCE_POINTS -> output += pointDistance(x, ids[0], ids[1]) - pointDistance(x, ids[2], ids[3])
                     ConstraintType.RADIUS -> output += x[circleIndex.getValue(ids[0])] - c.value!! / scale
                     ConstraintType.EQUAL_LENGTH -> output += norm(direction(x, ids[0])) - norm(direction(x, ids[1]))
                     ConstraintType.LENGTH_RATIO -> output +=
@@ -271,13 +276,14 @@ class ConstraintSolver {
             active.forEach { c ->
                 val ends = when (c.type) {
                     ConstraintType.LENGTH -> segments.getValue(c.entityIds[0]).let { it.startPointId to it.endPointId }
+                    ConstraintType.DISTANCE_POINTS -> c.entityIds[0] to c.entityIds[1]
                     ConstraintType.POINT_ON_CIRCLE -> circles.getValue(c.entityIds[1]).centerPointId to c.entityIds[0]
                     else -> null
                 }
                 if (ends != null && ends.first != ends.second) {
                     val a = pointIndex.getValue(ends.first); val b = pointIndex.getValue(ends.second)
                     if (hypot(x[a] - x[b], x[a + 1] - x[b + 1]) < 1e-12) {
-                        val target = if (c.type == ConstraintType.LENGTH) c.value!! / scale else x[circleIndex.getValue(c.entityIds[1])]
+                        val target = if (c.type == ConstraintType.LENGTH || c.type == ConstraintType.DISTANCE_POINTS) c.value!! / scale else x[circleIndex.getValue(c.entityIds[1])]
                         if (ends.second !in fixed) x[b] += max(target * 0.05, 1e-5)
                         else if (ends.first !in fixed) x[a] -= max(target * 0.05, 1e-5)
                     }
@@ -319,6 +325,9 @@ class ConstraintSolver {
                     else -> emptyList()
                 }
                 if (directions.any { norm(direction(x, it)) * scale < SceneValidator.MIN_LENGTH }) errors[c.id] = Double.POSITIVE_INFINITY
+                if (c.type == ConstraintType.EQUAL_DISTANCE_POINTS &&
+                    (pointDistance(x, c.entityIds[0], c.entityIds[1]) * scale < SceneValidator.MIN_LENGTH ||
+                        pointDistance(x, c.entityIds[2], c.entityIds[3]) * scale < SceneValidator.MIN_LENGTH)) errors[c.id] = Double.POSITIVE_INFINITY
                 if (c.type == ConstraintType.INTERIOR_ANGLE || c.type == ConstraintType.EQUAL_ANGLE) {
                     val offsets = if (c.type == ConstraintType.EQUAL_ANGLE) listOf(0, 3) else listOf(0)
                     if (offsets.any { offset -> angleRays(x, c.entityIds, offset).let {
@@ -370,6 +379,7 @@ class ConstraintSolver {
             }
             active.forEach { c ->
                 if (c.type == ConstraintType.LENGTH) segments.getValue(c.entityIds[0]).let { link(it.startPointId, it.endPointId) }
+                if (c.type == ConstraintType.DISTANCE_POINTS) link(c.entityIds[0], c.entityIds[1])
                 if (c.type == ConstraintType.POINT_ON_CIRCLE) link(c.entityIds[0], circles.getValue(c.entityIds[1]).centerPointId)
             }
             return buildList {
@@ -399,6 +409,10 @@ class ConstraintSolver {
             return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
         }
         private fun point(x: DoubleArray, id: String): DoubleArray = pointIndex.getValue(id).let { doubleArrayOf(x[it], x[it + 1]) }
+        private fun pointDistance(x: DoubleArray, a: String, b: String): Double {
+            val first = point(x, a); val second = point(x, b)
+            return hypot(second[0] - first[0], second[1] - first[1])
+        }
         private fun lineDistance(x: DoubleArray, pointId: String, lineId: String): Double {
             val line = segments.getValue(lineId); val p = point(x, pointId); val a = point(x, line.startPointId); val d = direction(x, line.id)
             return ((p[0] - a[0]) * d[1] - (p[1] - a[1]) * d[0]) / max(norm(d), 1e-12)

@@ -4,6 +4,7 @@ import android.graphics.Canvas
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PointF
 import android.graphics.RectF
 import com.studyink.construction.core.ConstructionScene
 import com.studyink.construction.core.ConstraintType
@@ -20,6 +21,10 @@ internal data class ConstructionAnnotationHit(
     val bounds: RectF,
     /** Visible caption/badge outranks a nearby point; expanded touch padding does not. */
     val visualBounds: RectF = RectF(bounds),
+    val label: String = "",
+    val targetEntityId: String? = null,
+    /** Screen-space attachment point for local relation leaders, not a model coordinate. */
+    val targetAnchor: PointF? = null,
 )
 
 /** CAD-style annotations have their own hit targets and never become geometric lines. */
@@ -60,7 +65,6 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
         }
         val dimensionIds = dimensions.mapTo(mutableSetOf()) { it.first.id }
         scene.constraints.filter { it.type == ConstraintType.EQUAL_ANGLE }.forEachIndexed { index, constraint ->
-            if (!constraint.enabled && constraint.id != selectedConstraint && constraint.entityIds.none { it in selected }) return@forEachIndexed
             val layouts = ConstructionMeasurementGeometry.equalAngleLayouts(scene, constraint)
             layouts.forEach { layout ->
                 // Matching captions on both arcs identify an equality, not a fixed degree value.
@@ -71,13 +75,37 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
             }
             if (layouts.isNotEmpty()) dimensionIds += constraint.id
         }
+        scene.constraints.filter { it.type == ConstraintType.EQUAL_DISTANCE_POINTS }.forEachIndexed { index, constraint ->
+            val layouts = ConstructionMeasurementGeometry.equalDistanceLayouts(scene, constraint)
+            layouts.forEach { layout ->
+                val relation = layout.copy(captionOverride = "같은 거리 ${index + 1}")
+                drawDimension(canvas, placeDrivingCaption(canvas, relation, constraint.enabled), constraint.id,
+                    ConstructionAnnotationKind.CONSTRAINT, constraint.id == selectedConstraint, reference = false, enabled = constraint.enabled)
+            }
+            if (layouts.isNotEmpty()) dimensionIds += constraint.id
+        }
         val related = scene.constraints.filter { c ->
             c.id !in dimensionIds && (c.enabled || c.id == selectedConstraint || c.entityIds.any { id ->
                 id in selected || scene.segment(id)?.let { it.startPointId in selected || it.endPointId in selected } == true ||
                     scene.circle(id)?.centerPointId in selected
             })
         }
-        related.forEach { drawBadge(canvas, scene, it, it.id == selectedConstraint) }
+        // Slot allocation includes hidden disabled relations. Selecting a condition must not
+        // shuffle its neighbors; a slot belongs to its local entity, not to screen-wide free space.
+        val visibleIds = related.mapTo(hashSetOf()) { it.id }
+        val reservedCaptions = hits.mapTo(mutableListOf()) { RectF(it.visualBounds) }
+        val localSlots = mutableMapOf<String, Int>()
+        val groups = mutableMapOf<ConstraintType, Int>()
+        scene.constraints.filter { it.id !in dimensionIds }.forEach { constraint ->
+            val group = (groups[constraint.type] ?: 0) + 1
+            groups[constraint.type] = group
+            constraint.entityIds.distinct().forEachIndexed { member, entityId ->
+                val slot = localSlots[entityId] ?: 0
+                localSlots[entityId] = slot + 1
+                drawBadge(canvas, scene, constraint, entityId, member, group, slot,
+                    constraint.id == selectedConstraint, constraint.id in visibleIds, reservedCaptions)
+            }
+        }
         return hits.toList()
     }
 
@@ -95,7 +123,7 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
         val step = 24f * density
         val gap = 3f * density
         val margin = 4f * density
-        for (ring in 1..16) {
+        for (ring in 1..3) {
             val candidates = buildList {
                 for (dx in -ring..ring) for (dy in -ring..ring) {
                     if (maxOf(kotlin.math.abs(dx), kotlin.math.abs(dy)) == ring) add(dx to dy)
@@ -122,6 +150,7 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
         paint.reset(); paint.isAntiAlias = true; paint.strokeWidth = density * 1.15f
         paint.color = when { !enabled -> DIMENSION_DISABLED; selected -> DIMENSION_SELECTED; else -> DIMENSION_GUIDE }
         paint.style = Paint.Style.STROKE
+        if (reference) paint.pathEffect = DashPathEffect(floatArrayOf(4 * density, 3 * density), 0f)
         when (layout.type) {
             MeasurementType.DISTANCE -> {
                 val a = layout.first; val b = layout.second!!
@@ -196,8 +225,12 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
                 (if (layout.directionSegments.isNotEmpty()) "방향각 " else "") + "${formatGeometry(layout.value)}°" else "각도 미정"
             MeasurementType.AREA -> "${formatGeometry(layout.value)} cm²"
         })
-        val prefix = when { !enabled -> "꺼짐 · 설정 "; reference -> "≈ "; else -> "" }
-        return prefix + text
+        return when {
+            !enabled -> "꺼짐 · $text"
+            reference -> "측정 · ($text)"
+            layout.captionOverride != null -> "조건 · $text"
+            else -> "고정 · $text"
+        }
     }
 
     private fun line(canvas: Canvas, a: ConstructionVector, b: ConstructionVector) = canvas.drawLine(sx(a.x), sy(a.y), sx(b.x), sy(b.y), paint)
@@ -212,73 +245,131 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
         paint.reset(); paint.isAntiAlias = true; paint.textSize = 12f * density
         val half = paint.measureText(text) / 2
         val bounds = captionBounds(text, x, y)
-        paint.color = if (selected) 0xFFE5EDFF.toInt() else 0xF7FFFEF9.toInt()
+        val reference = kind == ConstructionAnnotationKind.MEASUREMENT
+        paint.color = when { selected -> 0xFFE5EDFF.toInt(); reference -> 0xF7FFFEF9.toInt(); else -> 0xFFEAF0F7.toInt() }
         canvas.drawRoundRect(bounds, 4 * density, 4 * density, paint)
-        if (selected) {
-            paint.color = DIMENSION_SELECTED; paint.style = Paint.Style.STROKE; paint.strokeWidth = density
-            canvas.drawRoundRect(bounds, 4 * density, 4 * density, paint); paint.style = Paint.Style.FILL
-        }
+        paint.color = if (selected) DIMENSION_SELECTED else DIMENSION_GUIDE
+        paint.style = Paint.Style.STROKE; paint.strokeWidth = density
+        if (reference) paint.pathEffect = DashPathEffect(floatArrayOf(3 * density, 3 * density), 0f)
+        canvas.drawRoundRect(bounds, 4 * density, 4 * density, paint)
+        paint.pathEffect = null; paint.style = Paint.Style.FILL
         paint.color = when { !enabled -> DIMENSION_DISABLED; selected -> DIMENSION_SELECTED; else -> DIMENSION_TEXT }
         canvas.drawText(text, x - half, y - (paint.ascent() + paint.descent()) / 2, paint)
-        hits += ConstructionAnnotationHit(id, kind, touchBounds(bounds), RectF(bounds))
+        if (!reference) {
+            paint.style = Paint.Style.STROKE; paint.strokeWidth = density
+            val lockX = bounds.left + 6 * density
+            canvas.drawRoundRect(RectF(lockX - 2.5f * density, y, lockX + 2.5f * density, y + 4 * density), density, density, paint)
+            canvas.drawArc(RectF(lockX - 1.8f * density, y - 4 * density, lockX + 1.8f * density, y + 2 * density), 180f, 180f, false, paint)
+            if (!enabled) canvas.drawLine(lockX - 4 * density, y + 5 * density, lockX + 4 * density, y - 5 * density, paint)
+        }
+        hits += ConstructionAnnotationHit(id, kind, touchBounds(bounds), RectF(bounds), label = text)
     }
 
     private fun captionBounds(text: String, x: Float, y: Float): RectF {
         paint.textSize = 12f * density
         val half = paint.measureText(text) / 2
-        return RectF(x - half - 5 * density, y - 10 * density, x + half + 5 * density, y + 10 * density)
+        val leading = if (text.startsWith("측정")) 5f else 14f
+        return RectF(x - half - leading * density, y - 10 * density, x + half + leading * density, y + 10 * density)
     }
 
     private fun touchBounds(visual: RectF) = RectF(visual).apply { inset(-5 * density, -10 * density) }
 
-    private fun drawBadge(canvas: Canvas, scene: ConstructionScene, constraint: GeometryConstraint, selected: Boolean) {
-        val target = constraint.entityIds.firstOrNull() ?: return
-        val anchor = scene.point(target)?.let { ConstructionVector(it.x, it.y) }
-            ?: scene.segment(target)?.let { s ->
-                val a = scene.point(s.startPointId); val b = scene.point(s.endPointId)
-                if (a == null || b == null) null else ConstructionVector((a.x + b.x) / 2, (a.y + b.y) / 2)
+    private fun drawBadge(canvas: Canvas, scene: ConstructionScene, constraint: GeometryConstraint,
+                          target: String, member: Int, group: Int, slot: Int, selected: Boolean,
+                          visible: Boolean, reservedCaptions: MutableList<RectF>) {
+        val normal: ConstructionVector
+        val anchor: ConstructionVector
+        val segment = scene.segment(target)
+        val circle = scene.circle(target)
+        when {
+            segment != null -> {
+                val a = scene.point(segment.startPointId) ?: return
+                val b = scene.point(segment.endPointId) ?: return
+                anchor = ConstructionVector((a.x + b.x) / 2, (a.y + b.y) / 2)
+                val direction = ConstructionVector(b.x - a.x, b.y - a.y).unit()
+                // Normal follows the same stable start/end IDs as the actual line.
+                normal = ConstructionVector(-direction.y, -direction.x)
             }
-            ?: scene.circle(target)?.let { c -> scene.point(c.centerPointId)?.let { ConstructionVector(it.x + c.radius, it.y) } }
-            ?: return
-        // Persistent badges belong to visible geometry, not a stack of offscreen constraints
-        // clamped against the edge while the user pans around the shared sheet.
-        if (sx(anchor.x) < 0f || sx(anchor.x) > canvas.width || sy(anchor.y) < 0f || sy(anchor.y) > canvas.height) return
+            circle != null -> {
+                val center = scene.point(circle.centerPointId) ?: return
+                anchor = ConstructionVector(center.x + circle.radius, center.y)
+                normal = ConstructionVector(1.0, 0.0)
+            }
+            else -> {
+                val point = scene.point(target) ?: return
+                anchor = ConstructionVector(point.x, point.y)
+                normal = ConstructionVector(.707106781, -.707106781)
+            }
+        }
+        val ax = sx(anchor.x); val ay = sy(anchor.y)
+        if (ax < 0f || ax > canvas.width || ay < 0f || ay > canvas.height) return
         val relationText = when (constraint.type) {
-            ConstraintType.POINT_FRACTION -> {
-                val segment = constraint.entityIds.getOrNull(1)?.let(scene::segment)
-                val start = segment?.startPointId?.let(scene::point)?.label.orEmpty()
-                val end = segment?.endPointId?.let(scene::point)?.label.orEmpty()
-                "$start→$end · ${constraint.numerator}/${constraint.denominator}"
-            }
-            ConstraintType.LENGTH_RATIO -> "비 ${formatGeometry(constraint.value ?: 1.0)}:1"
-            else -> null
+            ConstraintType.FIXED_POINT -> "고정"
+            ConstraintType.COINCIDENT -> "일치 $group"
+            ConstraintType.POINT_ON_LINE -> "직선 위 $group"
+            ConstraintType.POINT_ON_SEGMENT -> "선분 위 $group"
+            ConstraintType.POINT_ON_CIRCLE -> "원 위 $group"
+            ConstraintType.POINT_FRACTION -> "${constraint.numerator}/${constraint.denominator} 위치 $group"
+            ConstraintType.LENGTH_RATIO -> "비$group ×${if (member == 0) formatGeometry(constraint.value ?: 1.0) else "1"}"
+            ConstraintType.PARALLEL -> "평행 $group"
+            ConstraintType.PERPENDICULAR -> "직각 $group"
+            ConstraintType.HORIZONTAL -> "수평"
+            ConstraintType.VERTICAL -> "수직"
+            ConstraintType.EQUAL_LENGTH -> "같은 길이 $group"
+            else -> "조건 $group"
+        }.let { if (constraint.enabled) it else "꺼짐 · $it" }
+        paint.reset(); paint.isAntiAlias = true; paint.textSize = 10f * density
+        val halfHeight = 11f * density
+        val halfWidth = (paint.measureText(relationText) + 23 * density) / 2
+        // Nine bounded local slots (three outward tiers, three side offsets). Dense diagrams may
+        // still overlap; their relations remain selectable in the list instead of fleeing elsewhere.
+        val normalExtent = kotlin.math.abs(normal.x).toFloat() * halfWidth + kotlin.math.abs(normal.y).toFloat() * halfHeight
+        fun localBounds(localSlot: Int): RectF {
+            val tier = localSlot % 3
+            val column = when ((localSlot / 3) % 3) { 1 -> 1; 2 -> -1; else -> 0 }
+            val distance = normalExtent + (11 + tier * 24) * density
+            val tangent = column * 34f * density
+            val x = ax + normal.x.toFloat() * distance - normal.y.toFloat() * tangent
+            val y = ay + normal.y.toFloat() * distance + normal.x.toFloat() * tangent
+            return RectF(x - halfWidth, y - halfHeight, x + halfWidth, y + halfHeight)
         }
-        paint.reset(); paint.isAntiAlias = true; paint.textSize = 11f * density
-        val half = 12f * density
-        val halfWidth = if (relationText == null) half else max(half, paint.measureText(relationText) / 2 + 6f * density)
-        var bounds = RectF()
-        for (attempt in 0..40) {
-            val x = (sx(anchor.x) + (attempt % 5 - 2) * (halfWidth * 2 + 5 * density)).coerceIn(halfWidth + 3 * density, max(halfWidth + 3 * density, canvas.width - halfWidth - 3 * density))
-            val y = (sy(anchor.y) + 27 * density + (attempt / 5) * 29 * density).coerceIn(half + 3 * density, max(half + 3 * density, canvas.height - half - 3 * density))
-            bounds = RectF(x - halfWidth, y - half, x + halfWidth, y + half)
-            if (hits.none { RectF.intersects(it.bounds, bounds) }) break
-        }
-        paint.reset(); paint.isAntiAlias = true; paint.color = if (selected) 0xFFDFEAFE.toInt() else 0xF7F3F6FB.toInt()
-        canvas.drawRoundRect(bounds, 6 * density, 6 * density, paint)
+        val preferred = localBounds(slot % 9)
+        val gap = 3f * density
+        // Reserve every measurement caption and earlier local badge, including hidden paused
+        // relations. Only these same nine nearby slots are tried; selection cannot rearrange them.
+        val bounds = (0 until 9).asSequence().map { localBounds((slot + it) % 9) }.firstOrNull { candidate ->
+            val spaced = RectF(candidate).apply { inset(-gap, -gap) }
+            reservedCaptions.none { RectF.intersects(it, spaced) }
+        } ?: preferred
+        reservedCaptions += RectF(bounds)
+        if (!visible) return
+        val x = bounds.centerX(); val y = bounds.centerY()
+        // Clip with the viewport naturally. Never clamp a badge to a distant screen edge.
+        if (!RectF.intersects(bounds, RectF(0f, 0f, canvas.width.toFloat(), canvas.height.toFloat()))) return
         paint.style = Paint.Style.STROKE; paint.strokeWidth = density
-        paint.color = if (constraint.enabled) 0xFF526A84.toInt() else 0xFF9A9FA8.toInt()
-        canvas.drawRoundRect(bounds, 6 * density, 6 * density, paint)
-        canvas.save(); canvas.translate(bounds.centerX(), bounds.centerY()); canvas.scale(density, density)
-        paint.strokeWidth = 1.4f
-        if (relationText == null) symbol(canvas, constraint.type) else {
-            paint.style = Paint.Style.FILL; paint.textSize = 11f
-            canvas.drawText(relationText, -paint.measureText(relationText) / 2, -(paint.ascent() + paint.descent()) / 2, paint)
-            paint.style = Paint.Style.STROKE
-        }
+        paint.color = when { !constraint.enabled -> DIMENSION_DISABLED; selected -> DIMENSION_SELECTED; else -> DIMENSION_GUIDE }
+        val leaderX = x - normal.x.toFloat() * normalExtent
+        val leaderY = y - normal.y.toFloat() * normalExtent
+        canvas.drawLine(ax, ay, leaderX, leaderY, paint)
+        canvas.drawLine(ax + normal.y.toFloat() * 3 * density, ay - normal.x.toFloat() * 3 * density,
+            ax - normal.y.toFloat() * 3 * density, ay + normal.x.toFloat() * 3 * density, paint)
+        paint.style = Paint.Style.FILL; paint.color = if (selected) 0xFFDFEAFE.toInt() else 0xFFEAF0F7.toInt()
+        canvas.drawRoundRect(bounds, 4 * density, 4 * density, paint)
+        paint.style = Paint.Style.STROKE; paint.strokeWidth = density
+        paint.color = if (selected) DIMENSION_SELECTED else if (constraint.enabled) DIMENSION_TEXT else DIMENSION_DISABLED
+        canvas.drawRoundRect(bounds, 4 * density, 4 * density, paint)
+        // A blue selection outline only indicates focus. Paused relation symbols and text stay
+        // gray (with "꺼짐" and a strike) so selecting one never makes it appear enabled.
+        paint.color = when { !constraint.enabled -> DIMENSION_DISABLED; selected -> DIMENSION_SELECTED; else -> DIMENSION_TEXT }
+        canvas.save(); canvas.translate(bounds.left + 10 * density, y); canvas.scale(density * .8f, density * .8f)
+        paint.strokeWidth = 1.3f
+        symbol(canvas, constraint.type)
         if (!constraint.enabled) canvas.drawLine(-8f, 8f, 8f, -8f, paint)
         canvas.restore()
+        paint.style = Paint.Style.FILL; paint.textSize = 10f * density
+        canvas.drawText(relationText, bounds.left + 20 * density, y - (paint.ascent() + paint.descent()) / 2, paint)
         hits += ConstructionAnnotationHit(constraint.id, ConstructionAnnotationKind.CONSTRAINT,
-            RectF(bounds).apply { inset(-8 * density, -8 * density) }, RectF(bounds))
+            RectF(bounds).apply { inset(-4 * density, -7 * density) }, RectF(bounds), relationText, target, PointF(ax, ay))
     }
 
     private fun symbol(c: Canvas, type: ConstraintType) {
@@ -294,12 +385,12 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
             ConstraintType.PERPENDICULAR -> { line(-6f, 5f, 6f, 5f); line(0f, -6f, 0f, 5f) }
             ConstraintType.HORIZONTAL -> line(-7f, 0f, 7f, 0f)
             ConstraintType.VERTICAL -> line(0f, -7f, 0f, 7f)
-            ConstraintType.EQUAL_LENGTH -> { line(-6f, -3f, 6f, -3f); line(-6f, 3f, 6f, 3f) }
+            ConstraintType.EQUAL_LENGTH, ConstraintType.EQUAL_DISTANCE_POINTS -> { line(-6f, -3f, 6f, -3f); line(-6f, 3f, 6f, 3f) }
             ConstraintType.LENGTH_RATIO -> { line(-7f, -3f, 7f, -3f); line(-7f, 3f, 0f, 3f) }
             ConstraintType.ANGLE, ConstraintType.INTERIOR_ANGLE -> { line(-6f, 5f, 7f, 5f); line(-6f, 5f, 3f, -6f); c.drawArc(RectF(-12f, -1f, 0f, 11f), -50f, 50f, false, paint) }
             ConstraintType.EQUAL_ANGLE -> { line(-7f, 5f, 7f, 5f); line(-7f, 5f, 0f, -5f); line(2f, -3f, 7f, -3f); line(2f, 0f, 7f, 0f) }
             ConstraintType.FIXED_POINT -> { c.drawRect(-5f, -1f, 5f, 7f, paint); c.drawArc(RectF(-3f, -7f, 3f, 3f), 180f, 180f, false, paint) }
-            ConstraintType.LENGTH -> { line(-7f, 0f, 7f, 0f); line(-7f, 0f, -3f, -3f); line(-7f, 0f, -3f, 3f); line(7f, 0f, 3f, -3f); line(7f, 0f, 3f, 3f) }
+            ConstraintType.LENGTH, ConstraintType.DISTANCE_POINTS -> { line(-7f, 0f, 7f, 0f); line(-7f, 0f, -3f, -3f); line(-7f, 0f, -3f, 3f); line(7f, 0f, 3f, -3f); line(7f, 0f, 3f, 3f) }
             ConstraintType.DISTANCE_POINT_LINE -> { line(-7f, 6f, 7f, 6f); line(0f, -7f, 0f, 6f); c.drawCircle(0f, -7f, 2f, paint) }
             ConstraintType.RADIUS -> { paint.style = Paint.Style.FILL; paint.textSize = 16f; c.drawText("r", -3f, 5f, paint); paint.style = Paint.Style.STROKE }
         }

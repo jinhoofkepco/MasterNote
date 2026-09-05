@@ -21,6 +21,12 @@ internal data class ConstructionVector(val x: Double, val y: Double) {
     fun unit() = if (length() > 1e-10) this * (1.0 / length()) else ConstructionVector(0.0, 1.0)
 }
 
+/** Display-only relation focus. These IDs must never become the editable selection. */
+internal data class ConstructionAnnotationTargets(
+    val entityIds: Set<String> = emptySet(),
+    val pointPairs: List<Pair<String, String>> = emptyList(),
+)
+
 /** Model-space layout; offsets stay relative to the same geometric anchor across zoom and reload. */
 internal data class ConstructionMeasurementLayout(
     val id: String,
@@ -57,6 +63,11 @@ internal object ConstructionMeasurementGeometry {
                 val measurement = scene.measurements.firstOrNull { matchesConstraint(scene, it, constraint) }
                     ?.copy(id = constraint.id)
                     ?: GeometryMeasurement(constraint.id, MeasurementType.DISTANCE, listOf(segment.startPointId, segment.endPointId))
+                layout(scene, measurement)
+            }
+            ConstraintType.DISTANCE_POINTS -> {
+                val measurement = scene.measurements.firstOrNull { matchesConstraint(scene, it, constraint) }
+                    ?.copy(id = constraint.id) ?: GeometryMeasurement(constraint.id, MeasurementType.DISTANCE, refs)
                 layout(scene, measurement)
             }
             ConstraintType.RADIUS -> {
@@ -105,6 +116,8 @@ internal object ConstructionMeasurementGeometry {
             ConstraintType.LENGTH -> measurement.type == MeasurementType.DISTANCE &&
                 measurement.entityIds.toSet() == constraint.entityIds.firstOrNull()?.let(scene::segment)
                     ?.let { setOf(it.startPointId, it.endPointId) }
+            ConstraintType.DISTANCE_POINTS -> measurement.type == MeasurementType.DISTANCE &&
+                measurement.entityIds.toSet() == constraint.entityIds.toSet()
             ConstraintType.RADIUS -> measurement.type == MeasurementType.RADIUS && measurement.entityIds == constraint.entityIds
             ConstraintType.INTERIOR_ANGLE -> measurement.type == MeasurementType.ANGLE &&
                 measurement.entityIds.size == 3 && constraint.entityIds.size == 3 &&
@@ -124,6 +137,58 @@ internal object ConstructionMeasurementGeometry {
         return constraint.entityIds.chunked(3).mapNotNull { refs ->
             layout(scene, GeometryMeasurement(constraint.id, MeasurementType.ANGLE, refs))
         }
+    }
+
+    fun equalDistanceLayouts(scene: ConstructionScene, constraint: GeometryConstraint): List<ConstructionMeasurementLayout> {
+        if (constraint.type != ConstraintType.EQUAL_DISTANCE_POINTS || constraint.entityIds.size != 4) return emptyList()
+        return constraint.entityIds.chunked(2).mapNotNull { refs ->
+            layout(scene, GeometryMeasurement(constraint.id, MeasurementType.DISTANCE, refs))
+        }
+    }
+
+    fun annotationTargets(scene: ConstructionScene, constraintId: String?, measurementId: String?): ConstructionAnnotationTargets {
+        val constraint = scene.constraints.firstOrNull { it.id == constraintId }
+        val measurement = scene.measurements.firstOrNull { it.id == measurementId }
+        val ids = linkedSetOf<String>()
+        val pairs = linkedSetOf<Pair<String, String>>()
+        fun entity(id: String) {
+            if (scene.point(id) != null) ids += id
+            scene.segment(id)?.let { ids += it.id; ids += it.startPointId; ids += it.endPointId }
+            scene.circle(id)?.let { ids += it.id; ids += it.centerPointId }
+        }
+        fun pair(a: String, b: String) {
+            entity(a); entity(b)
+            if (a == b || scene.point(a) == null || scene.point(b) == null) return
+            val key = if (a < b) a to b else b to a
+            pairs += key
+            scene.segments.filter { setOf(it.startPointId, it.endPointId) == setOf(a, b) }.forEach { entity(it.id) }
+        }
+        fun angle(refs: List<String>) {
+            if (refs.size == 3) { pair(refs[0], refs[1]); pair(refs[1], refs[2]) }
+        }
+        constraint?.let { c ->
+            c.entityIds.forEach(::entity)
+            when (c.type) {
+                ConstraintType.DISTANCE_POINTS -> if (c.entityIds.size == 2) pair(c.entityIds[0], c.entityIds[1])
+                ConstraintType.EQUAL_DISTANCE_POINTS -> c.entityIds.chunked(2).filter { it.size == 2 }.forEach { pair(it[0], it[1]) }
+                ConstraintType.INTERIOR_ANGLE -> angle(c.entityIds)
+                ConstraintType.EQUAL_ANGLE -> c.entityIds.chunked(3).forEach(::angle)
+                else -> Unit
+            }
+        }
+        // A condition takes priority if the controller briefly retains the prior measurement ID.
+        if (constraint == null) measurement?.let { m ->
+            m.entityIds.forEach(::entity)
+            when (m.type) {
+                MeasurementType.DISTANCE -> if (m.entityIds.size == 2) pair(m.entityIds[0], m.entityIds[1])
+                MeasurementType.ANGLE -> angle(m.entityIds)
+                MeasurementType.AREA -> if (m.entityIds.size == 3) {
+                    pair(m.entityIds[0], m.entityIds[1]); pair(m.entityIds[1], m.entityIds[2]); pair(m.entityIds[2], m.entityIds[0])
+                }
+                MeasurementType.RADIUS -> Unit
+            }
+        }
+        return ConstructionAnnotationTargets(ids, pairs.toList())
     }
 
     private fun directedAngleLayout(scene: ConstructionScene, constraint: GeometryConstraint): ConstructionMeasurementLayout? {

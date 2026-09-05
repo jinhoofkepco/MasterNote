@@ -25,7 +25,6 @@ import com.studyink.construction.storage.ConstructionTarget
 import java.io.File
 import java.util.UUID
 import kotlin.math.hypot
-import kotlin.math.max
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -352,7 +351,7 @@ class ConstructionConditionInteractionTest {
 
     @Test
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
-    fun `numeric canvas labels open adjacent controls clamped on phone and tablet without moving the shared plane`() {
+    fun `numeric canvas labels open fixed upper right controls on phone and tablet without moving the shared plane`() {
         save(example())
         for ((label, width, height) in listOf(Triple("phone", 420, 900), Triple("tablet", 1000, 700))) {
             val editor = open(width, height)
@@ -383,16 +382,17 @@ class ConstructionConditionInteractionTest {
             val overlay = tag(editor, "construction-overlay")
             val panelBounds = globalBounds(overlay)
             val canvasBounds = globalBounds(canvas)
-            val labelBounds = RectF(dimension).apply { offset(canvasBounds.left, canvasBounds.top) }
             assertEquals(View.VISIBLE, overlay.visibility)
             assertNotNull(tag(editor, "condition-plus-length"))
             assertEquals(sharedBounds, globalBounds(host))
             assertEquals(globalBounds(canvas), globalBounds(inkLayer))
             assertEquals(geometryPoint, canvas.pointScreenPosition("A"))
             assertTrue("$label popup must stay inside the drawing area: $panelBounds in $canvasBounds", canvasBounds.contains(panelBounds))
-            val dx = max(0f, max(labelBounds.left - panelBounds.right, panelBounds.left - labelBounds.right))
-            val dy = max(0f, max(labelBounds.top - panelBounds.bottom, panelBounds.top - labelBounds.bottom))
-            assertTrue("$label adjustment must stay adjacent to its numeric label", hypot(dx.toDouble(), dy.toDouble()) <= 36.0)
+            val density = activity.resources.displayMetrics.density
+            assertEquals("$label inspector stays at the right margin", canvasBounds.right - 8f * density, panelBounds.right, 1f)
+            assertEquals("$label inspector stays at the top margin", canvasBounds.top + 8f * density, panelBounds.top, 1f)
+            assertEquals(272f * density, panelBounds.width(), 1f)
+            assertEquals(300f * density, panelBounds.height(), 1f)
             savePreview(editor, "build/outputs/condition-controls-$label-qa.png")
             description(editor, "작도 메뉴 닫기").performClick()
             settleLayout(editor, width, height)

@@ -53,6 +53,9 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
         set(value) { field = value; snapPreview = null; publishHint(); invalidate() }
     var selectedMeasurementId: String? = null
         set(value) { field = value; invalidate() }
+    /** Pending equality reference remains visible while a second measurement is chosen. */
+    var referenceMeasurementId: String? = null
+        set(value) { field = value; invalidate() }
     var selectedConstraintId: String? = null
         set(value) { field = value; invalidate() }
     var onSelectionChanged: (Set<String>) -> Unit = {}
@@ -131,6 +134,11 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
 
     internal fun pointScreenPosition(id: String): PointF? = point(id)?.let { PointF(sx(it.x), sy(it.y)) }
     internal fun viewportCenterWorld(): ConstructionAnchor = world(width / 2f, height / 2f)
+    internal fun annotationTargets(): ConstructionAnnotationTargets {
+        val primary = ConstructionMeasurementGeometry.annotationTargets(scene, selectedConstraintId, selectedMeasurementId)
+        val reference = ConstructionMeasurementGeometry.annotationTargets(scene, null, referenceMeasurementId)
+        return ConstructionAnnotationTargets(primary.entityIds + reference.entityIds, (primary.pointPairs + reference.pointPairs).distinct())
+    }
     internal fun constraintScreenBounds(id: String): RectF? = annotationHits.filter {
         it.id == id && it.kind == ConstructionAnnotationKind.CONSTRAINT
     }.let { hits -> hits.getOrNull(if (id == anchorConstraintId) anchorConstraintIndex else 0) ?: hits.firstOrNull() }?.bounds?.let(::RectF)
@@ -237,16 +245,31 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
         val gridLabel = "격자 ${formatGeometry(gridStep)} cm"
         pen.textSize = 12f * density
         label(gridLabel, width - pen.measureText(gridLabel) - 8f * density, height - 9f * density)
+        val focus = annotationTargets()
+        val highlighted = selectedIds + focus.entityIds
+        // Measurements may name two points or angle rays without a drawable segment. Highlight
+        // only that span as an overlay; never insert a new segment or alter the editable selection.
+        for ((aId, bId) in focus.pointPairs) {
+            if (scene.segments.any { setOf(it.startPointId, it.endPointId) == setOf(aId, bId) }) continue
+            val a = point(aId) ?: continue; val b = point(bId) ?: continue
+            pen.reset(); pen.isAntiAlias = true; pen.style = Paint.Style.STROKE; pen.strokeCap = Paint.Cap.ROUND
+            pen.color = SELECTION_HALO; pen.strokeWidth = 9f * density
+            canvas.drawLine(sx(a.x), sy(a.y), sx(b.x), sy(b.y), pen)
+            pen.color = 0xFF6B8FBB.toInt(); pen.strokeWidth = 1.2f * density
+            pen.pathEffect = DashPathEffect(floatArrayOf(4 * density, 3 * density), 0f)
+            canvas.drawLine(sx(a.x), sy(a.y), sx(b.x), sy(b.y), pen)
+            pen.pathEffect = null
+        }
         for (circle in scene.circles) {
             val center = point(circle.centerPointId) ?: continue
-            geometryStroke(circle.colorArgb ?: CIRCLE, circle.id in selectedIds, 1.6f, circle.lineStyle) {
+            geometryStroke(circle.colorArgb ?: CIRCLE, circle.id in highlighted, 1.6f, circle.lineStyle) {
                 canvas.drawCircle(sx(center.x), sy(center.y), (circle.radius * scale).toFloat(), pen)
             }
         }
         for (segment in scene.segments) {
             val a = point(segment.startPointId) ?: continue
             val b = point(segment.endPointId) ?: continue
-            geometryStroke(segment.colorArgb ?: INK, segment.id in selectedIds, 1.8f, segment.lineStyle) {
+            geometryStroke(segment.colorArgb ?: INK, segment.id in highlighted, 1.8f, segment.lineStyle) {
                 canvas.drawLine(sx(a.x), sy(a.y), sx(b.x), sy(b.y), pen)
             }
         }
@@ -257,7 +280,7 @@ internal class ConstructionCanvasView(context: Context) : View(context) {
         for (p in scene.points) {
             val fixed = scene.constraints.any { it.enabled && it.type == ConstraintType.FIXED_POINT && p.id in it.entityIds }
             pen.reset(); pen.isAntiAlias = true; pen.style = Paint.Style.FILL
-            if (p.id in selectedIds) { pen.color = SELECTION_HALO; canvas.drawCircle(sx(p.x), sy(p.y), 9f * density, pen) }
+            if (p.id in highlighted) { pen.color = SELECTION_HALO; canvas.drawCircle(sx(p.x), sy(p.y), 9f * density, pen) }
             pen.color = p.colorArgb ?: INK
             canvas.drawCircle(sx(p.x), sy(p.y), 3.5f * density, pen)
             if (fixed) {

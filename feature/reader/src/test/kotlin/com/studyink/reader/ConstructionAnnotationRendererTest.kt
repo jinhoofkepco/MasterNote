@@ -78,6 +78,7 @@ class ConstructionAnnotationRendererTest {
         render(scene().copy(constraints = listOf(constraint)), selectedConstraint = constraint.id) { bitmap, hits ->
             assertTrue(bitmap.hasOpaqueColor(0xFF9A9FA8.toInt()))
             assertEquals(constraint.id, hits.single().id)
+            assertTrue(hits.single().label.startsWith("꺼짐"))
         }
     }
 
@@ -191,8 +192,9 @@ class ConstructionAnnotationRendererTest {
             GeometryConstraint("ratio", ConstraintType.LENGTH_RATIO, listOf("AB", "AC"), value = 2.0),
         )
         for (constraint in constraints) render(scene().copy(constraints = listOf(constraint))) { _, hits ->
-            assertEquals(constraint.id, hits.single().id)
-            assertTrue(hits.single().visualBounds.width() > 48f)
+            assertEquals(2, hits.size)
+            assertTrue(hits.all { it.id == constraint.id && it.visualBounds.width() > 48f })
+            assertEquals(constraint.entityIds.toSet(), hits.mapNotNull { it.targetEntityId }.toSet())
         }
     }
 

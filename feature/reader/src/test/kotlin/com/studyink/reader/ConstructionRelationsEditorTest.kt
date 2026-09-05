@@ -211,13 +211,14 @@ class ConstructionRelationsEditorTest {
     @Test fun `same angle cannot match itself and changing tools cancels the staged angle`() {
         save(angleScene())
         val editor = open(); val canvas = canvas(editor)
-        canvas.onMeasurementSelected("left"); click(editor, "이 각과 다른 각을 같게…")
-        canvas.onMeasurementSelected("left"); click(editor, "기준 각과 이 각을 같게")
+        canvas.onMeasurementSelected("left"); tag(editor, "measurement-equal-start-left").performClick()
+        canvas.onMeasurementSelected("left")
+        assertFalse("A measurement cannot be paired with itself", walk(editor).any { it.tag == "measurement-equal-apply-left" })
         awaitReady(editor)
         assertTrue(access.load(target).scene.constraints.isEmpty())
-        assertTrue((description(editor, "현재 작도 동작") as TextView).text.contains("다른 각"))
+        assertTrue((description(editor, "현재 작도 동작") as TextView).text.contains("다른 측정"))
         click(editor, "선분")
-        assertFalse((description(editor, "현재 작도 동작") as TextView).text.contains("다른 각"))
+        assertFalse((description(editor, "현재 작도 동작") as TextView).text.contains("다른 측정"))
         click(editor, "선택")
         select(canvas, "P", "B", "C"); click(editor, "조건 추가")
         assertNotNull(description(editor, "작도 이 각과 다른 각을 같게…"))
@@ -308,7 +309,7 @@ class ConstructionRelationsEditorTest {
 
     @Test
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
-    fun `tapping the second equal angle caption anchors the menu to that second angle`() {
+    fun `tapping the second equal angle caption selects that angle with a fixed upper right inspector`() {
         val scene = ConstructionScene(
             points = listOf(GeometryPoint("A", 0.0, 5.0, "A"), GeometryPoint("B", 0.0, 0.0, "B"), GeometryPoint("C", 5.0, 0.0, "C"),
                 GeometryPoint("D", 15.0, 5.0, "D"), GeometryPoint("E", 15.0, 0.0, "E"), GeometryPoint("F", 20.0, 0.0, "F")),
@@ -339,6 +340,11 @@ class ConstructionRelationsEditorTest {
             assertEquals(second.bounds.centerY(), anchored.centerY(), .02f)
             val overlay = tag(editor, "construction-overlay")
             assertEquals(View.VISIBLE, overlay.visibility)
+            val density = activity.resources.displayMetrics.density
+            assertEquals(canvas.width - 8f * density, overlay.right.toFloat(), 1f)
+            assertEquals(8f * density, overlay.top.toFloat(), 1f)
+            assertEquals(272f * density, overlay.width.toFloat(), 1f)
+            assertEquals(300f * density, overlay.height.toFloat(), 1f)
             assertNotNull(tag(editor, "condition-controls-equal"))
             assertEquals(scene, access.load(target).scene)
             savePreview(editor, "build/outputs/relations-equal-angle-phone.png")

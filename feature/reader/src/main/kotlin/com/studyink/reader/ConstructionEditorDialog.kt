@@ -11,7 +11,6 @@ import android.os.Looper
 import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -85,12 +84,7 @@ internal class ConstructionEditorView(
     private val viewport = FrameLayout(context)
     private val panel = LinearLayout(context)
     private val panelBody = LinearLayout(context)
-    private val panelScroll = object : ScrollView(context) {
-        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-            val limit = minOf(dp(260), (viewport.height * .44f).toInt()).coerceAtLeast(dp(70))
-            super.onMeasure(widthMeasureSpec, View.MeasureSpec.makeMeasureSpec(limit, View.MeasureSpec.AT_MOST))
-        }
-    }
+    private val panelScroll = ScrollView(context)
     private val panelTitle = TextView(context)
     private val toolButtons = mutableMapOf<ConstructionTool, Button>()
     private val panelButtons = mutableMapOf<PanelKind, Button>()
@@ -103,8 +97,9 @@ internal class ConstructionEditorView(
     private var newLineStyle = GeometryLineStyle.SOLID
     private var selectedCondition: String? = null
     private var pendingEqualAngle: List<String>? = null
-    private var panelAnchorConstraint: String? = null
+    private var pendingEqualMeasurement: String? = null
     private var panelRevision = 0L
+    private var renderedDetailKey: String? = null
     private val conditionSteps = mutableMapOf<String, Double>()
     private var measurementBase: ConstructionScene? = null
     private enum class PanelKind { RELATIONS, MEASURE, CONDITIONS, MORE, DETAIL }
@@ -229,8 +224,19 @@ internal class ConstructionEditorView(
         canvas.onDragPoint =(::onDrag)
         canvas.onMeasurementSelected = { id -> canvas.selectedMeasurementId = id; showMeasurementDetails(id) }
         canvas.onMeasurementDrag = ::onMeasurementDrag
-        canvas.onConstraintSelected = { id -> panelAnchorConstraint = id; showConditionDetails(id) }
-        canvas.onAnnotationLayoutChanged = { positionConditionPanel() }
+        canvas.onConstraintSelected = { id ->
+            // A driving dimension takes over its saved measurement's hit target. While choosing
+            // a second measurement, that visible label must still participate in the same flow.
+            val reference = scene.measurements.firstOrNull { it.id == pendingEqualMeasurement }
+            val constraint = scene.constraints.firstOrNull { it.id == id }
+            val measurement = if (reference == null || constraint == null) null else scene.measurements.firstOrNull {
+                it.type == reference.type && ConstructionMeasurementGeometry.matchesConstraint(scene, it, constraint)
+            }
+            if (measurement != null) {
+                showMeasurementDetails(measurement.id)
+                canvas.selectedConstraintId = id
+            } else showConditionDetails(id)
+        }
         restoreListener = store.addRestoreListener {
             uiHandler.post {
                 if (!closed) {
@@ -295,7 +301,7 @@ internal class ConstructionEditorView(
         panel.tag = "construction-overlay"; panel.elevation = dp(7).toFloat()
         panel.background = surface(0xfafffef9.toInt()); panel.setPadding(dp(5), dp(2), dp(5), dp(5))
         val heading = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL }
-        panelTitle.apply { textSize = 12f; setTextColor(Color.rgb(51,69,59)); setSingleLine(); ellipsize = TextUtils.TruncateAt.END; setPadding(dp(5), 0, 0, 0); contentDescription = "작은 메뉴 제목 · 끌어서 이동" }
+        panelTitle.apply { textSize = 12f; setTextColor(Color.rgb(51,69,59)); setSingleLine(); ellipsize = TextUtils.TruncateAt.END; setPadding(dp(5), 0, 0, 0); contentDescription = "고정 조절 메뉴 제목" }
         heading.addView(panelTitle, LinearLayout.LayoutParams(0, dp(32), 1f))
         heading.addView(constructionButton(context, "메뉴 닫기", ConstructionIcon.CLOSE, true) { closePanel() }.apply {
             layoutParams = LinearLayout.LayoutParams(dp(32), dp(32))
@@ -303,53 +309,22 @@ internal class ConstructionEditorView(
         panel.addView(heading)
         panelBody.orientation = LinearLayout.VERTICAL
         panelScroll.isFillViewport = false; panelScroll.addView(panelBody)
-        panel.addView(panelScroll, LinearLayout.LayoutParams(-1, -2))
-        viewport.addView(panel, FrameLayout.LayoutParams(dp(310), -2, Gravity.TOP or Gravity.START).apply { leftMargin = dp(8); topMargin = dp(36) })
-        var startX = 0f; var startY = 0f; var initialX = 0f; var initialY = 0f
-        panelTitle.setOnTouchListener { _, event ->
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { panelAnchorConstraint = null; startX = event.rawX; startY = event.rawY; initialX = panel.translationX; initialY = panel.translationY; true }
-                MotionEvent.ACTION_MOVE -> { panel.translationX = initialX + event.rawX - startX; panel.translationY = initialY + event.rawY - startY; clampPanel(); true }
-                MotionEvent.ACTION_UP -> { panelTitle.performClick(); true }
-                MotionEvent.ACTION_CANCEL -> true
-                else -> false
-            }
-        }
+        panel.addView(panelScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        viewport.addView(panel, FrameLayout.LayoutParams(dp(272), dp(300), Gravity.TOP or Gravity.END).apply { rightMargin = dp(8); topMargin = dp(8) })
         viewport.addOnLayoutChangeListener { _, l,t,r,b, oldL,oldT,oldR,oldB ->
-            if (r-l != oldR-oldL || b-t != oldB-oldT) {
-                val width = minOf(dp(if (panelAnchorConstraint != null) 256 else 310), (r-l-dp(16)).coerceAtLeast(dp(120)))
-                panel.layoutParams = (panel.layoutParams as FrameLayout.LayoutParams).apply { this.width = width }
-                panelScroll.requestLayout(); panel.post { clampPanel() }
-            }
-        }
-        panel.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-            if (panelAnchorConstraint != null) positionConditionPanel() else clampPanel()
+            if (r-l != oldR-oldL || b-t != oldB-oldT) updatePanelFrame()
         }
     }
-    /** Place the existing overlay beside the dimension. Neither canvas layer is ever resized. */
-    private fun positionConditionPanel() {
-        if (panelKind != PanelKind.DETAIL || panel.visibility != View.VISIBLE || panel.width == 0) return
-        val id = panelAnchorConstraint ?: return
-        val bounds = canvas.constraintScreenBounds(id) ?: return
-        val gap = dp(8).toFloat()
-        val margin = dp(4).toFloat()
-        val right = bounds.right + gap
-        val left = bounds.left - gap - panel.width
-        val x: Float
-        val y: Float
-        when {
-            right + panel.width <= viewport.width - margin -> { x = right; y = bounds.centerY() - panel.height / 2f }
-            left >= margin -> { x = left; y = bounds.centerY() - panel.height / 2f }
-            bounds.bottom + gap + panel.height <= viewport.height - margin -> { x = bounds.centerX() - panel.width / 2f; y = bounds.bottom + gap }
-            else -> { x = bounds.centerX() - panel.width / 2f; y = bounds.top - gap - panel.height }
+    /** One predictable inspector rectangle for every menu. Only the window, never its contents
+     * or a moving dimension, may resize it; overflow belongs to the inner scroll view. */
+    private fun updatePanelFrame() {
+        if (viewport.width <= 0 || viewport.height <= 0) return
+        val w = minOf(dp(272), (viewport.width - dp(16)).coerceAtLeast(1))
+        val h = minOf(dp(300), (viewport.height - dp(16)).coerceAtLeast(1))
+        val params = panel.layoutParams as FrameLayout.LayoutParams
+        if (params.width != w || params.height != h) {
+            panel.layoutParams = params.apply { width = w; height = h }
         }
-        panel.translationX = x - panel.left
-        panel.translationY = y - panel.top
-        clampPanel()
-    }
-    private fun clampPanel() {
-        panel.translationX = panel.translationX.coerceIn(-panel.left.toFloat() + dp(4), maxOf(-panel.left.toFloat() + dp(4), (viewport.width-panel.right-dp(4)).toFloat()))
-        panel.translationY = panel.translationY.coerceIn(-panel.top.toFloat() + dp(4), maxOf(-panel.top.toFloat() + dp(4), (viewport.height-panel.bottom-dp(4)).toFloat()))
     }
     private fun hideKeyboard() {
         (context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)?.hideSoftInputFromWindow(panel.windowToken, 0)
@@ -358,19 +333,17 @@ internal class ConstructionEditorView(
     private fun closePanel() {
         hideKeyboard(); panelKind = null; panel.visibility = View.GONE
         panelRevision++
-        panelAnchorConstraint = null
+        renderedDetailKey = null
         panelBody.removeAllViews(); selectedCondition = null; canvas.selectedConstraintId = null
         canvas.selectedMeasurementId = null; updateToolbar()
     }
     private fun showPanel(title: String, kind: PanelKind, build: LinearLayout.() -> Unit) {
-        val retainedScroll = if (kind == PanelKind.CONDITIONS && panelKind == kind) panelScroll.scrollY else 0
+        val detailKey = selectedCondition?.let { "condition:$it" } ?: canvas.selectedMeasurementId?.let { "measurement:$it" }
+        val retainedScroll = if (panelKind == kind && (kind == PanelKind.CONDITIONS || kind == PanelKind.DETAIL && detailKey != null && detailKey == renderedDetailKey)) panelScroll.scrollY else 0
         val revision = ++panelRevision
-        if (kind != PanelKind.DETAIL) panelAnchorConstraint = null
+        renderedDetailKey = if (kind == PanelKind.DETAIL) detailKey else null
         hideKeyboard(); panelKind = kind; panelTitle.text = title
-        val desiredWidth = dp(if (panelAnchorConstraint != null) 256 else 310)
-        panel.layoutParams = (panel.layoutParams as FrameLayout.LayoutParams).apply {
-            width = minOf(desiredWidth, (viewport.width - dp(16)).coerceAtLeast(dp(120)))
-        }
+        updatePanelFrame()
         detailSelection = canvas.selectedIds.toSet(); panelBody.removeAllViews(); panelBody.build()
         panelScroll.scrollTo(0, retainedScroll); panel.visibility = View.VISIBLE; panel.bringToFront(); updateToolbar()
         if (retainedScroll > 0) panelBody.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
@@ -383,10 +356,11 @@ internal class ConstructionEditorView(
     private fun LinearLayout.info(text: String) {
         addView(TextView(context).apply { this.text = text; textSize = 11f; setTextColor(Color.rgb(80,91,83)); setPadding(dp(7), dp(4), dp(7), dp(5)) }, LinearLayout.LayoutParams(-1, -2))
     }
-    private fun LinearLayout.action(label: String, icon: ConstructionIcon? = null, apply: () -> Unit) {
+    private fun LinearLayout.action(label: String, icon: ConstructionIcon? = null, actionTag: String? = null, apply: () -> Unit) {
         val token = generation
         addView(button(label, register = false, icon = icon) { if (isCurrent(token)) apply() }.apply {
             gravity = Gravity.CENTER_VERTICAL or Gravity.START; layoutParams = LinearLayout.LayoutParams(-1, dp(36))
+            if (actionTag != null) tag = actionTag
         })
     }
     private fun togglePanel(kind: PanelKind) {
@@ -423,7 +397,10 @@ internal class ConstructionEditorView(
         actionButtons.firstOrNull { it.tag == "더보기" }?.isSelected = panelKind == PanelKind.MORE
     }
     private fun updateHint() {
-        selectionInfo.text = if (pendingEqualAngle != null) {
+        val reference = scene.measurements.firstOrNull { it.id == pendingEqualMeasurement }
+        selectionInfo.text = if (reference != null) {
+            "${if (reference.type == MeasurementType.ANGLE) "같은 각" else "같은 길이"} · 기준 ${reference.entityIds.joinToString("") { name(it) }} → 다른 측정 표시를 누르세요"
+        } else if (pendingEqualAngle != null) {
             "∠${pendingEqualAngle!!.joinToString("") { name(it) }}와 같게 · 다른 각의 세 점(끝→꼭짓점→끝) 선택 후 조건 추가"
         } else if (canvas.tool == ConstructionTool.SELECT) {
             if (canvas.selectedIds.isEmpty()) "선택 · 대상을 눌러 주세요" else "선택 · ${canvas.selectedIds.joinToString { name(it) }}"
@@ -462,11 +439,13 @@ internal class ConstructionEditorView(
     }
     private fun chooseTool(tool: ConstructionTool) {
         onEditingRequested()
+        clearMeasurementReference()
         pendingEqualAngle = null
         canvas.tool = tool; canvas.clearSelection()
         closePanel(); updateToolbar(); updateHint()
     }
     private fun load(fit: Boolean = true) {
+        clearMeasurementReference()
         pendingEqualAngle = null
         dismissChildren()
         loadFailed = false
@@ -635,7 +614,7 @@ internal class ConstructionEditorView(
     private fun history(backward: Boolean) {
         val next = if (backward) undo.lastOrNull() else redo.lastOrNull()
         if (next == null) return notice(if (backward) "되돌릴 작업이 없습니다." else "다시 실행할 작업이 없습니다.")
-        pendingEqualAngle = null
+        pendingEqualAngle = null; clearMeasurementReference()
         generation++; dismissChildren()
         persist(next, historyDirection = if (backward) -1 else 1)
     }
@@ -646,6 +625,7 @@ internal class ConstructionEditorView(
         ?: scene.segments.firstOrNull { it.id == id }?.let { "${name(it.startPointId)}${name(it.endPointId)}" }
         ?: scene.circles.firstOrNull { it.id == id }?.let { "원(${name(it.centerPointId)})" } ?: "대상"
     private fun updateSelection() {
+        if (pendingEqualMeasurement != null && scene.measurements.none { it.id == pendingEqualMeasurement }) clearMeasurementReference()
         updateHint(); updateToolbar()
         // Transient input menus capture a generation. A completed unrelated edit must dismiss
         // them rather than leave visible buttons that silently reject every subsequent click.
@@ -654,14 +634,25 @@ internal class ConstructionEditorView(
         if (dragBase == null && measurementBase == null) refreshPanel()
     }
 
-    private data class RelationAction(val label: String, val run: () -> Unit)
+    private data class RelationAction(val label: String, val icon: ConstructionIcon = ConstructionIcon.CONSTRAINT, val run: () -> Unit)
+    private fun relationIcon(type: ConstraintType): ConstructionIcon = when (type) {
+        ConstraintType.LENGTH, ConstraintType.DISTANCE_POINTS, ConstraintType.POINT_DISTANCE,
+        ConstraintType.DISTANCE_POINT_LINE -> ConstructionIcon.MEASURE
+        ConstraintType.ANGLE, ConstraintType.INTERIOR_ANGLE, ConstraintType.EQUAL_ANGLE -> ConstructionIcon.ANGLE
+        ConstraintType.EQUAL_LENGTH, ConstraintType.EQUAL_DISTANCE_POINTS, ConstraintType.LENGTH_RATIO -> ConstructionIcon.EQUAL
+        ConstraintType.POINT_FRACTION -> ConstructionIcon.DIVIDE
+        ConstraintType.RADIUS, ConstraintType.POINT_ON_CIRCLE -> ConstructionIcon.CIRCLE
+        ConstraintType.COINCIDENT, ConstraintType.FIXED_POINT, ConstraintType.POINT_ON_LINE,
+        ConstraintType.POINT_ON_SEGMENT -> ConstructionIcon.POINT
+        else -> ConstructionIcon.CONSTRAINT
+    }
     private fun showRelationMenu() {
         val token = generation
         val points = selectedPoints(); val lines = selectedSegments(); val circles = selectedCircles()
         val count = canvas.selectedIds.size
         val actions = mutableListOf<RelationAction>()
         fun relation(label: String, type: ConstraintType, ids: List<String>, numeric: Double? = null) {
-            actions += RelationAction(label) {
+            actions += RelationAction(label, relationIcon(type)) {
                 if (numeric != null) numberInput(label, numeric, angle = type in setOf(ConstraintType.ANGLE, ConstraintType.INTERIOR_ANGLE), allowZero = type == ConstraintType.DISTANCE_POINT_LINE,
                     description = if (type == ConstraintType.LENGTH_RATIO) "${name(ids[0])} 길이 = 입력 배수 × ${name(ids[1])} 길이" else null) { value ->
                     edit(ConstructionEdits.addConstraint(scene, GeometryConstraint(ConstructionEdits.id(), type, ids, value = value)))
@@ -718,7 +709,7 @@ internal class ConstructionEditorView(
             info(if (count == 0) "그림에서 대상을 선택하세요.\n점 2개 → 일치 · 선분 1개 → 길이" else canvas.selectedIds.joinToString { name(it) })
             if (pendingEqualAngle != null) action("같은 각 선택 취소") { pendingEqualAngle = null; updateHint(); showRelationMenu() }
             if (actions.isEmpty() && count > 0) info("점·선·원을 선택하세요. 각도는 세 점(끝→꼭짓점→끝), 같은 길이는 여러 선분입니다.")
-            actions.forEach { option -> action(option.label) { if (isCurrent(token)) option.run() } }
+            actions.forEach { option -> action(option.label, option.icon) { if (isCurrent(token)) option.run() } }
         }
     }
 
@@ -735,6 +726,7 @@ internal class ConstructionEditorView(
 
     /** Select each angle separately so a shared vertex can participate in both triples. */
     private fun chooseEqualAngle(ids: List<String>) {
+        clearMeasurementReference()
         val first = pendingEqualAngle
         if (first == null) {
             pendingEqualAngle = ids.toList()
@@ -749,9 +741,9 @@ internal class ConstructionEditorView(
     }
 
     private fun showPresets() {
-        pendingEqualAngle = null
+        pendingEqualAngle = null; clearMeasurementReference()
         canvas.tool = ConstructionTool.SELECT; updateHint()
-        panelAnchorConstraint = null; selectedCondition = null; canvas.selectedMeasurementId = null
+        selectedCondition = null; canvas.selectedMeasurementId = null
         showPanel("기본 도형", PanelKind.DETAIL) {
             info("현재 화면 가운데에 추가합니다. 점·선분과 관계로 만들어져 길이를 바꾸거나 움직일 수 있습니다.")
             ConstructionPreset.entries.forEach { preset -> action(preset.koreanName(), preset.icon()) {
@@ -768,7 +760,7 @@ internal class ConstructionEditorView(
     }
 
     private fun showDivideSegment(segmentId: String) {
-        panelAnchorConstraint = null; selectedCondition = null; canvas.selectedMeasurementId = null
+        selectedCondition = null; canvas.selectedMeasurementId = null
         val input = integerInput(3, "전체 등분 수")
         showPanel("${name(segmentId)} 등분점 만들기", PanelKind.DETAIL) {
             info("원래 선분은 나누어 삭제하지 않습니다. 새 점들이 선분의 길이 변화에 따라 함께 움직입니다.")
@@ -824,7 +816,7 @@ internal class ConstructionEditorView(
 
     private fun showPointLocation(pointId: String, segmentId: String, existing: GeometryConstraint? = null) {
         val line = scene.segment(segmentId) ?: return
-        panelAnchorConstraint = null; selectedCondition = null; canvas.selectedMeasurementId = null
+        selectedCondition = null; canvas.selectedMeasurementId = null
         val fromEnd = CheckBox(context).apply { text = "${name(line.endPointId)}부터 재기 (기본: ${name(line.startPointId)})"; isChecked = existing?.fromEnd ?: false; textSize = 11f }
         val extension = CheckBox(context).apply { text = "반대 끝점을 넘어 연장 허용"; isChecked = existing?.allowExtension ?: false; textSize = 11f }
         val saved = existing ?: scene.constraints.firstOrNull { it.entityIds == listOf(pointId, segmentId) && it.type == ConstraintType.POINT_FRACTION }
@@ -872,7 +864,7 @@ internal class ConstructionEditorView(
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
             setText(formatGeometry(initial)); selectAll(); setSingleLine(); contentDescription = "작도 치수 값"
         }
-        panelAnchorConstraint = null; panel.translationX = 0f; panel.translationY = 0f
+        panel.translationX = 0f; panel.translationY = 0f
         selectedCondition = null; canvas.selectedMeasurementId = null
         showPanel(title, PanelKind.DETAIL) {
             info(description ?: if (angle) "각도 · 0~180° (꼭짓점을 확인하세요)" else "조건 값 · cm (화면 확대와 무관)")
@@ -941,7 +933,7 @@ internal class ConstructionEditorView(
         }
     }
 
-    /** The same controls are embedded in a list row or in the overlay next to a dimension. */
+    /** The same controls are embedded in a list row or in the fixed top-right inspector. */
     private fun LinearLayout.addConditionControls(c: GeometryConstraint) {
         addView(LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL; tag = "condition-controls-${c.id}"
@@ -1044,12 +1036,12 @@ internal class ConstructionEditorView(
                 addView(conditionCheckBox(c), LinearLayout.LayoutParams(dp(36), dp(36)))
                 addView(TextView(context).apply {
                     text = conditionLabel(c); textSize = 11f; setTextColor(Color.rgb(80,91,83))
-                }, LinearLayout.LayoutParams(0, -2, 1f))
-            })
+                    maxLines = 2; ellipsize = TextUtils.TruncateAt.END
+                }, LinearLayout.LayoutParams(0, -1, 1f))
+            }, LinearLayout.LayoutParams(-1, dp(48)))
             addConditionControls(c)
             action("조건 목록으로") { showConditions() }
         }
-        positionConditionPanel()
     }
 
     private fun length(line: GeometrySegment): Double {
@@ -1120,21 +1112,91 @@ internal class ConstructionEditorView(
     }
     private fun showMeasurementDetails(id: String) {
         val m = scene.measurements.firstOrNull { it.id == id } ?: return closePanel()
-        panelAnchorConstraint = null
         selectedCondition = null; canvas.selectedConstraintId = null; canvas.selectedMeasurementId = id
-        showPanel("측정 표시", PanelKind.DETAIL) {
-            info(measurementLabel(m)); info("글자를 끌어 위치를 바꾸세요. 측정은 조건이 아니므로 도형을 고정하지 않습니다.")
-            if (m.type == MeasurementType.ANGLE) action(if (pendingEqualAngle == null) "이 각과 다른 각을 같게…" else "기준 각과 이 각을 같게", ConstructionIcon.EQUAL) { chooseEqualAngle(m.entityIds) }
+        val value = ConstructionMeasurementGeometry.layout(scene, m)?.value
+        val existing = scene.constraints.firstOrNull { ConstructionMeasurementGeometry.matchesConstraint(scene, m, it) }
+        showPanel("측정 · 값 확인 / 조건 부여", PanelKind.DETAIL) {
+            info(measurementLabel(m)); info("측정은 따라 변하는 값입니다. 고정하면 도형이 그 값을 유지합니다.")
+            if (m.type != MeasurementType.AREA && value != null && value.isFinite()) {
+                if (existing != null) {
+                    action(if (existing.enabled) "고정 조건 보기" else "꺼진 조건 보기", ConstructionIcon.CONSTRAINT,
+                        "measurement-existing-condition-$id") { showConditionDetails(existing.id) }
+                } else {
+                    action("현재 값으로 고정", ConstructionIcon.CONSTRAINT, "measurement-fix-current-$id") { fixMeasurement(id) }
+                    action("값 입력 후 고정", ConstructionIcon.MEASURE, "measurement-fix-value-$id") {
+                        numberInput("측정값 고정", value, angle = m.type == MeasurementType.ANGLE,
+                            description = if (m.type == MeasurementType.ANGLE) "∠${m.entityIds.joinToString("") { name(it) }} · 가운데 점이 꼭짓점입니다" else "${m.entityIds.joinToString("~") { name(it) }} · cm") { entered -> fixMeasurement(id, entered) }
+                    }
+                }
+            }
+            if (m.type in setOf(MeasurementType.ANGLE, MeasurementType.DISTANCE)) {
+                val first = scene.measurements.firstOrNull { it.id == pendingEqualMeasurement }
+                if (first != null && first.id != id && first.type == m.type) {
+                    info("기준: ${measurementLabel(first)}")
+                    action("기준 측정과 같게", ConstructionIcon.EQUAL, "measurement-equal-apply-$id") { applyMeasurementEquality(first.id, id) }
+                } else if (first != null) {
+                    info(if (first.id == id) "이 표시가 기준입니다. 다른 ${if (m.type == MeasurementType.ANGLE) "각" else "길이"} 측정 표시를 누르세요." else "기준과 같은 종류의 측정 표시를 선택하세요.")
+                }
+                action(if (first == null) "다른 측정과 같게…" else "이 측정을 새 기준으로", ConstructionIcon.EQUAL, "measurement-equal-start-$id") { beginMeasurementEquality(id) }
+            }
+            if (m.type == MeasurementType.ANGLE && pendingEqualAngle != null) {
+                action("기준 각과 이 각을 같게", ConstructionIcon.EQUAL) { chooseEqualAngle(m.entityIds) }
+            }
+            if (pendingEqualMeasurement != null) action("같은 측정 선택 취소", actionTag = "measurement-equal-cancel") {
+                clearMeasurementReference(); updateHint(); showMeasurementDetails(id)
+            }
             action("표시 위치 초기화") { presentationEdit(scene.copy(measurements = scene.measurements.map { if (it.id == id) it.copy(offsetX = 0.0, offsetY = 0.0) else it })) }
             action("표시 지우기", ConstructionIcon.DELETE) { closePanel(); presentationEdit(scene.copy(measurements = scene.measurements.filterNot { it.id == id })) }
             action("측정으로") { showMeasurement() }
         }
     }
+
+    private fun clearMeasurementReference() {
+        pendingEqualMeasurement = null
+        canvas.referenceMeasurementId = null
+    }
+
+    private fun beginMeasurementEquality(id: String) {
+        val measurement = scene.measurements.firstOrNull { it.id == id } ?: return
+        if (measurement.type !in setOf(MeasurementType.ANGLE, MeasurementType.DISTANCE)) return
+        pendingEqualAngle = null
+        pendingEqualMeasurement = id
+        canvas.referenceMeasurementId = id
+        closePanel(); canvas.tool = ConstructionTool.SELECT; canvas.clearSelection(); updateHint()
+    }
+
+    private fun fixMeasurement(id: String, value: Double? = null) {
+        runCatching { ConstructionEdits.constrainMeasurement(scene, id, value) }
+            .onSuccess { next -> showNewMeasurementCondition(next) }
+            .onFailure { notice(it.message ?: "이 측정값에는 고정 조건을 만들 수 없습니다.") }
+    }
+
+    private fun applyMeasurementEquality(firstId: String, secondId: String) {
+        val existing = runCatching { ConstructionEdits.matchingEqualityConstraint(scene, firstId, secondId) }.getOrNull()
+        if (existing != null) {
+            pendingEqualAngle = null; clearMeasurementReference(); updateHint(); showConditionDetails(existing.id)
+            return
+        }
+        runCatching { ConstructionEdits.equalMeasurements(scene, firstId, secondId) }
+            .onSuccess { next -> showNewMeasurementCondition(next) }
+            .onFailure { notice(it.message ?: "서로 다른 같은 종류의 측정을 선택하세요.") }
+    }
+
+    private fun showNewMeasurementCondition(next: ConstructionScene) {
+        val condition = next.constraints.firstOrNull { candidate -> scene.constraints.none { it == candidate } }
+        pendingEqualAngle = null; clearMeasurementReference(); updateHint()
+        if (condition == null) { closePanel(); return notice("같은 관계가 이미 있습니다. 조건 목록에서 켜짐 상태를 확인하세요.") }
+        // Keep the same fixed inspector after the atomic solve/save. If solving fails, the
+        // previous durable scene stays intact and the nonexistent new detail is dismissed.
+        selectedCondition = condition.id; canvas.selectedConstraintId = condition.id; canvas.selectedMeasurementId = null
+        panelKind = PanelKind.DETAIL; detailSelection = canvas.selectedIds.toSet()
+        edit(next)
+    }
     private fun renamePoint() {
         val token = generation
         val p = selectedPoints().singleOrNull()?.takeIf { canvas.selectedIds.size == 1 } ?: return notice("이름을 바꿀 점 하나를 선택하세요.")
         val input = EditText(context).apply { setText(p.label); setSingleLine(); selectAll(); filters = arrayOf(android.text.InputFilter.LengthFilter(12)) }
-        panelAnchorConstraint = null; panel.translationX = 0f; panel.translationY = 0f
+        panel.translationX = 0f; panel.translationY = 0f
         selectedCondition = null; canvas.selectedMeasurementId = null
         showPanel("점 이름", PanelKind.DETAIL) {
             addView(input, LinearLayout.LayoutParams(-1, dp(42)))
@@ -1195,17 +1257,17 @@ internal class ConstructionEditorView(
     }
     private fun showHelp() {
         AlertDialog.Builder(context).setTitle("함께 작도하기")
-            .setMessage("1. 눌린 도구와 왼쪽 위 안내가 다음 동작입니다. 선분·원은 두 번 눌러 만듭니다. 선택한 도형은 색·선종류 버튼으로 바뀝니다.\n2. □ 기본 도형은 점·선분과 관계로 추가됩니다. 길이는 고정되지 않으므로 필요할 때 치수를 넣으세요.\n3. 점과 선분 선택 → 조건 추가 → 선분 위 위치. 중점·k/n·내분비·끝점부터 cm를 지정합니다. 같은 점/선분의 이전 위치 조건을 바꾸며, 꺼진 조건은 체크해야 적용됩니다.\n4. 선분 하나 → 등분점 만들기. 원래 선분은 그대로입니다. 선분 여러 개 → 같은 길이, 두 선분 → 길이 비율을 지정합니다.\n5. 각도는 세 점(끝→꼭짓점→끝) 또는 꼭짓점을 공유하는 두 선분을 선택하세요. ‘이 각과 다른 각을 같게’ → 다른 각 선택 → 조건 추가로 묶습니다. 측정된 각 표시를 눌러서도 연결할 수 있습니다. 각 이등분은 두 작은 각을 같게 구성하세요.\n6. 길이·반지름·각도 표시를 누르면 옆 메뉴에서 ±로 바꿉니다. 조건 목록은 항목 아래로 펼쳐지며 체크로 잠시 끄고 켭니다. 측정은 모양을 고정하지 않으며 글자를 끌어 옮길 수 있습니다.\n7. 작은 메뉴 제목을 끌면 옮겨집니다. 열고 닫아도 도형은 밀리지 않습니다. 두 손가락으로 도형과 필기를 함께 확대·이동합니다.\n\n자석은 끝점·선분 안쪽·두 선분의 교점에 자동 연결합니다. 명시적으로 만드는 직선 위 조건·수선·직선 교점은 연장선을 포함합니다. 원과 선·두 원의 교점 자동 연결은 아직 지원하지 않습니다.\n\n${if (embedded) "필기와 도형은 같은 평면이지만 지우기·되돌리기는 서로 영향을 주지 않습니다. 학생 도형은 저장 후 자동 전송되고 선생 도형은 발행해야 전송됩니다. 새 관계와 종이 바깥 확장 필기를 동기화하려면 두 기기를 모두 업데이트하세요. 기존 필기 좌표는 바뀌지 않습니다." else "현재 기기에 자동 저장되고 앱 백업에 포함됩니다. 메모 안의 도형만 원격 동기화 대상입니다."}")
+            .setMessage("1. 눌린 도구와 왼쪽 위 안내가 다음 동작입니다. 선분·원은 두 번 눌러 만듭니다. 선택한 도형은 색·선종류 버튼으로 바뀝니다.\n2. □ 기본 도형은 점·선분과 관계로 추가됩니다. 길이는 고정되지 않으므로 필요할 때 치수를 넣으세요.\n3. 점과 선분 선택 → 조건 추가 → 선분 위 위치. 중점·k/n·내분비·끝점부터 cm를 지정합니다. 같은 점/선분의 이전 위치 조건을 바꾸며, 꺼진 조건은 체크해야 적용됩니다.\n4. 선분 하나 → 등분점 만들기. 원래 선분은 그대로입니다. 선분 여러 개 → 같은 길이, 두 선분 → 길이 비율을 지정합니다.\n5. 각도는 세 점(끝→꼭짓점→끝) 또는 꼭짓점을 공유하는 두 선분을 선택하세요. ‘이 각과 다른 각을 같게’ → 다른 각 선택 → 조건 추가로 묶습니다. 측정된 각 표시를 눌러서도 연결할 수 있습니다. 각 이등분은 두 작은 각을 같게 구성하세요.\n6. 길이·반지름·각도 표시를 누르면 오른쪽 위 고정 메뉴에서 ±로 바꿉니다. 조건 목록은 항목 아래로 펼쳐지며 체크로 잠시 끄고 켭니다. 측정은 모양을 고정하지 않으며 글자를 끌어 옮길 수 있습니다. 측정 표시를 누르면 현재 값 또는 입력값으로 고정하거나 다른 길이·각과 같게 묶습니다. 고정·측정·꺼짐 글자로 구분하며 조건 아이콘을 누르면 관련 대상이 함께 강조됩니다.\n7. 조절 메뉴는 오른쪽 위에서 같은 크기를 유지합니다. 긴 내용은 메뉴 안에서 스크롤하세요. 열고 닫아도 도형은 밀리지 않습니다. 두 손가락으로 도형과 필기를 함께 확대·이동합니다.\n\n자석은 끝점·선분 안쪽·두 선분의 교점에 자동 연결합니다. 명시적으로 만드는 직선 위 조건·수선·직선 교점은 연장선을 포함합니다. 원과 선·두 원의 교점 자동 연결은 아직 지원하지 않습니다.\n\n${if (embedded) "필기와 도형은 같은 평면이지만 지우기·되돌리기는 서로 영향을 주지 않습니다. 학생 도형은 저장 후 자동 전송되고 선생 도형은 발행해야 전송됩니다. 새 관계와 종이 바깥 확장 필기를 동기화하려면 두 기기를 모두 업데이트하세요. 기존 필기 좌표는 바뀌지 않습니다." else "현재 기기에 자동 저장되고 앱 백업에 포함됩니다. 메모 안의 도형만 원격 동기화 대상입니다."}")
             .setPositiveButton("확인", null).showChild()
     }
     private fun requestClose() {
         if (busy || dragSolving) return notice("저장을 마친 뒤 닫을 수 있습니다.")
         canvas.cancelDrag(); onRequestClose()
     }
-    fun handleBack() { if (panelKind != null) closePanel() else if (pendingEqualAngle != null) { pendingEqualAngle = null; updateHint() } else requestClose() }
+    fun handleBack() { if (panelKind != null) closePanel() else if (pendingEqualAngle != null || pendingEqualMeasurement != null) { pendingEqualAngle = null; clearMeasurementReference(); updateHint() } else requestClose() }
     fun undoEdit(): Boolean = if (canUndo) { history(true); true } else false
     fun redoEdit(): Boolean = if (canRedo) { history(false); true } else false
-    fun cancelInteraction() { pendingEqualAngle = null; canvas.cancelDrag(); canvas.tool = canvas.tool; dismissChildren(); updateHint() }
+    fun cancelInteraction() { pendingEqualAngle = null; clearMeasurementReference(); canvas.cancelDrag(); canvas.tool = canvas.tool; dismissChildren(); updateHint() }
 
     /** Toolbars remain outside the shared content rectangle; both editable layers fill it exactly. */
     fun attachSharedCanvas(host: SharedMemoCanvasHost) {
