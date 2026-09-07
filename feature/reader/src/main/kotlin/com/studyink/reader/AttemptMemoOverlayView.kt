@@ -192,6 +192,7 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     }
     private var constructionEditor: ConstructionEditorView? = null
     private var constructionMemo: Pair<MemoTarget, String>? = null
+    private var activateGeometryOnAttach = false
     private var constructionLoadGeneration = 0L
     private var constructionLoading = false
     private var pendingConstructionMemo: StudentMemo? = null
@@ -928,6 +929,7 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     private fun enableConstruction(memo: StudentMemo) {
         if (constructionLoading || constructionEditor != null || inkInput.hasActiveGesture) return
         val ensure = ensureConstructionAttachment ?: return
+        activateGeometryOnAttach = true
         val role = constructionRole
         constructionLoading = true
         updateInputEnabled()
@@ -966,11 +968,15 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         editor.attachSharedCanvas(sharedCanvas)
         composition.addView(editor, LayoutParams(MATCH, MATCH))
         constructionButton.contentDescription = "도형 편집 모드"
-        setGeometryMode(true)
+        // Opening or forking a teacher note must not switch the next pen stroke into geometry.
+        // Only an explicit '도형 넣기' request activates construction editing on attachment.
+        setGeometryMode(activateGeometryOnAttach || constructionRole != ConstructionReplicaRole.TEACHER)
+        activateGeometryOnAttach = false
         updateInputEnabled(); publishUndoState()
     }
 
     private fun detachConstruction() {
+        activateGeometryOnAttach = false
         removeCallbacks(retryConstructionAttachment)
         pendingConstructionMemo = null
         constructionLoadGeneration++
