@@ -10,6 +10,7 @@ import com.studyink.library.data.LibraryRepository
 import com.studyink.memo.core.MemoTarget
 import com.studyink.memo.core.StudentMemoChangeBus
 import com.studyink.memo.core.StudentMemoRepository
+import com.studyink.memo.core.StudentMemo
 import com.studyink.monitor.telegram.PendingTelegramPeerDocument
 import com.studyink.monitor.telegram.RemoteMonitorGateway
 import com.studyink.monitor.telegram.RemoteReviewPeerStatus
@@ -25,7 +26,7 @@ import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
-/** Geometry has its own state machine and never calls a handwriting mutation API. */
+/** Dedicated publication channel. Teacher-owned memo drafts travel only in explicit publication. */
 internal object MasterNoteConstructionSyncCoordinator {
     private var runtime: ConstructionSyncRuntime? = null
     @Synchronized fun initialize(application: Application) {
@@ -62,6 +63,8 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
     private val root = File(app.filesDir, "masternote")
     private val store = ConstructionReplicaStore(root)
     private val memos = StudentMemoRepository.get(app)
+    private val teacherMemos = StudentMemoRepository.teacherDrafts(app)
+    private val teacherMemoBases = StudentMemoRepository.teacherBases(app)
     private val library = LibraryRepository.get(app)
     private val gateway = RemoteMonitorGateway.get(app)
     private val worker = Executors.newSingleThreadScheduledExecutor { Thread(it, "construction-state") }
@@ -86,8 +89,9 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
     }
     private data class Query(val id: String, val teacherDigest: String, val base: ConstructionVersion?,
         val pin: PeerPin, val startedAt: Long, val choice: ConstructionConflictChoice? = null,
-        val comparedStudent: ConstructionVersion? = null)
-    private data class Conflict(val token: String, val teacherDigest: String, val student: ConstructionVersion, val pin: PeerPin)
+        val comparedStudent: ConstructionVersion? = null, val comparedMemoDigest: String? = null)
+    private data class Conflict(val token: String, val teacherDigest: String, val student: ConstructionVersion, val pin: PeerPin,
+        val memoDigest: String? = null)
 
     fun start() {
         ConstructionUiBridgeProvider.bridge = this
@@ -104,8 +108,10 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
             val target = ConstructionTarget(change.target.bookId, change.target.pageNumber, change.target.attemptNo, change.memo.id)
             if (change.memo.deleted) {
                 // Replays a failed UI deletion hook; the parent tombstone always dominates.
-                ConstructionReplicaRole.entries.forEach { store.markMemoDeleted(target, it) }
+                (if (change.teacherDraft) listOf(ConstructionReplicaRole.TEACHER) else ConstructionReplicaRole.entries)
+                    .forEach { store.markMemoDeleted(target, it) }
             }
+            if (!change.teacherDraft) dirtyStudents += target
             drainTelegram()
         } }
         subscriptions += ConstructionLanBridge.addReceiver { peer, bytes ->
@@ -116,6 +122,8 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
                 val target = ConstructionTarget(peer.localBookId, packet.pageNumber, packet.attemptNo, packet.memoId)
                 val book = library.book(peer.localBookId)
                 if (book.contentSha256.lowercase() != peer.documentSha256) return@execute
+                if (target.pageNumber !in 0 until book.pageCount ||
+                    library.attempts(target.bookId, target.pageNumber).none { it.attemptNo == target.attemptNo }) return@execute
                 accept(target, packet, peer.peerIsStudent, pin(peer)) {
                     ConstructionLanBridge.peer(peer.localBookId) == peer && epoch == MasterNoteDataRootBus.currentGeneration()
                 }
@@ -136,7 +144,7 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
             if (role == ConstructionReplicaRole.STUDENT && state.attached) dirtyStudents += target
             if (role == ConstructionReplicaRole.TEACHER) {
                 // Opening the memo repairs a restored/offline shadow without publishing a draft.
-                currentPin(target, true)?.let { transmit(target, store.requestState(target), it) }
+                currentPin(target, true)?.let { transmit(target, store.requestState(target).copy(includeMemo = true), it) }
             }
             updateState(target)
         }
@@ -150,6 +158,7 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
     }
     override fun requestPublish(target: ConstructionTarget) = execute {
         if (roles[target] != ConstructionReplicaRole.TEACHER || queries.containsKey(target)) return@execute
+        if (teacherMemo(target) != null) store.ensureAttachment(target, ConstructionReplicaRole.TEACHER)
         beginQuery(target)
     }
     override fun resolveConflict(target: ConstructionTarget, choice: ConstructionConflictChoice, expectedToken: String) = execute {
@@ -174,9 +183,9 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
         if (conflict != null && !conflict.pin.accepts(peer)) {
             conflicts.remove(target); updateState(target, "연결 상대가 바뀌었습니다. 다시 발행해 주세요."); return
         }
-        val packet = store.requestState(target)
+        val packet = store.requestState(target).copy(includeMemo = true)
         queries[target] = Query(packet.requestId, digest(current), current.commonBase?.version, peer,
-            System.currentTimeMillis(), choice, conflict?.student)
+            System.currentTimeMillis(), choice, conflict?.student, conflict?.memoDigest)
         conflicts.remove(target)
         updateState(target, "학생 최신 도형 확인 중… 아직 발행하지 않았습니다.")
         transmit(target, packet, peer)
@@ -192,15 +201,32 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
         val applied = MasterNoteOptionalDataRootGuard.withStableDataRoot(root) {
         if (!constructionPeerMaySend(peerIsStudent, packet.kind) || target.attemptNo <= 0 || epoch != MasterNoteDataRootBus.currentGeneration()) return@withStableDataRoot false
         if (packet.memoId != target.memoId || packet.pageNumber != target.pageNumber || packet.attemptNo != target.attemptNo) return@withStableDataRoot false
-        val parent = memos.memo(MemoTarget(target.bookId, target.pageNumber, target.attemptNo), target.memoId, includeDeleted = true)
-            ?: return@withStableDataRoot false // Parent may still be arriving on the separate memo channel.
+        val parent = memos.memo(memoTarget(target), target.memoId, includeDeleted = true)
+            ?: if (peerIsStudent) teacherMemo(target) else null
+        val canCreateParent = !peerIsStudent && (packet.kind == ConstructionPacketKind.REQUEST_STATE && packet.includeMemo ||
+            packet.kind == ConstructionPacketKind.PUBLISH && packet.memoJson != null)
+        if (parent == null && !canCreateParent) return@withStableDataRoot false
+        packet.student?.memoJson?.let { decodeMemo(target, it) }
+        val publishedMemo = packet.memoJson?.let { decodeMemo(target, it) }
         val localRole = if (peerIsStudent) ConstructionReplicaRole.TEACHER else ConstructionReplicaRole.STUDENT
-        if (parent.deleted) store.markMemoDeleted(target, localRole)
+        if (parent?.deleted == true) store.markMemoDeleted(target, localRole)
         when (packet.kind) {
-            ConstructionPacketKind.REQUEST_STATE -> transmit(target, store.studentSnapshot(target, packet.requestId), source)
-            ConstructionPacketKind.PUBLISH -> transmit(target, store.receivePublish(target, packet), source)
+            ConstructionPacketKind.REQUEST_STATE -> transmit(target, studentSnapshot(target, packet.requestId, packet.includeMemo), source)
+            ConstructionPacketKind.PUBLISH -> {
+                val response = store.receivePublish(target, packet, applyMemo = if (publishedMemo == null) null else {
+                    {
+                        // Do not acquire the pairing operationLock while holding replica/root locks.
+                        check(epoch == MasterNoteDataRootBus.currentGeneration())
+                        val saved = memos.applyPublishedMemo(publishedMemo, memoTarget(target), packet.expectedMemoDigest)
+                        val actual = saved ?: memos.memo(memoTarget(target), target.memoId, true)
+                        ConstructionMemoApplyResult(saved != null, actual?.let { memos.encodeMemo(it).toString(Charsets.UTF_8) })
+                    }
+                })
+                transmit(target, response, source)
+            }
             ConstructionPacketKind.STUDENT_SNAPSHOT -> {
-                val current = store.receiveStudentSnapshot(target, packet)
+                val comparing = queries[target]?.let { it.id == packet.requestId && it.pin.accepts(source) } == true
+                val current = store.receiveStudentSnapshot(target, packet, preserveDraft = comparing)
                 afterApply = {
                 val query = queries[target]
                 if (query != null && query.id == packet.requestId && query.pin.accepts(source)) {
@@ -220,8 +246,16 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
                 if (!expectedPin.accepts(source)) return@withStableDataRoot false
                 val pending = store.load(target, ConstructionReplicaRole.TEACHER).pendingPublish
                 if (pending?.requestId != packet.requestId) return@withStableDataRoot true
+                val acknowledgedMemo = if (packet.result == ConstructionPublishResult.APPLIED && pending.memoJson != null) {
+                    val actual = decodeMemo(target, requireNotNull(packet.student?.memoJson))
+                    require(StudentMemoRepository.sameContent(decodeMemo(target, pending.memoJson!!), actual)) {
+                        "Publication acknowledgement did not include the submitted note"
+                    }
+                    actual
+                } else null
                 val current = store.receiveResult(target, packet)
                 afterApply = {
+                if (acknowledgedMemo != null) rememberMemoBase(target, acknowledgedMemo)
                 when (packet.result) {
                     ConstructionPublishResult.APPLIED -> updateState(target, if (current.draftDirty)
                         "발행 완료 · 이후 수정한 선생 초안은 아직 전송되지 않았습니다." else "발행 완료 · 학생 기기에 저장됐습니다.")
@@ -244,20 +278,43 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
         if (digest(current) != query.teacherDigest || current.pendingPublish != null || current.deleted) {
             updateState(target, "확인 중 선생 도형이나 메모가 바뀌었습니다. 다시 발행해 주세요."); return
         }
+        val draftMemo = teacherMemo(target)
+        val studentMemo = received.memoJson?.let { decodeMemo(target, it) }
+        if (draftMemo != null && !received.memoStateKnown) {
+            updateState(target, "노트까지 발행하려면 학생과 선생 앱을 모두 업데이트해 주세요."); return
+        }
         if (current.studentShadow?.version != received.version ||
-            query.choice != null && query.comparedStudent != received.version) {
+            query.choice != null && (query.comparedStudent != received.version ||
+                draftMemo != null && query.comparedMemoDigest != studentMemo?.digestSha256)) {
             showConflict(target, current, query.pin); return
         }
+        if (draftMemo != null && query.choice == null) {
+            val baseMemo = teacherMemoBases.memo(memoTarget(target), target.memoId)
+            if (baseMemo == null && studentMemo != null || baseMemo != null &&
+                (studentMemo == null || !StudentMemoRepository.sameContent(baseMemo, studentMemo))) {
+                showConflict(target, current, query.pin); return
+            }
+        }
         if (query.choice == ConstructionConflictChoice.USE_STUDENT) {
-            store.adoptStudent(current, received.version)
-            updateState(target, "학생 도형으로 선생 도형을 맞췄습니다. 필기는 그대로 유지했습니다.")
+            store.adoptStudent(current, received.version) {
+                if (draftMemo != null) {
+                    check(studentMemo != null && !studentMemo.deleted &&
+                        teacherMemos.applyPublishedMemo(studentMemo, memoTarget(target), draftMemo.digestSha256) != null) {
+                        "노트 상태가 바뀌어 덮어쓰지 않았습니다."
+                    }
+                    rememberMemoBase(target, studentMemo)
+                }
+            }
+            updateState(target, if (draftMemo == null) "학생 도형으로 맞췄습니다. 필기는 그대로입니다." else "학생 노트·도형으로 선생 초안을 맞췄습니다.")
             return
         }
         val id = UUID.randomUUID().toString()
         // Reserve the peer identity before creating a durable pending request. Orphans are harmless.
         writePin(id, query.pin)
         val compared = if (query.choice == ConstructionConflictChoice.USE_TEACHER) received.version else query.base
-        val result = store.preparePublish(current, compared, id)
+        val result = store.preparePublish(current, compared, id,
+            memoJson = draftMemo?.let { teacherMemos.encodeMemo(it).toString(Charsets.UTF_8) },
+            expectedMemoDigest = if (draftMemo != null) studentMemo?.digestSha256 else null)
         if (result.conflict) showConflict(target, result.snapshot, query.pin)
         else {
             updateState(target, "발행 중… 학생 기기의 저장 완료 응답을 기다립니다.")
@@ -268,8 +325,9 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
     private fun showConflict(target: ConstructionTarget, current: ConstructionReplicaSnapshot, pin: PeerPin) {
         val student = current.studentShadow?.takeUnless { it.deleted }
         if (student == null || current.deleted) { updateState(target, "학생 메모가 없거나 삭제되어 발행하지 않았습니다."); return }
-        conflicts[target] = Conflict(UUID.randomUUID().toString(), digest(current), student.version, pin)
-        updateState(target, "충돌: 학생 도형에 업데이트가 있습니다. 어느 도형으로 맞출지 선택해 주세요.")
+        conflicts[target] = Conflict(UUID.randomUUID().toString(), digest(current), student.version, pin,
+            student.memoJson?.let { decodeMemo(target, it).digestSha256 })
+        updateState(target, "충돌: 학생 노트 또는 도형에 업데이트가 있습니다. 발행을 눌러 사용할 내용을 선택하세요.")
     }
 
     private fun tick() {
@@ -294,20 +352,20 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
     }
 
     private fun sendStudent(target: ConstructionTarget) {
-        if (target.attemptNo <= 0 || !parentExists(target, includeDeleted = true)) return
+        if (target.attemptNo <= 0 || memos.memo(memoTarget(target), target.memoId, true) == null) return
         val peer = currentPin(target, false) ?: return
         var current = store.load(target, ConstructionReplicaRole.STUDENT)
         if (memos.memo(MemoTarget(target.bookId, target.pageNumber, target.attemptNo), target.memoId, true)?.deleted == true) {
             current = store.markMemoDeleted(target, ConstructionReplicaRole.STUDENT)
         }
         if (!current.attached && !current.deleted) return
-        val stableId = ConstructionTelegramWire.stableId("$target:${current.studentShadow?.version}")
+        val stableId = ConstructionTelegramWire.stableId("$target:${current.studentShadow?.version}:${memos.memo(memoTarget(target), target.memoId, true)?.digestSha256}")
         val routeKey = "$peer:$stableId:${ConstructionLanBridge.peer(target.bookId)?.sessionId}"
         val now = System.currentTimeMillis()
         val previous = lastStudentOffers[target]
         if (previous?.first == routeKey && now - previous.second < 120_000L) return
         lastStudentOffers[target] = routeKey to now
-        transmit(target, store.studentSnapshot(target, stableId), peer)
+        transmit(target, studentSnapshot(target, stableId, true), peer)
     }
 
     private fun drainTelegram() {
@@ -360,7 +418,7 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
                 val delivery = prepareDelivery(route, packet, bytes)
                 val frames = ConstructionTelegramWire.frames(route.address, bytes, delivery.id)
                 val automaticSnapshot = packet.kind == ConstructionPacketKind.STUDENT_SNAPSHOT &&
-                    packet.requestId == ConstructionTelegramWire.stableId("$target:${packet.student?.version}")
+                    packet.requestId == ConstructionTelegramWire.stableId("$target:${packet.student?.version}:${packet.student?.memoJson?.let { decodeMemo(target, it).digestSha256 }}")
                 val streamRequest = if (automaticSnapshot) "latest" else "${packet.requestId}:${delivery.id}"
                 for ((id, frame) in frames) {
                     if (epoch != MasterNoteDataRootBus.currentGeneration() ||
@@ -422,8 +480,27 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
     private fun pin(lan: ConstructionLanPeer) = PeerPin(lanDevice = lan.peerDeviceId, contentSha256 = lan.documentSha256)
     private fun pin(route: ConstructionTelegramRoute) = PeerPin(pairId = route.address.pairId, peerBotId = route.peerBotId, contentSha256 = route.address.contentSha256)
     private fun parentExists(target: ConstructionTarget, includeDeleted: Boolean = false): Boolean = target.attemptNo > 0 &&
-        memos.memo(MemoTarget(target.bookId, target.pageNumber, target.attemptNo), target.memoId, includeDeleted) != null
-    private fun digest(snapshot: ConstructionReplicaSnapshot) = ConstructionSyncCodec.sceneDigest(snapshot.scene, snapshot.deleted, snapshot.attached)
+        (teacherMemo(target) != null || memos.memo(memoTarget(target), target.memoId, includeDeleted) != null)
+    private fun memoTarget(target: ConstructionTarget) = MemoTarget(target.bookId, target.pageNumber, target.attemptNo)
+    private fun teacherMemo(target: ConstructionTarget) = teacherMemos.memo(memoTarget(target), target.memoId)
+    private fun decodeMemo(target: ConstructionTarget, json: String): StudentMemo = memos.decodeMemo(json.toByteArray(Charsets.UTF_8)).also {
+        require(it.id == target.memoId && it.target.pageNumber == target.pageNumber && it.target.attemptNo == target.attemptNo) {
+            "Parent note does not match the authenticated construction target"
+        }
+    }
+    private fun studentSnapshot(target: ConstructionTarget, requestId: String, includeMemo: Boolean): ConstructionSyncPacket {
+        val packet = store.studentSnapshot(target, requestId)
+        if (!includeMemo) return packet
+        val parent = memos.memo(memoTarget(target), target.memoId, true)
+        return packet.copy(student = requireNotNull(packet.student).copy(memoStateKnown = true,
+            memoJson = parent?.let { memos.encodeMemo(it).toString(Charsets.UTF_8) }))
+    }
+    private fun rememberMemoBase(target: ConstructionTarget, source: StudentMemo) {
+        val base = teacherMemoBases.memo(memoTarget(target), target.memoId)
+        check(teacherMemoBases.applyPublishedMemo(source, memoTarget(target), base?.digestSha256) != null)
+    }
+    private fun digest(snapshot: ConstructionReplicaSnapshot) =
+        ConstructionSyncCodec.sceneDigest(snapshot.scene, snapshot.deleted, snapshot.attached) + ":" + teacherMemo(snapshot.target)?.digestSha256.orEmpty()
 
     private fun updateState(target: ConstructionTarget, message: String? = null) {
         val role = roles[target] ?: return

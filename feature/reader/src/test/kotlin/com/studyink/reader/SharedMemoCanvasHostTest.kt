@@ -50,6 +50,8 @@ class SharedMemoCanvasHostTest {
         activity.setContentView(root)
         shadowOf(Looper.getMainLooper()).idle()
         resize(400, 600)
+        // Set the fixture's initial camera explicitly; later resizes intentionally preserve it.
+        host.resetViewport()
         time = SystemClock.uptimeMillis()
     }
 
@@ -169,6 +171,27 @@ class SharedMemoCanvasHostTest {
         assertTrue(geometry.events.isEmpty())
     }
 
+    @Test fun `rotation through a placeholder size keeps both layers visible and the last camera stable`() {
+        host.zoomBy(3f)
+        val scale = host.viewport.pixelsPerCm
+        val center = host.viewport.viewToWorld(200f, 300f)
+        val previousBounds = host.viewport.activePageBounds()
+        resize(900, 1)
+        assertEquals("Do not resize or fit into a one-pixel rotation placeholder", previousBounds, host.viewport.activePageBounds())
+        assertEquals(scale, host.viewport.pixelsPerCm, .001f)
+        resize(900, 400)
+        assertEquals(scale, host.viewport.pixelsPerCm, .001f)
+        val afterCenter = host.viewport.viewToWorld(450f, 200f)
+        assertEquals(center.x, afterCenter.x, .001f)
+        assertEquals(center.y, afterCenter.y, .001f)
+        for (layer in listOf(geometry, ink)) {
+            assertEquals(View.VISIBLE, layer.visibility)
+            assertSame(host, layer.parent)
+            assertEquals(900, layer.width)
+            assertEquals(400, layer.height)
+        }
+    }
+
     @Test fun `new memo reset waits for durable ink even without a resize event`() {
         host.zoomBy(3f)
         var ready = false
@@ -187,6 +210,9 @@ class SharedMemoCanvasHostTest {
         assertFalse(fresh.fitContent())
         fresh.resumePendingResize()
         assertNull(fresh.viewport.activePageBounds())
+        fresh.measure(exact(900), exact(1))
+        fresh.layout(0, 0, 900, 1)
+        assertNull("Initial fit must wait until rotation/insets provide a usable drawing area", fresh.viewport.activePageBounds())
         fresh.measure(exact(400), exact(600))
         fresh.layout(0, 0, 400, 600)
         val center = fresh.viewport.worldToView(40.0, 5.0)

@@ -20,6 +20,7 @@ import kotlin.math.min
 internal class SharedMemoViewport : InkViewport {
     private var viewWidth = 0
     private var viewHeight = 0
+    private var largestViewportWidth = 0
     private var offsetX = 0f
     private var offsetY = 0f
     var pixelsPerCm: Float = 1f
@@ -51,15 +52,16 @@ internal class SharedMemoViewport : InkViewport {
         TOP.toFloat() - (y - offsetY) / pixelsPerCm,
     )
 
-    /** Keep the same center on the sheet and the same width-relative magnification on resize. */
+    /** Rotation changes the visible area, never the physical size of a drawn centimeter. */
     fun updateSize(w: Int, h: Int) {
         if (w <= 0 || h <= 0 || (w == viewWidth && h == viewHeight)) return
         val wasSized = viewWidth > 0 && viewHeight > 0
         val oldCenter = if (wasSized) viewToWorld(viewWidth / 2f, viewHeight / 2f) else null
-        val zoomRatio = if (wasSized) pixelsPerCm / widthScale() else 1f
+        val previousScale = pixelsPerCm
         viewWidth = w
         viewHeight = h
-        pixelsPerCm = (widthScale() * zoomRatio).coerceIn(minScale(), maxScale())
+        largestViewportWidth = max(largestViewportWidth, w)
+        pixelsPerCm = (if (wasSized) previousScale else widthScale()).coerceIn(minScale(), maxScale())
         if (oldCenter == null) {
             offsetX = 0f
             offsetY = 0f
@@ -161,7 +163,9 @@ internal class SharedMemoViewport : InkViewport {
             viewHeight / (coordinateSpan * HEIGHT.toFloat()))
         return max(safeFloor, min(paperFit / 16f, contentFit))
     }
-    private fun maxScale() = widthScale() * 8f
+    // Narrow or intermediate rotation layouts must not lower the zoom ceiling and clamp a
+    // camera the user already chose. This also keeps the first pan after rotation from zooming.
+    private fun maxScale() = largestViewportWidth / WIDTH.toFloat() * 8f
 
     private fun constrainPan() {
         // Keep the whole visible viewport writable, including near the generous numeric safety

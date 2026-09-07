@@ -48,6 +48,9 @@ data class ConstructionRemoteScene(
     val scene: ConstructionScene,
     val deleted: Boolean = false,
     val attached: Boolean = true,
+    /** False is an older geometry-only peer; true with null means the parent memo is absent. */
+    val memoStateKnown: Boolean = false,
+    val memoJson: String? = null,
 )
 
 enum class ConstructionPacketKind { REQUEST_STATE, STUDENT_SNAPSHOT, PUBLISH, RESULT }
@@ -64,7 +67,13 @@ data class ConstructionSyncPacket(
     val expectedStudent: ConstructionVersion? = null,
     val scene: ConstructionScene? = null,
     val result: ConstructionPublishResult? = null,
+    val includeMemo: Boolean = false,
+    val memoJson: String? = null,
+    val expectedMemoDigest: String? = null,
 )
+
+/** The app validates/applies the parent memo under the same root guard before geometry commits. */
+data class ConstructionMemoApplyResult(val accepted: Boolean, val memoJson: String?)
 
 class ConstructionReplicaSnapshot internal constructor(
     val target: ConstructionTarget,

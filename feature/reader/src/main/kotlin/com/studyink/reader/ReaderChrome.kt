@@ -170,8 +170,8 @@ internal fun isToolExtensionGestureArmed(
     currentTool: ReaderTool?,
 ): Boolean = startedTool != null && startedTool == currentTool
 
-/** Student memo creation replaces the teacher-only grade slot, so the main ring stays stable. */
-private fun mainMenuItemCount(state: ReaderUiState) = 7
+/** Keep the familiar seven slots; teachers additionally retain grading beside memo creation. */
+internal fun mainMenuItemCount(state: ReaderUiState) = if (state.capabilities.canGrade) 8 else 7
 
 /**
  * Whether an S Pen side button is held down, read straight from the platform event.
@@ -447,7 +447,7 @@ private fun MainRadialMenu(
 ) {
     val tokens = readerChromeTokens(state.role)
     val canGrade = state.capabilities.canGrade
-    val paletteIndex = if (canGrade) 4 else 5
+    val paletteIndex = if (canGrade) 7 else 5
     val redoIndex = 6
     RadialFan(
         itemCount = mainMenuItemCount(state),
@@ -498,7 +498,7 @@ private fun MainRadialMenu(
                 radialAngleDegrees = angleDegrees,
                 radialRadius = geometry.radius,
             )
-            !canGrade && index == 4 -> RadialActionButton(
+            index == 4 -> RadialActionButton(
                 iconRes = R.drawable.ic_memo,
                 label = "메모 만들기",
                 enabled = state.documentReady && state.storageAvailable &&

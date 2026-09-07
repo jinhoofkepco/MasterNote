@@ -49,6 +49,7 @@ data class StudentMemoChange(
     val target: MemoTarget,
     val memo: StudentMemo,
     val kind: StudentMemoChangeKind,
+    val teacherDraft: Boolean = false,
 )
 
 object StudentMemoChangeBus {
@@ -72,9 +73,11 @@ class StudentMemoRepository(
     rootDirectory: File,
     private val nowEpochMillis: () -> Long = System::currentTimeMillis,
     private val newUuid: () -> String = { UUID.randomUUID().toString() },
+    private val teacherDraft: Boolean = false,
+    private val teacherBase: Boolean = false,
 ) : StudentMemoReader {
     private val dataRoot = rootDirectory
-    private val featureRoot = File(rootDirectory, FEATURE_DIRECTORY)
+    private val featureRoot = File(rootDirectory, if (teacherBase) "teacher-memo-bases-v1" else if (teacherDraft) "teacher-memo-drafts-v1" else FEATURE_DIRECTORY)
     private val repositoryLock = lockFor(featureRoot)
     private val readOnlyView = object : StudentMemoReader {
         override fun targets(bookId: String?) = this@StudentMemoRepository.targets(bookId)
@@ -143,6 +146,8 @@ class StudentMemoRepository(
         return MemoJsonCodec.decodeMemo(bytes.copyOf())
     }
 
+    fun encodeMemo(memo: StudentMemo): ByteArray = encodeTransportableMemo(memo)
+
     fun create(target: MemoTarget, anchor: MemoAnchor): StudentMemo {
         val mutation = locked {
             val current = readSnapshot(target)
@@ -163,6 +168,29 @@ class StudentMemoRepository(
             writeSnapshot(next)
             DurableMemoMutation(memo, StudentMemoChangeKind.CREATED)
         }
+        publish(mutation)
+        return mutation.memo
+    }
+
+    /** Explicit, compare-and-set publication of one teacher-created note. Never replaces the
+     * page's other notes, resurrects a tombstone, or overwrites ink edited since the comparison.
+     * A repeated identical delivery is harmless, including after a geometry save is retried. */
+    fun applyPublishedMemo(source: StudentMemo, target: MemoTarget, expectedDigest: String?): StudentMemo? {
+        require(!source.deleted && source.target.pageNumber == target.pageNumber && source.target.attemptNo == target.attemptNo)
+        val incoming = MemoJsonCodec.validateAndCopy(source.target, listOf(source)).single()
+        val mutation = locked {
+            val current = readSnapshot(target)
+            val prior = current.memos.firstOrNull { it.id == incoming.id }
+            if (prior?.deleted == true) return@locked null
+            if (prior != null && sameContent(prior, incoming)) return@locked DurableMemoMutation(prior, null)
+            if (prior?.digestSha256 != expectedDigest) return@locked null
+            val created = prior?.createdAtEpochMillis ?: incoming.createdAtEpochMillis
+            val updated = maxOf(created, prior?.let { monotonicNow(it.updatedAtEpochMillis) } ?: validNow())
+            val memo = buildMemo(incoming.id, target, incoming.anchor, prior?.let { nextRevision(it.revision) } ?: 1L,
+                incoming.strokes, created, updated, null)
+            writeSnapshot(nextSnapshot(current, current.memos.filterNot { it.id == incoming.id } + memo))
+            DurableMemoMutation(memo, StudentMemoChangeKind.AUTHORITATIVE_APPLIED)
+        } ?: return null
         publish(mutation)
         return mutation.memo
     }
@@ -397,7 +425,7 @@ class StudentMemoRepository(
         }
         if (changes.isNotEmpty() || result.status == MemoAuthoritativeApplyStatus.APPLIED) {
             MasterNoteDataCommitBus.recordDurableCommit()
-            changes.forEach { StudentMemoChangeBus.publish(StudentMemoChange(it.memo.target, it.memo, requireNotNull(it.kind))) }
+            changes.forEach { StudentMemoChangeBus.publish(StudentMemoChange(it.memo.target, it.memo, requireNotNull(it.kind), teacherDraft || teacherBase)) }
         }
         return result
     }
@@ -543,7 +571,7 @@ class StudentMemoRepository(
     private fun publish(mutation: DurableMemoMutation) {
         val kind = mutation.kind ?: return
         MasterNoteDataCommitBus.recordDurableCommit()
-        StudentMemoChangeBus.publish(StudentMemoChange(mutation.memo.target, mutation.memo, kind))
+        StudentMemoChangeBus.publish(StudentMemoChange(mutation.memo.target, mutation.memo, kind, teacherDraft || teacherBase))
     }
 
     private fun <T> locked(block: () -> T): T =
@@ -561,6 +589,22 @@ class StudentMemoRepository(
         private val TARGET_BACKUP_FILE = Regex("[0-9a-f]{64}\\.json\\.bak")
 
         @Volatile private var instance: StudentMemoRepository? = null
+        @Volatile private var teacherInstance: StudentMemoRepository? = null
+        @Volatile private var teacherBaseInstance: StudentMemoRepository? = null
+
+        fun teacherBases(context: Context): StudentMemoRepository = teacherBaseInstance ?: synchronized(this) {
+            teacherBaseInstance ?: StudentMemoRepository(File(context.applicationContext.filesDir, "masternote"),
+                teacherBase = true).also { teacherBaseInstance = it }
+        }
+
+        fun teacherDrafts(context: Context): StudentMemoRepository = teacherInstance ?: synchronized(this) {
+            teacherInstance ?: StudentMemoRepository(File(context.applicationContext.filesDir, "masternote"),
+                teacherDraft = true).also { teacherInstance = it }
+        }
+
+        /** Ignores device-local book IDs, revision counters and save times. */
+        fun sameContent(first: StudentMemo, second: StudentMemo): Boolean = first.id == second.id &&
+            first.anchor == second.anchor && first.strokes == second.strokes && first.deleted == second.deleted
 
         fun get(context: Context): StudentMemoRepository = instance ?: synchronized(this) {
             instance ?: StudentMemoRepository(
@@ -570,6 +614,8 @@ class StudentMemoRepository(
 
         internal fun resetForTest() {
             instance = null
+            teacherInstance = null
+            teacherBaseInstance = null
         }
 
         private fun lockFor(featureRoot: File): Any =

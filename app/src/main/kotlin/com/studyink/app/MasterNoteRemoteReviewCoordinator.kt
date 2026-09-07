@@ -1422,6 +1422,7 @@ private class RemoteReviewRuntime(
     }
 
     private fun onStudentMemoChanged(change: StudentMemoChange) {
+        if (change.teacherDraft) return // Teacher ink is sent only by explicit note publication.
         val session = refreshSession()?.takeIf { it.role == RemoteReviewRole.STUDENT } ?: return
         if (session != observedSession) return
         pageSync.onLocalOperation(change.target.bookId, change.target.pageNumber)

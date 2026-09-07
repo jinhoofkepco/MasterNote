@@ -126,7 +126,14 @@ internal class SharedMemoCanvasHost(context: Context) : FrameLayout(context) {
         return true
     }
 
-    private fun hasViewportSize(): Boolean = width > 0 && height > 0
+    private fun hasViewportSize(): Boolean {
+        // During reparenting / orientation changes the outer editor can briefly lay us out at
+        // one pixel while its toolbar and insets settle. Fitting content into that placeholder
+        // would save a tiny zoom that survives the final layout. Keep the last camera until a
+        // usable shared drawing surface exists; the next size callback resumes pending work.
+        val minimumEdge = 48f * resources.displayMetrics.density
+        return width >= minimumEdge && height >= minimumEdge
+    }
 
     private fun applyPendingViewport() {
         if (pendingSize) {

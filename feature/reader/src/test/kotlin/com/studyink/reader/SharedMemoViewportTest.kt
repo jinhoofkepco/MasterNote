@@ -29,13 +29,20 @@ class SharedMemoViewportTest {
         val viewport = SharedMemoViewport().apply { updateSize(900, 1200) }
         val circleTop = viewport.worldToView(12.0, 14.0)
         val handwrittenPoint = viewport.viewToCanonical(circleTop.x, circleTop.y)!!.point
-        viewport.zoom(2f, 450f, 600f)
+        viewport.zoom(8f, 450f, 600f)
         viewport.pan(-80f, -100f)
         same(viewport.worldToView(12.0, 14.0), viewport.canonicalToView(0, handwrittenPoint)!!)
         val previousCenter = viewport.viewToWorld(450f, 600f)
+        val previousScale = viewport.pixelsPerCm
         viewport.updateSize(1200, 900)
+        assertEquals("Rotation must not resize a drawn centimeter", previousScale, viewport.pixelsPerCm, .001f)
         same(previousCenter, viewport.viewToWorld(600f, 450f))
         same(viewport.worldToView(12.0, 14.0), viewport.canonicalToView(0, handwrittenPoint)!!)
+        viewport.updateSize(420, 900)
+        assertEquals("A narrow layout must not clamp an already chosen zoom", previousScale, viewport.pixelsPerCm, .001f)
+        same(previousCenter, viewport.viewToWorld(210f, 450f))
+        viewport.pan(10f, 0f)
+        assertEquals("The first pan after rotation must not secretly zoom", previousScale, viewport.pixelsPerCm, .001f)
         assertAligned(viewport)
     }
 

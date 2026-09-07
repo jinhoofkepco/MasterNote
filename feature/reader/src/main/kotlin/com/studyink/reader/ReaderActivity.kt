@@ -108,6 +108,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     private val viewport = PdfViewportAdapter()
     private val assistantRepository by lazy { AssistantRepositoryProvider.get(this) }
     private val memoRepository by lazy { StudentMemoRepository.get(this) }
+    private val teacherMemoDrafts by lazy { StudentMemoRepository.teacherDrafts(this) }
+    private val teacherMemoBases by lazy { StudentMemoRepository.teacherBases(this) }
+    private var teacherOwnedMemoIds: Set<String> = emptySet()
     private val constructionReplicas by lazy { ConstructionReplicaStore(File(applicationContext.filesDir, "masternote")) }
     @Volatile private var memoConstructionRole = ConstructionReplicaRole.STUDENT
     private var memoPreviousSoftInputMode: Int? = null
@@ -441,24 +444,46 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         }
 
         memoOverlay = AttemptMemoOverlayView(this).also { overlay ->
-            val memoStore = memoRepository
+            fun writer(target: MemoTarget, id: String): StudentMemoRepository {
+                if (memoConstructionRole == ConstructionReplicaRole.STUDENT) return memoRepository
+                if (teacherMemoDrafts.memo(target, id) == null) {
+                    val source = requireNotNull(memoRepository.memo(target, id)) { "Memo no longer exists" }
+                    constructionReplicas.ensureAttachment(ConstructionTarget(target.bookId, target.pageNumber, target.attemptNo, id),
+                        ConstructionReplicaRole.TEACHER)
+                    val base = teacherMemoBases.memo(target, id)
+                    check(teacherMemoBases.applyPublishedMemo(source, target, base?.digestSha256) != null)
+                    teacherMemoDrafts.applyAuthoritative(source)
+                }
+                return teacherMemoDrafts
+            }
             overlay.pageViewport = viewport
             overlay.setTool(selectedTool)
             overlay.setPenColor(selectedPenColor)
             overlay.setPenWidth(selectedPenWidthDp)
             overlay.setPenOpacity(selectedPenOpacity)
+            overlay.canEditMemo = { true }
+            overlay.onPublishMemo = { memo ->
+                val target = ConstructionTarget(memo.target.bookId, memo.target.pageNumber, memo.target.attemptNo, memo.id)
+                val bridge = ConstructionUiBridgeProvider.bridge
+                if (bridge == null) Toast.makeText(this, "학생 연결이 준비되지 않았습니다.", Toast.LENGTH_SHORT).show()
+                else {
+                    bridge.registerTarget(target, ConstructionReplicaRole.TEACHER)
+                    bridge.requestPublish(target)
+                    Toast.makeText(this, "노트 발행 요청 · 학생 최신 상태를 확인합니다.", Toast.LENGTH_SHORT).show()
+                }
+            }
             overlay.onReplaceStrokes = { target, memoId, revision, strokes ->
-                memoStore.replaceStrokes(target, memoId, revision, strokes)
+                writer(target, memoId).replaceStrokes(target, memoId, revision, strokes)
             }
             overlay.onMoveMemo = { target, memoId, revision, anchor ->
-                memoStore.move(target, memoId, revision, anchor)
+                writer(target, memoId).move(target, memoId, revision, anchor)
             }
             overlay.onDeleteMemo = { target, memoId, revision ->
-                memoStore.delete(target, memoId, revision).also {
+                writer(target, memoId).delete(target, memoId, revision).also {
                     runCatching {
                         constructionReplicas.markMemoDeleted(
                             ConstructionTarget(target.bookId, target.pageNumber, target.attemptNo, memoId),
-                            ConstructionReplicaRole.STUDENT,
+                            memoConstructionRole,
                         )
                     }.onFailure { error -> Log.w(MEMO_LOG_TAG, "Memo deleted; geometry tombstone needs retry", error) }
                 }
@@ -754,6 +779,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     }
 
     private fun toggleTeacherMode() {
+        if (::memoOverlay.isInitialized && memoOverlay.editorVisible && !memoOverlay.minimizeEditor()) {
+            Toast.makeText(this, "노트 저장을 마친 뒤 모드를 바꿔주세요.", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (role != ReaderRole.STUDENT) {
             role = ReaderRole.STUDENT
             workflow = ReaderWorkflow.STUDY
@@ -956,10 +985,13 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun currentMemoTarget(state: ReaderUiState): MemoTarget? {
         if (!state.documentReady || state.bookId.isBlank() ||
-            state.attemptNo <= TEACHER_PAGE_REVIEW_ATTEMPT_NO
+            state.role == ReaderRole.STUDENT && state.attemptNo <= TEACHER_PAGE_REVIEW_ATTEMPT_NO
         ) return null
-        return runCatching { MemoTarget(state.bookId, state.pageNumber, state.attemptNo) }.getOrNull()
+        return runCatching { MemoTarget(state.bookId, state.pageNumber, memoAttemptNo(state)) }.getOrNull()
     }
+
+    private fun memoAttemptNo(state: ReaderUiState): Int = if (state.attemptNo > 0) state.attemptNo
+        else state.studentAttemptNo?.takeIf { it > 0 } ?: state.pageAttemptNos.maxOrNull()?.coerceAtLeast(1) ?: 1
 
     private fun refreshAttemptMemos(force: Boolean = false) {
         if (!::memoOverlay.isInitialized) return
@@ -975,7 +1007,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             memoOverlay.clearMemos()
             return
         }
-        val writable = latestState.role == ReaderRole.STUDENT && latestState.currentAttemptWritable
+        val writable = latestState.role != ReaderRole.STUDENT || latestState.currentAttemptWritable
         if (!force && displayedMemoTarget == target) {
             // The overlay owns edits that have just been durably committed. Rebinding the activity's
             // older cache here can briefly roll that memo back before its change-bus reload arrives.
@@ -988,19 +1020,23 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         if (!force && loadingMemoTarget == target) return
         loadingMemoTarget = target
         val generation = ++memoLoadGeneration
+        val teacher = latestState.role != ReaderRole.STUDENT
         lifecycleScope.launch {
             val result = runCatching {
-                withContext(Dispatchers.IO) { memoRepository.activeMemos(target) }
+                withContext(Dispatchers.IO) {
+                    val drafts = if (teacher) teacherMemoDrafts.snapshot(target).memos else emptyList()
+                    (memoRepository.activeMemos(target).filterNot { memo -> drafts.any { it.id == memo.id } } + drafts.filterNot { it.deleted }) to drafts.mapTo(hashSetOf()) { it.id }
+                }
             }
-            if (generation != memoLoadGeneration || target != currentMemoTarget(latestState)) {
+            if (generation != memoLoadGeneration || target != currentMemoTarget(latestState) || teacher != (latestState.role != ReaderRole.STUDENT)) {
                 return@launch
             }
             loadingMemoTarget = null
-            result.onSuccess { memos ->
+            result.onSuccess { (memos, ownedIds) ->
+                teacherOwnedMemoIds = ownedIds
                 displayedMemoTarget = target
                 displayedMemos = memos
-                val canWrite = latestState.role == ReaderRole.STUDENT &&
-                    latestState.currentAttemptWritable
+                val canWrite = latestState.role != ReaderRole.STUDENT || latestState.currentAttemptWritable
                 memoOverlay.showMemos(target, memos, canWrite)
                 pendingOpenMemo?.takeIf { it.first == target }?.let { (_, memoId) ->
                     if (memoOverlay.openMemo(memoId)) pendingOpenMemo = null
@@ -1016,7 +1052,7 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     private fun createAttemptMemoAtStylus() {
         val state = latestState
-        if (state.role != ReaderRole.STUDENT || !state.documentReady ||
+        if (!state.documentReady ||
             !state.storageAvailable || state.submissionInProgress
         ) return
         val pageBounds = viewport.activePageBounds() ?: return
@@ -1038,15 +1074,18 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
         lifecycleScope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
-                    val attempt = LibraryRepository.get(this@ReaderActivity)
+                    val attemptNo = if (state.role != ReaderRole.STUDENT) memoAttemptNo(state) else LibraryRepository.get(this@ReaderActivity)
                         .writableAttempt(sourceBookId, sourcePage, create = true)
-                        ?: error("Writable attempt is unavailable")
-                    val target = MemoTarget(sourceBookId, sourcePage, attempt.attemptNo)
-                    target to memoRepository.create(target, anchor)
+                        ?.attemptNo ?: error("Writable attempt is unavailable")
+                    val target = MemoTarget(sourceBookId, sourcePage, attemptNo)
+                    val memo = (if (state.role == ReaderRole.STUDENT) memoRepository else teacherMemoDrafts).create(target, anchor)
+                    if (state.role != ReaderRole.STUDENT) constructionReplicas.ensureAttachment(
+                        ConstructionTarget(target.bookId, target.pageNumber, target.attemptNo, memo.id), ConstructionReplicaRole.TEACHER)
+                    target to memo
                 }
             }
             if (latestState.bookId != sourceBookId || latestState.pageNumber != sourcePage ||
-                latestState.role != ReaderRole.STUDENT
+                latestState.role != state.role
             ) return@launch
             result.onSuccess { (target, memo) ->
                 viewModel.showWritableAttemptForMemo(target.attemptNo)

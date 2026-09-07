@@ -192,6 +192,7 @@ class LanSyncService : Service(),
             override fun send(bookId: String, payload: ByteArray, expectedPeer: ConstructionLanPeer) = sendConstruction(bookId, payload, expectedPeer)
         })
         memoChangeSubscription = StudentMemoChangeBus.addListener { change ->
+            if (change.teacherDraft) return@addListener
             if (role != LanPeerRole.STUDENT_SERVER || change.target.bookId != bookId ||
                 change.target.pageNumber != subscribedPage || !peerSupportsStudentMemo ||
                 studentMemoSubscriptionGeneration != connectionGeneration

@@ -68,27 +68,45 @@ class ConstructionReplicaStore(private val dataRoot: File) {
         return emitIfChanged(expected, result, ConstructionReplicaChangeKind.LOCAL_EDIT)
     }
 
-    fun requestState(target: ConstructionTarget, requestId: String = newId()) = packet(target, ConstructionPacketKind.REQUEST_STATE, requestId)
+    fun requestState(target: ConstructionTarget, requestId: String = newId(), includeMemo: Boolean = false) =
+        packet(target, ConstructionPacketKind.REQUEST_STATE, requestId).copy(includeMemo = includeMemo)
 
-    fun studentSnapshot(target: ConstructionTarget, requestId: String = newId()): ConstructionSyncPacket {
+    fun studentSnapshot(
+        target: ConstructionTarget,
+        requestId: String = newId(),
+        memoStateKnown: Boolean = false,
+        memoJson: String? = null,
+    ): ConstructionSyncPacket {
         val state = load(target, ConstructionReplicaRole.STUDENT)
-        return packet(target, ConstructionPacketKind.STUDENT_SNAPSHOT, requestId).copy(student = requireNotNull(state.studentShadow))
+        val student = requireNotNull(state.studentShadow).copy(memoStateKnown = memoStateKnown, memoJson = memoJson)
+        ConstructionSyncCodec.validateRemote(student)
+        return packet(target, ConstructionPacketKind.STUDENT_SNAPSHOT, requestId).copy(student = student)
     }
 
     /** A higher generation supersedes a restored past; a lower generation can never roll it back. */
-    fun receiveStudentSnapshot(target: ConstructionTarget, packet: ConstructionSyncPacket): ConstructionReplicaSnapshot {
+    fun receiveStudentSnapshot(target: ConstructionTarget, packet: ConstructionSyncPacket, preserveDraft: Boolean = false): ConstructionReplicaSnapshot {
         requirePacket(target, packet, ConstructionPacketKind.STUDENT_SNAPSHOT)
         val incoming = freezeRemote(requireNotNull(packet.student))
         var changed = false
         val result = locked {
             val old = readCurrent(target, ConstructionReplicaRole.TEACHER)
-            if (old.deleted || !isNewer(incoming, old.student)) return@locked snapshot(old)
-            val clean = !dirty(old) && old.pending == null
+            val newerGeometry = isNewer(incoming, old.student)
+            if (old.deleted || !newerGeometry && !refreshesMemo(incoming, old.student)) return@locked snapshot(old)
+            val clean = !preserveDraft && !dirty(old) && old.pending == null
+            val previousBase = old.base
+            // A fresh memo-only query updates the shadow, not an already-known comparison base.
+            // The app separately tracks parent-memo edits, which this geometry dirty flag cannot see.
+            val base = when {
+                clean && newerGeometry -> incoming
+                clean && previousBase != null && previousBase.version == incoming.version && !previousBase.memoStateKnown && incoming.memoStateKnown ->
+                    previousBase.copy(memoStateKnown = true, memoJson = incoming.memoJson)
+                else -> old.base
+            }
             val next = old.copy(
                 student = incoming,
-                scene = if (clean) incoming.scene else old.scene,
-                attached = if (clean) incoming.attached else old.attached,
-                base = if (clean) incoming else old.base,
+                scene = if (clean && newerGeometry) incoming.scene else old.scene,
+                attached = if (clean && newerGeometry) incoming.attached else old.attached,
+                base = base,
                 deleted = old.deleted || incoming.deleted,
             )
             changed = true
@@ -106,6 +124,8 @@ class ConstructionReplicaStore(private val dataRoot: File) {
         expected: ConstructionReplicaSnapshot,
         comparedStudent: ConstructionVersion? = expected.commonBase?.version,
         requestId: String = newId(),
+        memoJson: String? = null,
+        expectedMemoDigest: String? = null,
     ): ConstructionPublishPreparation {
         ConstructionSyncCodec.requireUuid(requestId)
         val prepared = locked {
@@ -118,7 +138,7 @@ class ConstructionReplicaStore(private val dataRoot: File) {
                 !(comparedStudent == student.version || comparedStudent == null && initialEmpty)
             ) return@locked ConstructionPublishPreparation(snapshot(old), null, true)
             val request = packet(old.target, ConstructionPacketKind.PUBLISH, requestId)
-                .copy(expectedStudent = student.version, scene = old.scene)
+                .copy(expectedStudent = student.version, scene = old.scene, memoJson = memoJson, expectedMemoDigest = expectedMemoDigest)
             ConstructionSyncCodec.encode(request) // Reject an untransportable draft before marking it pending.
             ConstructionPublishPreparation(snapshot(write(old.copy(pending = request))), request, false)
         }
@@ -126,7 +146,11 @@ class ConstructionReplicaStore(private val dataRoot: File) {
         return prepared
     }
 
-    fun adoptStudent(expected: ConstructionReplicaSnapshot, comparedStudent: ConstructionVersion): ConstructionReplicaSnapshot {
+    fun adoptStudent(
+        expected: ConstructionReplicaSnapshot,
+        comparedStudent: ConstructionVersion,
+        beforeAdopt: (() -> Unit)? = null,
+    ): ConstructionReplicaSnapshot {
         val result = locked {
             val old = requireCurrent(expected)
             require(old.role == ConstructionReplicaRole.TEACHER)
@@ -134,13 +158,19 @@ class ConstructionReplicaStore(private val dataRoot: File) {
             val student = requireNotNull(old.student) { "Student state is not available" }
             if (student.version != comparedStudent) throw ConcurrentModificationException("Student changed after comparison")
             check(!old.deleted && !student.deleted) { "The memo was deleted" }
+            // Parent-memo CAS must not run until the geometry comparison is known to be current.
+            beforeAdopt?.invoke()
             snapshot(write(old.copy(scene = student.scene, attached = student.attached, base = student)))
         }
         return emitIfChanged(expected, result, ConstructionReplicaChangeKind.ADOPTED_STUDENT)
     }
 
     /** Atomic CAS + previous-scene recovery + receipt. A duplicate returns its original durable result. */
-    fun receivePublish(target: ConstructionTarget, request: ConstructionSyncPacket): ConstructionSyncPacket {
+    fun receivePublish(
+        target: ConstructionTarget,
+        request: ConstructionSyncPacket,
+        applyMemo: (() -> ConstructionMemoApplyResult)? = null,
+    ): ConstructionSyncPacket {
         requirePacket(target, request, ConstructionPacketKind.PUBLISH)
         val requestHash = ConstructionSyncCodec.packetDigest(request)
         var applied: ConstructionReplicaSnapshot? = null
@@ -152,20 +182,34 @@ class ConstructionReplicaStore(private val dataRoot: File) {
             }
             check(old.receipts.size < MAX_RECEIPTS) { "Publication receipt capacity exceeded; existing records preserved" }
             val prior = requireNotNull(old.student)
-            val status = when {
+            var status = when {
                 old.deleted -> ConstructionPublishResult.DELETED
                 prior.version != request.expectedStudent -> ConstructionPublishResult.CONFLICT
                 else -> ConstructionPublishResult.APPLIED
             }
+            // Never apply a parent when the geometry CAS failed, or run an idempotent retry twice.
+            val memoResult = if (status == ConstructionPublishResult.APPLIED && request.memoJson != null) {
+                requireNotNull(applyMemo) { "Parent memo apply callback is required" }.invoke().also {
+                    it.memoJson?.let(ConstructionSyncCodec::validateMemoText)
+                    require(!it.accepted || it.memoJson != null) { "Applied parent memo is missing" }
+                    if (!it.accepted) status = ConstructionPublishResult.CONFLICT
+                }
+            } else null
             var next = old
             if (status == ConstructionPublishResult.APPLIED) {
                 val scene = ConstructionJsonCodec.immutableScene(requireNotNull(request.scene))
                 next = old.copy(scene = scene, attached = true, recovery = prior)
-                val student = localRemote(next, nextStudentRevision(old))
+                val student = localRemote(next, nextStudentRevision(old)).let { remote ->
+                    if (memoResult == null) remote else remote.copy(memoStateKnown = true, memoJson = memoResult.memoJson)
+                }
                 next = next.copy(student = student, base = student)
             }
+            val remote = requireNotNull(next.student).let {
+                if (memoResult == null) it else it.copy(memoStateKnown = true, memoJson = memoResult.memoJson)
+            }
             val response = packet(target, ConstructionPacketKind.RESULT, request.requestId)
-                .copy(student = requireNotNull(next.student), result = status)
+                .copy(student = remote, result = status)
+            ConstructionSyncCodec.encode(response)
             // Keeping the receipt in the same atomic replace is what makes ACK safe after a crash.
             next = next.copy(receipts = next.receipts + receipt(requestHash, response))
             val committed = snapshot(write(next))
@@ -185,9 +229,12 @@ class ConstructionReplicaStore(private val dataRoot: File) {
             val old = readCurrent(target, ConstructionReplicaRole.TEACHER)
             val pending = old.pending ?: return@locked snapshot(old)
             if (pending.requestId != response.requestId) return@locked snapshot(old)
-            val shadow = if (isNewer(incoming, old.student)) incoming else old.student ?: incoming
+            val shadow = if (isNewer(incoming, old.student) || refreshesMemo(incoming, old.student)) incoming else old.student ?: incoming
             val applied = response.result == ConstructionPublishResult.APPLIED
             if (applied) {
+                require(pending.memoJson == null || incoming.memoStateKnown && incoming.memoJson != null) {
+                    "Publication acknowledgement omitted the parent memo"
+                }
                 require(incoming.version.generation == pending.expectedStudent?.generation &&
                     incoming.version.revision == requireNotNull(pending.expectedStudent).revision + 1L &&
                     incoming.version.digestSha256 == ConstructionSyncCodec.sceneDigest(requireNotNull(pending.scene)) &&
@@ -309,6 +356,10 @@ class ConstructionReplicaStore(private val dataRoot: File) {
         return false
     }
 
+    private fun refreshesMemo(incoming: ConstructionRemoteScene, previous: ConstructionRemoteScene?) =
+        previous != null && incoming.version == previous.version && incoming.memoStateKnown &&
+            (!previous.memoStateKnown || incoming.memoJson != previous.memoJson)
+
     private fun freezeRemote(value: ConstructionRemoteScene): ConstructionRemoteScene = value.copy(
         scene = ConstructionJsonCodec.immutableScene(value.scene),
     ).also(ConstructionSyncCodec::validateRemote)
@@ -354,7 +405,8 @@ class ConstructionReplicaStore(private val dataRoot: File) {
             .put("receipts", JSONArray(value.receipts.map { receipt -> JSONObject().put("id", receipt.requestId)
                 .put("hash", receipt.requestHash).put("result", receipt.result.name)
                 .put("version", ConstructionSyncCodec.versionJson(receipt.version))
-                .put("student", receipt.student?.let(ConstructionSyncCodec::remoteJson) ?: JSONObject.NULL) }))
+                .put("student", receipt.student?.let(ConstructionSyncCodec::remoteJson) ?: JSONObject.NULL)
+                .also { json -> receipt.memoJson?.let { json.put("memoJson", it) } } }))
             .toString()
         return JSONObject().put("formatVersion", 1).put("body", body)
             .put("sha256", ConstructionSyncCodec.sha256(body.toByteArray(Charsets.UTF_8))).toString().toByteArray(Charsets.UTF_8)
@@ -375,20 +427,25 @@ class ConstructionReplicaStore(private val dataRoot: File) {
             (0 until receipts.length()).map { receipts.getJSONObject(it).let { item ->
                 if (item.has("response")) receipt(item.getString("hash"), ConstructionSyncCodec.fromJson(item.getJSONObject("response")))
                 else Receipt(item.getString("id"), item.getString("hash"), ConstructionPublishResult.valueOf(item.getString("result")),
-                    ConstructionSyncCodec.version(item.getJSONObject("version")), item.optionalRemote("student"))
+                    ConstructionSyncCodec.version(item.getJSONObject("version")), item.optionalRemote("student"),
+                    if (item.isNull("memoJson")) null else item.getString("memoJson"))
             } })
         require(value.revision > 0 && value.generation > 0)
         ConstructionSyncCodec.requireUuid(value.commitId)
         require(value.attached || value.scene == ConstructionScene())
         require(!value.deleted || !value.attached)
-        if (value.role == ConstructionReplicaRole.STUDENT) require(value.student == localRemote(value, requireNotNull(value.student).version.revision))
+        if (value.role == ConstructionReplicaRole.STUDENT) {
+            val student = requireNotNull(value.student)
+            require(student.copy(memoStateKnown = false, memoJson = null) == localRemote(value, student.version.revision))
+        }
         value.pending?.let { requirePacket(target, it, ConstructionPacketKind.PUBLISH) }
         require(value.receipts.map { it.requestId }.distinct().size == value.receipts.size)
         value.receipts.forEach {
             ConstructionSyncCodec.requireUuid(it.requestId)
             require(Regex("[0-9a-f]{64}").matches(it.requestHash))
+            it.memoJson?.let(ConstructionSyncCodec::validateMemoText)
             if (it.result == ConstructionPublishResult.APPLIED) require(it.student == null)
-            else require(it.student != null && it.student.version == it.version)
+            else require(it.student != null && it.student.version == it.version && it.memoJson == null)
         }
         return value
     }
@@ -399,19 +456,22 @@ class ConstructionReplicaStore(private val dataRoot: File) {
     private fun receipt(hash: String, response: ConstructionSyncPacket) = Receipt(
         response.requestId, hash, requireNotNull(response.result), requireNotNull(response.student).version,
         response.student.takeUnless { response.result == ConstructionPublishResult.APPLIED },
+        requireNotNull(response.student).memoJson.takeIf { response.result == ConstructionPublishResult.APPLIED },
     )
 
     private fun receiptResponse(target: ConstructionTarget, request: ConstructionSyncPacket, receipt: Receipt): ConstructionSyncPacket {
         // APPLIED scene bytes are already present in the retried request, whose canonical hash matched.
-        // Keeping just its version makes old successful receipts compact without silently evicting ids.
+        // Keep only its version and the exact applied memo, not another full geometry scene.
         val student = receipt.student ?: ConstructionRemoteScene(receipt.version,
-            ConstructionJsonCodec.immutableScene(requireNotNull(request.scene)), deleted = false, attached = true)
+            ConstructionJsonCodec.immutableScene(requireNotNull(request.scene)), deleted = false, attached = true,
+            memoStateKnown = receipt.memoJson != null, memoJson = receipt.memoJson)
         ConstructionSyncCodec.validateRemote(student)
         return packet(target, ConstructionPacketKind.RESULT, request.requestId).copy(student = student, result = receipt.result)
     }
 
     private data class Receipt(val requestId: String, val requestHash: String,
-        val result: ConstructionPublishResult, val version: ConstructionVersion, val student: ConstructionRemoteScene?)
+        val result: ConstructionPublishResult, val version: ConstructionVersion, val student: ConstructionRemoteScene?,
+        val memoJson: String? = null)
     private data class Replica(
         val target: ConstructionTarget, val role: ConstructionReplicaRole, val revision: Long,
         val commitId: String, val generation: Long, val scene: ConstructionScene, val attached: Boolean,

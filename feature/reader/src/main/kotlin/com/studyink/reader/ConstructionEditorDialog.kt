@@ -105,6 +105,7 @@ internal class ConstructionEditorView(
     private enum class PanelKind { RELATIONS, MEASURE, CONDITIONS, MORE, DETAIL }
     private val actionButtons = mutableListOf<Button>()
     private var closeButton: Button? = null
+    private var deleteButton: Button? = null
     private var snapshot: ConstructionSceneSnapshot? = null
     private var scene = ConstructionScene()
     private val undo = ArrayDeque<ConstructionScene>()
@@ -163,6 +164,12 @@ internal class ConstructionEditorView(
                 Triple(ConstructionTool.SEGMENT,"선분",ConstructionIcon.SEGMENT), Triple(ConstructionTool.CIRCLE,"원",ConstructionIcon.CIRCLE)).forEach { (tool, label, icon) ->
                 val b = button(label, icon = icon, iconOnly = true) { chooseTool(tool) }
                 toolButtons[tool] = b; addView(b)
+                if (tool == ConstructionTool.SELECT) {
+                    deleteButton = button("선택 도형 삭제", icon = ConstructionIcon.DELETE, iconOnly = true) {
+                        onEditingRequested(); deleteSelection()
+                    }.apply { tag = "construction-delete-selected" }
+                    addView(deleteButton)
+                }
             }
             addView(TextView(context).apply { text = "│"; setTextColor(Color.LTGRAY); gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(15), dp(36)))
             for ((color, label) in palette()) {
@@ -222,7 +229,9 @@ internal class ConstructionEditorView(
         canvas.onSegment = { a, b -> runCatching { ConstructionEdits.addSegment(scene, a, b, newColor, newLineStyle) }.onSuccess { edit(it) }.onFailure { notice(it.message.orEmpty()) } }
         canvas.onCircle = { center, radius -> runCatching { ConstructionEdits.addCircle(scene, center, radius, newColor, newLineStyle) }.onSuccess { edit(it) }.onFailure { notice(it.message.orEmpty()) } }
         canvas.onDragPoint =(::onDrag)
-        canvas.onMeasurementSelected = { id -> canvas.selectedMeasurementId = id; showMeasurementDetails(id) }
+        canvas.onMeasurementSelected = { id ->
+            canvas.selectedMeasurementId = id; showMeasurementDetails(id); updateHint()
+        }
         canvas.onMeasurementDrag = ::onMeasurementDrag
         canvas.onConstraintSelected = { id ->
             // A driving dimension takes over its saved measurement's hit target. While choosing
@@ -236,6 +245,7 @@ internal class ConstructionEditorView(
                 showMeasurementDetails(measurement.id)
                 canvas.selectedConstraintId = id
             } else showConditionDetails(id)
+            updateHint()
         }
         restoreListener = store.addRestoreListener {
             uiHandler.post {
@@ -395,6 +405,8 @@ internal class ConstructionEditorView(
         lineStyleButtons.forEach { (style,b) -> b.isSelected = style == shownStyle }
         actionButtons.firstOrNull { it.tag == "snap-toggle" }?.isSelected = canvas.snapEnabled
         actionButtons.firstOrNull { it.tag == "더보기" }?.isSelected = panelKind == PanelKind.MORE
+        deleteButton?.isEnabled = !busy && !closed && dragBase == null && measurementBase == null &&
+            canvas.selectedIds.any { it in allIds() }
     }
     private fun updateHint() {
         val reference = scene.measurements.firstOrNull { it.id == pendingEqualMeasurement }
@@ -403,7 +415,11 @@ internal class ConstructionEditorView(
         } else if (pendingEqualAngle != null) {
             "∠${pendingEqualAngle!!.joinToString("") { name(it) }}와 같게 · 다른 각의 세 점(끝→꼭짓점→끝) 선택 후 조건 추가"
         } else if (canvas.tool == ConstructionTool.SELECT) {
-            if (canvas.selectedIds.isEmpty()) "선택 · 대상을 눌러 주세요" else "선택 · ${canvas.selectedIds.joinToString { name(it) }}"
+            when {
+                canvas.selectedIds.isNotEmpty() -> "선택 ${canvas.selectedIds.size}개 · ${canvas.selectedIds.joinToString { name(it) }} · 휴지통으로 삭제"
+                canvas.selectedConstraintId != null || canvas.selectedMeasurementId != null -> "표시 확인 중 · 도형을 지우려면 ‘대상 도형 선택’ 후 휴지통"
+                else -> "선택 · 점·선·원을 눌러 선택한 뒤 휴지통으로 삭제"
+            }
         } else toolHint
     }
     private fun showMore() = showPanel("더보기", PanelKind.MORE) {
@@ -906,7 +922,8 @@ internal class ConstructionEditorView(
                         addView(button("${if (expanded) "▾" else "▸"} ${conditionLabel(c)}", register = false) {
                             selectedCondition = if (expanded) null else c.id
                             canvas.selectedConstraintId = selectedCondition; canvas.selectedMeasurementId = null
-                            showConditions()
+                            if (selectedCondition != null) canvas.selectedIds = emptySet()
+                            showConditions(); updateHint()
                         }.apply {
                             tag = "condition-expand-${c.id}"; maxLines = 2; gravity = Gravity.CENTER_VERTICAL or Gravity.START
                             contentDescription = "조건 세부 메뉴 ${conditionLabel(c)}"
@@ -1029,6 +1046,9 @@ internal class ConstructionEditorView(
 
     private fun showConditionDetails(id: String) {
         val c = scene.constraints.firstOrNull { it.id == id } ?: return closePanel()
+        // Relation emphasis is not a destructive entity selection. An explicit target-selection
+        // action below is required before deleting any of the associated geometry.
+        canvas.selectedIds = emptySet()
         selectedCondition = id; canvas.selectedConstraintId = id; canvas.selectedMeasurementId = null
         showPanel("조건 · ${c.type.koreanName()}", PanelKind.DETAIL) {
             addView(LinearLayout(context).apply {
@@ -1040,8 +1060,10 @@ internal class ConstructionEditorView(
                 }, LinearLayout.LayoutParams(0, -1, 1f))
             }, LinearLayout.LayoutParams(-1, dp(48)))
             addConditionControls(c)
+            action("대상 도형 선택", ConstructionIcon.SELECT, "condition-select-entities-$id") { selectAnnotationEntities(id, null) }
             action("조건 목록으로") { showConditions() }
         }
+        updateHint()
     }
 
     private fun length(line: GeometrySegment): Double {
@@ -1112,6 +1134,7 @@ internal class ConstructionEditorView(
     }
     private fun showMeasurementDetails(id: String) {
         val m = scene.measurements.firstOrNull { it.id == id } ?: return closePanel()
+        canvas.selectedIds = emptySet()
         selectedCondition = null; canvas.selectedConstraintId = null; canvas.selectedMeasurementId = id
         val value = ConstructionMeasurementGeometry.layout(scene, m)?.value
         val existing = scene.constraints.firstOrNull { ConstructionMeasurementGeometry.matchesConstraint(scene, m, it) }
@@ -1145,10 +1168,12 @@ internal class ConstructionEditorView(
             if (pendingEqualMeasurement != null) action("같은 측정 선택 취소", actionTag = "measurement-equal-cancel") {
                 clearMeasurementReference(); updateHint(); showMeasurementDetails(id)
             }
+            action("대상 도형 선택", ConstructionIcon.SELECT, "measurement-select-entities-$id") { selectAnnotationEntities(null, id) }
             action("표시 위치 초기화") { presentationEdit(scene.copy(measurements = scene.measurements.map { if (it.id == id) it.copy(offsetX = 0.0, offsetY = 0.0) else it })) }
             action("표시 지우기", ConstructionIcon.DELETE) { closePanel(); presentationEdit(scene.copy(measurements = scene.measurements.filterNot { it.id == id })) }
             action("측정으로") { showMeasurement() }
         }
+        updateHint()
     }
 
     private fun clearMeasurementReference() {
@@ -1205,14 +1230,42 @@ internal class ConstructionEditorView(
     }
     private fun deleteSelection() {
         val token = generation
-        val selected = canvas.selectedIds.toSet()
+        val selected = canvas.selectedIds.intersect(allIds())
         if (selected.isEmpty()) return notice("삭제할 점·선·원을 선택하세요.")
         val next = ConstructionEdits.remove(scene, selected)
+        val errors = SceneValidator.validate(next)
+        if (errors.isNotEmpty()) return notice("연결 상태를 확인하지 못해 삭제하지 않았습니다: ${errors.first()}")
         val count = scene.points.size + scene.segments.size + scene.circles.size - next.points.size - next.segments.size - next.circles.size
         val constraints = scene.constraints.size - next.constraints.size
+        val measurements = scene.measurements.size - next.measurements.size
         AlertDialog.Builder(context).setTitle("선택한 도형 삭제")
-            .setMessage("연결된 도형을 포함해 ${count}개와 관련 조건 ${constraints}개를 삭제합니다. 되돌리기로 복구할 수 있습니다.")
-            .setNegativeButton("취소", null).setPositiveButton("삭제") { _, _ -> if (isCurrent(token)) edit(next) }.showChild()
+            .setMessage("선택: ${selected.joinToString { name(it) }}\n연결된 도형을 포함해 ${count}개, 관련 조건 ${constraints}개, 관련 측정 표시 ${measurements}개를 삭제합니다.\n손필기는 지우지 않습니다. 되돌리기로 복구할 수 있습니다.")
+            .setNegativeButton("취소", null).setPositiveButton("삭제") { _, _ ->
+                if (!isCurrent(token) || canvas.selectedIds.intersect(allIds()) != selected) {
+                    notice("삭제 대상이 바뀌었습니다. 대상을 다시 선택해 주세요.")
+                } else {
+                    pendingEqualAngle = null; clearMeasurementReference(); closePanel()
+                    // Removing entities only removes their dependent conditions. Preserve the
+                    // coordinates of all surviving objects rather than rerunning a shape solve.
+                    presentationEdit(next)
+                }
+            }.showChild()
+    }
+
+    /** Explicitly promote annotation emphasis into an entity selection. A highlighted segment
+     * selects that segment, not its endpoints (which would also delete unrelated adjoining lines). */
+    private fun selectAnnotationEntities(constraintId: String?, measurementId: String?) {
+        val targets = ConstructionMeasurementGeometry.annotationTargets(scene, constraintId, measurementId).entityIds
+        val shapes = targets.filterTo(linkedSetOf()) { scene.segment(it) != null || scene.circle(it) != null }
+        val shapePoints = shapes.flatMapTo(hashSetOf()) { id ->
+            scene.segment(id)?.let { listOf(it.startPointId, it.endPointId) }
+                ?: scene.circle(id)?.let { listOf(it.centerPointId) }.orEmpty()
+        }
+        val selection = shapes + targets.filter { scene.point(it) != null && it !in shapePoints }
+        if (selection.isEmpty()) return notice("선택할 도형이 없습니다.")
+        pendingEqualAngle = null; clearMeasurementReference()
+        canvas.tool = ConstructionTool.SELECT; closePanel()
+        canvas.selectedIds = selection; updateSelection()
     }
 
     private fun createIntersection(first: GeometrySegment, second: GeometrySegment) {
@@ -1318,6 +1371,7 @@ internal class ConstructionEditorView(
         syncStatus.isClickable = state?.conflictToken != null
         publishButton?.isEnabled = !hasPendingWork && state?.canPublish == true && !state.busy
     }
+    fun publishMemo() = requestPublication()
     private fun requestPublication() {
         if (hasPendingWork || closed) return
         val state = syncBridge?.state(target) ?: return notice("원격 연결 상태를 확인해 주세요.")
@@ -1331,9 +1385,9 @@ internal class ConstructionEditorView(
         val bridge = syncBridge ?: return
         val expectedToken = bridge.state(target).conflictToken ?: return
         val token = generation
-        val labels = arrayOf("선생 도형으로 학생 맞추기", "학생 도형으로 선생 맞추기")
-        AlertDialog.Builder(context).setTitle("서로 다른 도형이 있습니다")
-            .setMessage("두 기기의 도형이 달라졌습니다. 어느 도형을 사용할지 선택하세요. 손필기는 변경되지 않습니다.")
+        val labels = arrayOf("선생 노트·도형으로 학생 맞추기", "학생 노트·도형으로 선생 맞추기")
+        AlertDialog.Builder(context).setTitle("노트 또는 도형에 변경이 있습니다")
+            .setMessage("어느 내용을 사용할지 선택하세요. 선생이 필기를 수정한 노트는 그 필기도 함께 반영됩니다. 다른 노트는 변경하지 않습니다.")
             .setPositiveButton(labels[0]) { _, _ -> confirmConflict(bridge, expectedToken, token, ConstructionConflictChoice.USE_TEACHER, labels[0]) }
             .setNeutralButton(labels[1]) { _, _ -> confirmConflict(bridge, expectedToken, token, ConstructionConflictChoice.USE_STUDENT, labels[1]) }
             .setNegativeButton("취소", null).showChild()
@@ -1342,7 +1396,7 @@ internal class ConstructionEditorView(
         if (!isCurrent(token) || bridge.state(target).conflictToken != expectedToken) {
             notice("비교하는 동안 도형이 바뀌었습니다. 최신 도형을 다시 확인해 주세요."); return
         }
-        AlertDialog.Builder(context).setTitle(label).setMessage("선택한 도형으로 맞출까요? 상대 도형이 다시 바뀌면 재확인합니다.")
+        AlertDialog.Builder(context).setTitle(label).setMessage("선택한 노트·도형으로 맞출까요? 비교 후 상대 내용이 다시 바뀌면 덮어쓰지 않고 재확인합니다.")
             .setPositiveButton("확인") { _, _ ->
                 if (isCurrent(token) && bridge.state(target).conflictToken == expectedToken) {
                     bridge.resolveConflict(target, choice, expectedToken); refreshSyncState()
