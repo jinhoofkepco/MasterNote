@@ -174,6 +174,7 @@ class LanSyncBusTest {
         assertTrue(LAN_CAPABILITY_GPT_EXPLANATION_V2 in lanCapabilities())
         assertTrue(LAN_CAPABILITY_TEACHER_REVIEW_STATE_V1 in lanCapabilities())
         assertTrue(LAN_CAPABILITY_STUDENT_MEMO_V1 in lanCapabilities())
+        assertTrue(LAN_CAPABILITY_STUDENT_MEMO_V3 in lanCapabilities())
         assertTrue(LAN_CAPABILITY_ANNOTATION_Q16_DELTA_V1 in lanCapabilities())
         assertEquals(lanCapabilities().size, lanCapabilities().distinct().size)
     }

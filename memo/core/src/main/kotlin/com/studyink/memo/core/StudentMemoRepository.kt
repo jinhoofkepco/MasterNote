@@ -23,9 +23,9 @@ interface StudentMemoReader {
 
 enum class MemoAuthoritativeApplyStatus { APPLIED, ALREADY_CURRENT, STALE, CONFLICT }
 
-/** Hard contract shared by the local writer and the single-document remote transports. */
+/** Transport allowance includes headroom over the separate 8 MiB storage admission limit. */
 object MemoTransportLimits {
-    const val MAX_ENCODED_MEMO_BYTES: Int = 1_572_864 // 1.5 MiB
+    const val MAX_ENCODED_MEMO_BYTES: Int = 10 * 1024 * 1024
 }
 
 data class MemoAuthoritativeApplyResult(
@@ -79,6 +79,9 @@ class StudentMemoRepository(
     private val dataRoot = rootDirectory
     private val featureRoot = File(rootDirectory, if (teacherBase) "teacher-memo-bases-v1" else if (teacherDraft) "teacher-memo-drafts-v1" else FEATURE_DIRECTORY)
     private val repositoryLock = lockFor(featureRoot)
+    private val cacheRootIdentity = rootDirectory.canonicalPath
+    private val hotCache get() = MemoHotCaches.forRoot(cacheRootIdentity)
+    private fun pointCache(target: MemoTarget) = if (teacherBase) null else hotCache.points(target)
     private val readOnlyView = object : StudentMemoReader {
         override fun targets(bookId: String?) = this@StudentMemoRepository.targets(bookId)
         override fun snapshot(target: MemoTarget) = this@StudentMemoRepository.snapshot(target)
@@ -92,15 +95,28 @@ class StudentMemoRepository(
 
     fun readOnly(): StudentMemoReader = readOnlyView
 
+    /** Foreground hint only; background sync must not call this. No memo files are read. */
+    fun focusPage(bookId: String, pageNumber: Int) {
+        MemoTarget(bookId, pageNumber, 1)
+        if (!teacherBase) hotCache.focus(bookId, pageNumber)
+    }
+
+    /** Cached after a save; call cold estimates off the UI thread. */
+    fun usage(memo: StudentMemo): MemoUsage = locked {
+        hotCache.usage(memo.digestSha256) ?: hotCache.rememberUsage(memo,
+            MemoJsonCodec.encodeMemo(memo, pointCache(memo.target)).size)
+    }
+
     override fun targets(bookId: String?): List<MemoTarget> = locked {
         bookId?.let {
             require(it.isNotBlank() && it.toByteArray(Charsets.UTF_8).size <= MAX_MEMO_BOOK_ID_BYTES)
         }
         storedTargetBaseFiles().mapNotNull { baseFile ->
             try {
-                val bytes = AtomicMemoFile(baseFile, MAX_TARGET_FILE_BYTES).readOrNull()
-                    ?: return@mapNotNull null
-                val decoded = MemoJsonCodec.decode(bytes)
+                val decoded = (if (teacherBase) null else hotCache.find(baseFile)) ?: run {
+                    val bytes = AtomicMemoFile(baseFile, MAX_TARGET_FILE_BYTES).readOrNull() ?: return@mapNotNull null
+                    MemoJsonCodec.decode(bytes)
+                }
                 require(
                     targetFile(decoded.target).baseFileForTest().canonicalFile == baseFile.canonicalFile,
                 ) { "Memo target file identity mismatch" }
@@ -124,25 +140,28 @@ class StudentMemoRepository(
         return snapshot(target).memos.firstOrNull { it.id == memoId && (includeDeleted || !it.deleted) }
     }
 
-    override fun exportMemo(target: MemoTarget, memoId: String): ByteArray = locked {
+    override fun exportMemo(target: MemoTarget, memoId: String): ByteArray = exportMemoWithMetadata(target, memoId).bytes
+
+    /** One consistent local snapshot and its wire bytes; senders need not decode their own ink. */
+    fun exportMemoWithMetadata(target: MemoTarget, memoId: String): MemoExport = locked {
         requireValidMemoUuid(memoId, "memo id")
         val memo = readSnapshot(target).memos.firstOrNull { it.id == memoId } ?: error("Unknown memo")
-        encodeTransportableMemo(memo)
+        MemoExport(memo, encodeTransportableMemo(memo))
     }
 
     override fun exportSnapshot(target: MemoTarget): ByteArray = locked {
-        MemoJsonCodec.encode(readSnapshot(target))
+        MemoJsonCodec.encode(readSnapshot(target), pointCache(target))
     }
 
     /** Validates transport bytes without mutating local state. */
     fun decodeSnapshot(bytes: ByteArray): StudentMemoTargetSnapshot {
-        require(bytes.size <= MAX_TARGET_FILE_BYTES) { "Memo snapshot is too large" }
+        if (bytes.size > MAX_TARGET_FILE_BYTES) throw MemoPayloadTooLargeException(bytes.size, MAX_TARGET_FILE_BYTES, MemoLimitScope.TARGET_BYTES)
         return MemoJsonCodec.decode(bytes.copyOf())
     }
 
     /** Validates one independently retryable memo/tombstone transport body. */
     fun decodeMemo(bytes: ByteArray): StudentMemo {
-        require(bytes.size <= MemoTransportLimits.MAX_ENCODED_MEMO_BYTES) { "Memo payload is too large" }
+        if (bytes.size > MemoTransportLimits.MAX_ENCODED_MEMO_BYTES) throw MemoPayloadTooLargeException(bytes.size)
         return MemoJsonCodec.decodeMemo(bytes.copyOf())
     }
 
@@ -206,6 +225,13 @@ class StudentMemoRepository(
             val current = readSnapshot(target)
             val prior = current.requireMemo(memoId)
             requireMutable(prior, expectedRevision)
+            // The UI rebuilds all lists on save. Reuse exact point content by stable stroke ID,
+            // allowing immutable points and their compressed bodies to survive that rebuild.
+            val previousStrokes = prior.strokes.associateBy { it.id }
+            val sharedStrokes = strokes.map { stroke ->
+                val previous = previousStrokes[stroke.id]
+                if (previous != null && previous.points == stroke.points) stroke.copy(points = previous.points) else stroke
+            }
             val copiedStrokes = MemoJsonCodec.validateAndCopy(
                 target,
                 listOf(buildMemo(
@@ -213,7 +239,7 @@ class StudentMemoRepository(
                     target = target,
                     anchor = prior.anchor,
                     revision = prior.revision,
-                    strokes = strokes,
+                    strokes = sharedStrokes,
                     createdAtEpochMillis = prior.createdAtEpochMillis,
                     updatedAtEpochMillis = prior.updatedAtEpochMillis,
                     deletedAtEpochMillis = null,
@@ -434,21 +460,35 @@ class StudentMemoRepository(
         applyAuthoritative(decodeSnapshot(bytes))
 
     private fun readSnapshot(target: MemoTarget): StudentMemoTargetSnapshot {
-        val bytes = targetFile(target).readOrNull() ?: return emptySnapshot(target)
+        val file = targetFile(target)
+        if (!teacherBase) hotCache.find(file.baseFileForTest())?.let { return it }
+        val bytes = file.readOrNull() ?: return emptySnapshot(target)
         return try {
-            MemoJsonCodec.decode(bytes, target)
+            MemoJsonCodec.decode(bytes, target, pointCache(target)).also {
+                if (!teacherBase) hotCache.remember(file.baseFileForTest(), it)
+            }
         } catch (error: Exception) {
+            hotCache.pruneEncodings()
             throw CorruptMemoDataException("Stored memo data is invalid", error)
         }
     }
 
     private fun writeSnapshot(snapshot: StudentMemoTargetSnapshot) {
-        snapshot.memos.forEach { encodeTransportableMemo(it) }
-        targetFile(snapshot.target).write(MemoJsonCodec.encode(snapshot))
+        try {
+        val usages = mutableListOf<Pair<StudentMemo, Int>>()
+        val bytes = MemoJsonCodec.encode(snapshot, pointCache(snapshot.target), enforceStorageLimits = true) { memo, size -> usages += memo to size }
+        val file = targetFile(snapshot.target)
+        hotCache.invalidate(file.baseFileForTest())
+        file.write(bytes)
+        if (!teacherBase) hotCache.remember(file.baseFileForTest(), snapshot)
+        usages.forEach { (memo, size) -> hotCache.rememberUsage(memo, size) }
+        } finally {
+            hotCache.pruneEncodings()
+        }
     }
 
     private fun encodeTransportableMemo(memo: StudentMemo): ByteArray {
-        val bytes = MemoJsonCodec.encodeMemo(memo)
+        val bytes = MemoJsonCodec.encodeMemo(memo, pointCache(memo.target))
         if (bytes.size > MemoTransportLimits.MAX_ENCODED_MEMO_BYTES) {
             throw MemoPayloadTooLargeException(bytes.size)
         }
@@ -581,7 +621,7 @@ class StudentMemoRepository(
 
     companion object {
         private const val FEATURE_DIRECTORY = "student-memos-v1"
-        private const val MAX_TARGET_FILE_BYTES = 16 * 1024 * 1024
+        private const val MAX_TARGET_FILE_BYTES = MemoStorageLimits.MAX_TARGET_FILE_BYTES
         private const val MAX_ID_GENERATION_ATTEMPTS = 32
         private const val MAX_STORED_TARGETS = 100_000
         private val locks = ConcurrentHashMap<String, Any>()
@@ -616,7 +656,11 @@ class StudentMemoRepository(
             instance = null
             teacherInstance = null
             teacherBaseInstance = null
+            MemoHotCaches.trim()
         }
+
+        /** Safe under Android memory pressure; never changes durable memos. */
+        fun trimMemoryCaches() = MemoHotCaches.trim()
 
         private fun lockFor(featureRoot: File): Any =
             locks.computeIfAbsent(featureRoot.toPath().toAbsolutePath().normalize().toString()) { Any() }
@@ -634,12 +678,6 @@ class StudentMemoRepository(
 }
 
 class CorruptMemoDataException(message: String, cause: Throwable) : IllegalStateException(message, cause)
-
-class MemoPayloadTooLargeException(
-    val actualBytes: Int,
-) : IllegalArgumentException(
-    "Memo payload is $actualBytes bytes; maximum is ${MemoTransportLimits.MAX_ENCODED_MEMO_BYTES} bytes",
-)
 
 private data class DurableMemoMutation(
     val memo: StudentMemo,

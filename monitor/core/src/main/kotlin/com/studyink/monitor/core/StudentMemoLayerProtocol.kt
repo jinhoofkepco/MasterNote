@@ -1,6 +1,7 @@
 package com.studyink.monitor.core
 
 import java.security.MessageDigest
+import java.util.UUID
 
 /**
  * Complete student-authored memo state for one exact workbook page and attempt.
@@ -25,6 +26,8 @@ class StudentMemoEnvelope(
     payloadBytes: ByteArray,
     /** Requires the v2 outer frame so an older peer retains the document without a false ACK. */
     val extendedCanvas: Boolean = false,
+    /** Non-null always uses an outer v3 frame, including a one-fragment compact memo. */
+    val chunk: StudentMemoChunkInfo? = null,
 ) : RemoteReviewEnvelope {
     override val type: RemoteReviewEnvelopeType = RemoteReviewEnvelopeType.STUDENT_MEMO
 
@@ -64,6 +67,60 @@ class StudentMemoEnvelope(
             ),
             "payloadSha256",
         ) { "does not match payloadBytes" }
+        chunk?.let {
+            checkProtocol(transferId == studentMemoChunkTransferId(it.groupId, it.index), "transferId") { "does not match chunk identity" }
+            checkProtocol(payloadSizeBytes == minOf(RemoteReviewLimits.STUDENT_MEMO_CHUNK_BYTES,
+                it.totalBytes - it.index * RemoteReviewLimits.STUDENT_MEMO_CHUNK_BYTES), "payloadBytes") { "incorrect chunk size" }
+        }
+    }
+}
+
+data class StudentMemoChunkInfo(val groupId: String, val index: Int, val count: Int,
+    val totalBytes: Int, val completeSha256: String) {
+    init {
+        validateOpaqueToken(groupId, "chunk.groupId")
+        validateMemoSha256(completeSha256, "chunk.completeSha256")
+        checkProtocol(totalBytes in 1..RemoteReviewLimits.MAX_STUDENT_MEMO_ASSEMBLED_BYTES, "chunk.totalBytes") { "invalid assembly size" }
+        checkProtocol(count in 1..RemoteReviewLimits.MAX_STUDENT_MEMO_CHUNKS &&
+            count == (totalBytes + RemoteReviewLimits.STUDENT_MEMO_CHUNK_BYTES - 1) / RemoteReviewLimits.STUDENT_MEMO_CHUNK_BYTES,
+            "chunk.count") { "invalid fragment count" }
+        checkProtocol(index in 0 until count, "chunk.index") { "invalid fragment index" }
+    }
+}
+
+fun studentMemoChunkTransferId(groupId: String, index: Int): String =
+    UUID.nameUUIDFromBytes("memo-v3:$groupId:$index".toByteArray(Charsets.UTF_8)).toString()
+
+/** Stateless assembly: unacknowledged gateway files, not this memory, are the restart journal. */
+object StudentMemoChunks {
+    fun compatible(first: StudentMemoEnvelope, next: StudentMemoEnvelope): Boolean {
+        val a = first.chunk ?: return false
+        val b = next.chunk ?: return false
+        return a.copy(index = b.index) == b && first.createdAtEpochMs == next.createdAtEpochMs &&
+            first.syncGeneration == next.syncGeneration && first.pageToken == next.pageToken &&
+            first.workbookToken == next.workbookToken && first.contentSha256 == next.contentSha256 &&
+            first.pageNumber == next.pageNumber && first.attemptNo == next.attemptNo && first.memoId == next.memoId &&
+            first.memoRevision == next.memoRevision && first.memoDigestSha256 == next.memoDigestSha256 &&
+            first.extendedCanvas == next.extendedCanvas
+    }
+
+    fun assemble(frames: Collection<StudentMemoEnvelope>): ByteArray? {
+        val first = frames.firstOrNull() ?: return null
+        val header = requireNotNull(first.chunk)
+        val slots = arrayOfNulls<StudentMemoEnvelope>(header.count)
+        frames.forEach { frame ->
+            require(compatible(first, frame)) { "Memo fragment identity changed" }
+            val index = requireNotNull(frame.chunk).index
+            val old = slots[index]
+            require(old == null || old.payloadSha256 == frame.payloadSha256) { "Memo fragment changed during retry" }
+            slots[index] = frame
+        }
+        if (slots.any { it == null }) return null
+        val bytes = ByteArray(header.totalBytes)
+        slots.forEachIndexed { index, frame -> requireNotNull(frame).payloadBytesForCodec()
+            .copyInto(bytes, index * RemoteReviewLimits.STUDENT_MEMO_CHUNK_BYTES) }
+        require(studentMemoPayloadSha256Hex(bytes) == header.completeSha256) { "Memo assembly checksum mismatch" }
+        return bytes
     }
 }
 

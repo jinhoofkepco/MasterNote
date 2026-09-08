@@ -119,6 +119,7 @@ class LanSyncService : Service(),
     @Volatile private var peerSupportsGptExplanation = false
     @Volatile private var peerSupportsTeacherReviewState = false
     @Volatile private var peerSupportsStudentMemo = false
+    @Volatile private var peerSupportsStudentMemoV3 = false
     @Volatile private var peerSupportsConstruction = false
     @Volatile private var constructionSessionId = 0L
     private val constructionAssembly = ConstructionLanAssembly()
@@ -613,6 +614,10 @@ class LanSyncService : Service(),
                 peerSupportsStudentMemo = announcedCapabilities != null &&
                     (0 until announcedCapabilities.length()).any { index ->
                         announcedCapabilities.optString(index) == LAN_CAPABILITY_STUDENT_MEMO_V1
+                    }
+                peerSupportsStudentMemoV3 = announcedCapabilities != null &&
+                    (0 until announcedCapabilities.length()).any { index ->
+                        announcedCapabilities.optString(index) == LAN_CAPABILITY_STUDENT_MEMO_V3
                     }
                 val peerSupportsCompactAnnotation = announcedCapabilities != null &&
                     (0 until announcedCapabilities.length()).any { index ->
@@ -2122,7 +2127,9 @@ class LanSyncService : Service(),
      * One corrupt or oversized memo can then never prevent another memo from being retried.
      */
     private fun sendStudentMemosForPage(page: Int): Boolean {
-        if (!peerSupportsStudentMemo) return true
+        // A legacy peer must not see v3 JSON and report a completed page while dropping its memo.
+        // Keep ordinary page catch-up independent; the durable memo remains available after update.
+        if (!peerSupportsStudentMemoV3) return true
         if (role != LanPeerRole.STUDENT_SERVER || page != subscribedPage || writer == null) return false
         val attempts = runCatching { library.attempts(bookId, page) }
             .onFailure { error ->
@@ -2177,16 +2184,16 @@ class LanSyncService : Service(),
     }
 
     private fun sendStudentMemo(requested: StudentMemo): Boolean = studentMemoTransferGate.serialize {
-        if (!peerSupportsStudentMemo || role != LanPeerRole.STUDENT_SERVER || writer == null ||
+        if (!peerSupportsStudentMemoV3 || role != LanPeerRole.STUDENT_SERVER || writer == null ||
             requested.target.bookId != bookId || !isPageInBook(requested.target.pageNumber) ||
             requested.target.pageNumber != subscribedPage ||
             studentMemoSubscriptionGeneration != connectionGeneration
         ) return@serialize false
         val expectedGeneration = connectionGeneration
-        val payload = memoRepository.exportMemo(requested.target, requested.id)
-        // The memo may have advanced between the change callback and this serialized send. Derive
-        // every header from the exact immutable bytes on the wire, never from the stale callback.
-        val memo = memoRepository.decodeMemo(payload)
+        val exported = memoRepository.exportMemoWithMetadata(requested.target, requested.id)
+        val payload = exported.bytes
+        // The atomic export keeps headers tied to these bytes without re-inflating local ink.
+        val memo = exported.memo
         val payloadSha256 = sha256Hex(payload)
         val chunks = splitLanTeacherReviewPayload(payload, STUDENT_MEMO_CHUNK_BYTES)
         if (chunks.isEmpty() || chunks.size > MAX_STUDENT_MEMO_CHUNKS) return@serialize false
@@ -2203,9 +2210,10 @@ class LanSyncService : Service(),
         )
         chunks.indices.all { index ->
             if (connectionGeneration != expectedGeneration || writer == null ||
-                role != LanPeerRole.STUDENT_SERVER || !peerSupportsStudentMemo
+                role != LanPeerRole.STUDENT_SERVER || !peerSupportsStudentMemoV3
             ) return@all false
             send(LanWire.message("STUDENT_MEMO_CHUNK") {
+                put("memoFormatVersion", 3)
                 put("transferId", transferId)
                 put("sourceBookId", memo.target.bookId)
                 put("page", memo.target.pageNumber)
@@ -2245,11 +2253,15 @@ class LanSyncService : Service(),
         require(memoDigestSha256.matches(SHA256_HEX) && payloadSha256.matches(SHA256_HEX))
         require(payloadSize in 1..MemoTransportLimits.MAX_ENCODED_MEMO_BYTES)
         require(chunkCount in 1..MAX_STUDENT_MEMO_CHUNKS && chunkIndex in 0 until chunkCount)
+        require(message.optInt("memoFormatVersion", 1) in 1..3)
+        require(message.optInt("memoFormatVersion", 1) < 3 || peerSupportsStudentMemoV3) { "Compact memo capability was not negotiated" }
+        require(chunkCount == (payloadSize + STUDENT_MEMO_CHUNK_BYTES - 1) / STUDENT_MEMO_CHUNK_BYTES)
         require(isExactLanTeacherReviewAttempt(library.attempts(bookId, page), bookId, page, attemptNo)) {
             "Student memo belongs to an unknown attempt"
         }
         val chunk = Base64.decode(message.getString("payload"), Base64.NO_WRAP)
         require(chunk.isNotEmpty() && chunk.size <= STUDENT_MEMO_CHUNK_BYTES)
+        require(chunk.size == minOf(STUDENT_MEMO_CHUNK_BYTES, payloadSize - chunkIndex * STUDENT_MEMO_CHUNK_BYTES))
         val completed = synchronized(incomingStudentMemoChunks) {
             if (chunkIndex == 0 && transferId !in incomingStudentMemoChunks &&
                 incomingStudentMemoChunks.size >= MAX_INCOMING_STUDENT_MEMOS
@@ -2475,6 +2487,7 @@ class LanSyncService : Service(),
         peerSupportsGptExplanation = false
         peerSupportsTeacherReviewState = false
         peerSupportsStudentMemo = false
+        peerSupportsStudentMemoV3 = false
         negotiatedAnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS
         authenticatedConnectionGeneration = 0L
         peerDeviceId = ""
@@ -2517,6 +2530,7 @@ class LanSyncService : Service(),
         peerSupportsGptExplanation = false
         peerSupportsTeacherReviewState = false
         peerSupportsStudentMemo = false
+        peerSupportsStudentMemoV3 = false
         negotiatedAnnotationPointEncoding = AnnotationPointEncoding.LEGACY_FLOAT_ARRAYS
         peerDeviceId = ""
         localAuthNonce = ""
@@ -2722,7 +2736,7 @@ class LanSyncService : Service(),
                 PageOperationLogStore.MAX_TEACHER_REVIEW_MARK_GROUP_BYTES + Int.SIZE_BYTES * 2
         private const val STUDENT_MEMO_SEND_DEBOUNCE_MS = 500L
         private const val STUDENT_MEMO_CHUNK_BYTES = 256 * 1024
-        private const val MAX_STUDENT_MEMO_CHUNKS = 8
+        private const val MAX_STUDENT_MEMO_CHUNKS = 40
         private const val MAX_INCOMING_STUDENT_MEMOS = 4
         private const val TAG = "MasterNoteLan"
 

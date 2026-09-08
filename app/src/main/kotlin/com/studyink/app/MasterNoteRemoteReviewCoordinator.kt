@@ -1,6 +1,8 @@
 package com.studyink.app
 
 import com.studyink.construction.storage.ConstructionTarget
+import com.studyink.core.model.MasterNoteOptionalDataRootGuard
+import com.studyink.core.model.MasterNoteDataRootBus
 
 import android.app.Application
 import android.os.SystemClock
@@ -72,6 +74,10 @@ import com.studyink.monitor.core.SnapshotReference
 import com.studyink.monitor.core.StudentStudyPresence
 import com.studyink.monitor.core.StudentStudyPresenceBus
 import com.studyink.monitor.core.StudentMemoEnvelope
+import com.studyink.monitor.core.StudentMemoChunkInfo
+import com.studyink.monitor.core.StudentMemoChunks
+import com.studyink.monitor.core.studentMemoChunkTransferId
+import com.studyink.monitor.core.studentMemoPayloadSha256Hex
 import com.studyink.monitor.core.StudentWorkHeartbeat
 import com.studyink.monitor.core.StudentWorkHeartbeatBus
 import com.studyink.monitor.core.StudentWorkKind
@@ -276,6 +282,8 @@ private class RemoteReviewRuntime(
     private val annotationStore = PageOperationLogStore.get(application)
     private val assistantRepository = AssistantRepositoryProvider.get(application)
     private val memoRepository = StudentMemoRepository.get(application)
+    private val memoDataRoot = File(application.filesDir, "masternote")
+    private val memoChunkReceipts = StudentMemoTelegramReceipts(memoDataRoot)
     private val ledger = RemoteReviewLedger(
         File(application.noBackupFilesDir, "remote-review/exchange-ledger"),
     )
@@ -393,6 +401,7 @@ private class RemoteReviewRuntime(
     private var legacyRenderedPageTransportRetired = false
     /** Decode failures are retried after process/session restart, but skipped within this runtime. */
     private val retainedUndecodableUpdateIds = linkedSetOf<Long>()
+    private val memoChunkInbox = linkedMapOf<String, MemoChunkInboxGroup>()
     private val lanListener = object : LanSyncBus.Listener {
         override fun onLocalOperation(bookId: String, pageNumber: Int) {
             execute { pageSync.onLocalOperation(bookId, pageNumber) }
@@ -1056,6 +1065,7 @@ private class RemoteReviewRuntime(
         telegramPeerLinkState = gateway.peerLinkState()
         captureState.reset()
         retainedUndecodableUpdateIds.clear()
+        memoChunkInbox.clear()
         clearStudentMemoQueues()
         current?.let { session ->
             chatScope(session)?.let { scope -> RemotePeerChatStateBus.publish(peerChat.state(scope)) }
@@ -1462,6 +1472,8 @@ private class RemoteReviewRuntime(
     }
 
     private fun clearStudentMemoQueues() {
+        memoChunkInbox.values.forEach { retainedUndecodableUpdateIds.removeAll(it.documents.keys) }
+        memoChunkInbox.clear()
         pendingMemoChanges.clear()
         memoRecoveryTargets.clear()
         memoRecoveryMemos.clear()
@@ -1497,7 +1509,7 @@ private class RemoteReviewRuntime(
         pendingMemoChanges.entries.firstOrNull { (_, state) -> state.isDue(nowElapsed) }?.let { (key, state) ->
             val result = runCatching { sendStudentMemo(session, key) }
                 .getOrDefault(StudentMemoSendResult.RETRY)
-            if (result == StudentMemoSendResult.RETRY) {
+            if (result == StudentMemoSendResult.RETRY || result == StudentMemoSendResult.DEFERRED) {
                 deferStudentMemoRetry(key, state, nowElapsed)
             } else {
                 pendingMemoChanges.remove(key)
@@ -1517,8 +1529,8 @@ private class RemoteReviewRuntime(
         while (key in pendingMemoChanges) {
             key = memoRecoveryMemos.pollFirst() ?: return
         }
-        if (runCatching { sendStudentMemo(session, key) }.getOrDefault(StudentMemoSendResult.RETRY) ==
-            StudentMemoSendResult.RETRY
+        if (runCatching { sendStudentMemo(session, key) }.getOrDefault(StudentMemoSendResult.RETRY) in
+            setOf(StudentMemoSendResult.RETRY, StudentMemoSendResult.DEFERRED)
         ) deferStudentMemoRetry(key, null, nowElapsed)
     }
 
@@ -1562,18 +1574,20 @@ private class RemoteReviewRuntime(
             )
         ) return StudentMemoSendResult.RETRY
 
-        val payload = runCatching { memoRepository.exportMemo(key.target, key.memoId) }.getOrNull()
+        val exported = runCatching { memoRepository.exportMemoWithMetadata(key.target, key.memoId) }.getOrNull()
             ?: return StudentMemoSendResult.RETRY
-        if (payload.isEmpty() || payload.size > RemoteReviewLimits.MAX_STUDENT_MEMO_BYTES) {
+        val payload = exported.bytes
+        if (payload.isEmpty() || payload.size > RemoteReviewLimits.MAX_STUDENT_MEMO_ASSEMBLED_BYTES) {
             return StudentMemoSendResult.SKIP
         }
-        // Export and metadata must describe the same immutable revision. A pen commit may race this
-        // worker between two repository reads, so derive the envelope only from the exported bytes.
-        val memo = runCatching { memoRepository.decodeMemo(payload) }.getOrNull()
-            ?.takeIf { it.target == key.target && it.id == key.memoId }
+        // Atomic export returns the original frozen memo with its bytes; sending must not inflate
+        // our just-compressed points again merely to recover the same revision metadata.
+        val memo = exported.memo.takeIf { it.target == key.target && it.id == key.memoId }
             ?: return StudentMemoSendResult.RETRY
-        val attemptTransferIds = (0 until STUDENT_MEMO_DELIVERY_ATTEMPTS).associateWith { attempt ->
-            studentMemoTelegramTransferId(
+        val payloadDigest = studentMemoPayloadSha256Hex(payload)
+        val chunkCount = (payload.size + RemoteReviewLimits.STUDENT_MEMO_CHUNK_BYTES - 1) / RemoteReviewLimits.STUDENT_MEMO_CHUNK_BYTES
+        val attemptGroups = (0 until STUDENT_MEMO_DELIVERY_ATTEMPTS).associateWith { attempt ->
+            val legacyId = studentMemoTelegramTransferId(
                 pairId = session.pairId,
                 syncGeneration = generation,
                 pageToken = pageToken,
@@ -1582,66 +1596,123 @@ private class RemoteReviewRuntime(
                 memoDigestSha256 = memo.digestSha256,
                 deliveryAttempt = attempt,
             )
+            UUID.nameUUIDFromBytes("memo-v3:$legacyId:$payloadDigest".toByteArray(Charsets.UTF_8)).toString()
         }
-        val receipts = attemptTransferIds.mapValues { (_, transferId) ->
-            gateway.peerDeliveryReceipt(transferId)
+        val attemptTransferIds = attemptGroups.mapValues { (_, group) ->
+            (0 until chunkCount).map { studentMemoChunkTransferId(group, it) }
         }
-        if (receipts.values.any { it?.acknowledgedAtEpochMs != null }) {
+        val receipts = attemptTransferIds.values.flatten().associateWith(gateway::peerDeliveryReceipt)
+        if (attemptTransferIds.values.any { ids -> ids.all { receipts[it]?.acknowledgedAtEpochMs != null } }) {
             return StudentMemoSendResult.ACKNOWLEDGED
         }
         val pendingTransferIds = gateway.pendingPeerDocumentTransfers(
             setOf(RemoteReviewEnvelopeType.STUDENT_MEMO.name),
         ).mapTo(linkedSetOf()) { it.transferId }
-        if (attemptTransferIds.values.any { it in pendingTransferIds }) {
-            return StudentMemoSendResult.DEFERRED
-        }
         val nowEpochMs = System.currentTimeMillis()
-        if (receipts.values.any { receipt ->
-                receipt != null && !isUnacknowledgedPeerReceiptExpired(
-                    receipt.serverAcceptedAtEpochMs ?: receipt.sentAtEpochMs,
-                    nowEpochMs,
+        // Resume missing suffixes of the existing delivery even while its first chunks are queued.
+        val deliveryAttempt = attemptTransferIds.entries.firstOrNull { (_, ids) -> ids.any { id ->
+            id in pendingTransferIds || receipts[id]?.let { receipt ->
+                receipt.acknowledgedAtEpochMs == null && !isUnacknowledgedPeerReceiptExpired(
+                    receipt.serverAcceptedAtEpochMs ?: receipt.sentAtEpochMs, nowEpochMs)
+            } == true
+        } }?.key ?: studentMemoDeliveryAttemptSlot(nowEpochMs)
+        val groupId = requireNotNull(attemptGroups[deliveryAttempt])
+        val ids = requireNotNull(attemptTransferIds[deliveryAttempt])
+        val deadIds = gateway.deadLetters().mapNotNullTo(hashSetOf()) { it.entry.peerTransferId }
+        var retry = false
+        for (index in 0 until chunkCount) {
+            val transferId = ids[index]
+            if (transferId in pendingTransferIds || receipts[transferId] != null || transferId in deadIds) continue
+            val offset = index * RemoteReviewLimits.STUDENT_MEMO_CHUNK_BYTES
+            val part = payload.copyOfRange(offset, minOf(payload.size, offset + RemoteReviewLimits.STUDENT_MEMO_CHUNK_BYTES))
+            val envelope = runCatching {
+                StudentMemoEnvelope(
+                    transferId = transferId,
+                    createdAtEpochMs = memo.updatedAtEpochMillis,
+                    syncGeneration = generation,
+                    pageToken = pageToken,
+                    workbookToken = page.workbookToken,
+                    contentSha256 = page.contentSha256,
+                    pageNumber = page.pageNumber + 1,
+                    attemptNo = memo.target.attemptNo,
+                    memoId = memo.id,
+                    memoRevision = memo.revision,
+                    memoDigestSha256 = memo.digestSha256,
+                    payloadSha256 = studentMemoPayloadSha256Hex(part),
+                    payloadBytes = part,
+                    extendedCanvas = memo.usesExtendedCanvas,
+                    chunk = StudentMemoChunkInfo(groupId, index, chunkCount, payload.size, payloadDigest),
                 )
+            }.getOrNull() ?: return StudentMemoSendResult.SKIP
+            when (enqueuePageSyncEnvelope(envelope)) {
+                TelegramEnqueueResult.ENQUEUED,
+                TelegramEnqueueResult.ALREADY_PENDING,
+                TelegramEnqueueResult.ALREADY_DELIVERED,
+                TelegramEnqueueResult.PREVIOUSLY_DEAD,
+                TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED,
+                -> Unit
+                TelegramEnqueueResult.NOT_CONFIGURED,
+                TelegramEnqueueResult.CHAT_CHANGED,
+                TelegramEnqueueResult.QUEUE_FULL,
+                -> { retry = true; break }
             }
-        ) return StudentMemoSendResult.DEFERRED
-        val deliveryAttempt = studentMemoDeliveryAttemptSlot(nowEpochMs)
-        val transferId = requireNotNull(attemptTransferIds[deliveryAttempt])
-        if (receipts[deliveryAttempt] != null ||
-            gateway.deadLetters().any { it.entry.peerTransferId == transferId }
-        ) return StudentMemoSendResult.DEFERRED
-
-        val envelope = runCatching {
-            StudentMemoEnvelope(
-                transferId = transferId,
-                createdAtEpochMs = memo.updatedAtEpochMillis,
-                syncGeneration = generation,
-                pageToken = pageToken,
-                workbookToken = page.workbookToken,
-                contentSha256 = page.contentSha256,
-                pageNumber = page.pageNumber + 1,
-                attemptNo = memo.target.attemptNo,
-                memoId = memo.id,
-                memoRevision = memo.revision,
-                memoDigestSha256 = memo.digestSha256,
-                payloadSha256 = com.studyink.monitor.core.studentMemoPayloadSha256Hex(payload),
-                payloadBytes = payload,
-                extendedCanvas = memo.usesExtendedCanvas,
-            )
-        }.getOrNull() ?: return StudentMemoSendResult.SKIP
-        return when (enqueuePageSyncEnvelope(envelope)) {
-            TelegramEnqueueResult.ENQUEUED,
-            TelegramEnqueueResult.ALREADY_PENDING,
-            TelegramEnqueueResult.ALREADY_DELIVERED,
-            TelegramEnqueueResult.PREVIOUSLY_DEAD,
-            TelegramEnqueueResult.PREVIOUSLY_SUPERSEDED,
-            -> StudentMemoSendResult.DEFERRED
-            TelegramEnqueueResult.NOT_CONFIGURED,
-            TelegramEnqueueResult.CHAT_CHANGED,
-            TelegramEnqueueResult.QUEUE_FULL,
-            -> StudentMemoSendResult.RETRY
         }
+        return if (retry) StudentMemoSendResult.RETRY else StudentMemoSendResult.DEFERRED
     }
 
-    private fun receiveStudentMemo(envelope: StudentMemoEnvelope): RemotePageSyncIncomingResult {
+    private fun receiveStudentMemoChunk(pending: PendingTelegramPeerDocument, envelope: StudentMemoEnvelope): RemotePageSyncIncomingResult {
+        val session = connectedSession()?.takeIf { it.role == RemoteReviewRole.TEACHER && it == observedSession }
+            ?: return RemotePageSyncIncomingResult.RETAIN
+        val chunk = requireNotNull(envelope.chunk)
+        val generation = MasterNoteDataRootBus.currentGeneration()
+        // Validate the authenticated current page/attempt before consulting completion receipts.
+        val page = pageSyncStore.teacherPage(envelope.pageToken) ?: return RemotePageSyncIncomingResult.RETAIN
+        val book = page.localBookId?.let { runCatching { library.book(it) }.getOrNull() }
+            ?: return RemotePageSyncIncomingResult.RETAIN
+        val localTarget = page.studentMemoLocalTarget(envelope, pageSyncStore.teacherManifestGeneration(), book.contentSha256.lowercase())
+            ?: return RemotePageSyncIncomingResult.RETAIN
+        val owner = "${session.pairId}:${session.peerBotId}:${localTarget.bookId}"
+        val key = "$owner:$generation:${chunk.groupId}"
+        if (memoChunkReceipts.contains(owner, envelope)) {
+            memoChunkInbox.remove(key)?.let { completed ->
+                retainedUndecodableUpdateIds.removeAll(completed.documents.keys)
+                completed.documents.values.filterNot { it.updateId == pending.updateId }
+                    .forEach { settlePageSyncIncoming(it, RemotePageSyncIncomingResult.ACKNOWLEDGE) }
+            }
+            return RemotePageSyncIncomingResult.ACKNOWLEDGE
+        }
+        if (key !in memoChunkInbox && memoChunkInbox.size >= 4) {
+            val removed = memoChunkInbox.remove(memoChunkInbox.keys.first())!!
+            retainedUndecodableUpdateIds.removeAll(removed.documents.keys)
+        }
+        val group = memoChunkInbox.getOrPut(key) { MemoChunkInboxGroup(envelope) }
+        if (!StudentMemoChunks.compatible(group.first, envelope)) return RemotePageSyncIncomingResult.RETAIN
+        val prior = group.frames[chunk.index]
+        if (prior != null && prior.payloadSha256 != envelope.payloadSha256) return RemotePageSyncIncomingResult.RETAIN
+        group.frames[chunk.index] = envelope
+        group.documents[pending.updateId] = pending
+        val bytes = StudentMemoChunks.assemble(group.frames.values)
+        if (bytes == null) {
+            retainedUndecodableUpdateIds += pending.updateId
+            return RemotePageSyncIncomingResult.RETAIN
+        }
+        val result = MasterNoteOptionalDataRootGuard.withStableDataRoot(memoDataRoot) {
+            if (generation != MasterNoteDataRootBus.currentGeneration()) return@withStableDataRoot RemotePageSyncIncomingResult.RETAIN
+            receiveStudentMemo(envelope, bytes).also {
+                if (it == RemotePageSyncIncomingResult.ACKNOWLEDGE) memoChunkReceipts.record(owner, envelope)
+            }
+        }
+        if (result != RemotePageSyncIncomingResult.RETAIN) {
+            // The receipt is durable before the first ACK, so a crash midway through these ACKs
+            // can settle the surviving fragments individually without needing deleted siblings.
+            group.documents.values.filterNot { it.updateId == pending.updateId }.forEach { settlePageSyncIncoming(it, result) }
+            retainedUndecodableUpdateIds.removeAll(group.documents.keys)
+            memoChunkInbox.remove(key)
+        }
+        return result
+    }
+
+    private fun receiveStudentMemo(envelope: StudentMemoEnvelope, completePayload: ByteArray? = null): RemotePageSyncIncomingResult {
         val session = connectedSession()?.takeIf { it.role == RemoteReviewRole.TEACHER }
             ?: return RemotePageSyncIncomingResult.RETAIN
         if (session != observedSession) return RemotePageSyncIncomingResult.RETAIN
@@ -1665,8 +1736,8 @@ private class RemoteReviewRuntime(
             manifestGeneration,
             localBook.contentSha256.lowercase(),
         ) ?: return RemotePageSyncIncomingResult.RETAIN
-        val decoded = runCatching { memoRepository.decodeMemo(envelope.copyPayloadBytes()) }
-            .getOrElse { return RemotePageSyncIncomingResult.DROP }
+        val decoded = runCatching { memoRepository.decodeMemo(completePayload ?: envelope.copyPayloadBytes()) }
+            .getOrElse { return RemotePageSyncIncomingResult.RETAIN }
         // Never apply a v2 coordinate payload carried in the legacy frame: pre-update readers
         // would DROP it and return a transport ACK without persisting the extended ink.
         if (!studentMemoCanvasFrameMatches(envelope, decoded)) return RemotePageSyncIncomingResult.RETAIN
@@ -1802,7 +1873,8 @@ private class RemoteReviewRuntime(
                     dropIncoming(pending)
                 } else {
                     processPageSyncIncoming(pending, dropWhenLanOwns = false) {
-                        receiveStudentMemo(envelope)
+                        if (envelope.chunk == null) receiveStudentMemo(envelope)
+                        else receiveStudentMemoChunk(pending, envelope)
                     }
                 }
             }
@@ -2251,6 +2323,11 @@ internal fun gptTelegramTransferId(
 }
 
 private data class StudentMemoKey(val target: MemoTarget, val memoId: String)
+
+private class MemoChunkInboxGroup(val first: StudentMemoEnvelope) {
+    val frames = linkedMapOf<Int, StudentMemoEnvelope>()
+    val documents = linkedMapOf<Long, PendingTelegramPeerDocument>()
+}
 
 private data class PendingStudentMemoChange(
     val firstChangedAtElapsedMs: Long,

@@ -9,7 +9,9 @@ import java.util.UUID
 /** Small independently encrypted documents; existing Telegram plaintext limits are unchanged. */
 internal object ConstructionTelegramWire {
     const val CHUNK_BYTES = 512 * 1024
+    const val MAX_CHUNKS = ConstructionSyncCodec.MAX_PACKET_BYTES / CHUNK_BYTES
     const val MAX_FRAME_BYTES = 710_000
+    private const val LEGACY_MAX_PACKET_BYTES = 4 * 1024 * 1024
     data class Chunk(val address: ConstructionTelegramAddress, val transmissionId: String, val digest: String,
         val totalBytes: Int, val index: Int, val count: Int, val bytes: ByteArray) {
         val transferId: String get() = transferId(transmissionId, index)
@@ -22,7 +24,7 @@ internal object ConstructionTelegramWire {
         val count = (payload.size + CHUNK_BYTES - 1) / CHUNK_BYTES
         return (0 until count).map { index ->
             val part = payload.copyOfRange(index * CHUNK_BYTES, minOf((index + 1) * CHUNK_BYTES, payload.size))
-            transferId(transmission, index) to JSONObject().put("format", 1)
+            transferId(transmission, index) to JSONObject().put("format", if (payload.size > LEGACY_MAX_PACKET_BYTES) 2 else 1)
                 .put("pairId", address.pairId).put("syncGeneration", address.syncGeneration)
                 .put("pageToken", address.pageToken).put("workbookToken", address.workbookToken)
                 .put("contentSha256", address.contentSha256).put("pageNumber", address.pageNumber)
@@ -35,7 +37,8 @@ internal object ConstructionTelegramWire {
     fun decode(bytes: ByteArray): Chunk {
         require(bytes.size in 1..MAX_FRAME_BYTES)
         val j = JSONObject(bytes.toString(Charsets.UTF_8))
-        require(j.number("format") == 1L)
+        val format = j.number("format")
+        require(format == 1L || format == 2L)
         val a = ConstructionTelegramAddress(j.text("pairId", 128), j.number("syncGeneration"),
             j.text("pageToken", 256), j.text("workbookToken", 256), j.text("contentSha256", 64),
             j.number("pageNumber").boundedInt(0, 1_000_000), j.number("attemptNo").boundedInt(1, 1_000_000), j.uuid("memoId"))
@@ -43,7 +46,8 @@ internal object ConstructionTelegramWire {
         val id = j.uuid("transmissionId")
         val digest = j.text("digest", 64).also { require(Regex("[0-9a-f]{64}").matches(it)) }
         val size = j.number("totalBytes").boundedInt(1, ConstructionSyncCodec.MAX_PACKET_BYTES)
-        val count = j.number("count").boundedInt(1, 8)
+        val count = j.number("count").boundedInt(1, MAX_CHUNKS)
+        require((size > LEGACY_MAX_PACKET_BYTES) == (format == 2L))
         require(count == (size + CHUNK_BYTES - 1) / CHUNK_BYTES)
         val index = j.number("index").boundedInt(0, count - 1)
         val encoded = j.text("payload", ((CHUNK_BYTES + 2) / 3) * 4)

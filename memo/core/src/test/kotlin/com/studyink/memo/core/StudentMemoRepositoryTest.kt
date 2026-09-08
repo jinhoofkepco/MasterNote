@@ -28,19 +28,19 @@ class StudentMemoRepositoryTest {
 
     @get:Rule val temporary = TemporaryFolder()
 
-    @Test fun `legacy memo encoding stays v1 while extended ink requires v2 without digest migration`() {
+    @Test fun `new memo encoding uses v3 for both legacy sheet and extended ink without digest migration`() {
         val directory = temporary.newFolder("extended")
         val repository = repository(directory) { MEMO_ONE }
         val created = repository.create(TARGET_ONE, MemoAnchor(.2f, .3f))
         val first = repository.replaceStrokes(TARGET_ONE, created.id, created.revision, listOf(stroke(STROKE_ONE)))
         val legacyBytes = repository.exportMemo(TARGET_ONE, created.id)
-        assertEquals(1, JSONObject(legacyBytes.toString(Charsets.UTF_8)).getInt("formatVersion"))
+        assertEquals(3, JSONObject(legacyBytes.toString(Charsets.UTF_8)).getInt("formatVersion"))
         assertFalse(first.usesExtendedCanvas)
         val extended = stroke(STROKE_TWO).copy(points = listOf(MemoPoint(-.5f, -1f, .7f), MemoPoint(1.5f, 2.25f, .8f)))
         val next = repository.replaceStrokes(TARGET_ONE, created.id, first.revision, first.strokes + extended)
         val encoded = repository.exportMemo(TARGET_ONE, created.id)
-        assertEquals(2, JSONObject(encoded.toString(Charsets.UTF_8)).getInt("formatVersion"))
-        assertEquals(2, JSONObject(repository.exportSnapshot(TARGET_ONE).toString(Charsets.UTF_8)).getInt("formatVersion"))
+        assertEquals(3, JSONObject(encoded.toString(Charsets.UTF_8)).getInt("formatVersion"))
+        assertEquals(3, JSONObject(repository.exportSnapshot(TARGET_ONE).toString(Charsets.UTF_8)).getInt("formatVersion"))
         assertEquals(first.strokes.single(), next.strokes.first())
         assertEquals(next, repository(directory) { error("No create expected") }.memo(TARGET_ONE, created.id))
         assertEquals(next, repository.decodeMemo(encoded))
@@ -59,7 +59,7 @@ class StudentMemoRepositoryTest {
             listOf(stroke(STROKE_ONE).copy(points = listOf(MemoPoint(-.5f, 2f)))))
         val memo = JSONObject(repository.exportMemo(TARGET_ONE, created.id).toString(Charsets.UTF_8))
         val target = JSONObject(repository.exportSnapshot(TARGET_ONE).toString(Charsets.UTF_8))
-        listOf(1, 0, 3, 2.5, "2").forEach { version ->
+        listOf(1, 2, 0, 4, 2.5, "2").forEach { version ->
             assertThrows(IllegalArgumentException::class.java) {
                 repository.decodeMemo(memo.put("formatVersion", version).toString().toByteArray())
             }
@@ -302,7 +302,7 @@ class StudentMemoRepositoryTest {
     }
 
     @Test
-    fun `oversized single memo is rejected before replacing durable state`() {
+    fun `legacy JSON size no longer rejects a fifty thousand point memo`() {
         val repository = repository(temporary.newFolder("data")) { MEMO_ONE }
         val created = repository.create(TARGET_ONE, MemoAnchor(.2f, .3f))
         val before = repository.exportSnapshot(TARGET_ONE)
@@ -318,13 +318,10 @@ class StudentMemoRepositoryTest {
             createdAtEpochMillis = 1_000L,
         )
 
-        val error = assertThrows(MemoPayloadTooLargeException::class.java) {
-            repository.replaceStrokes(TARGET_ONE, created.id, created.revision, listOf(oversized))
-        }
-
-        assertTrue(error.actualBytes > MemoTransportLimits.MAX_ENCODED_MEMO_BYTES)
-        assertArrayEquals(before, repository.exportSnapshot(TARGET_ONE))
-        assertTrue(repository.memo(TARGET_ONE, created.id)!!.strokes.isEmpty())
+        val written = repository.replaceStrokes(TARGET_ONE, created.id, created.revision, listOf(oversized))
+        assertEquals(50_000, repository.memo(TARGET_ONE, created.id)!!.strokes.single().points.size)
+        assertEquals(written, repository.decodeMemo(repository.exportMemo(TARGET_ONE, created.id)))
+        assertTrue(repository.exportSnapshot(TARGET_ONE).size < 1_572_864)
     }
 
     private fun repository(

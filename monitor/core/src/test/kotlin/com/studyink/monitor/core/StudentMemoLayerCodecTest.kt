@@ -62,7 +62,7 @@ class StudentMemoLayerCodecTest {
     @Test fun versionTwoIsReservedForExtendedMemosAndFutureVersionsStillFailClosed() {
         val bytes = RemoteReviewDocumentCodec.encode(memoEnvelope("memo".toByteArray(), extendedCanvas = true)).copyBytes()
         val otherType = bytes.copyOf().also { it[5] = 1 }
-        val unknownVersion = bytes.copyOf().also { it[4] = 3 }
+        val unknownVersion = bytes.copyOf().also { it[4] = 4 }
         listOf(otherType, unknownVersion).forEach { unsupported ->
             val failure = assertThrows(RemoteReviewCodecException::class.java) {
                 RemoteReviewDocumentCodec.decode(unsupported)

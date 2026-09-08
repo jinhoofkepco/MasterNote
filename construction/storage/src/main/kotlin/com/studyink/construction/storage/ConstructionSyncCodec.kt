@@ -9,8 +9,10 @@ import java.util.UUID
 
 /** Transport-independent, bounded versioned wire envelope. Payload identities are not credentials. */
 object ConstructionSyncCodec {
-    const val MAX_PACKET_BYTES = 4 * 1024 * 1024
-    const val MAX_MEMO_BYTES = 1600 * 1024
+    const val MAX_PACKET_BYTES = 16 * 1024 * 1024
+    const val MAX_MEMO_BYTES = 10 * 1024 * 1024
+    private const val LEGACY_MAX_PACKET_BYTES = 4 * 1024 * 1024
+    private const val LEGACY_MAX_MEMO_BYTES = 1600 * 1024
 
     fun encode(packet: ConstructionSyncPacket): ByteArray {
         validate(packet)
@@ -46,11 +48,16 @@ object ConstructionSyncCodec {
             if (packet.includeMemo) json.put("includeMemo", true)
             packet.memoJson?.let { json.put("memoJson", it) }
             packet.expectedMemoDigest?.let { json.put("expectedMemoDigest", it) }
+            // Old peers reject v3 instead of applying geometry while dropping an unsupported
+            // packed/large parent note. Ordinary v1/v2 envelopes keep their original fingerprints.
+            if (requiresExtendedEnvelope(packet) || json.toString().toByteArray(Charsets.UTF_8).size > LEGACY_MAX_PACKET_BYTES) {
+                json.put("formatVersion", 3)
+            }
         }
 
     internal fun fromJson(json: JSONObject): ConstructionSyncPacket {
         val format = json.exactLong("formatVersion")
-        require(format == 1L || format == 2L) { "Unsupported construction sync format" }
+        require(format in 1L..3L) { "Unsupported construction sync format; update both devices" }
         if (format == 1L) {
             require(listOf("includeMemo", "memoJson", "expectedMemoDigest").none(json::has) &&
                 (json.isNull("student") || listOf("memoStateKnown", "memoJson").none(json.getJSONObject("student")::has))) {
@@ -66,7 +73,9 @@ object ConstructionSyncCodec {
             if (json.isNull("result")) null else ConstructionPublishResult.valueOf(json.getString("result")),
             optionalBoolean(json, "includeMemo"), optionalText(json, "memoJson"), optionalText(json, "expectedMemoDigest"),
         ).also {
-            require((format == 2L) == usesMemoExtension(it)) { "Inconsistent construction sync format" }
+            // Preserve the old reader's acceptance of v2 with omitted/default extension fields.
+            // Only crossing the new v3 capability boundary must be rejected.
+            require((format == 3L) == (toJson(it).exactLong("formatVersion") == 3L)) { "Inconsistent construction sync format" }
             validate(it)
         }
     }
@@ -130,6 +139,12 @@ object ConstructionSyncCodec {
 
     private fun usesMemoExtension(packet: ConstructionSyncPacket) = packet.includeMemo || packet.memoJson != null ||
         packet.expectedMemoDigest != null || packet.student?.memoStateKnown == true
+
+    private fun requiresExtendedEnvelope(packet: ConstructionSyncPacket): Boolean =
+        listOfNotNull(packet.memoJson, packet.student?.memoJson).any { memo ->
+            memo.toByteArray(Charsets.UTF_8).size > LEGACY_MAX_MEMO_BYTES ||
+                runCatching { JSONObject(memo).optInt("formatVersion", 0) >= 3 }.getOrDefault(false)
+        }
 
     private fun optionalBoolean(json: JSONObject, key: String): Boolean =
         if (!json.has(key)) false else json.get(key).let { require(it is Boolean) { "Invalid $key" }; it }

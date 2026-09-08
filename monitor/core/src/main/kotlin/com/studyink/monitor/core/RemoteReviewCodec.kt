@@ -74,8 +74,11 @@ object RemoteReviewDocumentCodec {
         val framed = ByteArrayOutputStream(totalSize.toInt())
         DataOutputStream(framed).use { output ->
             output.writeInt(MAGIC)
-            output.writeByte(if (envelope is StudentMemoEnvelope && envelope.extendedCanvas)
-                EXTENDED_MEMO_VERSION else VERSION)
+            output.writeByte(when {
+                envelope is StudentMemoEnvelope && envelope.chunk != null -> CHUNKED_MEMO_VERSION
+                envelope is StudentMemoEnvelope && envelope.extendedCanvas -> EXTENDED_MEMO_VERSION
+                else -> VERSION
+            })
             output.writeByte(envelope.type.wireCode())
             output.writeInt(payload.size)
             output.write(digest)
@@ -84,7 +87,7 @@ object RemoteReviewDocumentCodec {
         return EncodedRemoteReviewDocument(framed.toByteArray(), digest.toHex())
     }
 
-    fun decode(bytes: ByteArray): DecodedRemoteReviewDocument = decodeWithVersionCeiling(bytes, EXTENDED_MEMO_VERSION)
+    fun decode(bytes: ByteArray): DecodedRemoteReviewDocument = decodeWithVersionCeiling(bytes, CHUNKED_MEMO_VERSION)
 
     /** The ceiling also exercises the exact pre-v2 rejection boundary in compatibility tests. */
     internal fun decodeWithVersionCeiling(bytes: ByteArray, maximumSupportedVersion: Int): DecodedRemoteReviewDocument {
@@ -104,13 +107,13 @@ object RemoteReviewDocumentCodec {
                 fail(RemoteReviewCodecError.BAD_MAGIC) { "Not a MasterNote remote-review document." }
             }
             val version = input.readUnsignedByte()
-            if (version !in VERSION..minOf(EXTENDED_MEMO_VERSION, maximumSupportedVersion)) {
+            if (version !in VERSION..minOf(CHUNKED_MEMO_VERSION, maximumSupportedVersion)) {
                 fail(RemoteReviewCodecError.UNSUPPORTED_VERSION) {
                     "Unsupported remote-review version $version."
                 }
             }
             val type = envelopeTypeFromWire(input.readUnsignedByte())
-            if (version == EXTENDED_MEMO_VERSION && type != RemoteReviewEnvelopeType.STUDENT_MEMO) {
+            if (version >= EXTENDED_MEMO_VERSION && type != RemoteReviewEnvelopeType.STUDENT_MEMO) {
                 fail(RemoteReviewCodecError.UNSUPPORTED_VERSION) {
                     "Remote-review version $version is reserved for extended memo canvas documents."
                 }
@@ -133,7 +136,8 @@ object RemoteReviewDocumentCodec {
                 }
             }
 
-            val envelope = decodePayload(type, payload, extendedMemoCanvas = version == EXTENDED_MEMO_VERSION)
+            val envelope = decodePayload(type, payload, extendedMemoCanvas = version == EXTENDED_MEMO_VERSION,
+                chunkedMemo = version == CHUNKED_MEMO_VERSION)
             return DecodedRemoteReviewDocument(
                 envelope = envelope,
                 payloadSha256Hex = actualDigest.toHex(),
@@ -392,6 +396,14 @@ object RemoteReviewDocumentCodec {
                     val memoPayload = envelope.payloadBytesForCodec()
                     output.writeInt(memoPayload.size)
                     output.write(memoPayload)
+                    envelope.chunk?.let { chunk ->
+                        output.writeBoolean(envelope.extendedCanvas)
+                        output.writeBoundedString(chunk.groupId)
+                        output.writeInt(chunk.index)
+                        output.writeInt(chunk.count)
+                        output.writeInt(chunk.totalBytes)
+                        output.writeBoundedString(chunk.completeSha256)
+                    }
                 }
             }
         }
@@ -402,6 +414,7 @@ object RemoteReviewDocumentCodec {
         type: RemoteReviewEnvelopeType,
         payload: ByteArray,
         extendedMemoCanvas: Boolean,
+        chunkedMemo: Boolean,
     ): RemoteReviewEnvelope {
         val input = DataInputStream(ByteArrayInputStream(payload))
         val transferId = input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES)
@@ -835,7 +848,11 @@ object RemoteReviewDocumentCodec {
                 memoDigestSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES),
                 payloadSha256 = input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES),
                 payloadBytes = input.readBoundedBytes(RemoteReviewLimits.MAX_STUDENT_MEMO_BYTES),
-                extendedCanvas = extendedMemoCanvas,
+                extendedCanvas = if (chunkedMemo) input.readBoolean() else extendedMemoCanvas,
+                chunk = if (chunkedMemo) StudentMemoChunkInfo(
+                    input.readBoundedString(RemoteReviewLimits.MAX_TOKEN_UTF8_BYTES), input.readInt(),
+                    input.readInt(), input.readInt(), input.readBoundedString(RemoteReviewLimits.SHA256_HEX_BYTES),
+                ) else null,
             )
         }
         if (input.available() != 0) {
@@ -1273,6 +1290,7 @@ object RemoteReviewDocumentCodec {
     private const val MAGIC: Int = 0x4d4e5252 // MNRR
     private const val VERSION: Int = 1
     private const val EXTENDED_MEMO_VERSION: Int = 2
+    private const val CHUNKED_MEMO_VERSION: Int = 3
     private const val SHA256_BYTES: Int = 32
     private const val FRAME_BYTES: Int = 4 + 1 + 1 + 4 + SHA256_BYTES
     private const val MAX_DETAIL_CODE_BYTES: Int = 64

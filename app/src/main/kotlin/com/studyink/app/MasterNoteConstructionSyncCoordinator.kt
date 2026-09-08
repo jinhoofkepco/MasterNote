@@ -372,6 +372,7 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
         val pending = gateway.pendingPeerDocuments().filter { it.payloadType == CONSTRUCTION_TELEGRAM_PAYLOAD }
         // The gateway's durable inbox owns chunk files. Never acknowledge a partial assembly.
         val groups = linkedMapOf<String, MutableList<Pair<PendingTelegramPeerDocument, ConstructionTelegramWire.Chunk>>>()
+        var reservedBytes = 0L
         pending.sortedByDescending { it.receivedAtEpochMs }.forEach { document ->
             // Incomplete superseded attempts are transport fragments, not the durable scene.
             // Both sides retain scene/request state and retry with a new outer delivery attempt.
@@ -383,7 +384,8 @@ internal class ConstructionSyncRuntime(private val app: Application) : Construct
                 require(document.file.length() in 1..ConstructionTelegramWire.MAX_FRAME_BYTES.toLong())
                 ConstructionTelegramWire.decode(document.file.readBytes()).also { require(it.transferId == document.transferId) }
             }.getOrElse { Log.w(TAG, "Invalid construction document retained", it); return@forEach }
-            if (groups.size < 8 || groups.containsKey(chunk.transmissionId)) {
+            if (groups.containsKey(chunk.transmissionId) || groups.size < 8 && reservedBytes + chunk.totalBytes <= 32L * 1024 * 1024) {
+                if (!groups.containsKey(chunk.transmissionId)) reservedBytes += chunk.totalBytes
                 groups.getOrPut(chunk.transmissionId) { mutableListOf() } += document to chunk
             }
         }

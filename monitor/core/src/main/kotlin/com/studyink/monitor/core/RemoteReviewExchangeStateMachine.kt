@@ -277,7 +277,8 @@ object RemoteReviewExchangeStateMachine {
         is GptExplanationLayerEnvelope ->
             "GPT_LAYER:${envelope.pageToken}:${envelope.attemptNo}"
         is StudentMemoEnvelope ->
-            "STUDENT_MEMO:${envelope.pageToken}:${envelope.attemptNo}:${envelope.memoId}"
+            if (envelope.chunk != null) null // Never supersede a sibling of an incomplete assembly.
+            else "STUDENT_MEMO:${envelope.pageToken}:${envelope.attemptNo}:${envelope.memoId}"
     }
 
     /**

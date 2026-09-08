@@ -395,7 +395,7 @@ class ConstructionReplicaStore(private val dataRoot: File) {
     private fun <T> locked(block: () -> T): T = MasterNoteOptionalDataRootGuard.withStableDataRoot(dataRoot, block)
 
     private fun encode(value: Replica): ByteArray {
-        val body = JSONObject().put("target", ConstructionJsonCodec.encodeTarget(value.target)).put("role", value.role.name)
+        val json = JSONObject().put("target", ConstructionJsonCodec.encodeTarget(value.target)).put("role", value.role.name)
             .put("revision", value.revision).put("commitId", value.commitId).put("generation", value.generation)
             .put("scene", ConstructionJsonCodec.encodeScene(value.scene)).put("attached", value.attached).put("deleted", value.deleted)
             .put("student", value.student?.let(ConstructionSyncCodec::remoteJson) ?: JSONObject.NULL)
@@ -407,17 +407,26 @@ class ConstructionReplicaStore(private val dataRoot: File) {
                 .put("version", ConstructionSyncCodec.versionJson(receipt.version))
                 .put("student", receipt.student?.let(ConstructionSyncCodec::remoteJson) ?: JSONObject.NULL)
                 .also { json -> receipt.memoJson?.let { json.put("memoJson", it) } } }))
-            .toString()
-        return JSONObject().put("formatVersion", 1).put("body", body)
+        // A published memo appears in the student shadow, common base and durable receipt.
+        // Keep its exact text once inside this same atomic file; no external blob may be lost
+        // between committing the scene and acknowledging a publication after process death.
+        val memoBodies = linkedMapOf<String, String>()
+        collectMemoBodies(json, memoBodies)
+        if (memoBodies.isNotEmpty()) json.put("memoBodies", JSONObject(memoBodies as Map<*, *>))
+        val body = json.toString()
+        return JSONObject().put("formatVersion", if (memoBodies.isEmpty()) 1 else 2).put("body", body)
             .put("sha256", ConstructionSyncCodec.sha256(body.toByteArray(Charsets.UTF_8))).toString().toByteArray(Charsets.UTF_8)
     }
 
     private fun decode(bytes: ByteArray): Replica {
         val envelope = JSONObject(bytes.toString(Charsets.UTF_8))
-        require(envelope.exactLong("formatVersion") == 1L)
+        val format = envelope.exactLong("formatVersion")
+        require(format == 1L || format == 2L) { "Unsupported construction replica format" }
         val body = envelope.getString("body")
         require(ConstructionSyncCodec.sha256(body.toByteArray(Charsets.UTF_8)) == envelope.getString("sha256"))
-        val json = JSONObject(body); val t = json.getJSONObject("target")
+        val json = JSONObject(body)
+        restoreMemoBodies(json, format)
+        val t = json.getJSONObject("target")
         val target = ConstructionTarget(t.getString("bookId"), t.exactInt("pageNumber"), t.exactInt("attemptNo"), t.getString("memoId"), t.getString("ownerScope"))
         val receipts = json.getJSONArray("receipts").also { require(it.length() <= MAX_RECEIPTS) }
         val value = Replica(target, ConstructionReplicaRole.valueOf(json.getString("role")), json.exactLong("revision"), json.getString("commitId"), json.exactLong("generation"),
@@ -453,6 +462,60 @@ class ConstructionReplicaStore(private val dataRoot: File) {
     private fun JSONObject.optionalRemote(key: String): ConstructionRemoteScene? =
         if (isNull(key)) null else ConstructionSyncCodec.remote(getJSONObject(key))
 
+    private fun collectMemoBodies(value: Any?, bodies: MutableMap<String, String>) {
+        when (value) {
+            is JSONObject -> {
+                if (value.has("memoJson") && !value.isNull("memoJson")) {
+                    val memo = value.get("memoJson")
+                    require(memo is String)
+                    ConstructionSyncCodec.validateMemoText(memo)
+                    val digest = ConstructionSyncCodec.sha256(memo.toByteArray(Charsets.UTF_8))
+                    require(bodies[digest] == null || bodies[digest] == memo) { "Memo body digest collision" }
+                    bodies[digest] = memo
+                    value.remove("memoJson")
+                    value.put("memoBodySha256", digest)
+                }
+                value.keys().asSequence().toList().forEach { collectMemoBodies(value.get(it), bodies) }
+            }
+            is JSONArray -> (0 until value.length()).forEach { collectMemoBodies(value.get(it), bodies) }
+        }
+    }
+
+    private fun restoreMemoBodies(root: JSONObject, format: Long) {
+        val bodies = if (format == 2L) root.getJSONObject("memoBodies") else null
+        if (format == 1L) require(!root.has("memoBodies")) { "Memo bodies require replica format 2" }
+        val texts = linkedMapOf<String, String>()
+        bodies?.keys()?.asSequence()?.forEach { digest ->
+            require(texts.size < MAX_RECEIPTS + 8 && Regex("[0-9a-f]{64}").matches(digest))
+            val text = bodies.get(digest)
+            require(text is String)
+            ConstructionSyncCodec.validateMemoText(text)
+            require(ConstructionSyncCodec.sha256(text.toByteArray(Charsets.UTF_8)) == digest) { "Memo body checksum mismatch" }
+            texts[digest] = text
+        }
+        if (format == 2L) require(texts.isNotEmpty()) { "Empty memo body table" }
+        root.remove("memoBodies")
+        val used = hashSetOf<String>()
+        fun restore(value: Any?) {
+            when (value) {
+                is JSONObject -> {
+                    if (value.has("memoBodySha256")) {
+                        require(format == 2L && !value.has("memoJson")) { "Invalid memo body reference" }
+                        val digest = value.get("memoBodySha256")
+                        require(digest is String)
+                        value.put("memoJson", requireNotNull(texts[digest]) { "Missing memo body" })
+                        value.remove("memoBodySha256")
+                        used += digest
+                    }
+                    value.keys().asSequence().toList().forEach { restore(value.get(it)) }
+                }
+                is JSONArray -> (0 until value.length()).forEach { restore(value.get(it)) }
+            }
+        }
+        restore(root)
+        require(used == texts.keys) { "Unreferenced memo body" }
+    }
+
     private fun receipt(hash: String, response: ConstructionSyncPacket) = Receipt(
         response.requestId, hash, requireNotNull(response.result), requireNotNull(response.student).version,
         response.student.takeUnless { response.result == ConstructionPublishResult.APPLIED },
@@ -482,7 +545,9 @@ class ConstructionReplicaStore(private val dataRoot: File) {
 
     companion object {
         const val FEATURE_DIRECTORY = "construction-replicas-v1"
-        private const val MAX_FILE_BYTES = 32 * 1024 * 1024
+        // Bounded even with distinct historical receipt bodies. Exceeding this fails atomically;
+        // receipts are never evicted because doing so could reapply an old publication.
+        private const val MAX_FILE_BYTES = 128 * 1024 * 1024
         private const val MAX_RECEIPTS = 10_000
         private fun newId() = UUID.randomUUID().toString()
     }

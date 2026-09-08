@@ -5,13 +5,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ConstructionLanWireTest {
-    @Test fun maximumPacketCrosses32BoundedFrames() {
+    @Test fun maximumPacketCrosses128BoundedFrames() {
         val payload = ByteArray(ConstructionLanBridge.MAX_PACKET_BYTES) { it.toByte() }
         val frames = ConstructionLanWire.frames("local-book", payload).map(::JSONObject).toList()
-        assertEquals(32, frames.size)
+        assertEquals(128, frames.size)
+        assertTrue(frames.all { it.getInt("constructionFormat") == 2 })
         val assembly = ConstructionLanAssembly()
         frames.dropLast(1).forEach { assertNull(assembly.accept(it, "local-book", 1, 10)) }
         assertArrayEquals(payload, assembly.accept(frames.last(), "local-book", 1, 20))
+        val downgrade = JSONObject(frames.first().toString()).apply { remove("constructionFormat") }
+        assertThrows(Exception::class.java) { assembly.accept(downgrade, "local-book", 1, 30) }
     }
     @Test fun sourceSessionTtlSizeAndChangedChunksFailClosed() {
         val frames = ConstructionLanWire.frames("book", ByteArray(ConstructionLanWire.CHUNK_BYTES + 1)).map(::JSONObject).toList()

@@ -12,11 +12,14 @@ class ConstructionTelegramWireTest {
     @Test fun maximumPacketRoundTripsInBoundedFramesAndArbitraryArrivalOrder() {
         val payload = ByteArray(ConstructionSyncCodec.MAX_PACKET_BYTES) { (it * 31).toByte() }
         val frames = ConstructionTelegramWire.frames(address, payload)
-        assertEquals(8, frames.size)
+        assertEquals(32, frames.size)
+        assertTrue(frames.all { JSONObject(it.second.toString(Charsets.UTF_8)).getInt("format") == 2 })
         assertTrue(frames.all { it.second.size <= ConstructionTelegramWire.MAX_FRAME_BYTES })
         val chunks = frames.reversed().map { (id, bytes) -> ConstructionTelegramWire.decode(bytes).also { assertEquals(id, it.transferId) } }
         assertArrayEquals(payload, ConstructionTelegramWire.assemble(chunks + chunks.first()))
         assertNull(ConstructionTelegramWire.assemble(chunks.drop(1)))
+        val downgrade = JSONObject(frames.first().second.toString(Charsets.UTF_8)).put("format", 1)
+        assertThrows(IllegalArgumentException::class.java) { ConstructionTelegramWire.decode(downgrade.toString().toByteArray()) }
     }
     @Test fun newDeliveryAttemptRetriesAfterAnOldTransportAcknowledgement() {
         val payload = "same durable publication request id".toByteArray()

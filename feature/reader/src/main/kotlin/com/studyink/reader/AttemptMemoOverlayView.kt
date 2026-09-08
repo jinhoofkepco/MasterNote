@@ -23,6 +23,7 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.TextView
+import android.widget.Toast
 import androidx.ink.authoring.InProgressStrokesFinishedListener
 import androidx.ink.authoring.InProgressStrokesView
 import androidx.ink.authoring.InProgressStrokeId
@@ -43,6 +44,7 @@ import com.studyink.memo.core.MemoAnchor
 import com.studyink.memo.core.MemoStroke
 import com.studyink.memo.core.MemoTarget
 import com.studyink.memo.core.MemoTool
+import com.studyink.memo.core.MemoUsage
 import com.studyink.memo.core.StudentMemo
 import java.lang.ref.WeakReference
 import java.util.concurrent.ExecutorService
@@ -96,6 +98,8 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
     var onStylusContact: () -> Unit = {}
     var onWorkActivity: () -> Unit = {}
     var onPersistenceError: (Throwable) -> Unit = {}
+    /** Queried off the main thread; a host may reuse the writer's compressed-size cache. */
+    var queryMemoUsage: ((StudentMemo) -> MemoUsage)? = null
     var onOpenConstruction: (StudentMemo) -> Unit = {}
     /** These repository callbacks run on the memo persistence worker, never on the UI thread. */
     var hasConstructionAttachment: ((StudentMemo, ConstructionReplicaRole) -> Boolean)? = null
@@ -175,9 +179,21 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         }
     }
     private var editorTopInset = 0
+    private var usageRequestedDigest: String? = null
+    private val capacityLabel = TextView(context).apply {
+        text = "사용 —"
+        textSize = 10f
+        gravity = Gravity.CENTER
+        isClickable = true
+        isFocusable = true
+        setTextColor(Color.rgb(72, 104, 135))
+        contentDescription = "메모 사용량 확인 중"
+        setOnClickListener { Toast.makeText(context, contentDescription, Toast.LENGTH_LONG).show() }
+    }
     private val header = FrameLayout(context).apply {
         setBackgroundColor(Color.rgb(246, 242, 230))
         addView(headerTitle, LayoutParams(MATCH, MATCH).apply { marginEnd = dpInt(40f) })
+        addView(capacityLabel, LayoutParams(dpInt(64f), MATCH, Gravity.END).apply { marginEnd = dpInt(40f) })
         addView(publishButton, LayoutParams(dpInt(52f), MATCH, Gravity.END).apply { marginEnd = dpInt(40f) })
         addView(minimizeButton, LayoutParams(dpInt(40f), MATCH, Gravity.END))
     }
@@ -353,6 +369,7 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
             loadEditor(refreshed)
         } else {
             activeMemo = refreshed
+            refreshMemoUsage(refreshed)
             bindConstruction(refreshed)
             updateInputEnabled()
         }
@@ -618,6 +635,10 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         dryInk.hoverPreview = null
         if (!preserveViewport) sharedCanvas.resetViewport()
         headerTitle.text = "메모 · ${memo.target.attemptNo}회"
+        usageRequestedDigest = null
+        capacityLabel.text = "사용 —"
+        capacityLabel.contentDescription = "메모 사용량 확인 중"
+        refreshMemoUsage(memo)
         bindConstruction(memo)
         updateInputEnabled()
         publishUndoState()
@@ -664,10 +685,43 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         publishButton.visibility = if (shown) VISIBLE else GONE
         publishButton.isEnabled = canPublishCurrentMemo()
         val params = headerTitle.layoutParams as? LayoutParams
-        val margin = dpInt(if (shown) 92f else 40f)
+        val actionsMargin = dpInt(if (shown) 92f else 40f)
+        val margin = actionsMargin + dpInt(64f)
         if (params != null && params.marginEnd != margin) {
             params.marginEnd = margin
             headerTitle.layoutParams = params
+        }
+        (capacityLabel.layoutParams as? LayoutParams)?.let {
+            if (it.marginEnd != actionsMargin) {
+                it.marginEnd = actionsMargin
+                capacityLabel.layoutParams = it
+            }
+        }
+    }
+
+    private fun refreshMemoUsage(memo: StudentMemo) {
+        val query = queryMemoUsage ?: return
+        if (usageRequestedDigest == memo.digestSha256) return
+        usageRequestedDigest = memo.digestSha256
+        val generation = operationGeneration
+        if (persistenceExecutor.isShutdown) persistenceExecutor = newPersistenceExecutor()
+        persistenceExecutor.execute {
+            val usage = runCatching { query(memo) }.getOrNull()
+            post {
+                if (operationGeneration != generation || activeMemo?.digestSha256 != memo.digestSha256 ||
+                    activeMemo?.id != memo.id || activeMemo?.target != memo.target
+                ) return@post
+                if (usage == null) {
+                    usageRequestedDigest = null
+                    capacityLabel.text = "사용 —"
+                    capacityLabel.contentDescription = "메모 사용량을 확인하지 못했습니다."
+                } else {
+                    val percent = memoUsagePercent(usage)
+                    capacityLabel.text = "사용 $percent%"
+                    capacityLabel.contentDescription = memoUsageDescription(usage)
+                    capacityLabel.setTextColor(if (percent >= 80) Color.rgb(178, 83, 30) else Color.rgb(72, 104, 135))
+                }
+            }
         }
     }
 
@@ -785,6 +839,7 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
             return
         }
         activeMemo = committed
+        refreshMemoUsage(committed)
         replaceMemo(committed)
         durableCheckpoint = request.checkpoint
         if (!binding.queue.isBusy) {

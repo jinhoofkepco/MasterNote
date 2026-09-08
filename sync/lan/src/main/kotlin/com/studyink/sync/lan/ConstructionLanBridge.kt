@@ -12,7 +12,7 @@ data class ConstructionLanPeer(val localBookId: String, val documentSha256: Stri
 
 /** Socket receipt is not a durable application acknowledgement. */
 object ConstructionLanBridge {
-    const val MAX_PACKET_BYTES = 4 * 1024 * 1024
+    const val MAX_PACKET_BYTES = 16 * 1024 * 1024
     interface Transport {
         fun peer(bookId: String): ConstructionLanPeer?
         fun send(bookId: String, payload: ByteArray, expectedPeer: ConstructionLanPeer): Boolean
@@ -47,7 +47,8 @@ object ConstructionLanBridge {
 internal object ConstructionLanWire {
     const val TYPE = "CONSTRUCTION_CHUNK"
     const val CHUNK_BYTES = 128 * 1024
-    const val MAX_CHUNKS = 32
+    const val MAX_CHUNKS = ConstructionLanBridge.MAX_PACKET_BYTES / CHUNK_BYTES
+    private const val LEGACY_MAX_PACKET_BYTES = 4 * 1024 * 1024
     const val TTL_MILLIS = 60_000L
     fun frames(bookId: String, payload: ByteArray): Sequence<String> {
         require(bookId.isNotBlank() && bookId.length <= 512)
@@ -60,6 +61,7 @@ internal object ConstructionLanWire {
             val part = payload.copyOfRange(start, minOf(start + CHUNK_BYTES, payload.size))
             LanWire.message(TYPE) {
                 put("sourceBookId", bookId); put("transferId", id); put("digestSha256", digest)
+                if (payload.size > LEGACY_MAX_PACKET_BYTES) put("constructionFormat", 2)
                 put("payloadSize", payload.size); put("chunkIndex", index); put("chunkCount", count)
                 put("payload", Base64.getEncoder().encodeToString(part))
             }
@@ -77,6 +79,8 @@ internal object ConstructionLanWire {
         val count = message.exactInt("chunkCount")
         val index = message.exactInt("chunkIndex")
         require(size in 1..ConstructionLanBridge.MAX_PACKET_BYTES)
+        require(if (size > LEGACY_MAX_PACKET_BYTES) message.exactInt("constructionFormat") == 2
+            else !message.has("constructionFormat") || message.exactInt("constructionFormat") == 1)
         require(count in 1..MAX_CHUNKS && count == (size + CHUNK_BYTES - 1) / CHUNK_BYTES)
         require(index in 0 until count)
         val encoded = message.text("payload", ((CHUNK_BYTES + 2) / 3) * 4)
@@ -109,7 +113,9 @@ internal class ConstructionLanAssembly {
         val prior = pending[key]
         require(prior != null || chunk.index == 0) { "Construction chunks must begin at zero" }
         val assembly = prior ?: run {
-            if (pending.size >= 4) pending.remove(pending.keys.first())
+            while (pending.size >= 4 || pending.values.sumOf { it.size.toLong() } + chunk.size > MAX_INFLIGHT_BYTES) {
+                pending.remove(pending.keys.first())
+            }
             Pending(chunk.digest, chunk.size, nowMillis, arrayOfNulls(chunk.count)).also { pending[key] = it }
         }
         require(assembly.digest == chunk.digest && assembly.size == chunk.size && assembly.parts.size == chunk.count)
@@ -123,4 +129,6 @@ internal class ConstructionLanAssembly {
         require(ConstructionLanWire.digest(bytes) == assembly.digest)
         return bytes
     }
+
+    private companion object { const val MAX_INFLIGHT_BYTES = 32L * 1024 * 1024 }
 }

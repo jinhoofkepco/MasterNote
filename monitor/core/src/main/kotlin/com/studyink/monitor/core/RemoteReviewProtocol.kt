@@ -63,6 +63,10 @@ object RemoteReviewLimits {
 
     /** Keeps a full memo snapshot and its metadata inside one ordinary two MiB document. */
     const val MAX_STUDENT_MEMO_BYTES: Int = OPERATIONAL_DOCUMENT_BYTES - (32 * 1024)
+    /** V3 transfers retain the ordinary document cap; only a verified assembly may be larger. */
+    const val STUDENT_MEMO_CHUNK_BYTES: Int = 512 * 1024
+    const val MAX_STUDENT_MEMO_ASSEMBLED_BYTES: Int = 10 * 1024 * 1024
+    const val MAX_STUDENT_MEMO_CHUNKS: Int = 20
 }
 
 class RemoteReviewValidationException(

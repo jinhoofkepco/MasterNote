@@ -462,6 +462,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             overlay.setPenWidth(selectedPenWidthDp)
             overlay.setPenOpacity(selectedPenOpacity)
             overlay.canEditMemo = { true }
+            overlay.queryMemoUsage = { memo ->
+                (if (memoConstructionRole == ConstructionReplicaRole.TEACHER) teacherMemoDrafts else memoRepository).usage(memo)
+            }
             overlay.onPublishMemo = { memo ->
                 val target = ConstructionTarget(memo.target.bookId, memo.target.pageNumber, memo.target.attemptNo, memo.id)
                 val bridge = ConstructionUiBridgeProvider.bridge
@@ -513,8 +516,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             overlay.onWorkActivity = {
                 publishStudentHeartbeat(StudentWorkKind.PEN_CONTACT)
             }
-            overlay.onPersistenceError = {
-                Toast.makeText(this, "메모를 저장하지 못했습니다.", Toast.LENGTH_SHORT).show()
+            overlay.onPersistenceError = { error ->
+                Log.w(MEMO_LOG_TAG, "Memo save failed", error)
+                Toast.makeText(this, memoSaveFailureMessage(error), Toast.LENGTH_LONG).show()
             }
             overlay.onOpenConstruction = { memo ->
                 openConstruction(
@@ -1008,6 +1012,9 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
             return
         }
         val writable = latestState.role != ReaderRole.STUDENT || latestState.currentAttemptWritable
+        // Record actual navigation order before asynchronous loads can finish out of order.
+        // This hint reads no memo files and performs no compression/decompression.
+        memoRepository.focusPage(target.bookId, target.pageNumber)
         if (!force && displayedMemoTarget == target) {
             // The overlay owns edits that have just been durably committed. Rebinding the activity's
             // older cache here can briefly roll that memo back before its change-bus reload arrives.
@@ -2285,6 +2292,10 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         if (answerCropLoaderDelegate.isInitialized()) answerCropLoader.trimMemory(level)
+        if (level == android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+            level == android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+            level >= android.content.ComponentCallbacks2.TRIM_MEMORY_MODERATE
+        ) StudentMemoRepository.trimMemoryCaches()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
