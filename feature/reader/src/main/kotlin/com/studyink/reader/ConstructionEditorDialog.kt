@@ -1320,7 +1320,9 @@ internal class ConstructionEditorView(
     fun handleBack() { if (panelKind != null) closePanel() else if (pendingEqualAngle != null || pendingEqualMeasurement != null) { pendingEqualAngle = null; clearMeasurementReference(); updateHint() } else requestClose() }
     fun undoEdit(): Boolean = if (canUndo) { history(true); true } else false
     fun redoEdit(): Boolean = if (canRedo) { history(false); true } else false
-    fun cancelInteraction() { pendingEqualAngle = null; clearMeasurementReference(); canvas.cancelDrag(); canvas.tool = canvas.tool; dismissChildren(); updateHint() }
+    /** A child dialog takes window focus too; cancel pointer input without closing that dialog. */
+    fun cancelActiveGesture() { canvas.cancelDrag() }
+    fun cancelInteraction() { pendingEqualAngle = null; clearMeasurementReference(); cancelActiveGesture(); canvas.tool = canvas.tool; dismissChildren(); updateHint() }
 
     /** Toolbars remain outside the shared content rectangle; both editable layers fill it exactly. */
     fun attachSharedCanvas(host: SharedMemoCanvasHost) {

@@ -64,26 +64,6 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
                 constraint.id == selectedConstraint, reference = false, enabled = constraint.enabled)
         }
         val dimensionIds = dimensions.mapTo(mutableSetOf()) { it.first.id }
-        scene.constraints.filter { it.type == ConstraintType.EQUAL_ANGLE }.forEachIndexed { index, constraint ->
-            val layouts = ConstructionMeasurementGeometry.equalAngleLayouts(scene, constraint)
-            layouts.forEach { layout ->
-                // Matching captions on both arcs identify an equality, not a fixed degree value.
-                val relation = layout.copy(captionOverride = "같은 각 ${index + 1}")
-                val placed = placeDrivingCaption(canvas, relation, constraint.enabled)
-                drawDimension(canvas, placed, constraint.id, ConstructionAnnotationKind.CONSTRAINT,
-                    constraint.id == selectedConstraint, reference = false, enabled = constraint.enabled)
-            }
-            if (layouts.isNotEmpty()) dimensionIds += constraint.id
-        }
-        scene.constraints.filter { it.type == ConstraintType.EQUAL_DISTANCE_POINTS }.forEachIndexed { index, constraint ->
-            val layouts = ConstructionMeasurementGeometry.equalDistanceLayouts(scene, constraint)
-            layouts.forEach { layout ->
-                val relation = layout.copy(captionOverride = "같은 거리 ${index + 1}")
-                drawDimension(canvas, placeDrivingCaption(canvas, relation, constraint.enabled), constraint.id,
-                    ConstructionAnnotationKind.CONSTRAINT, constraint.id == selectedConstraint, reference = false, enabled = constraint.enabled)
-            }
-            if (layouts.isNotEmpty()) dimensionIds += constraint.id
-        }
         val related = scene.constraints.filter { c ->
             c.id !in dimensionIds && (c.enabled || c.id == selectedConstraint || c.entityIds.any { id ->
                 id in selected || scene.segment(id)?.let { it.startPointId in selected || it.endPointId in selected } == true ||
@@ -99,12 +79,13 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
         scene.constraints.filter { it.id !in dimensionIds }.forEach { constraint ->
             val group = (groups[constraint.type] ?: 0) + 1
             groups[constraint.type] = group
-            constraint.entityIds.distinct().forEachIndexed { member, entityId ->
-                val slot = localSlots[entityId] ?: 0
-                localSlots[entityId] = slot + 1
-                drawBadge(canvas, scene, constraint, entityId, member, group, slot,
-                    constraint.id == selectedConstraint, constraint.id in visibleIds, reservedCaptions)
-            }
+            // One stable local icon per relation, not a duplicate on every participating entity.
+            // Tapping it still highlights all members and opens the single detail inspector.
+            val entityId = constraint.entityIds.firstOrNull() ?: return@forEach
+            val slot = localSlots[entityId] ?: 0
+            localSlots[entityId] = slot + 1
+            drawBadge(canvas, scene, constraint, entityId, group, slot,
+                constraint.id == selectedConstraint, constraint.id in visibleIds, reservedCaptions)
         }
         return hits.toList()
     }
@@ -275,7 +256,7 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
     private fun touchBounds(visual: RectF) = RectF(visual).apply { inset(-5 * density, -10 * density) }
 
     private fun drawBadge(canvas: Canvas, scene: ConstructionScene, constraint: GeometryConstraint,
-                          target: String, member: Int, group: Int, slot: Int, selected: Boolean,
+                          target: String, group: Int, slot: Int, selected: Boolean,
                           visible: Boolean, reservedCaptions: MutableList<RectF>) {
         val normal: ConstructionVector
         val anchor: ConstructionVector
@@ -310,17 +291,19 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
             ConstraintType.POINT_ON_SEGMENT -> "선분 위 $group"
             ConstraintType.POINT_ON_CIRCLE -> "원 위 $group"
             ConstraintType.POINT_FRACTION -> "${constraint.numerator}/${constraint.denominator} 위치 $group"
-            ConstraintType.LENGTH_RATIO -> "비$group ×${if (member == 0) formatGeometry(constraint.value ?: 1.0) else "1"}"
+            ConstraintType.LENGTH_RATIO -> "비$group ×${formatGeometry(constraint.value ?: 1.0)}"
             ConstraintType.PARALLEL -> "평행 $group"
             ConstraintType.PERPENDICULAR -> "직각 $group"
             ConstraintType.HORIZONTAL -> "수평"
             ConstraintType.VERTICAL -> "수직"
             ConstraintType.EQUAL_LENGTH -> "같은 길이 $group"
+            ConstraintType.EQUAL_ANGLE -> "같은 각 $group"
+            ConstraintType.EQUAL_DISTANCE_POINTS -> "같은 거리 $group"
             else -> "조건 $group"
         }.let { if (constraint.enabled) it else "꺼짐 · $it" }
         paint.reset(); paint.isAntiAlias = true; paint.textSize = 10f * density
         val halfHeight = 11f * density
-        val halfWidth = (paint.measureText(relationText) + 23 * density) / 2
+        val halfWidth = halfHeight
         // Nine bounded local slots (three outward tiers, three side offsets). Dense diagrams may
         // still overlap; their relations remain selectable in the list instead of fleeing elsewhere.
         val normalExtent = kotlin.math.abs(normal.x).toFloat() * halfWidth + kotlin.math.abs(normal.y).toFloat() * halfHeight
@@ -346,28 +329,17 @@ internal class ConstructionAnnotationRenderer(private val density: Float) {
         val x = bounds.centerX(); val y = bounds.centerY()
         // Clip with the viewport naturally. Never clamp a badge to a distant screen edge.
         if (!RectF.intersects(bounds, RectF(0f, 0f, canvas.width.toFloat(), canvas.height.toFloat()))) return
-        paint.style = Paint.Style.STROKE; paint.strokeWidth = density
-        paint.color = when { !constraint.enabled -> DIMENSION_DISABLED; selected -> DIMENSION_SELECTED; else -> DIMENSION_GUIDE }
-        val leaderX = x - normal.x.toFloat() * normalExtent
-        val leaderY = y - normal.y.toFloat() * normalExtent
-        canvas.drawLine(ax, ay, leaderX, leaderY, paint)
-        canvas.drawLine(ax + normal.y.toFloat() * 3 * density, ay - normal.x.toFloat() * 3 * density,
-            ax - normal.y.toFloat() * 3 * density, ay + normal.x.toFloat() * 3 * density, paint)
-        paint.style = Paint.Style.FILL; paint.color = if (selected) 0xFFDFEAFE.toInt() else 0xFFEAF0F7.toInt()
-        canvas.drawRoundRect(bounds, 4 * density, 4 * density, paint)
-        paint.style = Paint.Style.STROKE; paint.strokeWidth = density
-        paint.color = if (selected) DIMENSION_SELECTED else if (constraint.enabled) DIMENSION_TEXT else DIMENSION_DISABLED
-        canvas.drawRoundRect(bounds, 4 * density, 4 * density, paint)
-        // A blue selection outline only indicates focus. Paused relation symbols and text stay
-        // gray (with "꺼짐" and a strike) so selecting one never makes it appear enabled.
+        // No caption, border or background. Composite once so overlapping symbol strokes
+        // also stay at 0.3 opacity; the padded hit area remains easy to tap.
+        val iconLayer = canvas.saveLayerAlpha(bounds, 77)
+        paint.style = Paint.Style.STROKE
         paint.color = when { !constraint.enabled -> DIMENSION_DISABLED; selected -> DIMENSION_SELECTED; else -> DIMENSION_TEXT }
-        canvas.save(); canvas.translate(bounds.left + 10 * density, y); canvas.scale(density * .8f, density * .8f)
+        canvas.save(); canvas.translate(x, y); canvas.scale(density * .8f, density * .8f)
         paint.strokeWidth = 1.3f
         symbol(canvas, constraint.type)
         if (!constraint.enabled) canvas.drawLine(-8f, 8f, 8f, -8f, paint)
         canvas.restore()
-        paint.style = Paint.Style.FILL; paint.textSize = 10f * density
-        canvas.drawText(relationText, bounds.left + 20 * density, y - (paint.ascent() + paint.descent()) / 2, paint)
+        canvas.restoreToCount(iconLayer)
         hits += ConstructionAnnotationHit(constraint.id, ConstructionAnnotationKind.CONSTRAINT,
             RectF(bounds).apply { inset(-4 * density, -7 * density) }, RectF(bounds), relationText, target, PointF(ax, ay))
     }

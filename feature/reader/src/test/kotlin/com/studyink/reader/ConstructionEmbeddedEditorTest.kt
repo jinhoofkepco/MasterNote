@@ -187,6 +187,37 @@ class ConstructionEmbeddedEditorTest {
         assertEquals(teacher.load(target, ConstructionReplicaRole.TEACHER).scene, canvas(editor).scene)
     }
 
+    @Test fun `teacher deletion survives dialog focus loss and only changes the unpublished draft`() {
+        val student = ConstructionReplicaStore(File(temporary.root, "delete-student"))
+        val teacher = ConstructionReplicaStore(File(temporary.root, "delete-teacher"))
+        val original = ConstructionScene(
+            points = listOf(GeometryPoint("A", 0.0, 0.0), GeometryPoint("B", 5.0, 0.0)),
+            segments = listOf(GeometrySegment("AB", "A", "B")),
+        )
+        student.saveLocal(student.load(target, ConstructionReplicaRole.STUDENT), original)
+        teacher.receiveStudentSnapshot(target, student.studentSnapshot(target))
+        val teacherAccess = teacher.sceneAccess(ConstructionReplicaRole.TEACHER)
+        val bridge = TestBridge(teacherAccess)
+        val editor = open(bridge, teacherAccess)
+        canvas(editor).selectedIds = setOf("AB")
+        canvas(editor).onSelectionChanged(setOf("AB"))
+        walk(editor).single { it.tag == "construction-delete-selected" }.performClick()
+        editor.cancelActiveGesture()
+        shadowOf(Looper.getMainLooper()).idle()
+        val dialog = ShadowAlertDialog.getLatestAlertDialog()!!
+        assertTrue(dialog.isShowing)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+        awaitReady(editor) { it.segments.isEmpty() }
+        val stored = teacher.load(target, ConstructionReplicaRole.TEACHER)
+        assertTrue(stored.draftDirty)
+        assertEquals(original.points, stored.scene.points)
+        assertEquals(original, stored.studentShadow!!.scene)
+        assertEquals(original, student.load(target, ConstructionReplicaRole.STUDENT).scene)
+        assertEquals(0, bridge.publishCalls)
+        assertTrue(editor.undoEdit())
+        awaitReady(editor) { it == original }
+    }
+
     @Test fun `incoming student commit does not overwrite the teachers edited draft`() {
         val student = ConstructionReplicaStore(File(temporary.root, "student"))
         val teacher = ConstructionReplicaStore(File(temporary.root, "teacher"))

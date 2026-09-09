@@ -121,6 +121,28 @@ class ConstructionDeletionInteractionTest {
         assertFalse(editor.canUndo)
     }
 
+    @Test fun `losing window focus to deletion dialog cancels gestures but keeps confirmation and selection`() {
+        select("AB")
+        trash().performClick()
+        // ReaderActivity uses gesture-only cancellation on focus loss, including our own dialogs.
+        editor.cancelActiveGesture()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(setOf("AB"), canvas().selectedIds)
+        confirm()
+        awaitReady { it.segment("AB") == null }
+        assertNotNull(store.load(target).scene.segment("AC"))
+    }
+
+    @Test fun `explicit interaction cancellation still dismisses deletion without editing`() {
+        val original = store.load(target).scene
+        select("AB")
+        trash().performClick()
+        val dialog = ShadowAlertDialog.getLatestAlertDialog()!!
+        editor.cancelInteraction()
+        assertFalse(dialog.isShowing)
+        assertEquals(original, store.load(target).scene)
+    }
+
     private fun canvas() = walk(editor).filterIsInstance<ConstructionCanvasView>().single()
     private fun trash() = tagged("construction-delete-selected")
     private fun tagged(value: String): View = walk(editor).single { it.tag == value }

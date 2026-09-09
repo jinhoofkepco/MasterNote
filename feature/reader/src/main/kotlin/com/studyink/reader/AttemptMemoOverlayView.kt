@@ -526,9 +526,10 @@ internal class AttemptMemoOverlayView @JvmOverloads constructor(
         return persistChange(current, change, currentDocument.checkpoint())
     }
 
-    fun cancelActiveGesture(): Boolean {
+    fun cancelActiveGesture(dismissConstructionUi: Boolean = true): Boolean {
         sharedCanvas.cancelOwnedGesture()
-        constructionEditor?.cancelInteraction()
+        if (dismissConstructionUi) constructionEditor?.cancelInteraction()
+        else constructionEditor?.cancelActiveGesture()
         val cancelled = inkInput.cancelActiveGesture()
         dryInk.eraserPreview = null
         dryInk.hoverPreview = null

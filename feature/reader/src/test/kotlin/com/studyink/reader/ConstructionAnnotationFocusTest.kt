@@ -45,11 +45,11 @@ class ConstructionAnnotationFocusTest {
         }
     }
 
-    @Test fun `paired relation appears at each line with matching text and explicit local attachment`() {
+    @Test fun `paired relation has one compact icon near its stable first member`() {
         val scene = scene().copy(constraints = listOf(GeometryConstraint("equal", ConstraintType.EQUAL_LENGTH, listOf("AB", "CD"))))
         render(scene) { _, hits ->
-            assertEquals(2, hits.size)
-            assertEquals(setOf("AB", "CD"), hits.map { it.targetEntityId }.toSet())
+            assertEquals(1, hits.size)
+            assertEquals(setOf("AB"), hits.map { it.targetEntityId }.toSet())
             assertEquals(1, hits.map { it.label }.distinct().size)
             for (hit in hits) {
                 val line = scene.segment(hit.targetEntityId!!)!!
@@ -103,7 +103,7 @@ class ConstructionAnnotationFocusTest {
         for (scale in listOf(19.25f, 30f)) render(scene, scale = scale) { _, hits ->
             val measurement = hits.single { it.id == "angle" }
             val badges = hits.filter { it.id == "equal" }
-            assertEquals(2, badges.size)
+            assertEquals(1, badges.size)
             for (badge in badges) {
                 assertFalse("A local relation must not cover the visible angle caption", RectF.intersects(measurement.visualBounds, badge.visualBounds))
                 val anchor = badge.targetAnchor!!
@@ -135,16 +135,40 @@ class ConstructionAnnotationFocusTest {
         assertEquals(listOf(measure), scene.measurements)
     }
 
-    @Test fun `virtual distance equality displays both spans under one relation identity`() {
+    @Test fun `virtual distance equality displays one icon but highlights both spans`() {
         val relation = GeometryConstraint("equal", ConstraintType.EQUAL_DISTANCE_POINTS, listOf("A", "D", "B", "C"))
         val scene = scene().copy(constraints = listOf(relation))
         render(scene) { _, hits ->
-            assertEquals(listOf("equal", "equal"), hits.map { it.id })
+            assertEquals(listOf("equal"), hits.map { it.id })
             assertTrue(hits.all { it.label.contains("같은 거리 1") })
         }
         val targets = ConstructionMeasurementGeometry.annotationTargets(scene, "equal", null)
         assertEquals(setOf("A", "B", "C", "D"), targets.entityIds)
         assertEquals(setOf("A" to "D", "B" to "C"), targets.pointPairs.toSet())
+    }
+
+    @Test fun `relation icons have 0_3 opacity with no caption border or background even when selected`() {
+        for (type in listOf(ConstraintType.COINCIDENT, ConstraintType.EQUAL_LENGTH, ConstraintType.EQUAL_ANGLE)) {
+            val ids = when (type) {
+                ConstraintType.COINCIDENT -> listOf("A", "B")
+                ConstraintType.EQUAL_ANGLE -> listOf("B", "A", "C", "A", "B", "D")
+                else -> listOf("AB", "CD")
+            }
+            val scene = scene().copy(constraints = listOf(GeometryConstraint("relation", type, ids)))
+            for (selected in listOf(null, "relation")) render(scene, selectedConstraint = selected) { bitmap, hits ->
+                val bounds = hits.single().visualBounds
+                assertEquals(22f, bounds.width(), .001f)
+                val pixels = IntArray(bitmap.width * bitmap.height)
+                bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+                // Thin anti-aliased strokes may not fully cover any pixel, but cannot exceed 0.3.
+                val maximumAlpha = pixels.maxOf { android.graphics.Color.alpha(it) }
+                assertTrue("$type alpha=$maximumAlpha", maximumAlpha in 50..77)
+                assertEquals(0, bitmap.getPixel(bounds.left.toInt() + 1, bounds.top.toInt() + 1))
+                for (y in 0 until bitmap.height) for (x in 0 until bitmap.width) {
+                    if (!bounds.contains(x.toFloat(), y.toFloat())) assertEquals(0, bitmap.getPixel(x, y))
+                }
+            }
+        }
     }
 
     @Test fun `condition badge and measurement selection highlight targets without changing editable selection`() {

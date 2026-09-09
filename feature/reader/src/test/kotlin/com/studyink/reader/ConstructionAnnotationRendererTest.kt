@@ -13,6 +13,7 @@ import com.studyink.construction.core.GeometryPoint
 import com.studyink.construction.core.GeometrySegment
 import com.studyink.construction.core.MeasurementType
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -76,7 +77,12 @@ class ConstructionAnnotationRendererTest {
     @Test fun `disabled relation badges preserve muted disabled styling`() {
         val constraint = GeometryConstraint("horizontal", ConstraintType.HORIZONTAL, listOf("AB"), enabled = false)
         render(scene().copy(constraints = listOf(constraint)), selectedConstraint = constraint.id) { bitmap, hits ->
-            assertTrue(bitmap.hasOpaqueColor(0xFF9A9FA8.toInt()))
+            val pixels = IntArray(bitmap.width * bitmap.height)
+            bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+            val solidIconPixel = pixels.first { Color.alpha(it) == 77 }
+            assertTrue(kotlin.math.abs(Color.red(solidIconPixel) - 154) <= 2)
+            assertTrue(kotlin.math.abs(Color.green(solidIconPixel) - 159) <= 2)
+            assertTrue(kotlin.math.abs(Color.blue(solidIconPixel) - 168) <= 2)
             assertEquals(constraint.id, hits.single().id)
             assertTrue(hits.single().label.startsWith("꺼짐"))
         }
@@ -177,24 +183,25 @@ class ConstructionAnnotationRendererTest {
         }
     }
 
-    @Test fun `equal angle relation displays two nonoverlapping matching arc hits with the same identity`() {
+    @Test fun `equal angle relation displays one translucent icon with one identity`() {
         val relation = GeometryConstraint("equal", ConstraintType.EQUAL_ANGLE, listOf("B", "A", "C", "A", "B", "C"))
         render(scene().copy(constraints = listOf(relation))) { bitmap, hits ->
-            assertTrue(bitmap.hasOpaqueColor(0xFF5F82AD.toInt()))
-            assertEquals(listOf("equal", "equal"), hits.map { it.id })
-            assertTrue(!RectF.intersects(hits[0].bounds, hits[1].bounds))
+            assertFalse(bitmap.hasOpaqueColor(0xFF5F82AD.toInt()))
+            assertEquals(listOf("equal"), hits.map { it.id })
         }
     }
 
-    @Test fun `fraction and ratio badges are persistent and wide enough for readable condition text`() {
+    @Test fun `fraction and ratio each use one compact icon with a larger touch area`() {
         val constraints = listOf(
             GeometryConstraint("fraction", ConstraintType.POINT_FRACTION, listOf("C", "AB"), numerator = 1, denominator = 3),
             GeometryConstraint("ratio", ConstraintType.LENGTH_RATIO, listOf("AB", "AC"), value = 2.0),
         )
         for (constraint in constraints) render(scene().copy(constraints = listOf(constraint))) { _, hits ->
-            assertEquals(2, hits.size)
-            assertTrue(hits.all { it.id == constraint.id && it.visualBounds.width() > 48f })
-            assertEquals(constraint.entityIds.toSet(), hits.mapNotNull { it.targetEntityId }.toSet())
+            val hit = hits.single()
+            assertEquals(constraint.id, hit.id)
+            assertEquals(44f, hit.visualBounds.width(), .001f)
+            assertTrue(hit.bounds.width() > hit.visualBounds.width())
+            assertEquals(constraint.entityIds.first(), hit.targetEntityId)
         }
     }
 

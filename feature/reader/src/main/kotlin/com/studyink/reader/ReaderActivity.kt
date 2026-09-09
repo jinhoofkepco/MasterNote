@@ -2300,7 +2300,8 @@ class ReaderActivity : FragmentActivity(), ReaderPdfFragment.Listener {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         if (!hasFocus && ::inputView.isInitialized) cancelActiveInkInput()
-        if (!hasFocus && ::memoOverlay.isInitialized) memoOverlay.cancelActiveGesture()
+        // Showing our own confirmation/input dialog loses window focus, but must not dismiss it.
+        if (!hasFocus && ::memoOverlay.isInitialized) memoOverlay.cancelActiveGesture(dismissConstructionUi = false)
         super.onWindowFocusChanged(hasFocus)
     }
 

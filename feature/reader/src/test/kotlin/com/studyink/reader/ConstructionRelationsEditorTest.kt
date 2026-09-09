@@ -309,7 +309,7 @@ class ConstructionRelationsEditorTest {
 
     @Test
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
-    fun `tapping the second equal angle caption selects that angle with a fixed upper right inspector`() {
+    fun `tapping the single equal angle icon opens the fixed upper right inspector`() {
         val scene = ConstructionScene(
             points = listOf(GeometryPoint("A", 0.0, 5.0, "A"), GeometryPoint("B", 0.0, 0.0, "B"), GeometryPoint("C", 5.0, 0.0, "C"),
                 GeometryPoint("D", 15.0, 5.0, "D"), GeometryPoint("E", 15.0, 0.0, "E"), GeometryPoint("F", 20.0, 0.0, "F")),
@@ -327,7 +327,7 @@ class ConstructionRelationsEditorTest {
             val scale = (xPoint.x - origin.x) / 5f
             val hits = ConstructionAnnotationRenderer(activity.resources.displayMetrics.density).draw(Canvas(bitmap), scene,
                 emptySet(), null, null, scale, { origin.x + it.toFloat() * scale }, { origin.y - it.toFloat() * scale })
-            assertEquals(2, hits.size)
+            assertEquals(1, hits.size)
             val second = hits.last()
             val down = MotionEvent.obtain(0, 0, MotionEvent.ACTION_DOWN, second.visualBounds.centerX(), second.visualBounds.centerY(), 0)
             val up = MotionEvent.obtain(0, 16, MotionEvent.ACTION_UP, second.visualBounds.centerX(), second.visualBounds.centerY(), 0)
